@@ -34,8 +34,8 @@ function capsFor(task: Task): Registry {
   return task.caps === "alt" ? fileRegistry().withRenamed(RENAMES) : fileRegistry();
 }
 
-async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean, library: Library | null) {
-  const runDir = path.join(outDir, task.id);
+async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean, library: Library | null, rep = 0) {
+  const runDir = path.join(outDir, `rep${rep}`, task.id);          // one directory per repetition: logs are never overwritten
   fs.rmSync(runDir, { recursive: true, force: true });
   fs.mkdirSync(runDir, { recursive: true });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "b0ts-"));
@@ -103,6 +103,19 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   return rec;
 }
 
+/** Add this process's gateway summary to the one on disk (a resumed run spans several processes). */
+function mergeSummaries(prev: any, cur: any) {
+  if (!prev || prev.config !== cur.config) return cur;
+  const roles: Record<string, any> = { ...prev.roles };
+  for (const [role, s] of Object.entries<any>(cur.roles)) {
+    const p = roles[role];
+    roles[role] = !p ? s : { ...s, calls: p.calls + s.calls, tokens_in: p.tokens_in + s.tokens_in, tokens_out: p.tokens_out + s.tokens_out, cost_usd: p.cost_usd + s.cost_usd,
+      outcomes: Object.fromEntries([...new Set([...Object.keys(p.outcomes), ...Object.keys(s.outcomes)])].map((k) => [k, (p.outcomes[k] ?? 0) + (s.outcomes[k] ?? 0)])),
+      latency_p50: Math.round((p.latency_p50 * p.calls + s.latency_p50 * s.calls) / (p.calls + s.calls)), latency_p90: Math.max(p.latency_p90, s.latency_p90) };
+  }
+  return { config: cur.config, calls: prev.calls + cur.calls, spent_usd: Number((prev.spent_usd + cur.spent_usd).toFixed(4)), roles, processes: (prev.processes ?? 1) + 1 };
+}
+
 function report(paths: string[]) {
   const rows = paths.flatMap((p) => fs.readFileSync(p, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)));
   const by = new Map<string, any[]>();
@@ -121,6 +134,7 @@ async function main() {
     groups: { type: "string", default: "1,2,3,4,5,6" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
     out: { type: "string" }, v: { type: "boolean", default: false }, report: { type: "string", multiple: true },
     role: { type: "string", multiple: true, default: [] },
+    repeat: { type: "string", default: "1" },
   } });
   if (a.report?.length) return report(a.report);
   if (!a.tasks) throw new Error("--tasks <path to tasks.json> is required");
@@ -135,17 +149,23 @@ async function main() {
   const table = a.role!.length ? withOverrides(CONFIGS[a.config!]!, a.role!) : a.config!;
   const gw = new Gateway(table, { log: (r) => fs.writeSync(callsLog, JSON.stringify(r) + "\n"), maxCostUsd: Number(a["max-cost"]) });
   const resPath = path.join(out, "results.jsonl");
-  const done = new Set(fs.existsSync(resPath) ? fs.readFileSync(resPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l).task as string) : []);
-  const library = new Library(path.join(out, "skills.json"));
-  for (const t of tasks) {
-    if (done.has(t.id)) continue;
-    if (a.v) console.log(`\n=== ${t.id} (${t.split}): ${t.raw}`);
-    const r = await runTask(t, gw, out, a.v!, library);
-    fs.appendFileSync(resPath, JSON.stringify(r) + "\n");
-    console.log(`${r.correct ? "✓" : "✗"} ${t.id} ${r.status} (${(r.reason ?? "").slice(0, 60)}) calls=${r.model_calls} $${r.cost_usd.toFixed(4)} ${r.seconds}s ${r.correct ? "" : r.why.slice(0, 80)}`);
-    if (gw.spentUsd >= Number(a["max-cost"])) { console.log("cost cap reached, stopping"); break; }
+  const done = new Set(fs.existsSync(resPath) ? fs.readFileSync(resPath, "utf-8").split("\n").filter(Boolean).map((l) => { const r = JSON.parse(l); return `${r.task}#${r.rep ?? 0}`; }) : []);
+  const repeats = Number(a.repeat);
+  outer: for (let rep = 0; rep < repeats; rep++) {
+    const library = new Library(path.join(out, `rep${rep}`, "skills.json"));   // a fresh skill library per repetition
+    fs.mkdirSync(path.join(out, `rep${rep}`), { recursive: true });
+    for (const t of tasks) {
+      if (done.has(`${t.id}#${rep}`)) continue;
+      if (a.v) console.log(`\n=== ${t.id} (${t.split}, rep ${rep}): ${t.raw}`);
+      const r = { ...(await runTask(t, gw, out, a.v!, library, rep)), rep };
+      fs.appendFileSync(resPath, JSON.stringify(r) + "\n");
+      console.log(`${r.correct ? "✓" : "✗"} ${t.id}#${rep} ${r.status} (${(r.reason ?? "").slice(0, 60)}) calls=${r.model_calls} $${r.cost_usd.toFixed(4)} ${r.seconds}s ${r.correct ? "" : r.why.slice(0, 80)}`);
+      if (gw.spentUsd >= Number(a["max-cost"])) { console.log("cost cap reached, stopping"); break outer; }
+    }
   }
-  fs.writeFileSync(path.join(out, "gateway.json"), JSON.stringify(gw.summary(), null, 1));
+  const gwPath = path.join(out, "gateway.json");
+  const previous = fs.existsSync(gwPath) ? JSON.parse(fs.readFileSync(gwPath, "utf-8")) : null;
+  fs.writeFileSync(gwPath, JSON.stringify(mergeSummaries(previous, gw.summary()), null, 1));
   report([resPath]);
 }
 
