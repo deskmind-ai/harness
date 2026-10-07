@@ -94,7 +94,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   const sc = score(task, start, ws.tree(), summ, gui?.log ?? []);
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
-    ...sc, crashed, errored: (summ.reason ?? "").startsWith("model error"), counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
+    ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
     skill: summ.skill, taught, asked: user.asked, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
   fs.writeFileSync(path.join(runDir, "result.json"), JSON.stringify(rec, null, 1));
