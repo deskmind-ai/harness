@@ -35,14 +35,15 @@ export type BindAnswer = z.infer<typeof BindAnswer>;
 
 export const IntentAnswer = z.object({
   verdict: z.enum(["matches", "mismatch", "insufficient_information", "requires_more_steps"]),
-  reason: z.string(),
+  reason: z.string().default(""),
+  scores: z.record(z.number()).optional(),          // from a choice-only backend: probability per option
 });
 export type IntentAnswer = z.infer<typeof IntentAnswer>;
 
 export const choiceAnswer = (ids: readonly [string, ...string[]]) =>
-  z.object({ choice: z.enum(ids), reason: z.string().optional() });
+  z.object({ choice: z.enum(ids), reason: z.string().optional(), scores: z.record(z.number()).optional() });
 
-export const VerifyAnswer = z.object({ verdict: z.enum(["pass", "fail", "unknown"]), reason: z.string() });
+export const VerifyAnswer = z.object({ verdict: z.enum(["pass", "fail", "unknown"]), reason: z.string().default(""), scores: z.record(z.number()).optional() });
 export type VerifyAnswer = z.infer<typeof VerifyAnswer>;
 
 const strOrList = z.union([z.string(), z.array(z.string())]);

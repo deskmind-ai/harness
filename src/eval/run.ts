@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
-import { Gateway } from "../gateway/index.js";
+import { CONFIGS, Gateway, withOverrides } from "../gateway/index.js";
 import { Orchestrator, type Hooks, type User } from "../orchestrator/index.js";
 import { Crash, Registry } from "../registry/capability.js";
 import { RENAMES, fileRegistry } from "../registry/fs.js";
@@ -120,6 +120,7 @@ async function main() {
     tasks: { type: "string" }, config: { type: "string", default: "B0-luna" }, split: { type: "string", default: "dev" },
     groups: { type: "string", default: "1,2,3,4,5,6" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
     out: { type: "string" }, v: { type: "boolean", default: false }, report: { type: "string", multiple: true },
+    role: { type: "string", multiple: true, default: [] },
   } });
   if (a.report?.length) return report(a.report);
   if (!a.tasks) throw new Error("--tasks <path to tasks.json> is required");
@@ -128,10 +129,11 @@ async function main() {
   let tasks: Task[] = JSON.parse(fs.readFileSync(a.tasks, "utf-8"));
   tasks = tasks.filter((t) => groups.has(t.group) && t.split === a.split && (!only || only.has(t.id)));
   if (a.limit) tasks = tasks.slice(0, Number(a.limit));
-  const out = path.resolve("runs", a.out ?? `${a.config}-${a.split}`);
+  const out = path.resolve("runs", a.out ?? `${a.config}${a.role!.length ? "+" + a.role!.map((r) => r.split("=")[0]).join("+") : ""}-${a.split}`);
   fs.mkdirSync(out, { recursive: true });
   const callsLog = fs.openSync(path.join(out, "model_calls.jsonl"), "a");
-  const gw = new Gateway(a.config!, { log: (r) => fs.writeSync(callsLog, JSON.stringify(r) + "\n"), maxCostUsd: Number(a["max-cost"]) });
+  const table = a.role!.length ? withOverrides(CONFIGS[a.config!]!, a.role!) : a.config!;
+  const gw = new Gateway(table, { log: (r) => fs.writeSync(callsLog, JSON.stringify(r) + "\n"), maxCostUsd: Number(a["max-cost"]) });
   const resPath = path.join(out, "results.jsonl");
   const done = new Set(fs.existsSync(resPath) ? fs.readFileSync(resPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l).task as string) : []);
   const library = new Library(path.join(out, "skills.json"));

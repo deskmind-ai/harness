@@ -14,7 +14,15 @@ import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import type { Role } from "../protocol/roles.js";
 
-export type Backend = "openrouter" | "claude_cli" | "scripted";
+/**
+ * openrouter   chat completions with json_schema
+ * local_chat   an OpenAI-compatible chat server on this Mac (mlx_lm.server, llama.cpp): a generating local model
+ * systemone    DeskMind Brain's /v1/systemone: a choice-only local model; usable for roles whose answer is one of
+ *              a fixed set (choice, intent, verify). Probabilities over the options come back as `scores`.
+ * claude_cli   `claude -p`, local development on synthetic data only
+ * scripted     tests
+ */
+export type Backend = "openrouter" | "local_chat" | "systemone" | "claude_cli" | "scripted";
 export type RoleTable = Record<Role, { backend: Backend; model: string }>;
 
 const all = (backend: Backend, model: string): RoleTable =>
@@ -25,6 +33,23 @@ export const CONFIGS: Record<string, RoleTable> = {
   "B0-mix": { ...all("openrouter", "openai/gpt-6.1-sol"), choice: { backend: "openrouter", model: "openai/gpt-6-luna" } },
   "dev-claude": all("claude_cli", "sonnet"),
 };
+
+/** `--role goal=openrouter:openai/gpt-6-luna --role choice=systemone:http://127.0.0.1:18852` on top of a config. */
+export function withOverrides(base: RoleTable, overrides: string[]): RoleTable {
+  const t: RoleTable = { ...base };
+  for (const o of overrides) {
+    const m = /^(\w+)=(\w+):(.+)$/.exec(o);
+    if (!m) throw new Error(`bad --role ${o}; expected role=backend:model`);
+    const [, role, backend, model] = m;
+    if (!(role! in t)) throw new Error(`unknown role ${role}`);
+    t[role as Role] = { backend: backend as Backend, model: model! };
+  }
+  return t;
+}
+
+/** The URL part of a local backend's "model" (e.g. systemone:http://127.0.0.1:18852 or local_chat:http://127.0.0.1:8080|qwen). */
+const localUrl = (model: string) => model.split("|")[0]!;
+const localModelName = (model: string) => model.split("|")[1] ?? "local";
 
 /** USD per token (in, out); from openrouter.ai/api/v1/models on 2026-10-07, used only when a reply carries no cost. */
 const PRICES: Record<string, [number, number]> = {
@@ -117,6 +142,8 @@ export class Gateway {
     } else {
       const t0 = performance.now();
       let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema)
+        : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema)
+        : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user)
         : this.scripted(role, sys, user);
       for (let i = 0; i < 2 && backend === "openrouter" && (partial.outcome === "error" || partial.outcome === "timeout") && !/HTTP 4/.test(partial.error ?? ""); i++) {
@@ -196,6 +223,61 @@ export class Gateway {
       if (ch.message?.refusal || ch.finish_reason === "content_filter") return { ...rep, outcome: "refusal", error: String(ch.message?.refusal ?? "content_filter").slice(0, 300) };
       rep.data = extractJson(ch.message?.content ?? "");
       return rep;
+    } catch (e) {
+      return { outcome: "invalid", error: `bad reply: ${e instanceof Error ? e.message : e}: ${raw.slice(0, 300)}`, latencyMs };
+    }
+  }
+
+  /** An OpenAI-compatible local server (mlx_lm.server): same shape as OpenRouter, no key, no cost. */
+  private async localChat(model: string, system: string, user: string, jsonSchema: unknown): Promise<Partial<Reply>> {
+    const body = { model: localModelName(model), temperature: 0, max_tokens: 2000,
+      messages: [{ role: "system", content: system }, { role: "user", content: user }],
+      response_format: { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } };
+    const t0 = performance.now();
+    let res: Response;
+    try {
+      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(this.opts.timeoutMs ?? 300_000) });
+    } catch (e) {
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return { outcome: msg.includes("Timeout") ? "timeout" : "error", error: msg.slice(0, 300) };
+    }
+    const raw = await res.text(), latencyMs = performance.now() - t0;
+    if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
+    try {
+      const out = JSON.parse(raw);
+      const usage = out.usage ?? {};
+      return { outcome: "answered", data: extractJson(out.choices[0].message.content ?? ""), tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, latencyMs };
+    } catch (e) {
+      return { outcome: "invalid", error: `bad reply: ${e instanceof Error ? e.message : e}: ${raw.slice(0, 300)}`, latencyMs };
+    }
+  }
+
+  /**
+   * DeskMind Brain (/v1/systemone): a choice-only model. The role's schema must be a single-enum answer (choice,
+   * intent, verify): the enum values become the options, the state is the user prompt, and the reply carries the
+   * probabilities so the orchestrator can apply a calibrated floor later.
+   */
+  private async systemone(model: string, system: string, user: string, jsonSchema: unknown): Promise<Partial<Reply>> {
+    const sch = jsonSchema as { properties?: Record<string, { enum?: string[] }> };
+    const field = Object.entries(sch.properties ?? {}).find(([, v]) => Array.isArray(v.enum));
+    if (!field) return { outcome: "error", error: "systemone backend needs a role whose answer is one enum field" };
+    const [name, { enum: options }] = field;
+    const body = { state: user, questions: { [name]: { type: "choice", instructions: { goal: system, question: name }, criteria: options!.map((o) => ({ key: o, description: o })) } } };
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (process.env.DESKMIND_BRAIN_TOKEN) headers.Authorization = `Bearer ${process.env.DESKMIND_BRAIN_TOKEN}`;
+    const t0 = performance.now();
+    let res: Response;
+    try {
+      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/systemone", { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000) });
+    } catch (e) {
+      return { outcome: "error", error: (e instanceof Error ? e.message : String(e)).slice(0, 300) };
+    }
+    const raw = await res.text(), latencyMs = performance.now() - t0;
+    if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
+    try {
+      const a = JSON.parse(raw).answers[name];
+      if (a.scored === false) return { outcome: "invalid", error: "unscored placeholder", latencyMs };
+      return { outcome: "answered", data: { [name]: a.choice, scores: a.probabilities }, latencyMs };
     } catch (e) {
       return { outcome: "invalid", error: `bad reply: ${e instanceof Error ? e.message : e}: ${raw.slice(0, 300)}`, latencyMs };
     }
