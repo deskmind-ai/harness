@@ -20,7 +20,7 @@ export type Context = z.infer<typeof Context>;
 export const CheckKind = z.enum(["deterministic", "semantic", "user_confirmation"]);
 export const CheckName = z.enum([
   "file_exists", "file_absent", "is_folder", "text_equals", "text_contains", "last_line_is", "same_text", "unchanged",
-  "content_moved",
+  "content_moved", "last_line_is_content_of", "text_equals_content_of",
 ]);
 export type CheckName = z.infer<typeof CheckName>;
 

@@ -367,6 +367,9 @@ export class Orchestrator {
       actions.push(describe(cap, n.args!) + (hows.length ? "；" + hows.join("；") : ""));
       const { reads, writes } = cap.footprint(this.ws, n.args!);
       for (const p of [...reads, ...writes, ...derived.flatMap(([, b]) => b.from_paths)]) if (this.ws.exists(p) && !this.ws.isDir(p) && !(p in evidence)) evidence[p] = this.ws.read(p).slice(0, 600);
+      for (const [k, b] of Object.entries((n.bindings as Record<string, Binding> | null) ?? {})) {
+        if (b?.kind === "upstream_output") { const out = st.nodes.get(b.node_id)?.output; if (out) evidence[`${k} 的来源：节点 ${b.node_id} 的输出`] = JSON.stringify(out).slice(0, 600); }
+      }
     }
     const rep = await this.askModel("intent", P.intentPrompt(st.raw, st.answersText(), actions, st.goal!.constraints, evidence), R.IntentAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
@@ -390,7 +393,9 @@ export class Orchestrator {
     const rev = `${st.revs.goal_rev}/${st.revs.plan_rev}`;
     this.hook("before_execute");
     if (`${st.revs.goal_rev}/${st.revs.plan_rev}` !== rev || !st.nodes.has(node.id)) { this.emit("decision.rejected", { why: "stale: the goal or plan changed before execution" }); return; }
-    const { reads, writes, expectAfter } = cap.footprint(this.ws, args);
+    const fp = cap.footprint(this.ws, args);
+    const derivedFrom = Object.values((nd.bindings as Record<string, Binding> | null) ?? {}).filter((b): b is Extract<Binding, { kind: "derived" }> => b?.kind === "derived").flatMap((b) => b.from_paths.map((p) => p.trim().replace(/^\/+|\/+$/g, "")));
+    const reads = [...new Set([...fp.reads, ...derivedFrom])], writes = fp.writes, expectAfter = fp.expectAfter;
     const now: Record<string, string> = {};
     for (const p of [...reads, ...writes]) now[p] = this.ws.version(p);
     const changed = Object.keys(now).filter((p) => p in st.lastVersions && st.lastVersions[p] !== now[p]);
@@ -474,7 +479,23 @@ export class Orchestrator {
         return [lines[lines.length - 1] === a.line && lines.filter((l) => l === a.line).length === 1, `${a.path} 末行是「${a.line}」且只出现一次`];
       }
       case "same_text": return need("path", "other") ? [[a.path!, a.other!].every((x) => ws.exists(x) && !ws.isDir(x)) && ws.read(a.path!) === ws.read(a.other!), `${a.path} 与 ${a.other} 内容相同`] : [null, "缺参数"];
-      case "unchanged": return need("path") ? [v(a.path!) === (this.st.startVersions[a.path!] ?? ABSENT), `${a.path} 没被改动`] : [null, "缺参数"];
+      case "unchanged": {
+        if (!need("path")) return [null, "缺参数"];
+        const p = a.path!;
+        const ours = [...this.st.ops.values()].some((op) => op.state === "ok" && op.intent.writes.some((w) => w === p || w.startsWith(p + "/")));
+        return [!ours, ours ? `${p} 被本次任务改动了` : `${p} 没有被本次任务改动`];
+      }
+      case "last_line_is_content_of": {
+        if (!need("path", "source")) return [null, "缺参数"];
+        if (!ws.exists(a.path!) || ws.isDir(a.path!) || !ws.exists(a.source!) || ws.isDir(a.source!)) return [false, `${a.path} 或 ${a.source} 不存在`];
+        const lines = ws.read(a.path!).replace(/\n+$/, "").split("\n"), want = ws.read(a.source!).replace(/\n+$/, "");
+        return [lines[lines.length - 1] === want, `${a.path} 的末行等于 ${a.source} 现在的内容`];
+      }
+      case "text_equals_content_of": {
+        if (!need("path", "source")) return [null, "缺参数"];
+        const ok = ws.exists(a.path!) && !ws.isDir(a.path!) && ws.exists(a.source!) && !ws.isDir(a.source!) && ws.read(a.path!).replace(/\n+$/, "") === ws.read(a.source!).replace(/\n+$/, "");
+        return [ok, `${a.path} 的内容等于 ${a.source} 现在的内容`];
+      }
       case "content_moved": {
         if (!need("from", "to")) return [null, "缺参数"];
         const sv = this.st.lastSeen[a.from!] ?? this.st.startVersions[a.from!] ?? ABSENT;
@@ -666,4 +687,4 @@ export class Orchestrator {
   }
 }
 
-const C_CHECKS = ["file_exists", "file_absent", "is_folder", "text_equals", "text_contains", "last_line_is", "same_text", "unchanged", "content_moved"] as const;
+const C_CHECKS = ["file_exists", "file_absent", "is_folder", "text_equals", "text_contains", "last_line_is", "same_text", "unchanged", "content_moved", "last_line_is_content_of", "text_equals_content_of"] as const;

@@ -26,6 +26,9 @@ const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的
 - same_text {path, other}       两个文件内容相同
 - unchanged {path}              这个路径在任务期间不能被改动（用于「其他文件不动」这类约束）
 - content_moved {from, to}      to 的内容等于移动前 from 的内容（移动 / 复制 / 改名后内容没变）
+- last_line_is_content_of {path, source}   path 的末行等于 source 文件执行时的内容（「把 A 的内容追加到 B」用这个，不要把现在预览里看到的内容抄成常量）
+- text_equals_content_of {path, source}    path 的内容等于 source 文件执行时的内容
+值来自另一个文件时，一律用 *_content_of 引用那个文件；预览里的内容可能在执行前被改，抄成常量会把错的结果判成对。
 能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
 path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
 

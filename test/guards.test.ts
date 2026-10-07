@@ -176,6 +176,21 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
   });
 
+  it("a derived value's source file changing before execution blocks the stale value (B0 test, g3-*-change)", async () => {
+    // 「把 src.txt 的内容追加为 todo.txt 的最后一行」: the model derives the line from src.txt's preview; someone edits src.txt
+    const GOALD = { requirements: [{ id: "r1", statement: "todo.txt 末行等于 src.txt 的内容", check: { kind: "deterministic", name: "last_line_is_content_of", args: { path: "todo.txt", source: "src.txt" } }, quotes: ["src.txt"] }], constraints: [], missing: [], feasible: "yes" };
+    const bindFrom = (v: string) => ({ bindings: { target: { kind: "resource_ref", path: "todo.txt" }, line: { kind: "derived", value: v, from_paths: ["src.txt"], how: "src.txt 的内容" } }, unresolved: [] });
+    const stale = byRole({ goal: GOALD, plan: PLAN, bind: bindFrom("买牛奶"), intent: MATCH });
+    const fresh = byRole({ goal: GOALD, plan: PLAN, bind: bindFrom("买牛奶（更新）"), intent: MATCH });
+    let fired = false;
+    const hooks = { before_execute: (o: Orchestrator) => { if (!fired) { fired = true; fs.writeFileSync(o.ws.abs("src.txt"), "买牛奶（更新）"); } } };
+    const { o, ws } = setup({ ...TODO, "src.txt": "买牛奶" }, [stale, stale, stale, stale, fresh, fresh, fresh, fresh], user(), hooks);
+    const s = await o.run();
+    expect(s.counters["rejected:resource_changed"]).toBe(1);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶（更新）\n");
+  });
+
   it("a goal with only 'unchanged' constraints never succeeds without an effect", async () => {
     const triv = byRole({ goal: { ...GOAL, requirements: [{ id: "r1", statement: "不动", check: { kind: "deterministic", name: "unchanged", args: { path: "other.txt" } }, quotes: ["todo.txt"] }] }, plan: { nodes: [], outcome: "plan" } });
     const { o } = setup(TODO, [triv, triv, triv]);
