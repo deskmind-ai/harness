@@ -199,8 +199,8 @@ export class Orchestrator {
       return this.finish("failed", "goal: proposed checks the verifier does not have");
     }
     if (!g.requirements.length) return this.finish(st.answers.length ? "cancelled" : "failed", st.answers.length ? "the user withdrew the request" : "goal: no requirements");
-    const listing = this.ws.listing();
-    const texts = [st.raw, ...st.answersText(), ...listing.map((e) => e.path), ...listing.filter((e) => e.kind === "file").map((e) => this.ws.read(e.path).slice(0, 2000))].map(loose);
+    const shown = this.ws.listing().entries;                       // the model saw only these; so only these count as evidence
+    const texts = [st.raw, ...st.answersText(), ...shown.map((e) => e.path), ...shown.filter((e) => e.kind === "file").map((e) => this.ws.read(e.path).slice(0, 2000))].map(loose);
     for (const r of g.requirements) for (const q of r.quotes) {
       if (!texts.some((t) => t.includes(loose(q)))) {
         this.emit("decision.rejected", { why: `goal: quote not in evidence: ${q.slice(0, 40)}` });
@@ -265,7 +265,7 @@ export class Orchestrator {
     if (!cands.length) return false;
     const options = [...cands.map((s) => ({ id: s.id, text: `${s.title}。适用：${s.applies_when}` })), { id: "none", text: "都不适用，另外规划" }];
     const ids = options.map((o) => o.id) as [string, ...string[]];
-    const rep = await this.askModel("choice", P.choicePrompt("哪份已有的教材适用于这个任务？", { 用户原文: st.raw, 目录: this.ws.listing().map((e) => e.path) }, options), R.choiceAnswer(ids));
+    const rep = await this.askModel("choice", P.choicePrompt("哪份已有的教材适用于这个任务？", { 用户原文: st.raw, 目录: this.ws.listing() }, options), R.choiceAnswer(ids));
     if (rep.outcome !== "answered" || rep.data!.choice === "none") return false;
     const { nodes, unsure } = lib.instantiate(rep.data!.choice, this.ws);
     if (unsure.length) this.emit("note", { text: `教材 ${rep.data!.choice} 处理不了：${JSON.stringify(unsure)}` });
@@ -424,6 +424,7 @@ export class Orchestrator {
     this.emit("execution.intent", { command: cmd });
     if (this.opts.hooks?.crash_on_first_effect && st.get("actions") === 0 && cap.effect !== "observe") this.crashNext = true;
     const result = this.crashNext ? this.executeAndCrash(cap, args) : cap.execute(this.ws, args);   // Crash propagates: no receipt
+    this.ws.invalidate();
     const ok = versionsMatch(cmd.expect_after, this.ws);
     this.emit("execution.receipt", { operation_id: cmd.operation_id, result: { ...result, status: ok ? "ok" : "post_mismatch" }, text });
     if (ok) this.emit("node.verified", { node_id: node.id, output: result.output });
@@ -436,6 +437,7 @@ export class Orchestrator {
   private executeAndCrash(cap: Capability, args: Record<string, string>): never {
     this.crashNext = false;
     cap.execute(this.ws, args);
+    this.ws.invalidate();
     throw new Crash("crash after the effect, before the receipt");
   }
 

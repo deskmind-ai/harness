@@ -5,7 +5,7 @@
  * Source spans are given as an exact quote plus an occurrence; the runtime resolves the quote to code-point offsets in
  * the evidence and refuses quotes that are not there (2.0 §5.2).
  */
-import type { Entry } from "../registry/workspace.js";
+import type { Listing } from "../registry/workspace.js";
 import type { Goal, PlanNode } from "../protocol/schemas.js";
 
 export const SYSTEM =
@@ -29,7 +29,7 @@ const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的
 能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
 path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
 
-export function goalPrompt(raw: string, answers: string[], workspace: Entry[], caps: CapView[], scope: string): string {
+export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string): string {
   return [
     "任务：把用户的要求整理成可逐项验收的需求。保留用户的原话；不要替用户决定没说的事。",
     "", `用户原文：${J(raw)}`,
@@ -51,7 +51,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Entry[], c
   ].join("\n");
 }
 
-export function planPrompt(goal: Goal, raw: string, answers: string[], workspace: Entry[], caps: CapView[], effects: string[], previous: unknown, why: string): string {
+export function planPrompt(goal: Goal, raw: string, answers: string[], workspace: Listing, caps: CapView[], effects: string[], previous: unknown, why: string): string {
   return [
     "任务：给出完成用户要求的计划：一组能力调用节点，带依赖。每个节点只调用一个已注册能力；参数稍后由另一步绑定，这里只说每个节点的目的。",
     "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
@@ -89,7 +89,7 @@ const BIND_RULES = `绑定方式（每个参数一个对象，用 kind 字段说
 缺信息时：{"bindings": {"target": {"kind": "resource_ref", "path": "todo.txt"}},
  "unresolved": [{"parameter": "line", "reason": "missing_user_intent", "question": "要加的那一行写什么？"}]}`;
 
-export function bindPrompt(raw: string, answers: string[], node: Omit<PlanNode, "args">, cap: CapView, workspace: Entry[], upstream: Record<string, unknown>, scope: string, why: string): string {
+export function bindPrompt(raw: string, answers: string[], node: Omit<PlanNode, "args">, cap: CapView, workspace: Listing, upstream: Record<string, unknown>, scope: string, why: string): string {
   return [
     "任务：为计划里的一个节点绑定能力参数。每个参数说明值从哪里来；程序负责取值和校验。",
     "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充（按先后）：${J(answers)}`] : []),

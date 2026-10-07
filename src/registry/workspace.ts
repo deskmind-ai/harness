@@ -11,13 +11,38 @@ export const TRASH = ".deskmind-trash";
 
 export const sha = (b: string | Buffer) => "sha256:" + createHash("sha256").update(b).digest("hex").slice(0, 16);
 
-export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string }
+export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string; preview_truncated?: boolean }
+
+/** What a model is shown of a directory: a bounded projection that says what it left out (2.0 §5.4). */
+export interface Listing { entries: Entry[]; total: number; truncated: boolean; omitted: number; note?: string }
 
 export class Workspace {
   readonly root: string;
+  private cache: { entries: Record<string, string>; mtimes: string } | null = null;
 
   constructor(root: string) {
     this.root = path.resolve(root);
+  }
+
+  /** Forget the cached snapshot (after our own effect or a known external change). */
+  invalidate() {
+    this.cache = null;
+  }
+
+  /** A cheap fingerprint of the tree's shape and mtimes; when it is unchanged the digest snapshot is reused. */
+  private stamp(): string {
+    const parts: string[] = [];
+    const walk = (dir: string) => {
+      for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (d.name === TRASH || d.name === ".keep") continue;
+        const full = path.join(dir, d.name);
+        const st = fs.statSync(full);
+        parts.push(`${full}:${st.mtimeMs}:${st.size}`);
+        if (d.isDirectory()) walk(full);
+      }
+    };
+    walk(this.root);
+    return parts.join("\n");
   }
 
   abs(p: string): string {
@@ -26,8 +51,10 @@ export class Workspace {
     return full;
   }
 
-  /** path -> "dir" or the file's digest, for every entry. */
+  /** path -> "dir" or the file's digest, for every entry. Cached while the tree's mtimes and sizes are unchanged. */
   entries(): Record<string, string> {
+    const mtimes = this.stamp();
+    if (this.cache && this.cache.mtimes === mtimes) return this.cache.entries;
     const out: Record<string, string> = {};
     const walk = (dir: string, rel: string) => {
       const names = fs.readdirSync(dir, { withFileTypes: true });
@@ -38,6 +65,7 @@ export class Workspace {
       for (const d of dirs) walk(path.join(dir, d), rel ? `${rel}/${d}` : d);
     };
     walk(this.root, "");
+    this.cache = { entries: out, mtimes };
     return out;
   }
 
@@ -74,16 +102,21 @@ export class Workspace {
     return out;
   }
 
-  listing(maxFiles = 40, peek = 80): Entry[] {
-    const out: Entry[] = [];
-    for (const [p, v] of Object.entries(this.entries()).slice(0, maxFiles)) {
-      if (v === "dir") out.push({ path: p, kind: "folder" });
+  listing(maxFiles = 40, peek = 80): Listing {
+    const all = Object.entries(this.entries());
+    const entries: Entry[] = [];
+    for (const [p, v] of all.slice(0, maxFiles)) {
+      if (v === "dir") entries.push({ path: p, kind: "folder" });
       else {
         const t = this.read(p);
-        out.push({ path: p, kind: "file", bytes: Buffer.byteLength(t), preview: t.slice(0, peek) });
+        entries.push({ path: p, kind: "file", bytes: Buffer.byteLength(t), preview: t.slice(0, peek), ...(t.length > peek ? { preview_truncated: true } : {}) });
       }
     }
-    return out;
+    const omitted = Math.max(0, all.length - maxFiles);
+    return {
+      entries, total: all.length, truncated: omitted > 0, omitted,
+      ...(omitted > 0 ? { note: `目录共 ${all.length} 项，这里只列出前 ${maxFiles} 项；没列出的不等于不存在。要看其余的，先用只读能力 fs.list 列某个子文件夹，或 fs.read_text 读某个文件。` } : {}),
+    };
   }
 }
 

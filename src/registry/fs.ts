@@ -127,7 +127,13 @@ export const fsList = make({
   fields: { path: s('要列的文件夹，任务目录本身填 "."') }, pathFields: ["path"],
   footprint: (_ws, a) => ({ reads: [norm(a.path!)], writes: [], expectAfter: {} }),
   pre: (ws, a) => (folderOk(ws, norm(a.path!)) ? null : `${norm(a.path!)} is not a folder`),
-  run: (ws, a) => { const q = norm(a.path!); return { status: "ok", output: { entries: ws.listing().filter((e) => parentOf(e.path) === q) }, versions_after: {} }; },
+  run: (ws, a) => {
+    // the drill-down the bounded listing points at: one folder's direct members, itself bounded and self-describing
+    const q = norm(a.path!), limit = 200;
+    const members = Object.entries(ws.entries()).filter(([p]) => parentOf(p) === q);
+    const entries = members.slice(0, limit).map(([p, v]) => (v === "dir" ? { path: p, kind: "folder" } : { path: p, kind: "file", preview: ws.read(p).slice(0, 80) }));
+    return { status: "ok", output: { entries, total: members.length, truncated: members.length > limit }, versions_after: {} };
+  },
 });
 
 export const FS_CAPABILITIES = [fsCreateText, fsReplaceText, fsAppendLine, fsMove, fsCopy, fsMkdir, fsTrash, fsReadText, fsList];
