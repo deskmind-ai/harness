@@ -483,6 +483,12 @@ export class Orchestrator {
     return [null, `没有检查 ${name}`];
   }
 
+  private deterministicAllPass(): boolean {
+    const reqs = this.st.goal!.requirements;
+    return reqs.some((r) => r.check.kind !== "deterministic") &&
+      reqs.filter((r) => r.check.kind === "deterministic").every((r) => this.check(r.check.name!, r.check.args ?? {})[0] === true);
+  }
+
   /** Code checks every deterministic requirement; semantic ones go to the verify role only at the end. */
   async rootCheck(final: boolean): Promise<boolean> {
     const st = this.st;
@@ -518,6 +524,12 @@ export class Orchestrator {
   private async doGuiStep() {
     const st = this.st, gui = this.opts.gui!;
     if (await this.rootCheck(false)) return;
+    // every code-checkable requirement holds and only semantic ones remain: ask the verifier now instead of waiting
+    // for the model to pick "done" (a GUI run otherwise loops until its action budget)
+    if (this.deterministicAllPass() && st.get("semantic_checked_epoch") !== st.revs.evidence_epoch) {
+      st.n["semantic_checked_epoch"] = st.revs.evidence_epoch;
+      if (await this.rootCheck(true)) return;
+    }
     if (st.get("actions") >= this.budget.actions) return this.finish("failed", "budget: actions");
     this.hook("before_gui_step");
     const obs = gui.observe();
