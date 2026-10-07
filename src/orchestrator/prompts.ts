@@ -38,7 +38,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "", "系统已注册的能力（只有这些能被执行）：", J(caps.map((c) => ({ id: c.id, description: c.description }))),
     "", CHECKS_DOC,
     "", "要求：", "- requirements 逐条对应原文里的一个要求或约束（含「其他文件不动」「不要覆盖」这类限制）；每条给 quotes：原文里支持它的原话片段。",
-    "- 能用代码核验的用 deterministic 并填 name/args；只能看出来对不对的用 semantic。",
+    "- 能用代码核验的用 deterministic 并填 name/args；只能看出来对不对的用 semantic；user_confirmation 只用于结果只有用户能判断的要求，不要用它表达「用编辑器做」「不要覆盖」这类过程约束——过程约束放进 constraints。",
     "- 原文缺了只有用户知道的信息（哪个文件、内容、位置），写进 missing，并给一个用户能直接回答的问题；不要用猜的值补。",
     "- 「放到 / 移到 / 归档到 / 整理到」某处，默认是移动（原位置不再有），不要问「移动还是复制」。用户已经回答过的问题不要再问。",
     "- 目录里已有的文件名和内容也是证据：需求可以引用目录里看到的文件名。",

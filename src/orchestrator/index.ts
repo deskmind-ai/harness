@@ -510,6 +510,19 @@ export class Orchestrator {
       return false;
     }
     for (const r of semantic) {
+      if (r.check.kind === "user_confirmation") {
+        // only the user can judge this one: ask once, remember the answer (never the verify model)
+        const key = `confirm:${r.id}`;
+        if (!(key in st.n)) {
+          this.emit("interaction.request", { body: { kind: "authorize", text: r.statement, digest: sha(r.statement) } });
+          const ok = this.user.authorize(r.statement);
+          this.emit("interaction.reply", { body: { kind: "authorize", text: r.statement, digest: sha(r.statement), approved: ok } });
+          st.n[key] = ok ? 1 : 0;
+        }
+        results[r.id] = { passed: st.n[key] === 1, evidence: st.n[key] === 1 ? "用户确认" : "用户未确认" };
+        if (st.n[key] !== 1) failed.push(r.statement);
+        continue;
+      }
       const rep = await this.askModel("verify", P.verifyPrompt(r, st.raw, { 目录: this.ws.listing(), 已发生的效果: st.effects }), R.VerifyAnswer);
       const ok = rep.outcome === "answered" && rep.data!.verdict === "pass";
       results[r.id] = { passed: ok, evidence: rep.data?.reason ?? rep.error };
