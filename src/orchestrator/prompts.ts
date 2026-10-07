@@ -1,0 +1,124 @@
+/**
+ * Role prompts. The orchestrator never parses free text: every role answers in the JSON shape of its schema
+ * (protocol/roles.ts), and the gateway validates it first.
+ *
+ * Source spans are given as an exact quote plus an occurrence; the runtime resolves the quote to code-point offsets in
+ * the evidence and refuses quotes that are not there (2.0 §5.2).
+ */
+import type { Entry } from "../registry/workspace.js";
+import type { Goal, PlanNode } from "../protocol/schemas.js";
+
+export const SYSTEM =
+  "你是桌面助手 DeskMind 里的一个决策函数。你只根据给出的材料回答，不假设没给出的事实。" +
+  "你的回答是提议，由程序校验后才会执行；程序只会执行已注册的能力。只输出一个 JSON 对象。";
+
+const J = (x: unknown) => JSON.stringify(x, null, 1);
+
+export interface CapView { id: string; description: string; effect?: string; input?: unknown; required?: string[] }
+
+const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的值必须是用户原文里的原话或由原话直接确定）：
+- file_exists {path}            指定路径存在
+- file_absent {path}            指定路径不存在
+- is_folder {path}              指定路径是文件夹
+- text_equals {path, text}      文件全文等于 text（忽略末尾换行）
+- text_contains {path, text}    文件包含 text
+- last_line_is {path, line}     文件最后一行是 line，且 line 在文件里只出现一次
+- same_text {path, other}       两个文件内容相同
+- unchanged {path}              这个路径在任务期间不能被改动（用于「其他文件不动」这类约束）
+- content_moved {from, to}      to 的内容等于移动前 from 的内容（移动 / 复制 / 改名后内容没变）
+能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
+path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
+
+export function goalPrompt(raw: string, answers: string[], workspace: Entry[], caps: CapView[], scope: string): string {
+  return [
+    "任务：把用户的要求整理成可逐项验收的需求。保留用户的原话；不要替用户决定没说的事。",
+    "", `用户原文：${J(raw)}`,
+    ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    `任务目录（用户选定，相对路径的根；用户说的「这个目录」「当前目录」「下载」等指的就是它）：${scope}`, "目录现在的内容：", J(workspace),
+    "", "系统已注册的能力（只有这些能被执行）：", J(caps.map((c) => ({ id: c.id, description: c.description }))),
+    "", CHECKS_DOC,
+    "", "要求：", "- requirements 逐条对应原文里的一个要求或约束（含「其他文件不动」「不要覆盖」这类限制）；每条给 quotes：原文里支持它的原话片段。",
+    "- 能用代码核验的用 deterministic 并填 name/args；只能看出来对不对的用 semantic。",
+    "- 原文缺了只有用户知道的信息（哪个文件、内容、位置），写进 missing，并给一个用户能直接回答的问题；不要用猜的值补。",
+    "- 「放到 / 移到 / 归档到 / 整理到」某处，默认是移动（原位置不再有），不要问「移动还是复制」。用户已经回答过的问题不要再问。",
+    "- 目录里已有的文件名和内容也是证据：需求可以引用目录里看到的文件名。",
+    "- 如果所需的事超出了已注册能力（例如发邮件、转格式、OCR），feasible 填 needs_capability_we_lack 并说明；不要用现有能力硬凑。",
+    "", "输出格式示例（字段名必须一样）：",
+    J({ requirements: [
+      { id: "r1", statement: "任务目录里有 清单.log", check: { kind: "deterministic", name: "file_exists", args: { path: "清单.log" } }, quotes: ["新建 清单.log"] },
+      { id: "r2", statement: "清单.log 的内容是「等评审」", check: { kind: "deterministic", name: "text_equals", args: { path: "清单.log", text: "等评审" } }, quotes: ["内容为「等评审」"] },
+    ], constraints: ["不动其他文件"], missing: [], feasible: "yes" }),
+  ].join("\n");
+}
+
+export function planPrompt(goal: Goal, raw: string, answers: string[], workspace: Entry[], caps: CapView[], effects: string[], previous: unknown, why: string): string {
+  return [
+    "任务：给出完成用户要求的计划：一组能力调用节点，带依赖。每个节点只调用一个已注册能力；参数稍后由另一步绑定，这里只说每个节点的目的。",
+    "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    "已整理的需求：", J(goal.requirements), "约束：", J(goal.constraints),
+    "目录现在的内容：", J(workspace),
+    ...(effects.length ? ["已经发生、不能当作没发生的效果：", J(effects)] : []),
+    "", "可用能力（含输入字段和含义）：", J(caps),
+    ...(previous ? ["", `上一版计划：${J(previous)}`, `要改计划的原因：${why}`] : []),
+    "", "要求：", "- 只用列表里的能力 id；要读文件内容才能决定后续时，先放一个只读节点，后面的节点依赖它。",
+    "- 一个节点做一件事；需要对多个文件做同一件事就多个节点。", "- 不要加用户没要求的动作；不动无关文件。",
+    "- 覆盖每条需求：requirement_ids 写这个节点服务于哪些需求 id。",
+    "- 能力不够做不到就 outcome=cannot 并说明；缺用户信息就 outcome=need_user 并给 question。",
+    "", "输出格式示例（字段名必须一样）：",
+    J({ nodes: [
+      { id: "n1", capability: "fs.mkdir", depends_on: [], purpose: "新建文件夹 归档", requirement_ids: ["r1"] },
+      { id: "n2", capability: "fs.move", depends_on: ["n1"], purpose: "把 a.txt 移进 归档", requirement_ids: ["r2"] },
+    ], outcome: "plan" }),
+  ].join("\n");
+}
+
+const BIND_RULES = `绑定方式（每个参数一个对象，用 kind 字段说明方式，其余字段按方式给）：
+- source_span：值是用户原文（或用户补充）里的原话。给 quote（逐字、不改写、不加引号）和 occurrence（第几次出现，从 1 起）。程序会原样切片，所以 quote 必须能在原文里逐字找到。
+- resource_ref：值是目录里现有的一个文件或文件夹。给 path（目录列表里的相对路径）。
+- upstream_output：值来自前面一个只读节点的输出。给 node_id 和 field（如 text）。
+- literal：只有两种情况允许：能力的默认值，或从原文直接推出的路径拼接（例如把「归档」文件夹加上原文件名得到 归档/report.pdf）。给 value 和 authority（说明值怎么得来）。
+用户没有说的内容不要编（不要替用户起文件名、写正文）；写进 unresolved，reason=missing_user_intent，并给一个用户能直接回答的 question。
+值是不是在原文里出现过两次以上且指不同东西，要用 occurrence 区分；分不清就 unresolved reason=ambiguous。
+输出格式示例（字段名必须一样）：
+{"bindings": {"parent": {"kind": "literal", "value": ".", "authority": "用户没指定子文件夹，能力说明里任务目录本身填 ."},
+              "name": {"kind": "source_span", "quote": "清单.log", "occurrence": 1},
+              "text": {"kind": "source_span", "quote": "等评审", "occurrence": 1}},
+ "unresolved": []}
+缺信息时：{"bindings": {"target": {"kind": "resource_ref", "path": "todo.txt"}},
+ "unresolved": [{"parameter": "line", "reason": "missing_user_intent", "question": "要加的那一行写什么？"}]}`;
+
+export function bindPrompt(raw: string, answers: string[], node: Omit<PlanNode, "args">, cap: CapView, workspace: Entry[], upstream: Record<string, unknown>, scope: string, why: string): string {
+  return [
+    "任务：为计划里的一个节点绑定能力参数。每个参数说明值从哪里来；程序负责取值和校验。",
+    "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充（按先后）：${J(answers)}`] : []),
+    `任务目录（相对路径的根；用户说的「这个目录」「下载」等就是它，不是子文件夹；填 parent 时任务目录本身写 "."）：${scope}`, "目录现在的内容：", J(workspace),
+    "", `这个节点：${J(node)}`, "要调用的能力和参数定义：", J(cap),
+    ...(Object.keys(upstream).length ? ["前面节点的输出：", J(upstream)] : []),
+    "", BIND_RULES,
+    ...(why ? ["", `上一次绑定被拒绝，原因：${why}。请改正。`] : []),
+  ].join("\n");
+}
+
+export function intentPrompt(raw: string, answers: string[], actions: string[], constraints: string[], evidence: Record<string, string>): string {
+  return [
+    "任务：独立核对。下面是程序即将执行的动作（人话描述，参数已经取好）。请对照用户原文和给出的证据，判断这些动作是不是用户要的。",
+    "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    "约束：", J(constraints),
+    ...(Object.keys(evidence).length ? ["动作涉及的文件，现在的内容（证据；参数里的值如果来自文件内容，在这里核对）：", J(evidence)] : []),
+    "", "即将执行的动作（按顺序）：", ...actions.map((a, i) => `${i + 1}. ${a}`),
+    "", "判断：", "- matches：动作忠实于原文，没有改写、对调、漏掉要求，也没有多做。",
+    "- mismatch：有参数弄反、文件弄错、内容改写、违反约束等；说明哪里不对。",
+    "- insufficient_information：原文没说清楚，动作里的某个值是猜的。",
+    "- requires_more_steps：动作对，但只完成了一部分要求。",
+  ].join("\n");
+}
+
+export interface Option { id: string; text: string }
+
+export function choicePrompt(question: string, context: unknown, options: Option[]): string {
+  return ["任务：从下面的选项里选一个。只能选给出的 id。", "", "材料：", J(context), "", `问题：${question}`, "选项：", ...options.map((o) => `- ${o.id}: ${o.text}`)].join("\n");
+}
+
+export function verifyPrompt(requirement: unknown, raw: string, evidence: unknown): string {
+  return ["任务：根据证据判断一条需求是否满足。证据不足就 unknown，不要猜。", "", `用户原文：${J(raw)}`, `需求：${J(requirement)}`, "证据：", J(evidence)].join("\n");
+}
