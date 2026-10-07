@@ -6,8 +6,6 @@
  *   OPENROUTER_API_KEY=... pnpm eval -- --tasks <path> --config B0-luna --split dev --max-cost 3
  *   pnpm eval -- --report runs/B0-luna-dev/results.jsonl
  *
- * Groups 4 (GUI) and 5 (skills) need the GUI simulator and the skill library; until those are ported they are skipped
- * with a note, so the numbers stay comparable group by group.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -17,6 +15,8 @@ import { Gateway } from "../gateway/index.js";
 import { Orchestrator, type Hooks, type User } from "../orchestrator/index.js";
 import { Crash, FILE_CAPS, RENAMES, renamed, type Capability } from "../registry/capabilities.js";
 import { Workspace, build } from "../registry/workspace.js";
+import { EditorSim } from "../gui/sim.js";
+import { Library } from "../skills/library.js";
 import { score, type Task } from "./score.js";
 
 class SimUser implements User {
@@ -28,12 +28,13 @@ class SimUser implements User {
 }
 
 function capsFor(task: Task): Record<string, Capability> {
+  if (task.caps === "gui") return { "gui.editor": { id: "gui.editor", version: "1.0.0", description: "通过文本编辑器的界面新建、编辑和保存文本文件（观察界面，再点击或输入）。", schema: { type: "object", properties: {}, required: [], additionalProperties: false }, effect: "update", channel: "gui", requiresConfirmation: false } };
   const caps = { ...FILE_CAPS };
   if (task.caps === "alt") for (const id of Object.keys(RENAMES)) { delete caps[id]; const alt = renamed(FILE_CAPS[id]!); caps[alt.id] = alt; }
   return caps;
 }
 
-async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean) {
+async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean, library: Library | null) {
   const runDir = path.join(outDir, task.id);
   fs.rmSync(runDir, { recursive: true, force: true });
   fs.mkdirSync(runDir, { recursive: true });
@@ -50,10 +51,22 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   if (h.goal_update) chain.push((o) => { if (o.st.get("model_calls") >= h.goal_update.after_decisions && !fired.upd && o.st.goal) { fired.upd = true; o.updateGoal(h.goal_update.raw, "user changed the goal"); } });
   if (chain.length) hooks.before_execute = (o) => chain.forEach((f) => f(o));
   if (h.crash) hooks.crash_on_first_effect = true;
+  let gui: EditorSim | undefined;
+  if (h.gui) {
+    gui = new EditorSim(root);
+    if (h.gui.open) gui.openFile(h.gui.open);
+    const g = gui;
+    hooks.before_gui_step = (o) => {
+      const k = o.st.get("actions");
+      if (k === h.gui.at_step && !fired.gd) { fired.gd = true; g.disturb(h.gui.disturb); (fired as any).gd_at = k; (fired as any).gd_calls = o.st.get("model_calls"); }
+      else if (h.gui.disturb === "focus" && fired.gd && !fired.gr && k >= (fired as any).gd_at + 1 && o.st.get("model_calls") > (fired as any).gd_calls) { fired.gr = true; g.restoreFocus(); }
+    };
+  }
+  const skills = task.group === 5 ? library ?? undefined : undefined;
   const t0 = Date.now();
   const calls0 = gw.calls, spent0 = gw.spentUsd;
   const logPath = path.join(runDir, "log.jsonl");
-  let orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks });
+  let orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills });
   orch.start(task.raw);
   let crashed = false;
   let summ;
@@ -64,14 +77,25 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
     crashed = true;
     if (h.after_crash_set) build(root, h.after_crash_set);
     delete hooks.crash_on_first_effect;
-    orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks });
+    orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills });
     summ = await orch.run();
   }
-  const sc = score(task, start, ws.tree(), summ);
+  let taught: unknown = null;
+  if (library && task.group === 5 && task.stage === "teach" && summ.status === "succeeded" && !summ.skill) {
+    const filesBefore = Object.entries(start).filter(([, v]) => v !== null).map(([p]) => p);
+    const contents = Object.fromEntries(Object.entries(start).filter(([, v]) => v !== null)) as Record<string, string>;
+    const end = ws.tree();
+    const moves: Record<string, string> = {};
+    for (const p of filesBefore) if (!(p in end)) { const dst = Object.entries(end).find(([q, v]) => v === start[p] && !(q in start) && !Object.values(moves).includes(q))?.[0]; if (dst) moves[p] = dst; }
+    const rec = await library.teach(gw, task.raw + "\n用户说过：" + (task.answers ?? []).join(" "), filesBefore, contents, moves, task.family!, summ.run_id);
+    taught = { id: rec.id, status: rec.status, admission: rec.admission };
+  }
+  if (library && summ.skill) library.recordUse(summ.skill, summ.status === "succeeded", (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0));
+  const sc = score(task, start, ws.tree(), summ, gui?.log ?? []);
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
-    skill: summ.skill, asked: user.asked, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
+    skill: summ.skill, taught, asked: user.asked, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
   fs.writeFileSync(path.join(runDir, "result.json"), JSON.stringify(rec, null, 1));
   fs.rmSync(root, { recursive: true, force: true });
@@ -94,7 +118,7 @@ function report(paths: string[]) {
 async function main() {
   const { values: a } = parseArgs({ args: process.argv.slice(2).filter((x) => x !== "--"), allowPositionals: true, options: {
     tasks: { type: "string" }, config: { type: "string", default: "B0-luna" }, split: { type: "string", default: "dev" },
-    groups: { type: "string", default: "1,2,3,6" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
+    groups: { type: "string", default: "1,2,3,4,5,6" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
     out: { type: "string" }, v: { type: "boolean", default: false }, report: { type: "string", multiple: true },
   } });
   if (a.report?.length) return report(a.report);
@@ -103,9 +127,6 @@ async function main() {
   const only = a.only ? new Set(a.only.split(",")) : null;
   let tasks: Task[] = JSON.parse(fs.readFileSync(a.tasks, "utf-8"));
   tasks = tasks.filter((t) => groups.has(t.group) && t.split === a.split && (!only || only.has(t.id)));
-  const skipped = tasks.filter((t) => t.group === 4 || t.group === 5);
-  if (skipped.length) console.log(`skipping ${skipped.length} tasks of groups 4/5 (GUI simulator and skill library not ported yet)`);
-  tasks = tasks.filter((t) => t.group !== 4 && t.group !== 5);
   if (a.limit) tasks = tasks.slice(0, Number(a.limit));
   const out = path.resolve("runs", a.out ?? `${a.config}-${a.split}`);
   fs.mkdirSync(out, { recursive: true });
@@ -113,10 +134,11 @@ async function main() {
   const gw = new Gateway(a.config!, { log: (r) => fs.writeSync(callsLog, JSON.stringify(r) + "\n"), maxCostUsd: Number(a["max-cost"]) });
   const resPath = path.join(out, "results.jsonl");
   const done = new Set(fs.existsSync(resPath) ? fs.readFileSync(resPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l).task as string) : []);
+  const library = new Library(path.join(out, "skills.json"));
   for (const t of tasks) {
     if (done.has(t.id)) continue;
     if (a.v) console.log(`\n=== ${t.id} (${t.split}): ${t.raw}`);
-    const r = await runTask(t, gw, out, a.v!);
+    const r = await runTask(t, gw, out, a.v!, library);
     fs.appendFileSync(resPath, JSON.stringify(r) + "\n");
     console.log(`${r.correct ? "✓" : "✗"} ${t.id} ${r.status} (${(r.reason ?? "").slice(0, 60)}) calls=${r.model_calls} $${r.cost_usd.toFixed(4)} ${r.seconds}s ${r.correct ? "" : r.why.slice(0, 80)}`);
     if (gw.spentUsd >= Number(a["max-cost"])) { console.log("cost cap reached, stopping"); break; }
