@@ -8,7 +8,8 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { Gateway, type Scripted } from "../src/gateway/index.js";
 import { Orchestrator, type User } from "../src/orchestrator/index.js";
-import { Crash, FILE_CAPS } from "../src/registry/capabilities.js";
+import { Crash } from "../src/registry/capability.js";
+import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
 
 const scriptedTable = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
@@ -34,7 +35,7 @@ function setup(files: Record<string, string | null>, script: Scripted[], u = use
   const gw = new Gateway(scriptedTable);
   gw.script = script;
   const log = path.join(root, ".log.jsonl");
-  const o = new Orchestrator(log, ws, gw, u, FILE_CAPS, { hooks });
+  const o = new Orchestrator(log, ws, gw, u, fileRegistry(), { hooks });
   o.start("在 todo.txt 末尾加一行「买牛奶」");
   return { o, ws, gw, log, root, u };
 }
@@ -119,7 +120,7 @@ describe("execution guards", () => {
     const { o, ws, gw, log } = setup(TODO, Array(6).fill(HAPPY), user(), { crash_on_first_effect: true });
     await expect(o.run()).rejects.toBeInstanceOf(Crash);
     gw.script = Array(6).fill(HAPPY);
-    const o2 = new Orchestrator(log, ws, gw, user(), FILE_CAPS);
+    const o2 = new Orchestrator(log, ws, gw, user(), fileRegistry());
     const s = await o2.run();
     expect(s.status).toBe("succeeded");
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
@@ -132,7 +133,7 @@ describe("execution guards", () => {
     fs.writeFileSync(ws.abs("todo.txt"), "全被改了\n");
     gw.script = Array(6).fill(HAPPY);
     const before = gw.calls;
-    const o2 = new Orchestrator(log, ws, gw, user(), FILE_CAPS);
+    const o2 = new Orchestrator(log, ws, gw, user(), fileRegistry());
     const s = await o2.run();
     expect(s.status).toBe("needs_reconciliation");
     expect(ws.read("todo.txt")).toBe("全被改了\n");

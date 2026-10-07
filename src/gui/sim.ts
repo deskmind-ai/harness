@@ -11,6 +11,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Stale, type GuiApp, type GuiElement, type GuiObservation } from "../orchestrator/index.js";
+import { Registry, type Capability } from "../registry/capability.js";
+
+/** The GUI channel as the goal role sees it: one capability that stands for the reactive loop. */
+export const guiEditor: Capability = {
+  id: "gui.editor", version: "1.0.0", description: "通过文本编辑器的界面新建、编辑和保存文本文件（观察界面，再点击或输入）。",
+  schema: { type: "object", properties: {}, required: [], additionalProperties: false }, effect: "update", channel: "gui", requiresConfirmation: false,
+  typecheck: () => null, footprint: () => ({ reads: [], writes: [], expectAfter: {} }), preconditions: () => null,
+  execute: () => { throw new Error("the GUI channel runs through the orchestrator's GUI step, not execute()"); },
+};
+export const guiRegistry = () => new Registry().register(guiEditor);
 
 interface Doc { title: string; text: string; dirty: boolean; path: string | null }
 

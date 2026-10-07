@@ -13,7 +13,9 @@ import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { Gateway } from "../gateway/index.js";
 import { Orchestrator, type Hooks, type User } from "../orchestrator/index.js";
-import { Crash, FILE_CAPS, RENAMES, renamed, type Capability } from "../registry/capabilities.js";
+import { Crash, Registry } from "../registry/capability.js";
+import { RENAMES, fileRegistry } from "../registry/fs.js";
+import { guiRegistry } from "../gui/sim.js";
 import { Workspace, build } from "../registry/workspace.js";
 import { EditorSim } from "../gui/sim.js";
 import { Library } from "../skills/library.js";
@@ -27,11 +29,9 @@ class SimUser implements User {
   authorize() { return this.task.approve ?? false; }
 }
 
-function capsFor(task: Task): Record<string, Capability> {
-  if (task.caps === "gui") return { "gui.editor": { id: "gui.editor", version: "1.0.0", description: "通过文本编辑器的界面新建、编辑和保存文本文件（观察界面，再点击或输入）。", schema: { type: "object", properties: {}, required: [], additionalProperties: false }, effect: "update", channel: "gui", requiresConfirmation: false } };
-  const caps = { ...FILE_CAPS };
-  if (task.caps === "alt") for (const id of Object.keys(RENAMES)) { delete caps[id]; const alt = renamed(FILE_CAPS[id]!); caps[alt.id] = alt; }
-  return caps;
+function capsFor(task: Task): Registry {
+  if (task.caps === "gui") return guiRegistry();
+  return task.caps === "alt" ? fileRegistry().withRenamed(RENAMES) : fileRegistry();
 }
 
 async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean, library: Library | null) {
@@ -94,7 +94,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   const sc = score(task, start, ws.tree(), summ, gui?.log ?? []);
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
-    ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
+    ...sc, crashed, errored: (summ.reason ?? "").startsWith("model error"), counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
     skill: summ.skill, taught, asked: user.asked, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
   fs.writeFileSync(path.join(runDir, "result.json"), JSON.stringify(rec, null, 1));
@@ -107,10 +107,10 @@ function report(paths: string[]) {
   const rows = paths.flatMap((p) => fs.readFileSync(p, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)));
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = `${r.config}|${r.group}`; by.set(k, [...(by.get(k) ?? []), r]); }
-  console.log("config | group | n | correct | wrong effect | false success | stopped | asked | calls/task | $/task | s/task");
+  console.log("config | group | n | correct | wrong effect | false success | errored | stopped | asked | calls/task | $/task | s/task");
   for (const [k, rs] of [...by].sort()) {
     const n = rs.length, f = (key: string) => rs.filter((r) => r[key]).length;
-    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("wrong_effect")} | ${f("false_success")} | ${rs.filter((r) => ["waiting_user", "needs_reconciliation", "failed"].includes(r.status)).length} | ${rs.reduce((a, r) => a + r.asked.length, 0)} | ${(rs.reduce((a, r) => a + r.model_calls, 0) / n).toFixed(1)} | ${(rs.reduce((a, r) => a + r.cost_usd, 0) / n).toFixed(4)} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
+    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("wrong_effect")} | ${f("false_success")} | ${f("errored")} | ${rs.filter((r) => ["waiting_user", "needs_reconciliation", "failed"].includes(r.status)).length} | ${rs.reduce((a, r) => a + r.asked.length, 0)} | ${(rs.reduce((a, r) => a + r.model_calls, 0) / n).toFixed(1)} | ${(rs.reduce((a, r) => a + r.cost_usd, 0) / n).toFixed(4)} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
   }
   for (const [k, rs] of [...by].sort()) for (const r of rs.filter((r) => !r.correct)) console.log(`  ✗ ${k} ${r.task}: ${r.status} (${(r.reason ?? "").slice(0, 80)}) ${r.why.slice(0, 160)}`);
 }

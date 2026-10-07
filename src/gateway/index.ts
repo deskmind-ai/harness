@@ -116,9 +116,13 @@ export class Gateway {
       rep = { ...base, outcome: "error", error: "budget: gateway cost cap reached" };
     } else {
       const t0 = performance.now();
-      const partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema)
+      let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user)
         : this.scripted(role, sys, user);
+      for (let i = 0; i < 2 && backend === "openrouter" && (partial.outcome === "error" || partial.outcome === "timeout") && !/HTTP 4/.test(partial.error ?? ""); i++) {
+        await new Promise((r) => setTimeout(r, 2000));                 // transient network failure: retry, then report
+        partial = await this.openrouter(model, sys, user, jsonSchema);
+      }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;
       rep.latencyMs ||= performance.now() - t0;
       if (rep.outcome === "answered") {

@@ -18,9 +18,10 @@ import type { Gateway, Reply } from "../gateway/index.js";
 import * as R from "../protocol/roles.js";
 import type { Binding, Goal, PlanNode, RunStatus } from "../protocol/schemas.js";
 import { TERMINAL } from "../protocol/schemas.js";
-import * as C from "../registry/capabilities.js";
-import type { Capability } from "../registry/capabilities.js";
+import { describeCapability, type Capability, type Registry } from "../registry/capability.js";
+import { matches as versionsMatch, reconcile as reconcileVersions } from "../registry/reconcile.js";
 import { ABSENT, Workspace, sha } from "../registry/workspace.js";
+import { Crash } from "../registry/capability.js";
 import { Log, State, type NodeState } from "./log.js";
 import * as P from "./prompts.js";
 
@@ -75,7 +76,7 @@ export function findQuote(texts: string[], quote: string, occurrence: number): {
   return null;
 }
 
-export function describe(cap: Capability, args: C.Args): string {
+export function describe(cap: Capability, args: Record<string, string>): string {
   const parts = Object.entries(args).map(([k, v]) => `${k}=「${v}」（${(cap.schema.properties[k]?.description ?? "").split("。")[0]}）`);
   return `调用能力「${cap.description.split("；")[0]!.replace(/。$/, "")}」：${parts.join("，")}`;
 }
@@ -90,7 +91,7 @@ export class Orchestrator {
     readonly ws: Workspace,
     readonly gw: Gateway,
     readonly user: User,
-    readonly caps: Record<string, Capability>,
+    readonly registry: Registry,
     readonly opts: { skills?: SkillLibrary; gui?: GuiApp; hooks?: Hooks; budget?: Partial<typeof BUDGET> } = {},
   ) {
     this.log = new Log(logPath);
@@ -98,6 +99,12 @@ export class Orchestrator {
     for (const ev of this.log.events) this.st.apply(ev);
     const inFlight = [...this.st.ops].filter(([, v]) => v.state === "in_flight").map(([k]) => k);
     if (inFlight.length) this.emit("run.recovered", { unknown: inFlight });
+  }
+
+  private cap(id: string): Capability {
+    const c = this.registry.get(id);
+    if (!c) throw new Error(`capability ${id} vanished from the registry`);
+    return c;
   }
 
   emit(kind: string, body: Record<string, unknown> = {}) {
@@ -180,7 +187,7 @@ export class Orchestrator {
   // --- goal -------------------------------------------------------------------------------------------------------
   private async doGoal() {
     const st = this.st;
-    const caps = Object.values(this.caps).map((c) => ({ id: c.id, description: c.description }));
+    const caps = this.registry.list().map((c) => ({ id: c.id, description: c.description }));
     const rep = await this.askModel("goal", P.goalPrompt(st.raw, st.answersText(), this.ws.listing(), caps, st.scope), R.GoalAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const g = rep.data!;
@@ -192,7 +199,8 @@ export class Orchestrator {
       return this.finish("failed", "goal: proposed checks the verifier does not have");
     }
     if (!g.requirements.length) return this.finish(st.answers.length ? "cancelled" : "failed", st.answers.length ? "the user withdrew the request" : "goal: no requirements");
-    const texts = [st.raw, ...st.answersText(), ...this.ws.listing().map((e) => e.path)].map(loose);
+    const listing = this.ws.listing();
+    const texts = [st.raw, ...st.answersText(), ...listing.map((e) => e.path), ...listing.filter((e) => e.kind === "file").map((e) => this.ws.read(e.path).slice(0, 2000))].map(loose);
     for (const r of g.requirements) for (const q of r.quotes) {
       if (!texts.some((t) => t.includes(loose(q)))) {
         this.emit("decision.rejected", { why: `goal: quote not in evidence: ${q.slice(0, 40)}` });
@@ -211,7 +219,7 @@ export class Orchestrator {
       if (await this.trySkill()) return;
     }
     if (previous !== null && st.get("replans") >= this.budget.replans) return this.finish("failed", "budget: replans");
-    const caps = Object.values(this.caps).map((c) => ({ id: c.id, description: c.description, effect: c.effect, input: c.schema.properties, required: c.schema.required }));
+    const caps = this.registry.list().map(describeCapability);
     const rep = await this.askModel("plan", P.planPrompt(st.goal!, st.raw, st.answersText(), this.ws.listing(), caps, st.effects, previous, why), R.PlanAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const p = rep.data!;
@@ -231,7 +239,7 @@ export class Orchestrator {
     if (!ids.length) return "no nodes";
     if (new Set(ids).size !== ids.length) return "duplicate node ids";
     for (const n of nodes) {
-      if (!this.caps[n.capability]) return `unknown capability ${n.capability}`;
+      if (!this.registry.has(n.capability)) return `unknown capability ${n.capability}`;
       for (const d of n.depends_on) if (!ids.includes(d) || d === n.id) return `bad dependency ${d}`;
     }
     const seen = new Set<string>();
@@ -269,9 +277,9 @@ export class Orchestrator {
   // --- bind -------------------------------------------------------------------------------------------------------
   /** Bind one node. Returns true when it is bound and its intent check is left to the caller. */
   private async doBind(nd: NodeState, why = "", deferIntent = false): Promise<boolean> {
-    const st = this.st, node = nd.node, cap = this.caps[node.capability]!;
+    const st = this.st, node = nd.node, cap = this.cap(node.capability);
     if (node.args) {                                   // a skill fixed the arguments
-      const err = C.typecheck(cap, node.args);
+      const err = cap.typecheck(node.args);
       if (err) { this.emit("node.failed", { node_id: node.id, why: err }); return false; }
       this.emit("node.bound", { node_id: node.id, bindings: { source: "skill" }, args: node.args });
       if (deferIntent) return true;
@@ -306,9 +314,9 @@ export class Orchestrator {
     return false;
   }
 
-  resolve(cap: Capability, bindings: Record<string, Binding>, upstream: Record<string, unknown>): { args: C.Args } | { error: string } {
+  resolve(cap: Capability, bindings: Record<string, Binding>, upstream: Record<string, unknown>): { args: Record<string, string> } | { error: string } {
     const texts = [this.st.raw, ...this.st.answersText()];
-    const args: C.Args = {};
+    const args: Record<string, string> = {};
     for (const k of cap.schema.required) if (!(k in bindings)) return { error: `required parameter ${k} not bound` };
     for (const [k, b] of Object.entries(bindings)) {
       if (!(k in cap.schema.properties)) return { error: `unknown parameter ${k}` };
@@ -334,19 +342,31 @@ export class Orchestrator {
         case "literal":
           args[k] = b.value;
           break;
+        case "derived": {
+          const srcs = b.from_paths.map((p) => p.trim().replace(/^\/+|\/+$/g, ""));
+          if (!srcs.length || !b.how) return { error: `${k}: derived value needs from_paths and how` };
+          const missing = srcs.filter((p) => !this.ws.exists(p));
+          if (missing.length) return { error: `${k}: derived from files that do not exist: ${JSON.stringify(missing)}` };
+          args[k] = b.value;
+          break;
+        }
       }
     }
-    const err = C.typecheck(cap, args);
+    const err = cap.typecheck(args);
     return err ? { error: err } : { args };
   }
 
   private async intentCheck(nodes: NodeState[]) {
     const st = this.st;
-    const actions = nodes.map((n) => describe(this.caps[n.node.capability]!, n.args!));
+    const actions: string[] = [];
     const evidence: Record<string, string> = {};
     for (const n of nodes) {
-      const [reads, writes] = C.touched(this.caps[n.node.capability]!, n.args!);
-      for (const p of [...reads, ...writes]) if (this.ws.exists(p) && !this.ws.isDir(p) && !(p in evidence)) evidence[p] = this.ws.read(p).slice(0, 600);
+      const cap = this.cap(n.node.capability);
+      const derived = Object.entries((n.bindings as Record<string, Binding> | null) ?? {}).filter((e): e is [string, Extract<Binding, { kind: "derived" }>] => (e[1] as Binding)?.kind === "derived");
+      const hows = derived.map(([k, b]) => `${k} 的来历：${b.how}（依据 ${JSON.stringify(b.from_paths)}）`);
+      actions.push(describe(cap, n.args!) + (hows.length ? "；" + hows.join("；") : ""));
+      const { reads, writes } = cap.footprint(this.ws, n.args!);
+      for (const p of [...reads, ...writes, ...derived.flatMap(([, b]) => b.from_paths)]) if (this.ws.exists(p) && !this.ws.isDir(p) && !(p in evidence)) evidence[p] = this.ws.read(p).slice(0, 600);
     }
     const rep = await this.askModel("intent", P.intentPrompt(st.raw, st.answersText(), actions, st.goal!.constraints, evidence), R.IntentAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
@@ -364,13 +384,13 @@ export class Orchestrator {
 
   // --- execute ------------------------------------------------------------------------------------------------------
   private doExecute(nd: NodeState) {
-    const st = this.st, node = nd.node, cap = this.caps[node.capability]!, args = nd.args!;
+    const st = this.st, node = nd.node, cap = this.cap(node.capability), args = nd.args!;
     if (st.unknownOps().length) { this.emit("decision.rejected", { why: "unverified effect pending" }); return; }
     if (st.get("actions") >= this.budget.actions) return this.finish("failed", "budget: actions");
     const rev = `${st.revs.goal_rev}/${st.revs.plan_rev}`;
     this.hook("before_execute");
     if (`${st.revs.goal_rev}/${st.revs.plan_rev}` !== rev || !st.nodes.has(node.id)) { this.emit("decision.rejected", { why: "stale: the goal or plan changed before execution" }); return; }
-    const [reads, writes] = C.touched(cap, args);
+    const { reads, writes, expectAfter } = cap.footprint(this.ws, args);
     const now: Record<string, string> = {};
     for (const p of [...reads, ...writes]) now[p] = this.ws.version(p);
     const changed = Object.keys(now).filter((p) => p in st.lastVersions && st.lastVersions[p] !== now[p]);
@@ -382,7 +402,7 @@ export class Orchestrator {
       return;
     }
     this.emit("observation", { versions: { ...st.lastVersions, ...now } });
-    const pre = C.preconditions(this.ws, cap, args);
+    const pre = cap.preconditions(this.ws, args);
     if (pre) {
       this.emit("decision.rejected", { why: "precondition: " + pre });
       this.emit("node.unbound", { node_id: node.id });
@@ -400,20 +420,29 @@ export class Orchestrator {
       if (!ok) this.emit("node.failed", { node_id: node.id, why: "declined by the user" });
       return;
     }
-    const cmd = { operation_id: `op_${randomUUID().replace(/-/g, "").slice(0, 10)}`, node_id: node.id, capability: cap.id, args, reads, writes, versions_before: now, expect_after: C.expectedAfter(this.ws, cap, args), context: st.context(), text };
+    const cmd = { operation_id: `op_${randomUUID().replace(/-/g, "").slice(0, 10)}`, node_id: node.id, capability: cap.id, args, reads, writes, versions_before: now, expect_after: expectAfter, context: st.context(), text };
     this.emit("execution.intent", { command: cmd });
-    const crash = !!this.opts.hooks?.crash_on_first_effect && st.get("actions") === 0 && cap.effect !== "observe";
-    const result = C.execute(this.ws, cap, args, crash);                  // Crash propagates: no receipt
-    const ok = C.matches(cmd.expect_after, this.ws);
+    if (this.opts.hooks?.crash_on_first_effect && st.get("actions") === 0 && cap.effect !== "observe") this.crashNext = true;
+    const result = this.crashNext ? this.executeAndCrash(cap, args) : cap.execute(this.ws, args);   // Crash propagates: no receipt
+    const ok = versionsMatch(cmd.expect_after, this.ws);
     this.emit("execution.receipt", { operation_id: cmd.operation_id, result: { ...result, status: ok ? "ok" : "post_mismatch" }, text });
     if (ok) this.emit("node.verified", { node_id: node.id, output: result.output });
     else this.emit("node.failed", { node_id: node.id, why: "postcondition mismatch" });
   }
 
+  private crashNext = false;
+
+  /** Test hook: run the effect, then die before the receipt (what a power cut at the wrong moment does). */
+  private executeAndCrash(cap: Capability, args: Record<string, string>): never {
+    this.crashNext = false;
+    cap.execute(this.ws, args);
+    throw new Crash("crash after the effect, before the receipt");
+  }
+
   private reconcile(): boolean {
     for (const oid of this.st.unknownOps()) {
       const it = this.st.ops.get(oid)!.intent;
-      const finding = C.reconcile(this.ws, it.versions_before, it.expect_after);
+      const finding = reconcileVersions(this.ws, it.versions_before, it.expect_after);
       const ps = [...it.writes, ...it.writes.filter((w) => w.includes("/")).map((w) => w.slice(0, w.lastIndexOf("/")))];
       const versions: Record<string, string> = {};
       for (const p of ps) versions[p] = this.ws.version(p);
@@ -588,6 +617,7 @@ export class Orchestrator {
   }
 
   private modelFailed(rep: Reply) {
+    if (rep.outcome === "error" || rep.outcome === "timeout") return this.finish("failed", `model error: ${rep.role} ${rep.outcome} ${rep.error.slice(0, 120)}`);
     return this.finish("waiting_user", `model ${rep.role}: ${rep.outcome} ${rep.error.slice(0, 120)}`);
   }
 

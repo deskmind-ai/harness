@@ -77,6 +77,7 @@ const BIND_RULES = `绑定方式（每个参数一个对象，用 kind 字段说
 - resource_ref：值是目录里现有的一个文件或文件夹。给 path（目录列表里的相对路径）。
 - upstream_output：值来自前面一个只读节点的输出。给 node_id 和 field（如 text）。
 - literal：只有两种情况允许：能力的默认值，或从原文直接推出的路径拼接（例如把「归档」文件夹加上原文件名得到 归档/report.pdf）。给 value 和 authority（说明值怎么得来）。
+- derived：值要从目录里某些文件的文件名或内容推算出来（例如按发票里的开票日期得到 财务/发票/2025-06，或按用户的命名规则拼出新文件名）。给 value、from_paths（推算所依据的文件，必须是目录里有的）和 how（怎么算的，引用用户说的规则）。程序会把这些文件的内容交给核对方逐项核对，算错会被拦下。
 用户没有说的内容不要编（不要替用户起文件名、写正文）；写进 unresolved，reason=missing_user_intent，并给一个用户能直接回答的 question。
 值是不是在原文里出现过两次以上且指不同东西，要用 occurrence 区分；分不清就 unresolved reason=ambiguous。
 输出格式示例（字段名必须一样）：
@@ -84,6 +85,7 @@ const BIND_RULES = `绑定方式（每个参数一个对象，用 kind 字段说
               "name": {"kind": "source_span", "quote": "清单.log", "occurrence": 1},
               "text": {"kind": "source_span", "quote": "等评审", "occurrence": 1}},
  "unresolved": []}
+推算时：{"bindings": {"path": {"kind": "derived", "value": "财务/发票/2025-06", "from_paths": ["发票_京东_20250603_99元.pdf"], "how": "用户要求按开票年-月建文件夹，月份两位数；该文件名里的日期是 20250603"}}, "unresolved": []}
 缺信息时：{"bindings": {"target": {"kind": "resource_ref", "path": "todo.txt"}},
  "unresolved": [{"parameter": "line", "reason": "missing_user_intent", "question": "要加的那一行写什么？"}]}`;
 

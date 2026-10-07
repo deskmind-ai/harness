@@ -75,7 +75,10 @@ export const SourceSpanBinding = z.object({
 export const ResourceBinding = z.object({ kind: z.literal("resource_ref"), path: z.string() });
 export const UpstreamBinding = z.object({ kind: z.literal("upstream_output"), node_id: z.string(), field: z.string() });
 export const LiteralBinding = z.object({ kind: z.literal("literal"), value: z.string(), authority: z.string().min(1) });
-export const Binding = z.discriminatedUnion("kind", [SourceSpanBinding, ResourceBinding, UpstreamBinding, LiteralBinding]);
+/** A value computed from observed files (a date read from an invoice name, a folder from the user's rule): the
+ *  sources must exist, and the intent check gets their content plus the model's explanation. */
+export const DerivedBinding = z.object({ kind: z.literal("derived"), value: z.string(), from_paths: z.array(z.string()).min(1), how: z.string().min(1) });
+export const Binding = z.discriminatedUnion("kind", [SourceSpanBinding, ResourceBinding, UpstreamBinding, LiteralBinding, DerivedBinding]);
 export type Binding = z.infer<typeof Binding>;
 
 export const Unresolved = z.object({
