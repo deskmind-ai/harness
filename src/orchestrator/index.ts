@@ -432,6 +432,7 @@ export class Orchestrator {
   }
 
   private crashNext = false;
+  private lastGuiSig = "";
 
   /** Test hook: run the effect, then die before the receipt (what a power cut at the wrong moment does). */
   private executeAndCrash(cap: Capability, args: Record<string, string>): never {
@@ -593,6 +594,12 @@ export class Orchestrator {
     if (c === "cannot") return this.finish("failed", "cannot: " + (rep.data!.reason ?? ""));
     const [kind, target, value] = acts.get(c)!;
     const text = opts.find((o) => o.id === c)!.text;
+    const sig = `${c}@${JSON.stringify(obs.elements.map((e) => [e.target_id, e.value ?? ""]))}`;
+    if (this.lastGuiSig === sig) {                 // the same choice on an identical screen: nothing is moving
+      this.emit("note", { text: `同一个界面上重复选择「${text}」，没有进展` });
+      return this.finish("waiting_user", "no progress: the same action on an unchanged screen");
+    }
+    this.lastGuiSig = sig;
     if (text.includes("立即更新") || text.includes("替换")) {          // consequences the user did not ask for need the user
       const digest = sha(text);
       if (!st.approvals.has(digest)) {
@@ -636,6 +643,7 @@ export class Orchestrator {
   private clarify(question: string, why = "") {
     const st = this.st;
     if (st.get("ask:clarify") >= this.budget.asks) return this.finish("waiting_user", "asked the user too often without progress");
+    if (st.answers.some((a) => loose(a.question) === loose(question))) return this.finish("waiting_user", "the same question was already answered; not asking again");
     this.emit("interaction.request", { body: { kind: "clarify", question, why } });
     const text = this.user.clarify(question);
     if (text === null) return this.finish("waiting_user", "no answer from the user");
