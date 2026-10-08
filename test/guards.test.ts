@@ -209,15 +209,26 @@ describe("execution guards", () => {
     expect(s.status).not.toBe("succeeded");
   });
 
-  it("「随便」 does not unblock a missing-intent question; the run stops instead of deciding for the user", async () => {
-    const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改名的是哪个文件？" }], feasible: "yes" } });
+  it("「随便」 delegates the choice: the model's concrete action is shown for approval; declined, nothing changes", async () => {
+    const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改名的是哪个文件？", kind: "information" }], feasible: "yes" } });
     const guess = byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH });
-    const u = user(["你看着办吧"]);
-    const { o, ws } = setup(TODO, [ask, guess, guess, guess, guess], u);
+    const u = user(["你看着办吧"], false);
+    const { o, ws } = setup(TODO, [ask, guess, guess, guess, guess, guess, guess], u);
     const s = await o.run();
     expect(u.asked.length).toBe(1);
-    expect(s.status).toBe("waiting_user");
+    expect(s.counters["ask:authorize"]).toBe(1);          // the proposed append was put to the user
+    expect(s.status).not.toBe("succeeded");
     expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("an approval-kind missing item is not asked as a question", async () => {
+    const want = byRole({ goal: { ...GOAL, missing: [{ what: "确认追加", question: "可以追加吗？", kind: "approval" }] }, plan: PLAN, bind: BIND, intent: MATCH });
+    const u = user();
+    const { o, ws } = setup(TODO, Array(6).fill(want), u);
+    const s = await o.run();
+    expect(u.asked.length).toBe(0);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
   });
 
   it("a goal with only 'unchanged' constraints never succeeds without an effect", async () => {

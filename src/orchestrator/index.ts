@@ -201,7 +201,9 @@ export class Orchestrator {
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const g = rep.data!;
     if (g.feasible === "needs_capability_we_lack") return this.finish("failed", "cannot: " + (g.infeasible_reason ?? "需要没有注册的能力"));
-    if (g.missing.length) return this.clarify(g.missing[0]!.question, "goal: " + g.missing[0]!.what);
+    const info = g.missing.filter((m) => m.kind !== "approval");
+    if (info.length) return this.clarify(info[0]!.question, "goal: " + info[0]!.what);
+    if (g.missing.length) this.emit("note", { text: "模型想先要批准；批准由执行前的确认处理：" + g.missing.map((m) => m.what).join("；") });
     const bad = g.requirements.filter((r) => r.check.kind === "deterministic" && (!r.check.name || !(C_CHECKS as readonly string[]).includes(r.check.name) || typeof r.check.args !== "object"));
     if (bad.length) {
       this.emit("decision.rejected", { why: "goal: unknown check " + JSON.stringify(bad.map((r) => r.check)).slice(0, 200) });
@@ -437,9 +439,11 @@ export class Orchestrator {
     // Discarding content this run did not create is consequential: the user's (or another program's) data would be
     // lost. Only content written by this run may be overwritten without asking.
     const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p));
-    if ((cap.requiresConfirmation || foreign) && !st.approvals.has(digest)) {
+    const delegated = st.get("delegated") > 0 && cap.effect !== "observe";
+    if ((cap.requiresConfirmation || foreign || delegated) && !st.approvals.has(digest)) {
       if (st.declined.has(digest)) { this.emit("node.failed", { node_id: node.id, why: "declined by the user" }); return; }
-      const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）` : text;
+      const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）`
+        : delegated && !cap.requiresConfirmation ? `${text}（你让我决定的；这是我打算做的，可以吗？）` : text;
       this.emit("interaction.request", { body: { kind: "authorize", text: ask, digest } });
       const ok = this.user.authorize(ask);
       this.emit("interaction.reply", { body: { kind: "authorize", text: ask, digest, approved: ok } });
@@ -704,6 +708,7 @@ export class Orchestrator {
   private clarify(question: string, why = "") {
     const st = this.st;
     if (Orchestrator.isApprovalRequest(question)) {
+      st.count("approval_regex_fired");                       // the structural path is missing[].kind; this is the backstop
       const digest = sha("approval:" + question);
       if (!st.approvals.has(digest) && !st.declined.has(digest)) {
         this.emit("interaction.request", { body: { kind: "authorize", text: question, digest } });
@@ -722,9 +727,11 @@ export class Orchestrator {
     const text = this.user.clarify(question);
     if (text === null) return this.finish("waiting_user", "no answer from the user");
     this.emit("interaction.reply", { body: { kind: "clarify", question, text } });
-    if (Orchestrator.isUninformative(text) && why.startsWith("goal")) {
-      // 「随便」「你看着办」 is not the missing information: the model may not decide for the user (2.0 §8.1)
-      return this.finish("waiting_user", "the user did not supply the missing information; not deciding for them");
+    if (Orchestrator.isUninformative(text)) {
+      // 「随便」「你看着办」 delegates the choice: the model may decide, but every write it then proposes is shown to
+      // the user for approval first (a blank cheque it is not)
+      this.emit("note", { text: "用户把这个选择交给了我们；由此决定的每个改动执行前都先给用户确认" });
+      st.count("delegated");
     }
     st.goal = null; st.plan = null; st.nodes = new Map();        // the answer may change what the goal means
   }

@@ -45,7 +45,8 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "- 能用代码核验的用 deterministic 并填 name/args；只能看出来对不对的用 semantic；user_confirmation 只用于结果只有用户能判断的要求，不要用它表达「用编辑器做」「不要覆盖」这类过程约束——过程约束放进 constraints。",
     "- 原文缺了只有用户知道的信息（哪个文件、内容、位置），写进 missing，并给一个用户能直接回答的问题；不要用猜的值补。",
     "- 「放到 / 移到 / 归档到 / 整理到」某处，默认是移动（原位置不再有），不要问「移动还是复制」。用户已经回答过的问题不要再问。",
-    "- 删除、覆盖这类有后果的动作，程序会在执行前自己向用户确认；不要把「要不要确认」写进 missing。missing 只放用户没说、程序也看不到的信息。",
+    "- missing 的每条带 kind：information = 只有用户知道的信息（哪个文件、什么内容、放哪）；approval = 你已经知道怎么做、只是想要许可。有后果的动作（删除、覆盖）程序会在执行前自己向用户确认，所以 approval 类一般不需要写；写了也不会变成问题去问用户。",
+    "- 用户如果回答「随便」「你看着办」，就是把选择交给你：按常理做决定、写进需求，程序会把每个改动先给用户确认。",
     "- 目录里已有的文件名和内容也是证据：需求可以引用目录里看到的文件名。",
     "- 如果所需的事超出了已注册能力（例如发邮件、转格式、OCR），feasible 填 needs_capability_we_lack 并说明；不要用现有能力硬凑。",
     "", "输出格式示例（字段名必须一样）：",
@@ -53,6 +54,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
       { id: "r1", statement: "任务目录里有 清单.log", check: { kind: "deterministic", name: "file_exists", args: { path: "清单.log" } }, quotes: ["新建 清单.log"] },
       { id: "r2", statement: "清单.log 的内容是「等评审」", check: { kind: "deterministic", name: "text_equals", args: { path: "清单.log", text: "等评审" } }, quotes: ["内容为「等评审」"] },
     ], constraints: ["不动其他文件"], missing: [], feasible: "yes" }),
+    "缺信息时的 missing 示例：", J([{ what: "要改名的是哪个文件", question: "要改名的是 memo-a.txt 还是 方案-b.txt？", kind: "information" }]),
   ].join("\n");
 }
 

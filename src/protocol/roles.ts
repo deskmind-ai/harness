@@ -16,7 +16,9 @@ export const GoalAnswer = z.object({
     quotes: z.array(z.string()).default([]),
   })),
   constraints: z.array(z.string()),
-  missing: z.array(z.object({ what: z.string(), question: z.string() })),
+  /** kind: information = only the user knows it (which file, what text); approval = permission for an action the
+   *  model already knows how to do. The runtime asks for information and confirms actions itself. */
+  missing: z.array(z.object({ what: z.string(), question: z.string(), kind: z.enum(["information", "approval"]).default("information") })),
   feasible: z.enum(["yes", "needs_capability_we_lack", "unclear"]),
   infeasible_reason: z.string().optional(),
 });
