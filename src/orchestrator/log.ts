@@ -65,6 +65,7 @@ export class State {
   approvals = new Set<string>();
   declined = new Set<string>();
   effects: string[] = [];
+  externalChanges: string[] = [];       // paths another program changed while we were running (facts, not our effects)
   n: Record<string, number> = {};
   skillUsed: string | null = null;
   notes: string[] = [];
@@ -123,6 +124,7 @@ export class State {
       }
       case "env.changed":
         this.revs.evidence_epoch += 1;
+        for (const p of (e.paths as string[]) ?? []) if (p !== "gui" && !this.externalChanges.includes(p)) this.externalChanges.push(p);
         break;
       case "observation":
         this.lastVersions = e.versions; this.seen(e.versions);

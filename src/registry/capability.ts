@@ -37,6 +37,9 @@ export interface Capability {
   readonly channel: Channel;
   /** Consequential: the user approves the exact action before it runs. */
   readonly requiresConfirmation: boolean;
+  /** The action discards existing content of a written path (replace, trash). Overwriting content this run did not
+   *  write then needs the user's approval; an append or a move does not discard anything. */
+  readonly discards?: boolean;
   /** Set on a renamed variant: variant field -> base field. The runtime maps before calling the implementation. */
   readonly rename?: Record<string, string>;
   /** Argument checks beyond the schema (paths without '..', bare file names). Returns an error or null. */
@@ -66,7 +69,7 @@ export function renamed(c: Capability, map: Record<string, string>, suffix = ".a
   const base = c;
   const inv = (a: Args) => Object.fromEntries(Object.entries(a).map(([k, v]) => [map[k] ?? k, v]));
   return {
-    id: c.id + suffix, version: c.version, description: c.description, schema, effect: c.effect, channel: c.channel, requiresConfirmation: c.requiresConfirmation, rename: map,
+    id: c.id + suffix, version: c.version, description: c.description, schema, effect: c.effect, channel: c.channel, requiresConfirmation: c.requiresConfirmation, discards: c.discards, rename: map,
     typecheck: (a) => schemaCheck(schema, a) ?? base.typecheck(inv(a)),
     footprint: (ws, a) => base.footprint(ws, inv(a)),
     preconditions: (ws, a) => base.preconditions(ws, inv(a)),

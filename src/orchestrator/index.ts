@@ -166,7 +166,16 @@ export class Orchestrator {
         if (boundNow.length && boundNow.every((n) => st.nodes.has(n.node.id))) await this.intentCheck(boundNow);
         continue;
       }
-      if (nodes.some((n) => n.status === "failed")) { this.finish("failed", "a node failed and nothing else can run"); break; }
+      if (nodes.some((n) => n.status === "failed")) {
+        const declined = nodes.filter((n) => n.status === "failed" && st.declined.size > 0);
+        if (declined.length && st.get("replans") < this.budget.replans) {
+          await this.doPlan({ nodes: st.plan.nodes, source: st.plan.source }, "用户拒绝了其中一步（见提示）；已发生的效果保留，请换一种不需要那一步的做法，做不到就 cannot");
+          if (TERMINAL.has(st.status) || (st.status as RunStatus) === "waiting_user") break;
+          continue;
+        }
+        this.finish("failed", "a node failed and nothing else can run");
+        break;
+      }
       if (await this.rootCheck(true)) break;
       if (TERMINAL.has(st.status)) break;
       if (st.plan.source === "skill" && st.get("replans") < this.budget.replans) {
@@ -220,7 +229,7 @@ export class Orchestrator {
     }
     if (previous !== null && st.get("replans") >= this.budget.replans) return this.finish("failed", "budget: replans");
     const caps = this.registry.list().map(describeCapability);
-    const rep = await this.askModel("plan", P.planPrompt(st.goal!, st.raw, st.answersText(), this.ws.listing(), caps, st.effects, previous, why), R.PlanAnswer);
+    const rep = await this.askModel("plan", P.planPrompt(st.goal!, st.raw, st.answersText(), this.ws.listing(), caps, st.effects, previous, why, st.notes.slice(-3)), R.PlanAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const p = rep.data!;
     if (p.outcome === "cannot") return this.finish("failed", "cannot: " + (p.reason ?? ""));
@@ -417,12 +426,18 @@ export class Orchestrator {
     }
     const text = describe(cap, args);
     const digest = sha(canon({ cap: cap.id, args }));
-    if (cap.requiresConfirmation && !st.approvals.has(digest)) {
+    // Overwriting content this run did not write is consequential: someone else's edit would be lost.
+    const external = !!cap.discards && writes.some((p) => this.externallyEdited(p));
+    if ((cap.requiresConfirmation || external) && !st.approvals.has(digest)) {
       if (st.declined.has(digest)) { this.emit("node.failed", { node_id: node.id, why: "declined by the user" }); return; }
-      this.emit("interaction.request", { body: { kind: "authorize", text, digest } });
-      const ok = this.user.authorize(text);
-      this.emit("interaction.reply", { body: { kind: "authorize", text, digest, approved: ok } });
-      if (!ok) this.emit("node.failed", { node_id: node.id, why: "declined by the user" });
+      const ask = external && !cap.requiresConfirmation ? `${text}（注意：这个文件在任务开始后被别的程序改过，这一步会覆盖那些改动）` : text;
+      this.emit("interaction.request", { body: { kind: "authorize", text: ask, digest } });
+      const ok = this.user.authorize(ask);
+      this.emit("interaction.reply", { body: { kind: "authorize", text: ask, digest, approved: ok } });
+      if (!ok) {
+        this.emit("node.failed", { node_id: node.id, why: "declined by the user" });
+        this.emit("note", { text: `用户不同意：${ask}。要换一种不覆盖别人改动的做法。` });
+      }
       return;
     }
     const cmd = { operation_id: `op_${randomUUID().replace(/-/g, "").slice(0, 10)}`, node_id: node.id, capability: cap.id, args, reads, writes, versions_before: now, expect_after: expectAfter, context: st.context(), text };
@@ -445,6 +460,14 @@ export class Orchestrator {
     cap.execute(this.ws, args);
     this.ws.invalidate();
     throw new Crash("crash after the effect, before the receipt");
+  }
+
+  /** True when the path's current content is neither what the run started with nor something this run wrote. */
+  private externallyEdited(p: string): boolean {
+    const now = this.ws.version(p);
+    if (now === ABSENT || now.startsWith("dir:")) return false;
+    if (now === (this.st.startVersions[p] ?? ABSENT)) return false;
+    return ![...this.st.ops.values()].some((op) => op.state === "ok" && op.receipt?.versions_after?.[p] === now);
   }
 
   private reconcile(): boolean {
@@ -545,7 +568,10 @@ export class Orchestrator {
         if (st.n[key] !== 1) failed.push(r.statement);
         continue;
       }
-      const rep = await this.askModel("verify", P.verifyPrompt(r, st.raw, { 目录: this.ws.listing(), 已发生的效果: st.effects }), R.VerifyAnswer);
+      const evidence: Record<string, unknown> = { 目录: this.ws.listing(), 本任务做过的动作: st.effects };
+      if (st.externalChanges.length) evidence["任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）"] = st.externalChanges;
+      for (const p of Object.keys(r.check.args ?? {}).map((k) => r.check.args![k]!).filter((v) => this.ws.exists(v) && !this.ws.isDir(v))) evidence[`文件内容 ${p}`] = this.ws.read(p).slice(0, 600);
+      const rep = await this.askModel("verify", P.verifyPrompt(r, st.raw, evidence), R.VerifyAnswer);
       const ok = rep.outcome === "answered" && rep.data!.verdict === "pass";
       results[r.id] = { passed: ok, evidence: rep.data?.reason ?? rep.error };
       if (!ok) failed.push(r.statement);

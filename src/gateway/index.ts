@@ -95,15 +95,24 @@ export type Scripted = (role: Role, system: string, user: string) => unknown;
 
 const OPENROUTER = "https://openrouter.ai/api/v1/chat/completions";
 
+/** The first complete JSON object in the text (models sometimes add a second object or prose after it). */
 function extractJson(text: string): unknown {
   let t = text.trim();
   if (t.startsWith("```")) {
     t = t.includes("\n") ? t.slice(t.indexOf("\n") + 1) : t.slice(3);
     t = t.slice(0, t.lastIndexOf("```") >= 0 ? t.lastIndexOf("```") : undefined);
   }
-  const a = t.indexOf("{"), b = t.lastIndexOf("}");
-  if (a < 0 || b < 0) throw new Error("no JSON object in the answer");
-  return JSON.parse(t.slice(a, b + 1));
+  const a = t.indexOf("{");
+  if (a < 0) throw new Error("no JSON object in the answer");
+  let depth = 0, inStr = false, esc = false;
+  for (let i = a; i < t.length; i++) {
+    const c = t[i]!;
+    if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return JSON.parse(t.slice(a, i + 1));
+  }
+  throw new Error("unbalanced JSON object in the answer");
 }
 
 interface RoleStats { calls: number; tokens_in: number; tokens_out: number; cost_usd: number; latency_ms: number[]; outcomes: Record<string, number> }

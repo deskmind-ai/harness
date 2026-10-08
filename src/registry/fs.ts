@@ -29,6 +29,7 @@ interface Spec {
   fields: Record<string, FieldSchema>;
   effect: Effect;
   confirm?: boolean;
+  discards?: boolean;
   pathFields?: string[];
   footprint: (ws: Workspace, a: Args) => Footprint;
   pre: (ws: Workspace, a: Args) => string | null;
@@ -39,7 +40,7 @@ interface Spec {
 function make(sp: Spec): Capability {
   const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
   return {
-    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm,
+    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards,
     typecheck(a) {
       const err = schemaCheck(schema, a);
       if (err) return err;
@@ -66,7 +67,7 @@ export const fsCreateText = make({
 });
 
 export const fsReplaceText = make({
-  id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update",
+  id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true,
   fields: { target: p("要改写的文件"), text: s("新的全部正文") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: sha(a.text!) } }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
@@ -107,7 +108,7 @@ export const fsMkdir = make({
 });
 
 export const fsTrash = make({
-  id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true,
+  id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true, discards: true,
   fields: { target: p("要移到废纸篓的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: ABSENT } }),
   pre: (ws, a) => (ws.exists(norm(a.target!)) ? null : `${norm(a.target!)} does not exist`),

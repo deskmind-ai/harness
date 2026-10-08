@@ -29,6 +29,7 @@ const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的
 - last_line_is_content_of {path, source}   path 的末行等于 source 文件执行时的内容（「把 A 的内容追加到 B」用这个，不要把现在预览里看到的内容抄成常量）
 - text_equals_content_of {path, source}    path 的内容等于 source 文件执行时的内容
 值来自另一个文件时，一律用 *_content_of 引用那个文件；预览里的内容可能在执行前被改，抄成常量会把错的结果判成对。
+检查写的是任务做完后的最终状态，不是中间步骤：「复制再追加一行」的结果文件不再等于源文件，就不能用 content_moved 去查它。
 能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
 path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
 
@@ -54,13 +55,14 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
   ].join("\n");
 }
 
-export function planPrompt(goal: Goal, raw: string, answers: string[], workspace: Listing, caps: CapView[], effects: string[], previous: unknown, why: string): string {
+export function planPrompt(goal: Goal, raw: string, answers: string[], workspace: Listing, caps: CapView[], effects: string[], previous: unknown, why: string, notes: string[] = []): string {
   return [
     "任务：给出完成用户要求的计划：一组能力调用节点，带依赖。每个节点只调用一个已注册能力；参数稍后由另一步绑定，这里只说每个节点的目的。",
     "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
     "已整理的需求：", J(goal.requirements), "约束：", J(goal.constraints),
     "目录现在的内容：", J(workspace),
     ...(effects.length ? ["已经发生、不能当作没发生的效果：", J(effects)] : []),
+    ...(notes.length ? ["提示（含用户拒绝过的事）：", J(notes)] : []),
     "", "可用能力（含输入字段和含义）：", J(caps),
     ...(previous ? ["", `上一版计划：${J(previous)}`, `要改计划的原因：${why}`] : []),
     "", "要求：", "- 只用列表里的能力 id；要读文件内容才能决定后续时，先放一个只读节点，后面的节点依赖它。",
