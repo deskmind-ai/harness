@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { Gateway, type Scripted } from "../src/gateway/index.js";
-import { Orchestrator, type User } from "../src/orchestrator/index.js";
+import { Orchestrator, type Answer, type User } from "../src/orchestrator/index.js";
 import { Crash } from "../src/registry/capability.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
@@ -16,7 +16,7 @@ const scriptedTable = Object.fromEntries(["goal", "plan", "bind", "intent", "cho
 
 const user = (answers: string[] = [], approve = true): User & { asked: string[] } => ({
   asked: [],
-  clarify(q) { this.asked.push(q); return answers.shift() ?? "按我原来说的做。"; },
+  clarify(q): Answer { this.asked.push(q); return { text: answers.shift() ?? "按我原来说的做。" }; },
   authorize: () => approve,
 });
 
@@ -210,7 +210,7 @@ describe("execution guards", () => {
   });
 
   it("rewriting a file the user named for rewriting needs no extra approval (the request is the authorization)", async () => {
-    const GOALW = { requirements: [{ id: "r1", statement: "日志.log 内容是 X", check: { kind: "deterministic", name: "text_equals", args: { path: "日志.log", text: "X" } }, quotes: ["X"] }], constraints: [], missing: [], feasible: "yes" };
+    const GOALW = { requirements: [{ id: "r1", statement: "日志.log 内容是 X", check: { kind: "deterministic", name: "text_equals", args: { path: "日志.log", text: "X" } }, quotes: ["X"] }], constraints: [], authorized_rewrites: ["日志.log"], missing: [], feasible: "yes" };
     const PLANW = { nodes: [{ id: "n1", capability: "fs.replace_text", depends_on: [], purpose: "改写", requirement_ids: ["r1"] }], outcome: "plan" };
     const BINDW = { bindings: { target: { kind: "resource_ref", path: "日志.log" }, text: { kind: "source_span", quote: "X", occurrence: 1 } }, unresolved: [] };
     const w = byRole({ goal: GOALW, plan: PLANW, bind: BINDW, intent: MATCH });
@@ -229,7 +229,7 @@ describe("execution guards", () => {
 
   it("「随便」 delegates the choice: the model's concrete action is shown for approval; declined, nothing changes", async () => {
     const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改名的是哪个文件？", kind: "information" }], feasible: "yes" } });
-    const guess = byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH });
+    const guess = byRole({ goal: { ...GOAL, user_delegated: true }, plan: PLAN, bind: BIND, intent: MATCH });
     const u = user(["你看着办吧"], false);
     const { o, ws } = setup(TODO, [ask, guess, guess, guess, guess, guess, guess], u);
     const s = await o.run();

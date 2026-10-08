@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { CONFIGS, Gateway, withOverrides } from "../gateway/index.js";
-import { Orchestrator, type Hooks, type User } from "../orchestrator/index.js";
+import { Orchestrator, type Answer, type Hooks, type User } from "../orchestrator/index.js";
 import { Crash, Registry } from "../registry/capability.js";
 import { RENAMES, fileRegistry } from "../registry/fs.js";
 import { guiRegistry } from "../gui/sim.js";
@@ -25,12 +25,12 @@ class SimUser implements User {
   asked: string[] = [];
   private answers: string[];
   constructor(private readonly task: Task) { this.answers = [...(task.answers ?? [])]; }
-  clarify(q: string, options: string[] = []) {
+  clarify(q: string, options: string[]): Answer {
     this.asked.push(options.length ? `${q} [${options.map((o, i) => `${i + 1}.${o}`).join(" ")}]` : q);
     const a = this.answers.shift() ?? "按我原来说的做。";
     // the scripted user picks an option only when the answer IS that option; a richer answer stays free text
     const hit = options.findIndex((o) => a.trim() === o.trim());
-    return hit >= 0 ? String(hit + 1) : a;
+    return hit >= 0 ? { option: hit } : { text: a };
   }
   authorize() { return this.task.approve ?? false; }
 }

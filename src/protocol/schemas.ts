@@ -41,6 +41,8 @@ export type Requirement = z.infer<typeof Requirement>;
 export const Goal = z.object({
   requirements: z.array(Requirement),
   constraints: z.array(z.string()),
+  authorized_rewrites: z.array(z.string()).default([]),
+  user_delegated: z.boolean().default(false),
 });
 export type Goal = z.infer<typeof Goal>;
 

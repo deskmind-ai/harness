@@ -16,6 +16,11 @@ export const GoalAnswer = z.object({
     quotes: z.array(z.string()).default([]),
   })),
   constraints: z.array(z.string()),
+  /** Paths whose content the user explicitly asked to change (改写 / 替换 / 覆盖 / 追加到). Only these may lose content on
+   *  the user's word; the runtime checks each is named in the user's words. A file the user asked to *create* is not here. */
+  authorized_rewrites: z.array(z.string()).default([]),
+  /** The user handed a choice to us (「随便」「你看着办」「由你决定」). We may decide, and every write is then confirmed first. */
+  user_delegated: z.boolean().default(false),
   /** kind: information = only the user knows it (which file, what text); approval = permission for an action the
    *  model already knows how to do. The runtime asks for information and confirms actions itself. */
   missing: z.array(z.object({

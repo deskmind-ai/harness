@@ -25,9 +25,12 @@ import { Crash } from "../registry/capability.js";
 import { Log, State, type NodeState } from "./log.js";
 import * as P from "./prompts.js";
 
+/** A user's answer: a picked option (index into the options shown) or free text. */
+export type Answer = { option: number } | { text: string };
+
 export interface User {
-  /** Answer a question. `options` are shown as 1..n plus 「其他（直接输入）」; the answer may be a number or text. */
-  clarify(question: string, options?: string[]): string | null;
+  /** Answer a question. `options` are shown as 1..n plus 「其他（直接输入）」. null: no answer. */
+  clarify(question: string, options: string[]): Answer | null;
   authorize(text: string): boolean;
 }
 
@@ -219,7 +222,11 @@ export class Orchestrator {
         return this.finish("failed", "goal: cited words the user did not say");
       }
     }
-    const goal: Goal = { requirements: g.requirements, constraints: g.constraints };
+    const named = (p: string) => { const base = p.slice(p.lastIndexOf("/") + 1); return [st.raw, ...st.answersText()].some((t) => t.includes(base)); };
+    const rewrites = g.authorized_rewrites.filter(named);        // a rewrite authority must point at a file the user named
+    if (rewrites.length !== g.authorized_rewrites.length) this.emit("decision.rejected", { why: "goal: authorized_rewrites names a file the user did not: " + JSON.stringify(g.authorized_rewrites.filter((p) => !named(p))) });
+    if (g.user_delegated) this.emit("note", { text: "用户把这个选择交给了我们；由此决定的每个改动执行前都先给用户确认" });
+    const goal: Goal = { requirements: g.requirements, constraints: g.constraints, authorized_rewrites: rewrites, user_delegated: g.user_delegated };
     this.emit("goal.accepted", { goal });
   }
 
@@ -441,8 +448,9 @@ export class Orchestrator {
     // lost. Only content written by this run may be overwritten without asking.
     // The request itself authorizes rewriting a file the user named for rewriting (「把 X 的内容改成…」). It does not
     // authorize discarding a file the user asked to *create* (「新建 X」 when X exists) or one the user never named.
-    const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p) && !this.userAskedToRewrite(p));
-    const delegated = st.get("delegated") > 0 && cap.effect !== "observe";
+    const authorized = new Set(st.goal!.authorized_rewrites ?? []);
+    const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p) && !authorized.has(p));
+    const delegated = !!st.goal!.user_delegated && cap.effect !== "observe";
     if ((cap.requiresConfirmation || foreign || delegated) && !st.approvals.has(digest)) {
       if (st.declined.has(digest)) { this.emit("node.failed", { node_id: node.id, why: "declined by the user" }); return; }
       const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）`
@@ -480,16 +488,6 @@ export class Orchestrator {
     cap.execute(this.ws, args);
     this.ws.invalidate();
     throw new Crash("crash after the effect, before the receipt");
-  }
-
-  /** The user named this file and asked for it to be changed (not created): its content may be replaced on their word. */
-  private userAskedToRewrite(p: string): boolean {
-    const base = p.slice(p.lastIndexOf("/") + 1);
-    const words = [this.st.raw, ...this.st.answersText()].join("\n");
-    if (!words.includes(base)) return false;
-    const idx = words.indexOf(base);
-    const around = words.slice(Math.max(0, idx - 12), idx + base.length + 2);
-    return !/新建|创建|新增|建一个|建个|新文件/.test(around);
   }
 
   /** True when the path's current content was written by this run (so rewriting it loses nothing of anyone else's). */
@@ -706,63 +704,40 @@ export class Orchestrator {
     await this.rootCheck(false);
   }
 
-  /** Text the model may put into a field: only words the user said (quoted runs and file-like tokens). */
+  /** Text the model may put into a field: the values the goal's requirements name (file names, texts, lines).
+   *  Those came from the goal role and were checked against the user's words; nothing is extracted by pattern here. */
   private guiValues(): Record<string, string> {
     const out: Record<string, string> = {};
-    for (const t of [this.st.raw, ...this.st.answersText()]) {
-      for (const m of t.matchAll(/[「“"]([^」”"]+)[」”"]/g)) out[`q${Object.keys(out).length}`] = m[1]!;
-      for (const m of t.matchAll(/[A-Za-z0-9_一-鿿][A-Za-z0-9_一-鿿.\-]*\.[a-z]{2,4}/g)) if (!Object.values(out).includes(m[0])) out[`f${Object.keys(out).length}`] = m[0];
+    const add = (v: string) => { if (v && !Object.values(out).includes(v)) out[`v${Object.keys(out).length}`] = v; };
+    for (const r of this.st.goal!.requirements) {
+      const a = r.check.args ?? {};
+      for (const k of ["text", "line"]) if (a[k]) add(a[k]!);
+      for (const k of ["path", "to", "source", "other"]) if (a[k]) add(a[k]!.slice(a[k]!.lastIndexOf("/") + 1));
     }
     return out;
   }
 
+
   // --- interaction --------------------------------------------------------------------------------------------------------
-  /** A model asking "shall I really do X?" is asking for approval, not information: that goes through authorize. */
-  private static isApprovalRequest(q: string): boolean {
-    return /确认|批准|同意|是否要|要不要|可以(删|移|覆盖|执行)|真的要/.test(q) && !/叫什么|哪个|哪一|什么内容|放到哪|写什么|名字/.test(q);
-  }
+  static readonly DELEGATE = "由你决定";
 
   private clarify(question: string, why = "", options: string[] = []) {
     const st = this.st;
-    // options the model offers must exist in the evidence; the rest are dropped (a candidate is a fact, not a guess)
+    // options the model offers must exist in the evidence; the rest are dropped (a candidate is a fact, not a guess).
+    // 「由你决定」 is always offered: choosing it is the structural form of delegation.
     const shown = this.ws.listing().entries.map((e) => e.path);
     const evidence = [st.raw, ...st.answersText(), ...shown].map(loose);
-    const valid = options.filter((o) => /由你决定|你定|都可以/.test(o) || evidence.some((t) => t.includes(loose(o))));
-    // the regex backstop applies only to short questions from the goal/plan/bind roles; a verifier's long
-    // 'insufficient information' explanation is a request for information, whatever words it contains
-    if (!why.startsWith("intent") && question.length <= 60 && Orchestrator.isApprovalRequest(question)) {
-      st.count("approval_regex_fired");                       // the structural path is missing[].kind; this is the backstop
-      const digest = sha("approval:" + question);
-      if (!st.approvals.has(digest) && !st.declined.has(digest)) {
-        this.emit("interaction.request", { body: { kind: "authorize", text: question, digest } });
-        const ok = this.user.authorize(question);
-        this.emit("interaction.reply", { body: { kind: "authorize", text: question, digest, approved: ok } });
-        // the answer is recorded as the user's words so the next goal/plan round sees it
-        this.emit("interaction.reply", { body: { kind: "clarify", question, text: ok ? "确认，照做。" : "不要做。" } });
-        st.goal = null; st.plan = null; st.nodes = new Map();
-        if (!ok) this.finish("cancelled", "the user declined");
-        return;
-      }
-    }
+    const valid = [...options.filter((o) => o !== Orchestrator.DELEGATE && evidence.some((t) => t.includes(loose(o)))), Orchestrator.DELEGATE];
     if (st.get("ask:clarify") >= this.budget.asks) return this.finish("waiting_user", "asked the user too often without progress");
     if (st.answers.some((a) => loose(a.question) === loose(question))) return this.finish("waiting_user", "the same question was already answered; not asking again");
     this.emit("interaction.request", { body: { kind: "clarify", question, why, options: valid } });
-    let text = this.user.clarify(question, valid);
-    if (text === null) return this.finish("waiting_user", "no answer from the user");
-    const n = /^\s*(\d+)\s*[.．、)]?\s*$/.exec(text);
-    if (n && valid[Number(n[1]) - 1]) text = valid[Number(n[1]) - 1]!;        // a number picks an option
+    const ans = this.user.clarify(question, valid);
+    if (ans === null) return this.finish("waiting_user", "no answer from the user");
+    const text = "option" in ans ? (valid[ans.option] ?? "") : ans.text;
+    if (!text) return this.finish("waiting_user", "empty answer");
     this.emit("interaction.reply", { body: { kind: "clarify", question, text, options: valid } });
-    if (Orchestrator.isUninformative(text)) {
-      // 「随便」「你看着办」 delegates the choice: the model may decide, but every write it then proposes is shown to
-      // the user for approval first (a blank cheque it is not)
-      this.emit("note", { text: "用户把这个选择交给了我们；由此决定的每个改动执行前都先给用户确认" });
-      st.count("delegated");
-    }
+    // whether the words mean delegation is for the goal role to say (user_delegated), not for a pattern here
     st.goal = null; st.plan = null; st.nodes = new Map();        // the answer may change what the goal means
-  }
-
-  private static isUninformative(t: string): boolean {
-    return /^(随便|你看着办|你定|都行|无所谓|按我原来说的做|照原话做|按原来的做)/.test(t.trim());
   }
 
   private modelFailed(rep: Reply) {
