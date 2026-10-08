@@ -728,7 +728,9 @@ export class Orchestrator {
     const shown = this.ws.listing().entries.map((e) => e.path);
     const evidence = [st.raw, ...st.answersText(), ...shown].map(loose);
     const valid = options.filter((o) => /由你决定|你定|都可以/.test(o) || evidence.some((t) => t.includes(loose(o))));
-    if (Orchestrator.isApprovalRequest(question)) {
+    // the regex backstop applies only to short questions from the goal/plan/bind roles; a verifier's long
+    // 'insufficient information' explanation is a request for information, whatever words it contains
+    if (!why.startsWith("intent") && question.length <= 60 && Orchestrator.isApprovalRequest(question)) {
       st.count("approval_regex_fired");                       // the structural path is missing[].kind; this is the backstop
       const digest = sha("approval:" + question);
       if (!st.approvals.has(digest) && !st.declined.has(digest)) {

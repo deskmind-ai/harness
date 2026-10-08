@@ -28,8 +28,8 @@ class SimUser implements User {
   clarify(q: string, options: string[] = []) {
     this.asked.push(options.length ? `${q} [${options.map((o, i) => `${i + 1}.${o}`).join(" ")}]` : q);
     const a = this.answers.shift() ?? "按我原来说的做。";
-    // the scripted user may name an option by its text; return the option so the run exercises the numbered path
-    const hit = options.findIndex((o) => a.includes(o));
+    // the scripted user picks an option only when the answer IS that option; a richer answer stays free text
+    const hit = options.findIndex((o) => a.trim() === o.trim());
     return hit >= 0 ? String(hit + 1) : a;
   }
   authorize() { return this.task.approve ?? false; }
