@@ -129,6 +129,9 @@ export class State {
         if (nd) nd.status = "failed";
         break;
       }
+      case "goal.retry":                         // one shared re-derivation per run when a goal ignores the user's choice
+        this.count("goal_retry");
+        break;
       case "ambiguity.settled":                  // the judge read a free-text answer as picking one of the readings
         this.settled.push({ point: e.point, readings: e.readings, text: e.text, option: e.option });
         break;

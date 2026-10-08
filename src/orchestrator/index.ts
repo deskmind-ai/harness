@@ -244,7 +244,7 @@ export class Orchestrator {
         const chosen = s.readings[s.option]!;
         if (loose(a.reading) !== loose(chosen)) {
           this.emit("decision.rejected", { why: `goal: reading「${a.reading}」ignores the user's choice「${chosen}」at「${s.point}」` });
-          if (st.get("goal_retry") < 1) { st.count("goal_retry"); return; }        // goal stays empty: derived again
+          if (st.get("goal_retry") < 1) { this.emit("goal.retry", {}); return; }        // goal stays empty: derived again
           return this.finish("failed", "goal: kept ignoring the user's choice");
         }
         assumptions.push({ ...a, evidence: [s.text], backed: true, settled: true });
@@ -262,7 +262,7 @@ export class Orchestrator {
     const dropped = this.decided().filter((d) => !g.assumptions.some((a) => this.sameAmbiguity(a, d.s)));
     if (dropped.length) {
       this.emit("decision.rejected", { why: `goal: no reading for「${dropped[0]!.point}」, which the user settled as「${dropped[0]!.reading}」` });
-      if (st.get("goal_retry") < 1) { st.count("goal_retry"); return; }
+      if (st.get("goal_retry") < 1) { this.emit("goal.retry", {}); return; }
       return this.finish("failed", "goal: kept ignoring the user's choice");
     }
     // an independent judge decides whether the cited evidence actually tells the readings apart
@@ -277,7 +277,7 @@ export class Orchestrator {
       else if (fromAnswer.has(i) && k <= a.alternatives.length) {
         // the user's own words pick another reading: record it as their choice and derive the goal again
         this.emit("ambiguity.settled", { point: a.point, readings: [a.reading, ...a.alternatives], option: k, text: assumptions[i]!.evidence[0] ?? "" });
-        if (st.get("goal_retry") < 1) { st.count("goal_retry"); return; }
+        if (st.get("goal_retry") < 1) { this.emit("goal.retry", {}); return; }
         return this.finish("failed", "goal: kept ignoring the user's choice");
       } else {
         a.backed = false;
