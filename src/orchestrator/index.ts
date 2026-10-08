@@ -450,6 +450,10 @@ export class Orchestrator {
       this.emit("interaction.reply", { body: { kind: "authorize", text: ask, digest, approved: ok } });
       if (!ok) {
         this.emit("node.failed", { node_id: node.id, why: "declined by the user" });
+        if (delegated && !cap.requiresConfirmation && !foreign) {
+          // the user delegated, then rejected our proposal: guessing again is not useful, the user has to choose
+          return this.finish("waiting_user", "the user declined the proposed action; their choice is needed");
+        }
         this.emit("note", { text: `用户不同意：${ask}。要换一种不覆盖别人改动的做法。` });
       }
       return;
