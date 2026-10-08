@@ -134,9 +134,13 @@ export class Orchestrator {
   // --- entry ------------------------------------------------------------------------------------------------------
   start(raw: string, scope = ".") {
     const versions: Record<string, string> = {};
-    for (const p of Object.keys(this.ws.entries())) versions[p] = this.ws.version(p);
+    const contents: Record<string, string> = {};
+    for (const [p, v] of Object.entries(this.ws.entries())) {
+      versions[p] = this.ws.version(p);
+      if (v !== "dir") { const t = this.ws.read(p); if (t.length <= 1000) contents[p] = t; }   // 'before' state for the verifier
+    }
     versions["/"] = this.ws.version("/");
-    this.emit("run.start", { run_id: `run_${randomUUID().slice(0, 8)}`, raw, scope, versions });
+    this.emit("run.start", { run_id: `run_${randomUUID().slice(0, 8)}`, raw, scope, versions, contents });
   }
 
   /** The user changed what they want. Everything downstream of the goal is stale; effects stay. */
@@ -274,7 +278,7 @@ export class Orchestrator {
     const reqs = this.st.goal!.requirements;
     const uncovered = reqs.filter((r) => !covered.has(r.id) && !["unchanged", "file_absent"].includes(r.check.name ?? "") && r.check.kind !== "user_confirmation");
     if (uncovered.length && uncovered.length === reqs.length) return "no node serves any requirement";
-    if (nodes.length > 12) return "too many nodes";
+    if (nodes.length > 16) return "too many nodes";
     return null;
   }
 
@@ -597,6 +601,8 @@ export class Orchestrator {
         continue;
       }
       const evidence: Record<string, unknown> = { 目录: this.ws.listing(), 本任务做过的动作: st.effects };
+      const before = Object.fromEntries(Object.entries(st.startContents).filter(([p]) => Object.values(r.check.args ?? {}).includes(p)));
+      if (Object.keys(before).length) evidence["任务开始时这些文件的内容"] = before;
       if (st.externalChanges.length) evidence["任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）"] = st.externalChanges;
       for (const p of Object.keys(r.check.args ?? {}).map((k) => r.check.args![k]!).filter((v) => this.ws.exists(v) && !this.ws.isDir(v))) evidence[`文件内容 ${p}`] = this.ws.read(p).slice(0, 600);
       const rep = await this.askModel("verify", P.verifyPrompt(r, st.raw, evidence), R.VerifyAnswer);

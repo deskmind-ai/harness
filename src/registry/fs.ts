@@ -100,11 +100,16 @@ export const fsCopy = make({
 });
 
 export const fsMkdir = make({
-  id: "fs.mkdir", description: "新建一个文件夹；已存在时失败。", effect: "create",
+  id: "fs.mkdir", description: "新建一个文件夹，缺失的上级文件夹一并建好；已存在时失败。", effect: "create",
   fields: { path: p("新文件夹的路径") }, pathFields: ["path"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.path!)], expectAfter: { [norm(a.path!)]: "dir:*" } }),
-  pre: (ws, a) => { const q = norm(a.path!); return ws.exists(q) ? `${q} already exists` : !folderOk(ws, parentOf(q)) ? `folder ${parentOf(q)} does not exist` : null; },
-  run: (ws, a) => { const q = norm(a.path!); fs.mkdirSync(ws.abs(q)); maybeCrash(); return after(ws, [q]); },
+  pre: (ws, a) => {
+    const q = norm(a.path!);
+    if (ws.exists(q)) return `${q} already exists`;
+    for (let anc = parentOf(q); anc; anc = parentOf(anc)) if (ws.exists(anc) && !ws.isDir(anc)) return `${anc} is a file, not a folder`;
+    return null;
+  },
+  run: (ws, a) => { const q = norm(a.path!); fs.mkdirSync(ws.abs(q), { recursive: true }); maybeCrash(); return after(ws, [q]); },
 });
 
 export const fsTrash = make({

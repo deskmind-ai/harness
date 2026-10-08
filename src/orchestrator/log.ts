@@ -60,6 +60,7 @@ export class State {
   nodes = new Map<string, NodeState>();
   ops = new Map<string, OpState>();
   startVersions: Record<string, string> = {};
+  startContents: Record<string, string> = {};   // small files as they were when the run started
   lastVersions: Record<string, string> = {};
   lastSeen: Record<string, string> = {};
   approvals = new Set<string>();
@@ -87,6 +88,7 @@ export class State {
       case "run.start":
         this.runId = e.run_id; this.raw = e.raw; this.scope = e.scope;
         this.startVersions = e.versions; this.lastVersions = { ...e.versions }; this.seen(e.versions);
+        this.startContents = e.contents ?? {};
         break;
       case "goal.update":
         this.raw = e.raw; this.goal = null; this.plan = null; this.nodes = new Map();
