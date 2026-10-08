@@ -234,7 +234,8 @@ describe("execution guards", () => {
     const asked: { q: string; options: string[] }[] = [];
     const u: User = { clarify(q, options) { asked.push({ q, options }); return { option: 0 }; }, authorize: () => true };
     const open = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: ["在 todo.txt 末尾加一行"] }] } });  // the request itself is not evidence
-    const { o, ws } = setup(TODO, [open, HAPPY, HAPPY, HAPPY, HAPPY, HAPPY], u);
+    const carries = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH });   // the new goal carries the picked reading
+    const { o, ws } = setup(TODO, [open, carries, carries, carries, carries, carries], u);
     const s = await o.run();
     expect(asked.length).toBe(1);
     expect(asked[0]!.options).toEqual([AMB.reading, ...AMB.alternatives, Orchestrator.DELEGATE]);
@@ -343,6 +344,27 @@ describe("execution guards", () => {
     expect(s.assumptions).toEqual([AMB.alternatives[0]]);
     expect(s.status).toBe("succeeded");
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+  });
+
+  it("a goal that drops the ambiguity the user settled is rejected like one that ignores it", async () => {
+    const u: User = { clarify: () => ({ option: 1 }), authorize: () => true };
+    const open = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] } });
+    const silent = byRole({ goal: { ...GOAL, assumptions: [] }, plan: PLAN, bind: BIND, intent: MATCH });
+    const { o, ws } = setup(TODO, [open, silent, silent, silent], u);
+    const s = await o.run();
+    expect(s.status).toBe("failed");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("a free-text answer the judge reads as another reading settles that reading", async () => {
+    const u: User = { clarify: () => ({ text: "接在文字后面就行" }), authorize: () => true };
+    const open = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, choice: { choice: "r1" } });
+    const follows = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, reading: AMB.alternatives[0], alternatives: [AMB.reading], evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH });
+    const { o } = setup(TODO, [open, open, open, follows, follows, follows, follows, follows], u);   // goal, goal, judge, goal…
+    const s = await o.run();
+    expect(s.counters.goal_retry).toBe(1);
+    expect(s.assumptions).toEqual([AMB.alternatives[0]]);
+    expect(s.status).toBe("succeeded");
   });
 
   it("a goal that keeps ignoring the user's pick fails without writing", async () => {

@@ -115,10 +115,11 @@ export function bindPrompt(raw: string, answers: string[], node: Omit<PlanNode, 
   ].join("\n");
 }
 
-export function intentPrompt(raw: string, answers: string[], actions: string[], constraints: string[], evidence: Record<string, string>): string {
+export function intentPrompt(raw: string, answers: string[], actions: string[], constraints: string[], evidence: Record<string, string>, decided: { point: string; reading: string }[] = []): string {
   return [
     "任务：独立核对。下面是程序即将执行的动作（人话描述，参数已经取好）。请对照用户原文和给出的证据，判断这些动作是不是用户要的。",
     "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    ...(decided.length ? ["用户已经选定的理解（动作必须照这个理解；不照的判 mismatch）：", ...decided.map((d) => `- 「${d.point}」：${d.reading}`)] : []),
     "约束：", J(constraints),
     ...(Object.keys(evidence).length ? ["动作涉及的文件，现在的内容（证据；参数里的值如果来自文件内容，在这里核对）：", J(evidence)] : []),
     "", "即将执行的动作（按顺序）：", ...actions.map((a, i) => `${i + 1}. ${a}`),

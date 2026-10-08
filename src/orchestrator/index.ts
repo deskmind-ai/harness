@@ -207,8 +207,7 @@ export class Orchestrator {
   private async doGoal() {
     const st = this.st;
     const caps = this.registry.list().map((c) => ({ id: c.id, description: c.description }));
-    const decided = st.settled.filter((s) => s.option !== null && s.option < s.readings.length).map((s) => ({ point: s.point, reading: s.readings[s.option!]! }));
-    const rep = await this.askModel("goal", P.goalPrompt(st.raw, st.answersText(), this.ws.listing(), caps, st.scope, decided), R.GoalAnswer);
+    const rep = await this.askModel("goal", P.goalPrompt(st.raw, st.answersText(), this.ws.listing(), caps, st.scope, this.decided()), R.GoalAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const g = rep.data!;
     if (g.feasible === "needs_capability_we_lack") return this.finish("failed", "cannot: " + (g.infeasible_reason ?? "需要没有注册的能力"));
@@ -259,6 +258,13 @@ export class Orchestrator {
         assumptions.push({ ...a, evidence, backed: evidence.length > 0, settled: false });
       }
     }
+    // a goal that silently drops an ambiguity the user settled has nothing to check it against: treated like ignoring it
+    const dropped = this.decided().filter((d) => !g.assumptions.some((a) => this.sameAmbiguity(a, d.s)));
+    if (dropped.length) {
+      this.emit("decision.rejected", { why: `goal: no reading for「${dropped[0]!.point}」, which the user settled as「${dropped[0]!.reading}」` });
+      if (st.get("goal_retry") < 1) { st.count("goal_retry"); return; }
+      return this.finish("failed", "goal: kept ignoring the user's choice");
+    }
     // an independent judge decides whether the cited evidence actually tells the readings apart
     for (const [i, a] of assumptions.entries()) {
       if (a.settled || !a.backed || !a.alternatives.length || delegated) continue;
@@ -266,8 +272,14 @@ export class Orchestrator {
       const ids = opts.map((o) => o.id) as [string, ...string[]];
       const rep = await this.askModel("choice", P.choicePrompt(`用户原话里的「${a.point}」指的是哪一种？只根据下面的证据判断；证据区分不了就选「说不清」。`, { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") return this.modelFailed(rep);
-      if (rep.data!.choice === "r0") { if (fromAnswer.has(i)) a.settled = true; }
-      else {
+      const k = Number(rep.data!.choice.slice(1));
+      if (k === 0) { if (fromAnswer.has(i)) a.settled = true; }
+      else if (fromAnswer.has(i) && k <= a.alternatives.length) {
+        // the user's own words pick another reading: record it as their choice and derive the goal again
+        this.emit("ambiguity.settled", { point: a.point, readings: [a.reading, ...a.alternatives], option: k, text: assumptions[i]!.evidence[0] ?? "" });
+        if (st.get("goal_retry") < 1) { st.count("goal_retry"); return; }
+        return this.finish("failed", "goal: kept ignoring the user's choice");
+      } else {
         a.backed = false;
         this.emit("note", { text: `核对证据时没有支持「${a.reading}」（选了 ${opts.find((o) => o.id === rep.data!.choice)?.text}）` });
       }
@@ -455,7 +467,7 @@ export class Orchestrator {
         for (const p of upReads) if (this.ws.exists(p) && !this.ws.isDir(p) && !(p in evidence)) evidence[p] = this.ws.read(p).slice(0, 600);
       }
     }
-    const rep = await this.askModel("intent", P.intentPrompt(st.raw, st.answersText(), actions, st.goal!.constraints, evidence), R.IntentAnswer);
+    const rep = await this.askModel("intent", P.intentPrompt(st.raw, st.answersText(), actions, st.goal!.constraints, evidence, this.decided()), R.IntentAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const v = rep.data!.verdict;
     this.emit("verification", { subject: "intent", node_ids: nodes.map((n) => n.node.id), passed: v === "matches", verdict: v, reason: rep.data!.reason });
@@ -586,8 +598,17 @@ export class Orchestrator {
 
   /** The user's earlier answer about the same ambiguity: same point, or one of the readings offered then. */
   private settledFor(a: { point: string; reading: string; alternatives: string[] }) {
+    return [...this.st.settled].reverse().find((s) => this.sameAmbiguity(a, s));      // the latest answer wins
+  }
+
+  private sameAmbiguity(a: { point: string; reading: string; alternatives: string[] }, s: { point: string; readings: string[] }) {
     const mine = [a.reading, ...a.alternatives].map(loose);
-    return this.st.settled.find((s) => (a.point && loose(s.point) === loose(a.point)) || s.readings.some((r) => mine.includes(loose(r))));
+    return (!!a.point && loose(s.point) === loose(a.point)) || s.readings.some((r) => mine.includes(loose(r)));
+  }
+
+  /** Readings the user picked from options; every later goal must carry and follow them. */
+  private decided() {
+    return this.st.settled.filter((s) => s.option !== null && s.option < s.readings.length).map((s) => ({ point: s.point, reading: s.readings[s.option!]!, s }));
   }
 
   /** Evidence must be a whole entry of what the system observed — a path in the listing, complete lines of a file,
