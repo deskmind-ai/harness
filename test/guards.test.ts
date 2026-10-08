@@ -209,6 +209,24 @@ describe("execution guards", () => {
     expect(s.status).not.toBe("succeeded");
   });
 
+  it("rewriting a file the user named for rewriting needs no extra approval (the request is the authorization)", async () => {
+    const GOALW = { requirements: [{ id: "r1", statement: "日志.log 内容是 X", check: { kind: "deterministic", name: "text_equals", args: { path: "日志.log", text: "X" } }, quotes: ["X"] }], constraints: [], missing: [], feasible: "yes" };
+    const PLANW = { nodes: [{ id: "n1", capability: "fs.replace_text", depends_on: [], purpose: "改写", requirement_ids: ["r1"] }], outcome: "plan" };
+    const BINDW = { bindings: { target: { kind: "resource_ref", path: "日志.log" }, text: { kind: "source_span", quote: "X", occurrence: 1 } }, unresolved: [] };
+    const w = byRole({ goal: GOALW, plan: PLANW, bind: BINDW, intent: MATCH });
+    const u = user([], false);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "harness-guard-"));
+    build(root, { "日志.log": "旧内容" });
+    const ws = new Workspace(root);
+    const gw = new Gateway(scriptedTable); gw.script = Array(6).fill(w);
+    const o = new Orchestrator(path.join(root, ".log.jsonl"), ws, gw, u, fileRegistry());
+    o.start("把 日志.log 的内容改成「X」");
+    const s = await o.run();
+    expect(s.counters["ask:authorize"] ?? 0).toBe(0);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("日志.log")).toBe("X");
+  });
+
   it("「随便」 delegates the choice: the model's concrete action is shown for approval; declined, nothing changes", async () => {
     const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改名的是哪个文件？", kind: "information" }], feasible: "yes" } });
     const guess = byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH });

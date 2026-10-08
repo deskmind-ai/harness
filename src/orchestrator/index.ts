@@ -439,7 +439,9 @@ export class Orchestrator {
     const digest = sha(canon({ cap: cap.id, args }));
     // Discarding content this run did not create is consequential: the user's (or another program's) data would be
     // lost. Only content written by this run may be overwritten without asking.
-    const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p));
+    // The request itself authorizes rewriting a file the user named for rewriting (「把 X 的内容改成…」). It does not
+    // authorize discarding a file the user asked to *create* (「新建 X」 when X exists) or one the user never named.
+    const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p) && !this.userAskedToRewrite(p));
     const delegated = st.get("delegated") > 0 && cap.effect !== "observe";
     if ((cap.requiresConfirmation || foreign || delegated) && !st.approvals.has(digest)) {
       if (st.declined.has(digest)) { this.emit("node.failed", { node_id: node.id, why: "declined by the user" }); return; }
@@ -478,6 +480,16 @@ export class Orchestrator {
     cap.execute(this.ws, args);
     this.ws.invalidate();
     throw new Crash("crash after the effect, before the receipt");
+  }
+
+  /** The user named this file and asked for it to be changed (not created): its content may be replaced on their word. */
+  private userAskedToRewrite(p: string): boolean {
+    const base = p.slice(p.lastIndexOf("/") + 1);
+    const words = [this.st.raw, ...this.st.answersText()].join("\n");
+    if (!words.includes(base)) return false;
+    const idx = words.indexOf(base);
+    const around = words.slice(Math.max(0, idx - 12), idx + base.length + 2);
+    return !/新建|创建|新增|建一个|建个|新文件/.test(around);
   }
 
   /** True when the path's current content was written by this run (so rewriting it loses nothing of anyone else's). */
