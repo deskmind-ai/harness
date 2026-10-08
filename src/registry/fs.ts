@@ -30,18 +30,19 @@ interface Spec {
   effect: Effect;
   confirm?: boolean;
   discards?: boolean;
-  reversible: boolean;
   pathFields?: string[];
   footprint: (ws: Workspace, a: Args) => Footprint;
   pre: (ws: Workspace, a: Args) => string | null;
   run: (ws: Workspace, a: Args) => ExecResult;
+  /** reversible = this exists (or the capability only observes) */
+  undo?: (ws: Workspace, a: Args, r: ExecResult) => string | null;
 }
 
 /** A capability from a spec, with the shared argument checks (schema, '..', bare names) applied first. */
 function make(sp: Spec): Capability {
   const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
   return {
-    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards, reversible: sp.reversible,
+    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards, reversible: sp.effect === "observe" || !!sp.undo,
     typecheck(a) {
       const err = schemaCheck(schema, a);
       if (err) return err;
@@ -52,23 +53,31 @@ function make(sp: Spec): Capability {
     footprint: sp.footprint,
     preconditions: sp.pre,
     execute: sp.run,
+    ...(sp.undo ? { undo: sp.undo } : {}),
   };
 }
 
 export const CRASH_FLAG = { crashAfterEffect: false };     // test hook: die after the effect, before the receipt
 const maybeCrash = () => { if (CRASH_FLAG.crashAfterEffect) throw new Crash("crash after the effect, before the receipt"); };
 
+/** An undo may only touch paths still exactly as the action left them. */
+const untouched = (ws: Workspace, r: ExecResult, paths: string[]) => {
+  const moved = paths.filter((q) => q in r.versions_after && ws.version(q) !== r.versions_after[q]);
+  return moved.length ? `changed since the action: ${moved.join(", ")}` : null;
+};
+
 export const fsCreateText = make({
-  id: "fs.create_text", description: "在任务目录里新建一个 UTF-8 文本文件并写入正文；目标已存在时失败，不覆盖。", effect: "create", reversible: true,
+  id: "fs.create_text", description: "在任务目录里新建一个 UTF-8 文本文件并写入正文；目标已存在时失败，不覆盖。", effect: "create",
   fields: { parent: s('新文件所在的文件夹，相对任务目录；放在任务目录本身时填 "."'), name: s("新文件的文件名（只有 basename，不含目录）"), text: s("原样写入的正文，不自动加换行") },
   pathFields: ["parent"],
   footprint: (_ws, a) => { const q = join(a.parent!, a.name!); return { reads: [], writes: [q], expectAfter: { [q]: sha(a.text!) } }; },
   pre: (ws, a) => { const q = join(a.parent!, a.name!); return ws.exists(q) ? `${q} already exists` : !folderOk(ws, parentOf(q)) ? `folder ${parentOf(q)} does not exist` : null; },
   run: (ws, a) => { const q = join(a.parent!, a.name!); fs.writeFileSync(ws.abs(q), a.text!, { encoding: "utf-8", flag: "wx" }); maybeCrash(); return after(ws, [q], { file: q }); },
+  undo: (ws, a, r) => { const q = join(a.parent!, a.name!); const e = untouched(ws, r, [q]); if (e) return e; fs.unlinkSync(ws.abs(q)); return null; },
 });
 
 export const fsReplaceText = make({
-  id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true, reversible: false,
+  id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true,
   fields: { target: p("要改写的文件"), text: s("新的全部正文") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: sha(a.text!) } }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
@@ -77,31 +86,39 @@ export const fsReplaceText = make({
 
 const appended = (old: string, line: string) => old + (old === "" || old.endsWith("\n") ? "" : "\n") + line + "\n";
 export const fsAppendLine = make({
-  id: "fs.append_line", description: "在一个已有文本文件的末尾追加一行。", effect: "update", reversible: true,
+  id: "fs.append_line", description: "在一个已有文本文件的末尾追加一行。", effect: "update",
   fields: { target: p("要追加的文件"), line: s("追加的那一行文字，不含换行符") }, pathFields: ["target"],
   footprint: (ws, a) => { const q = norm(a.target!); return { reads: [], writes: [q], expectAfter: { [q]: sha(appended(ws.read(q), a.line!)) } }; },
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
-  run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return after(ws, [q]); },
+  run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
+  undo: (ws, a, r) => { const q = norm(a.target!); const e = untouched(ws, r, [q]); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
 });
 
 export const fsMove = make({
-  id: "fs.move", description: "移动或重命名一个文件或文件夹；目标位置已存在时失败。", effect: "update", reversible: true,
+  id: "fs.move", description: "移动或重命名一个文件或文件夹；目标位置已存在时失败。", effect: "update",
   fields: { source: p("要移动的文件或文件夹"), destination: p("新的完整路径（含新文件名）") }, pathFields: ["source", "destination"],
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [], writes: [src, dst], expectAfter: { [src]: ABSENT, [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]); },
+  undo: (ws, a, r) => {
+    const src = norm(a.source!), dst = norm(a.destination!);
+    const e = untouched(ws, r, [src, dst]); if (e) return e;
+    if (!folderOk(ws, parentOf(src))) return `folder ${parentOf(src)} is gone`;
+    fs.renameSync(ws.abs(dst), ws.abs(src)); return null;
+  },
 });
 
 export const fsCopy = make({
-  id: "fs.copy", description: "复制一个文件到新路径；目标已存在时失败。", effect: "create", reversible: true,
+  id: "fs.copy", description: "复制一个文件到新路径；目标已存在时失败。", effect: "create",
   fields: { source: p("要复制的文件"), destination: p("副本的完整路径") }, pathFields: ["source", "destination"],
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [src], writes: [dst], expectAfter: { [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.isDir(src) ? `${src} is a folder` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => { const dst = norm(a.destination!); fs.copyFileSync(ws.abs(norm(a.source!)), ws.abs(dst)); maybeCrash(); return after(ws, [dst]); },
+  undo: (ws, a, r) => { const dst = norm(a.destination!); const e = untouched(ws, r, [dst]); if (e) return e; fs.unlinkSync(ws.abs(dst)); return null; },
 });
 
 export const fsMkdir = make({
-  id: "fs.mkdir", description: "新建一个文件夹，缺失的上级文件夹一并建好；已存在时失败。", effect: "create", reversible: true,
+  id: "fs.mkdir", description: "新建一个文件夹，缺失的上级文件夹一并建好；已存在时失败。", effect: "create",
   fields: { path: p("新文件夹的路径") }, pathFields: ["path"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.path!)], expectAfter: { [norm(a.path!)]: "dir:*" } }),
   pre: (ws, a) => {
@@ -110,11 +127,24 @@ export const fsMkdir = make({
     for (let anc = parentOf(q); anc; anc = parentOf(anc)) if (ws.exists(anc) && !ws.isDir(anc)) return `${anc} is a file, not a folder`;
     return null;
   },
-  run: (ws, a) => { const q = norm(a.path!); fs.mkdirSync(ws.abs(q), { recursive: true }); maybeCrash(); return after(ws, [q]); },
+  run: (ws, a) => {
+    const q = norm(a.path!);
+    const made: string[] = [];
+    for (let d = q; d && !ws.exists(d); d = parentOf(d)) made.push(d);            // deepest first
+    fs.mkdirSync(ws.abs(q), { recursive: true }); maybeCrash();
+    return { ...after(ws, [q]), undo: { made } };
+  },
+  undo: (ws, _a, r) => {
+    const made = (r.undo?.made ?? []) as string[];
+    const busy = made.filter((d) => fs.readdirSync(ws.abs(d)).some((x) => !made.includes(d ? `${d}/${x}` : x)));
+    if (busy.length) return `folders not empty: ${busy.join(", ")}`;
+    for (const d of made) fs.rmdirSync(ws.abs(d));
+    return null;
+  },
 });
 
 export const fsTrash = make({
-  id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true, discards: true, reversible: false,
+  id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true, discards: true,
   fields: { target: p("要移到废纸篓的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: ABSENT } }),
   pre: (ws, a) => (ws.exists(norm(a.target!)) ? null : `${norm(a.target!)} does not exist`),
@@ -122,7 +152,7 @@ export const fsTrash = make({
 });
 
 export const fsReadText = make({
-  id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe", reversible: true,
+  id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe",
   fields: { target: p("要读的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [norm(a.target!)], writes: [], expectAfter: {} }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
@@ -130,7 +160,7 @@ export const fsReadText = make({
 });
 
 export const fsList = make({
-  id: "fs.list", description: "列出一个文件夹里的文件和子文件夹（只读）。", effect: "observe", reversible: true,
+  id: "fs.list", description: "列出一个文件夹里的文件和子文件夹（只读）。", effect: "observe",
   fields: { path: s('要列的文件夹，任务目录本身填 "."') }, pathFields: ["path"],
   footprint: (_ws, a) => ({ reads: [norm(a.path!)], writes: [], expectAfter: {} }),
   pre: (ws, a) => (folderOk(ws, norm(a.path!)) ? null : `${norm(a.path!)} is not a folder`),

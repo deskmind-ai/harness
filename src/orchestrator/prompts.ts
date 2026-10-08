@@ -33,11 +33,12 @@ const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的
 能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
 path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
 
-export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string): string {
+export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string, decided: { point: string; reading: string }[] = []): string {
   return [
     "任务：把用户的要求整理成可逐项验收的需求。保留用户的原话；不要替用户决定没说的事。",
     "", `用户原文：${J(raw)}`,
     ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    ...(decided.length ? ["用户已经选定的理解（必须照用；assumptions 里同一处的 reading 原样写用户选的这一项）：", ...decided.map((d) => `- 「${d.point}」：${d.reading}`)] : []),
     `任务目录（用户选定，相对路径的根；用户说的「这个目录」「当前目录」「下载」等指的就是它）：${scope}`, "目录现在的内容：", J(workspace),
     "", "系统已注册的能力（只有这些能被执行）：", J(caps.map((c) => ({ id: c.id, description: c.description }))),
     "", CHECKS_DOC,
@@ -47,7 +48,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "- 「放到 / 移到 / 归档到 / 整理到」某处，默认是移动（原位置不再有），不要问「移动还是复制」。用户已经回答过的问题不要再问。",
     "- missing 的每条带 kind：information = 只有用户知道的信息（哪个文件、什么内容、放哪）；observable = 打开文件或看目录就能查到的事（例如「哪份是最新的」「文件里写的是哪个项目」），程序不会去问用户，会让计划先读；approval = 你已经知道怎么做、只是想要许可。有后果的动作（删除、覆盖）程序会在执行前自己向用户确认，所以 approval 类一般不需要写；写了也不会变成问题去问用户。",
     "- 用户如果回答「随便」「你看着办」「由你决定」，就是把选择交给你：user_delegated 填 true，按常理做决定、写进需求；程序会在动手前把整个计划给用户过目一次。",
-    "- assumptions：原文某一处能有不止一种说得通的理解时，每处写一条：point = 原文里有歧义的那几个字；reading = 你选的理解；alternatives = 其他说得通的理解（做出来结果一样的不算，不要写）；evidence = 能把几种理解区分开的证据原文，只能摘自目录里的文件名、文件内容或用户后来的补充——用户原话本身不算证据，有歧义的正是它。",
+    "- assumptions：原文某一处能有不止一种说得通的理解时，每处写一条：point = 原文里有歧义的那几个字；reading = 你选的理解；alternatives = 其他说得通的理解（做出来结果一样的不算，不要写）；evidence = 能把几种理解区分开的证据，每条必须原样是下面之一：目录里的一个完整路径、某个文件里完整的一行（或连续几行）、用户后来的一条补充；原文里出现过的词不算证据——有歧义的正是原文。另有一个模型会只看这些证据来判断它们支持哪种理解。",
     "  程序据此决定：没有证据能区分 → 先把几种理解做成选项问用户；有证据、但计划里有删不掉改不回的动作 → 动手前把计划给用户确认一次；有证据、动作都能撤回 → 直接做，结果里告诉用户你是怎么理解的。只有一种说得通的理解时不要写。",
     "  例：原文「放『招聘/岗位』，改名『姓名-简历.pdf』」，目录里有「张三-前端.pdf」「李四-后端.pdf」 → { point: \"岗位\", reading: \"每份简历各自的岗位（前端、后端）\", alternatives: [\"一个字面名为「岗位」的文件夹\"], evidence: [\"张三-前端.pdf\"] }。",
     "- authorized_rewrites：用户明确要求改写 / 替换 / 覆盖 / 追加的那些已有文件的路径（例如「把 日志.log 的内容改成…」里的 日志.log）。只有列在这里的文件，程序才会不经确认地丢弃其内容；用户要「新建」的文件不要列（它若已存在属于冲突，要问用户）。",

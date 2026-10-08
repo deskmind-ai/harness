@@ -26,7 +26,8 @@ export interface Footprint {
   expectAfter: Record<string, string>;
 }
 
-export interface ExecResult { status: string; output: Record<string, unknown>; versions_after: Record<string, string>; why?: string }
+/** `undo` holds what the capability needs to take the action back (kept in the receipt, never shown to models). */
+export interface ExecResult { status: string; output: Record<string, unknown>; versions_after: Record<string, string>; why?: string; undo?: Record<string, unknown> }
 
 export interface Capability {
   readonly id: string;
@@ -41,6 +42,9 @@ export interface Capability {
    *  deleting or sending cannot. Decides whether an action taken on the model's reading of an ambiguous request may
    *  go ahead and be reported, or must be shown to the user first (docs/ask-policy.md). */
   readonly reversible: boolean;
+  /** Take a finished action back from its receipt. Refuses (returns the reason) when a written path changed since
+   *  the receipt, so an undo never destroys someone else's later work. Required when reversible and not observe. */
+  undo?(ws: Workspace, args: Args, receipt: ExecResult): string | null;
   /** The action discards existing content of a written path (replace, trash). Overwriting content this run did not
    *  write then needs the user's approval; an append or a move does not discard anything. */
   readonly discards?: boolean;
@@ -78,6 +82,7 @@ export function renamed(c: Capability, map: Record<string, string>, suffix = ".a
     footprint: (ws, a) => base.footprint(ws, inv(a)),
     preconditions: (ws, a) => base.preconditions(ws, inv(a)),
     execute: (ws, a) => base.execute(ws, inv(a)),
+    ...(base.undo ? { undo: (ws: Workspace, a: Args, r: ExecResult) => base.undo!(ws, inv(a), r) } : {}),
   };
 }
 
@@ -138,5 +143,6 @@ export function contract(c: Capability): string | null {
   for (const k of c.schema.required) if (!(k in c.schema.properties)) return `required field ${k} is not a property`;
   for (const m of ["typecheck", "footprint", "preconditions", "execute"] as const) if (typeof c[m] !== "function") return `${m} missing`;
   if (typeof c.reversible !== "boolean") return "reversible must be declared";
+  if (c.reversible && c.effect !== "observe" && typeof c.undo !== "function") return "reversible but has no undo";
   return null;
 }

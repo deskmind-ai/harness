@@ -70,6 +70,10 @@ export class State {
   n: Record<string, number> = {};
   skillUsed: string | null = null;
   planConfirmed = false;                         // the user approved the current plan (plan.confirmed)
+  /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
+   *  readings, or null for free text). They bind every later goal. */
+  settled: { point: string; readings: string[]; text: string; option: number | null }[] = [];
+  delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
   notes: string[] = [];
 
   count(key: string, by = 1) {
@@ -140,6 +144,8 @@ export class State {
         if (b.kind === "clarify") {
           // the answer may change what the goal means: goal and plan are re-derived (also when the log is replayed)
           this.answers.push({ question: b.question, text: b.text }); this.revs.evidence_epoch += 1;
+          if (b.delegated) this.delegatedByAnswer = true;
+          else if (b.point) this.settled.push({ point: b.point, readings: b.readings ?? [], text: b.text, option: typeof b.option === "number" ? b.option : null });
           this.goal = null; this.plan = null; this.nodes = new Map(); this.planConfirmed = false;
         }
         else if (b.kind === "authorize") {
