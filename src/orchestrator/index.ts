@@ -377,7 +377,15 @@ export class Orchestrator {
       const { reads, writes } = cap.footprint(this.ws, n.args!);
       for (const p of [...reads, ...writes, ...derived.flatMap(([, b]) => b.from_paths)]) if (this.ws.exists(p) && !this.ws.isDir(p) && !(p in evidence)) evidence[p] = this.ws.read(p).slice(0, 600);
       for (const [k, b] of Object.entries((n.bindings as Record<string, Binding> | null) ?? {})) {
-        if (b?.kind === "upstream_output") { const out = st.nodes.get(b.node_id)?.output; if (out) evidence[`${k} 的来源：节点 ${b.node_id} 的输出`] = JSON.stringify(out).slice(0, 600); }
+        if (b?.kind !== "upstream_output") continue;
+        // the value came from an earlier read: show which file that node read, and the file as it is now
+        const up = st.nodes.get(b.node_id);
+        if (!up) continue;
+        const upCap = this.registry.get(up.node.capability);
+        const upReads = up.args && upCap ? upCap.footprint(this.ws, up.args).reads : [];
+        const what = upReads.length ? `读取了 ${upReads.join(", ")}` : `${up.node.capability} ${JSON.stringify(up.args ?? {})}`;
+        evidence[`${k} 的来源：节点 ${b.node_id}（${what}）的输出字段 ${b.field}`] = JSON.stringify(up.output ?? {}).slice(0, 600);
+        for (const p of upReads) if (this.ws.exists(p) && !this.ws.isDir(p) && !(p in evidence)) evidence[p] = this.ws.read(p).slice(0, 600);
       }
     }
     const rep = await this.askModel("intent", P.intentPrompt(st.raw, st.answersText(), actions, st.goal!.constraints, evidence), R.IntentAnswer);
