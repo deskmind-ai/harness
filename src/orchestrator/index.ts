@@ -44,7 +44,7 @@ export interface GuiApp {
   observe(): GuiObservation;
   act(kind: "press" | "set_value" | "type", targetId: string, observationEpoch: number, value?: string): { status: string; why?: string; note?: string };
 }
-export interface GuiElement { target_id: string; role: string; label: string; actions: string[]; value?: string; options?: string[]; enabled?: boolean; focused?: boolean; in_modal?: boolean }
+export interface GuiElement { target_id: string; role: string; label: string; actions: string[]; value?: string; options?: string[]; enabled?: boolean; focused?: boolean; in_modal?: boolean; consequential?: boolean }
 export interface GuiObservation { observation_epoch: number; app: string; window: string; focus_app: string; modal: { title: string; blocking: boolean } | null; elements: GuiElement[]; documents: unknown[] }
 
 export class Stale extends Error {}
@@ -160,6 +160,7 @@ export class Orchestrator {
       if (!st.goal) { await this.doGoal(); continue; }
       if (this.opts.gui) { await this.doGuiStep(); continue; }
       if (!st.plan) { await this.doPlan(); continue; }
+      if (!st.planConfirmed && this.planNeedsConfirmation()) { this.confirmPlan(); continue; }
       if (await this.rootCheck(false)) break;
       const nodes = [...st.nodes.values()];
       const ready = nodes.filter((n) => n.status === "pending" && n.node.depends_on.every((d) => st.nodes.get(d)?.status === "verified"));
@@ -209,9 +210,11 @@ export class Orchestrator {
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const g = rep.data!;
     if (g.feasible === "needs_capability_we_lack") return this.finish("failed", "cannot: " + (g.infeasible_reason ?? "需要没有注册的能力"));
-    const info = g.missing.filter((m) => m.kind !== "approval");
+    const info = g.missing.filter((m) => m.kind === "information");
     if (info.length) return this.clarify(info[0]!.question, "goal: " + info[0]!.what, info[0]!.options);
-    if (g.missing.length) this.emit("note", { text: "模型想先要批准；批准由执行前的确认处理：" + g.missing.map((m) => m.what).join("；") });
+    const observable = g.missing.filter((m) => m.kind === "observable");
+    if (observable.length) this.emit("note", { text: "这些可以自己查到，计划里先加只读步骤：" + observable.map((m) => m.what).join("；") });
+    if (g.missing.some((m) => m.kind === "approval")) this.emit("note", { text: "模型想先要批准；批准由执行前的确认处理：" + g.missing.filter((m) => m.kind === "approval").map((m) => m.what).join("；") });
     const bad = g.requirements.filter((r) => r.check.kind === "deterministic" && (!r.check.name || !(C_CHECKS as readonly string[]).includes(r.check.name) || typeof r.check.args !== "object"));
     if (bad.length) {
       this.emit("decision.rejected", { why: "goal: unknown check " + JSON.stringify(bad.map((r) => r.check)).slice(0, 200) });
@@ -229,8 +232,22 @@ export class Orchestrator {
     const named = (p: string) => { const base = p.slice(p.lastIndexOf("/") + 1); return [st.raw, ...st.answersText()].some((t) => t.includes(base)); };
     const rewrites = g.authorized_rewrites.filter(named);        // a rewrite authority must point at a file the user named
     if (rewrites.length !== g.authorized_rewrites.length) this.emit("decision.rejected", { why: "goal: authorized_rewrites names a file the user did not: " + JSON.stringify(g.authorized_rewrites.filter((p) => !named(p))) });
-    if (g.user_delegated) this.emit("note", { text: "用户把这个选择交给了我们；由此决定的每个改动执行前都先给用户确认" });
-    const goal: Goal = { requirements: g.requirements, constraints: g.constraints, authorized_rewrites: rewrites, user_delegated: g.user_delegated, assumptions: g.assumptions };
+    // Ambiguity (docs/ask-policy.md). Evidence counts only if it is in what the system observed or in the user's later
+    // answers: the ambiguous request cannot settle its own ambiguity.
+    const observed = [...st.answersText(), ...shown.map((e) => e.path), ...shown.filter((e) => e.kind === "file").map((e) => this.ws.read(e.path).slice(0, 2000))].map(loose);
+    const assumptions = g.assumptions.map((a) => {
+      const evidence = a.evidence.filter((x) => loose(x).length >= 2 && observed.some((t) => t.includes(loose(x))));
+      return { point: a.point, reading: a.reading, alternatives: a.alternatives, evidence, backed: evidence.length > 0 };
+    });
+    // a user who handed the choice to us is not asked to choose again; the plan is shown to them instead (step 3)
+    const open = g.user_delegated ? undefined : assumptions.find((a) => a.alternatives.length && !a.backed);
+    if (open) {
+      // nothing in the evidence tells the readings apart: only the user can, so ask before planning anything
+      const where = open.point || open.reading;
+      return this.clarify(`「${where}」可以有几种理解，你指的是哪一种？`, "goal: ambiguous", [open.reading, ...open.alternatives], false);
+    }
+    if (g.user_delegated) this.emit("note", { text: "用户把这个选择交给了我们；计划定下后先给用户过目" });
+    const goal: Goal = { requirements: g.requirements, constraints: g.constraints, authorized_rewrites: rewrites, user_delegated: g.user_delegated, assumptions };
     this.emit("goal.accepted", { goal });
   }
 
@@ -322,7 +339,10 @@ export class Orchestrator {
     if (b.unresolved.length) {
       const u = b.unresolved[0]!;
       if (u.reason === "missing_user_intent" || u.reason === "ambiguous") this.clarify(u.question || `请说明 ${u.parameter} 应该是什么。`, `bind: ${u.reason}`);
-      else this.finish("failed", `bind: ${u.reason} on ${u.parameter}`);
+      else if (u.reason === "missing_observation" && st.get("replans") < this.budget.replans) {
+        // something the system can read is missing: plan read-only steps first instead of giving up or asking
+        await this.doPlan({ nodes: st.plan!.nodes, source: st.plan!.source }, `绑定 ${node.id} 的参数 ${u.parameter} 时缺少可以查到的信息：${u.question ?? ""}。先加只读步骤（fs.read_text / fs.list）把它查出来`);
+      } else this.finish("failed", `bind: ${u.reason} on ${u.parameter}`);
       return false;
     }
     const res = this.resolve(cap, b.bindings, upstream);
@@ -413,7 +433,11 @@ export class Orchestrator {
       if (nodes.every((n) => n.attempts <= this.budget.rebinds)) { for (const n of nodes) n.why = "意图核对认为不对：" + rep.data!.reason; return; }
       return this.finish("failed", "intent: mismatch twice");
     }
-    return this.clarify("请把要求说得更具体一些：" + rep.data!.reason, "intent: insufficient");
+    // insufficient information: ask the user only if the user can supply it; missing evidence is not the user's job
+    if (rep.data!.ask_user && rep.data!.question) return this.clarify(rep.data!.question, "intent: insufficient");
+    if (nodes[0]!.node.args) { for (const n of nodes) this.emit("node.failed", { node_id: n.node.id, why: "intent: insufficient evidence on a skill action" }); return; }
+    if (nodes.every((n) => n.attempts <= this.budget.rebinds)) { for (const n of nodes) n.why = "核对方认为证据不足：" + rep.data!.reason; return; }
+    return this.finish("failed", "intent: insufficient evidence twice");
   }
 
   // --- execute ------------------------------------------------------------------------------------------------------
@@ -452,35 +476,19 @@ export class Orchestrator {
     // lost. Only content written by this run may be overwritten without asking.
     // The request itself authorizes rewriting a file the user named for rewriting (「把 X 的内容改成…」). It does not
     // authorize discarding a file the user asked to *create* (「新建 X」 when X exists) or one the user never named.
-    if (cap.effect !== "observe" && (st.goal!.assumptions ?? []).length && !st.n["assumptions_confirmed"]) {
-      const text = "这个要求可以有不止一种理解，我打算这样做：" + st.goal!.assumptions.map((a) => `${a.reading}${a.because ? `（因为${a.because}）` : ""}`).join("；") + "。可以吗？";
-      const digest = sha("assumptions:" + text);
-      if (st.declined.has(digest)) return this.finish("waiting_user", "the user rejected our reading of the request");
-      if (!st.approvals.has(digest)) {
-        this.emit("interaction.request", { body: { kind: "authorize", text, digest } });
-        const ok = this.user.authorize(text);
-        this.emit("interaction.reply", { body: { kind: "authorize", text, digest, approved: ok } });
-        if (!ok) return this.finish("waiting_user", "the user rejected our reading of the request");
-      }
-      st.n["assumptions_confirmed"] = 1;
-    }
+    // Per-action confirmation, independent of ambiguity: consequential capabilities, and discarding content this run
+    // did not write unless the user named that file for rewriting (docs/ask-policy.md)
     const authorized = new Set(st.goal!.authorized_rewrites ?? []);
     const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p) && !authorized.has(p));
-    const delegated = !!st.goal!.user_delegated && cap.effect !== "observe";
-    if ((cap.requiresConfirmation || foreign || delegated) && !st.approvals.has(digest)) {
+    if ((cap.requiresConfirmation || foreign) && !st.approvals.has(digest)) {
       if (st.declined.has(digest)) { this.emit("node.failed", { node_id: node.id, why: "declined by the user" }); return; }
-      const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）`
-        : delegated && !cap.requiresConfirmation ? `${text}（你让我决定的；这是我打算做的，可以吗？）` : text;
+      const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）` : text;
       this.emit("interaction.request", { body: { kind: "authorize", text: ask, digest } });
       const ok = this.user.authorize(ask);
       this.emit("interaction.reply", { body: { kind: "authorize", text: ask, digest, approved: ok } });
       if (!ok) {
         this.emit("node.failed", { node_id: node.id, why: "declined by the user" });
-        if (delegated && !cap.requiresConfirmation && !foreign) {
-          // the user delegated, then rejected our proposal: guessing again is not useful, the user has to choose
-          return this.finish("waiting_user", "the user declined the proposed action; their choice is needed");
-        }
-        this.emit("note", { text: `用户不同意：${ask}。要换一种不覆盖别人改动的做法。` });
+        this.emit("note", { text: `用户不同意：${ask}。要换一种不需要这一步的做法。` });
       }
       return;
     }
@@ -504,6 +512,35 @@ export class Orchestrator {
     cap.execute(this.ws, args);
     this.ws.invalidate();
     throw new Crash("crash after the effect, before the receipt");
+  }
+
+  /** docs/ask-policy.md: the user delegated a choice, or the plan acts on a reading of an ambiguous request and contains
+   *  a step that cannot be undone. Either way the whole plan is shown once before anything is written. */
+  private planNeedsConfirmation(): boolean {
+    const st = this.st, g = st.goal!, plan = st.plan!;
+    const writes = plan.nodes.filter((n) => this.registry.get(n.capability)?.effect !== "observe");
+    if (!writes.length) return false;
+    if (g.user_delegated) return true;
+    const irreversible = writes.some((n) => !this.registry.get(n.capability)?.reversible);
+    return g.assumptions.length > 0 && irreversible;
+  }
+
+  private confirmPlan() {
+    const st = this.st, g = st.goal!, plan = st.plan!;
+    const steps = plan.nodes.filter((n) => this.registry.get(n.capability)?.effect !== "observe").map((n, i) => `${i + 1}. ${n.purpose}`);
+    const reading = g.assumptions.length ? "我是这样理解的：" + g.assumptions.map((a) => a.reading).join("；") + "。" : "";
+    const why = g.user_delegated ? "你让我决定的，" : "";
+    const text = `${why}${reading}我打算这样做：\n${steps.join("\n")}\n可以吗？`;
+    const digest = sha("plan:" + JSON.stringify(plan.nodes.map((n) => [n.capability, n.purpose])) + JSON.stringify(g.assumptions.map((a) => a.reading)));
+    if (st.declined.has(digest)) return this.finish("waiting_user", "the user declined the plan; their choice is needed");
+    if (!st.approvals.has(digest)) {
+      this.emit("interaction.request", { body: { kind: "authorize", text, digest } });
+      const ok = this.user.authorize(text);
+      this.emit("interaction.reply", { body: { kind: "authorize", text, digest, approved: ok } });
+      // the user rejected our proposal: proposing another guess is not useful, the user has to choose
+      if (!ok) return this.finish("waiting_user", "the user declined the plan; their choice is needed");
+    }
+    this.emit("plan.confirmed", {});
   }
 
   /** True when the path's current content was written by this run (so rewriting it loses nothing of anyone else's). */
@@ -601,15 +638,15 @@ export class Orchestrator {
     for (const r of semantic) {
       if (r.check.kind === "user_confirmation") {
         // only the user can judge this one: ask once, remember the answer (never the verify model)
-        const key = `confirm:${r.id}`;
-        if (!(key in st.n)) {
-          this.emit("interaction.request", { body: { kind: "authorize", text: r.statement, digest: sha(r.statement) } });
+        const digest = sha("confirm:" + r.statement);
+        if (!st.approvals.has(digest) && !st.declined.has(digest)) {
+          this.emit("interaction.request", { body: { kind: "authorize", text: r.statement, digest } });
           const ok = this.user.authorize(r.statement);
-          this.emit("interaction.reply", { body: { kind: "authorize", text: r.statement, digest: sha(r.statement), approved: ok } });
-          st.n[key] = ok ? 1 : 0;
+          this.emit("interaction.reply", { body: { kind: "authorize", text: r.statement, digest, approved: ok } });
         }
-        results[r.id] = { passed: st.n[key] === 1, evidence: st.n[key] === 1 ? "用户确认" : "用户未确认" };
-        if (st.n[key] !== 1) failed.push(r.statement);
+        const ok = st.approvals.has(digest);
+        results[r.id] = { passed: ok, evidence: ok ? "用户确认" : "用户未确认" };
+        if (!ok) failed.push(r.statement);
         continue;
       }
       const evidence: Record<string, unknown> = { 目录: this.ws.listing(), 本任务做过的动作: st.effects };
@@ -693,7 +730,8 @@ export class Orchestrator {
       return this.finish("waiting_user", "no progress: the same action on an unchanged screen");
     }
     this.lastGuiSig = sig;
-    if (text.includes("立即更新") || text.includes("替换")) {          // consequences the user did not ask for need the user
+    const el = obs.elements.find((e) => e.target_id === target);
+    if (el?.consequential) {                        // the app profile marks effects the user did not ask for
       const digest = sha(text);
       if (!st.approvals.has(digest)) {
         this.emit("interaction.request", { body: { kind: "authorize", text, digest } });
@@ -739,13 +777,13 @@ export class Orchestrator {
   // --- interaction --------------------------------------------------------------------------------------------------------
   static readonly DELEGATE = "由你决定";
 
-  private clarify(question: string, why = "", options: string[] = []) {
+  private clarify(question: string, why = "", options: string[] = [], checkOptions = true) {
     const st = this.st;
-    // options the model offers must exist in the evidence; the rest are dropped (a candidate is a fact, not a guess).
-    // 「由你决定」 is always offered: choosing it is the structural form of delegation.
+    // Candidate answers must exist in the evidence (a candidate is a fact, not a guess) — except the readings of an
+    // ambiguous request, which are interpretations by nature. 「由你决定」 is always offered: choosing it is delegation.
     const shown = this.ws.listing().entries.map((e) => e.path);
     const evidence = [st.raw, ...st.answersText(), ...shown].map(loose);
-    const valid = [...options.filter((o) => o !== Orchestrator.DELEGATE && evidence.some((t) => t.includes(loose(o)))), Orchestrator.DELEGATE];
+    const valid = [...options.filter((o) => o !== Orchestrator.DELEGATE && (!checkOptions || evidence.some((t) => t.includes(loose(o))))), Orchestrator.DELEGATE];
     if (st.get("ask:clarify") >= this.budget.asks) return this.finish("waiting_user", "asked the user too often without progress");
     if (st.answers.some((a) => loose(a.question) === loose(question))) return this.finish("waiting_user", "the same question was already answered; not asking again");
     this.emit("interaction.request", { body: { kind: "clarify", question, why, options: valid } });
@@ -753,9 +791,9 @@ export class Orchestrator {
     if (ans === null) return this.finish("waiting_user", "no answer from the user");
     const text = "option" in ans ? (valid[ans.option] ?? "") : ans.text;
     if (!text) return this.finish("waiting_user", "empty answer");
+    // the reply event re-derives goal and plan (State.apply); whether the words mean delegation is for the goal role
+    // to say (user_delegated), not for a pattern here
     this.emit("interaction.reply", { body: { kind: "clarify", question, text, options: valid } });
-    // whether the words mean delegation is for the goal role to say (user_delegated), not for a pattern here
-    st.goal = null; st.plan = null; st.nodes = new Map();        // the answer may change what the goal means
   }
 
   private modelFailed(rep: Reply) {
@@ -769,6 +807,7 @@ export class Orchestrator {
       status: st.status, reason: st.reason, counters: { ...st.n }, revs: st.revs,
       ops: Object.fromEntries([...st.ops].map(([k, v]) => [k, v.state])), effects: st.effects, skill: st.skillUsed,
       nodes: Object.fromEntries([...st.nodes].map(([k, v]) => [k, v.status])), answers: st.answersText(), run_id: st.runId,
+      assumptions: st.goal?.assumptions?.map((a) => a.reading) ?? [],        // shown to the user with the result
     };
   }
 }

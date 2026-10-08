@@ -16,7 +16,7 @@ import { Registry, type Capability } from "../registry/capability.js";
 /** The GUI channel as the goal role sees it: one capability that stands for the reactive loop. */
 export const guiEditor: Capability = {
   id: "gui.editor", version: "1.0.0", description: "通过文本编辑器的界面新建、编辑和保存文本文件（观察界面，再点击或输入）。",
-  schema: { type: "object", properties: {}, required: [], additionalProperties: false }, effect: "update", channel: "gui", requiresConfirmation: false,
+  schema: { type: "object", properties: {}, required: [], additionalProperties: false }, effect: "update", channel: "gui", requiresConfirmation: false, reversible: false,
   typecheck: () => null, footprint: () => ({ reads: [], writes: [], expectAfter: {} }), preconditions: () => null,
   execute: () => { throw new Error("the GUI channel runs through the orchestrator's GUI step, not execute()"); },
 };
@@ -30,7 +30,7 @@ export class EditorSim implements GuiApp {
   docs: Doc[] = [];
   current: number | null = null;
   sheet: { name: string; folder: string } | null = null;
-  modal: { title: string; buttons: string[] } | null = null;
+  modal: { title: string; buttons: string[]; consequential: string[] } | null = null;
   focusApp = "编辑器";
   focus: string | null = null;
   log: Record<string, unknown>[] = [];
@@ -64,7 +64,8 @@ export class EditorSim implements GuiApp {
       add("sheet_save", "button", "保存", { actions: ["press"] });
       add("sheet_cancel", "button", "取消", { actions: ["press"] });
     }
-    if (this.modal) this.modal.buttons.forEach((b, i) => add(`modal_${i}`, "button", b, { actions: ["press"], in_modal: true }));
+    // the app profile marks buttons whose effect the user did not ask for (start an update, replace a file)
+    if (this.modal) this.modal.buttons.forEach((b, i) => add(`modal_${i}`, "button", b, { actions: ["press"], in_modal: true, consequential: this.modal!.consequential.includes(b) }));
     const cur = this.current !== null ? this.docs[this.current]! : null;
     return {
       observation_epoch: this.epoch, app: "编辑器", window: cur ? cur.title + (cur.dirty ? "（已修改）" : "") : "编辑器", focus_app: this.focusApp,
@@ -108,7 +109,7 @@ export class EditorSim implements GuiApp {
       const d = this.docs[this.current!]!, name = this.sheet!.name.trim();
       if (!name || name.includes("/")) return { status: "error", why: "文件名无效" };
       const p = this.sheet!.folder === "." || !this.sheet!.folder ? name : `${this.sheet!.folder}/${name}`;
-      if (fs.existsSync(path.join(this.wsRoot, p)) && d.path !== p) { this.modal = { title: `「${name}」已存在，要替换吗？`, buttons: ["取消", "替换"] }; this.pendingReplace = p; this.bump(); return { status: "ok", note: "出现确认框" }; }
+      if (fs.existsSync(path.join(this.wsRoot, p)) && d.path !== p) { this.modal = { title: `「${name}」已存在，要替换吗？`, buttons: ["取消", "替换"], consequential: ["替换"] }; this.pendingReplace = p; this.bump(); return { status: "ok", note: "出现确认框" }; }
       this.write(d, p); this.sheet = null;
     } else if (key.startsWith("modal_")) {
       const label = this.modal!.buttons[Number(key.split("_")[1])]!;
@@ -137,7 +138,7 @@ export class EditorSim implements GuiApp {
 
   disturb(kind: "focus" | "modal" | "layout") {
     if (kind === "focus") { this.focusApp = "浏览器"; this.focus = null; }
-    else if (kind === "modal") this.modal = { title: "有新版本可用", buttons: ["稍后", "立即更新"] };
+    else if (kind === "modal") this.modal = { title: "有新版本可用", buttons: ["稍后", "立即更新"], consequential: ["立即更新"] };
     else this.gen += 1;
     this.bump();
   }

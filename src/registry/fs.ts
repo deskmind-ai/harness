@@ -30,6 +30,7 @@ interface Spec {
   effect: Effect;
   confirm?: boolean;
   discards?: boolean;
+  reversible: boolean;
   pathFields?: string[];
   footprint: (ws: Workspace, a: Args) => Footprint;
   pre: (ws: Workspace, a: Args) => string | null;
@@ -40,7 +41,7 @@ interface Spec {
 function make(sp: Spec): Capability {
   const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
   return {
-    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards,
+    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards, reversible: sp.reversible,
     typecheck(a) {
       const err = schemaCheck(schema, a);
       if (err) return err;
@@ -58,7 +59,7 @@ export const CRASH_FLAG = { crashAfterEffect: false };     // test hook: die aft
 const maybeCrash = () => { if (CRASH_FLAG.crashAfterEffect) throw new Crash("crash after the effect, before the receipt"); };
 
 export const fsCreateText = make({
-  id: "fs.create_text", description: "在任务目录里新建一个 UTF-8 文本文件并写入正文；目标已存在时失败，不覆盖。", effect: "create",
+  id: "fs.create_text", description: "在任务目录里新建一个 UTF-8 文本文件并写入正文；目标已存在时失败，不覆盖。", effect: "create", reversible: true,
   fields: { parent: s('新文件所在的文件夹，相对任务目录；放在任务目录本身时填 "."'), name: s("新文件的文件名（只有 basename，不含目录）"), text: s("原样写入的正文，不自动加换行") },
   pathFields: ["parent"],
   footprint: (_ws, a) => { const q = join(a.parent!, a.name!); return { reads: [], writes: [q], expectAfter: { [q]: sha(a.text!) } }; },
@@ -67,7 +68,7 @@ export const fsCreateText = make({
 });
 
 export const fsReplaceText = make({
-  id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true,
+  id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true, reversible: false,
   fields: { target: p("要改写的文件"), text: s("新的全部正文") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: sha(a.text!) } }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
@@ -76,7 +77,7 @@ export const fsReplaceText = make({
 
 const appended = (old: string, line: string) => old + (old === "" || old.endsWith("\n") ? "" : "\n") + line + "\n";
 export const fsAppendLine = make({
-  id: "fs.append_line", description: "在一个已有文本文件的末尾追加一行。", effect: "update",
+  id: "fs.append_line", description: "在一个已有文本文件的末尾追加一行。", effect: "update", reversible: true,
   fields: { target: p("要追加的文件"), line: s("追加的那一行文字，不含换行符") }, pathFields: ["target"],
   footprint: (ws, a) => { const q = norm(a.target!); return { reads: [], writes: [q], expectAfter: { [q]: sha(appended(ws.read(q), a.line!)) } }; },
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
@@ -84,7 +85,7 @@ export const fsAppendLine = make({
 });
 
 export const fsMove = make({
-  id: "fs.move", description: "移动或重命名一个文件或文件夹；目标位置已存在时失败。", effect: "update",
+  id: "fs.move", description: "移动或重命名一个文件或文件夹；目标位置已存在时失败。", effect: "update", reversible: true,
   fields: { source: p("要移动的文件或文件夹"), destination: p("新的完整路径（含新文件名）") }, pathFields: ["source", "destination"],
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [], writes: [src, dst], expectAfter: { [src]: ABSENT, [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
@@ -92,7 +93,7 @@ export const fsMove = make({
 });
 
 export const fsCopy = make({
-  id: "fs.copy", description: "复制一个文件到新路径；目标已存在时失败。", effect: "create",
+  id: "fs.copy", description: "复制一个文件到新路径；目标已存在时失败。", effect: "create", reversible: true,
   fields: { source: p("要复制的文件"), destination: p("副本的完整路径") }, pathFields: ["source", "destination"],
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [src], writes: [dst], expectAfter: { [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.isDir(src) ? `${src} is a folder` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
@@ -100,7 +101,7 @@ export const fsCopy = make({
 });
 
 export const fsMkdir = make({
-  id: "fs.mkdir", description: "新建一个文件夹，缺失的上级文件夹一并建好；已存在时失败。", effect: "create",
+  id: "fs.mkdir", description: "新建一个文件夹，缺失的上级文件夹一并建好；已存在时失败。", effect: "create", reversible: true,
   fields: { path: p("新文件夹的路径") }, pathFields: ["path"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.path!)], expectAfter: { [norm(a.path!)]: "dir:*" } }),
   pre: (ws, a) => {
@@ -113,7 +114,7 @@ export const fsMkdir = make({
 });
 
 export const fsTrash = make({
-  id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true, discards: true,
+  id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true, discards: true, reversible: false,
   fields: { target: p("要移到废纸篓的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: ABSENT } }),
   pre: (ws, a) => (ws.exists(norm(a.target!)) ? null : `${norm(a.target!)} does not exist`),
@@ -121,7 +122,7 @@ export const fsTrash = make({
 });
 
 export const fsReadText = make({
-  id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe",
+  id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe", reversible: true,
   fields: { target: p("要读的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [norm(a.target!)], writes: [], expectAfter: {} }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
@@ -129,7 +130,7 @@ export const fsReadText = make({
 });
 
 export const fsList = make({
-  id: "fs.list", description: "列出一个文件夹里的文件和子文件夹（只读）。", effect: "observe",
+  id: "fs.list", description: "列出一个文件夹里的文件和子文件夹（只读）。", effect: "observe", reversible: true,
   fields: { path: s('要列的文件夹，任务目录本身填 "."') }, pathFields: ["path"],
   footprint: (_ws, a) => ({ reads: [norm(a.path!)], writes: [], expectAfter: {} }),
   pre: (ws, a) => (folderOk(ws, norm(a.path!)) ? null : `${norm(a.path!)} is not a folder`),

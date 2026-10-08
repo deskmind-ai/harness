@@ -43,7 +43,8 @@ export const Goal = z.object({
   constraints: z.array(z.string()),
   authorized_rewrites: z.array(z.string()).default([]),
   user_delegated: z.boolean().default(false),
-  assumptions: z.array(z.object({ reading: z.string(), because: z.string().default("") })).default([]),
+  /** `backed`: at least one evidence item was found in the observation or the user's answers (checked by code). */
+  assumptions: z.array(z.object({ point: z.string(), reading: z.string(), alternatives: z.array(z.string()), evidence: z.array(z.string()), backed: z.boolean() })).default([]),
 });
 export type Goal = z.infer<typeof Goal>;
 

@@ -28,13 +28,13 @@ const MATCH = { verdict: "matches", reason: "ok" };
 const byRole = (answers: Record<string, unknown>): Scripted => (role) => answers[role] ?? { outcome: "error", error: `no scripted answer for ${role}` };
 const HAPPY = byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH });
 
-function setup(files: Record<string, string | null>, script: Scripted[], u = user(), hooks: any = {}) {
+function setup(files: Record<string, string | null>, script: Scripted[], u: User = user(), hooks: any = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "harness-guard-"));
   build(root, files);
   const ws = new Workspace(root);
   const gw = new Gateway(scriptedTable);
   gw.script = script;
-  const log = path.join(root, ".log.jsonl");
+  const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "harness-log-")), "log.jsonl");   // outside the workspace, as in eval runs
   const o = new Orchestrator(log, ws, gw, u, fileRegistry(), { hooks });
   o.start("在 todo.txt 末尾加一行「买牛奶」");
   return { o, ws, gw, log, root, u };
@@ -227,26 +227,122 @@ describe("execution guards", () => {
     expect(ws.read("日志.log")).toBe("X");
   });
 
-  it("「随便」 delegates the choice: the model's concrete action is shown for approval; declined, nothing changes", async () => {
-    const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改名的是哪个文件？", kind: "information" }], feasible: "yes" } });
+  // --- when to ask (docs/ask-policy.md) ---------------------------------------------------------------------------
+  const AMB = { point: "末尾", reading: "最后一行之后另起一行", alternatives: ["接在最后一行的文字后面"] };
+
+  it("ambiguity nothing observed can settle is asked before planning, with the readings as options", async () => {
+    const asked: { q: string; options: string[] }[] = [];
+    const u: User = { clarify(q, options) { asked.push({ q, options }); return { option: 0 }; }, authorize: () => true };
+    const open = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: ["在 todo.txt 末尾加一行"] }] } });  // the request itself is not evidence
+    const { o, ws } = setup(TODO, [open, HAPPY, HAPPY, HAPPY, HAPPY, HAPPY], u);
+    const s = await o.run();
+    expect(asked.length).toBe(1);
+    expect(asked[0]!.options).toEqual([AMB.reading, ...AMB.alternatives, Orchestrator.DELEGATE]);
+    expect(s.counters["calls:plan"]).toBe(1);             // the plan came after the answer, not before
+    expect(s.answers).toEqual([AMB.reading]);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+  });
+
+  it("a reading backed by what is in the directory, with only reversible steps, is acted on and reported", async () => {
+    const backed = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] }, plan: PLAN, bind: BIND, intent: MATCH });
+    const u = user([], false);
+    const { o, ws } = setup(TODO, Array(6).fill(backed), u);
+    const s = await o.run();
+    expect(u.asked.length).toBe(0);
+    expect(s.counters["ask:authorize"] ?? 0).toBe(0);
+    expect(s.status).toBe("succeeded");
+    expect(s.assumptions).toEqual([AMB.reading]);
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+  });
+
+  const GOALW = { requirements: [{ id: "r1", statement: "日志.log 内容是 X", check: { kind: "deterministic", name: "text_equals", args: { path: "日志.log", text: "X" } }, quotes: ["X"] }], constraints: [], authorized_rewrites: ["日志.log"], missing: [], feasible: "yes" };
+  const PLANW = { nodes: [{ id: "n1", capability: "fs.replace_text", depends_on: [], purpose: "改写", requirement_ids: ["r1"] }], outcome: "plan" };
+  const BINDW = { bindings: { target: { kind: "resource_ref", path: "日志.log" }, text: { kind: "source_span", quote: "X", occurrence: 1 } }, unresolved: [] };
+  function rewrite(script: Scripted[], u: User) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "harness-guard-"));
+    build(root, { "日志.log": "旧内容" });
+    const ws = new Workspace(root);
+    const gw = new Gateway(scriptedTable); gw.script = script;
+    const o = new Orchestrator(path.join(root, ".log.jsonl"), ws, gw, u, fileRegistry());
+    o.start("把 日志.log 的内容改成「X」");
+    return { o, ws };
+  }
+
+  it("a backed reading with a step that cannot be undone shows the plan once; declined, nothing changes", async () => {
+    const w = byRole({ goal: { ...GOALW, assumptions: [{ point: "内容", reading: "整个文件只剩 X", alternatives: ["把旧内容里的某处换成 X"], evidence: ["旧内容"] }] }, plan: PLANW, bind: BINDW, intent: MATCH });
+    const texts: string[] = [];
+    const { o, ws } = rewrite(Array(6).fill(w), { clarify: () => null, authorize: (t) => { texts.push(t); return false; } });
+    const s = await o.run();
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain("整个文件只剩 X");
+    expect(s.counters["calls:bind"] ?? 0).toBe(0);        // asked before anything was prepared
+    expect(s.status).toBe("waiting_user");
+    expect(ws.read("日志.log")).toBe("旧内容");
+  });
+
+  it("the same plan, approved once, runs without further questions", async () => {
+    const w = byRole({ goal: { ...GOALW, assumptions: [{ point: "内容", reading: "整个文件只剩 X", alternatives: ["把旧内容里的某处换成 X"], evidence: ["旧内容"] }] }, plan: PLANW, bind: BINDW, intent: MATCH });
+    const texts: string[] = [];
+    const { o, ws } = rewrite(Array(6).fill(w), { clarify: () => null, authorize: (t) => { texts.push(t); return true; } });
+    const s = await o.run();
+    expect(texts.length).toBe(1);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("日志.log")).toBe("X");
+  });
+
+  it("「随便」 delegates the choice: the whole plan is confirmed once, not every step", async () => {
+    const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "加什么", question: "要加哪一行？", kind: "information" }], feasible: "yes" } });
+    const PLAN2 = { nodes: [{ id: "n1", capability: "fs.append_line", depends_on: [], purpose: "追加第一行", requirement_ids: ["r1"] }, { id: "n2", capability: "fs.create_text", depends_on: ["n1"], purpose: "记一笔", requirement_ids: ["r1"] }], outcome: "plan" };
+    const bindFor = (n: number) => n === 0 ? BIND : { bindings: { path: { kind: "literal", value: "记录.txt" }, text: { kind: "source_span", quote: "买牛奶", occurrence: 1 } }, unresolved: [] };
+    let binds = 0;
+    const guess: Scripted = (role) => role === "goal" ? { ...GOAL, user_delegated: true } : role === "plan" ? PLAN2 : role === "bind" ? bindFor(binds++) : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    const texts: string[] = [];
+    const u: User & { asked: string[] } = { asked: [], clarify(q) { this.asked.push(q); return { option: 0 }; }, authorize: (t) => { texts.push(t); return true; } };
+    const { o, ws } = setup(TODO, [ask, ...Array(10).fill(guess)], u);
+    const s = await o.run();
+    expect(u.asked.length).toBe(1);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain("追加第一行");
+    expect(texts[0]).toContain("记一笔");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+  });
+
+  it("「随便」 then declining the proposed plan stops and waits; nothing changes", async () => {
+    const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改的是哪个文件？", kind: "information" }], feasible: "yes" } });
     const guess = byRole({ goal: { ...GOAL, user_delegated: true }, plan: PLAN, bind: BIND, intent: MATCH });
     const u = user(["你看着办吧"], false);
     const { o, ws } = setup(TODO, [ask, guess, guess, guess, guess, guess, guess], u);
     const s = await o.run();
     expect(u.asked.length).toBe(1);
-    expect(s.counters["ask:authorize"]).toBe(1);          // the proposed append was put to the user
-    expect(s.status).not.toBe("succeeded");
-    expect(ws.read("todo.txt")).toBe("交房租\n");
-  });
-
-  it("a reading the model chose is put to the user before the first write; rejected, nothing changes", async () => {
-    const amb = byRole({ goal: { ...GOAL, assumptions: [{ reading: "把末尾一行理解为最后一行之后", because: "原话说末尾" }] }, plan: PLAN, bind: BIND, intent: MATCH });
-    const u = user([], false);
-    const { o, ws } = setup(TODO, Array(6).fill(amb), u);
-    const s = await o.run();
     expect(s.counters["ask:authorize"]).toBe(1);
     expect(s.status).toBe("waiting_user");
     expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("something the system can read for itself is not asked", async () => {
+    const look = byRole({ goal: { ...GOAL, missing: [{ what: "todo.txt 现在最后一行是什么", question: "todo.txt 最后一行是什么？", kind: "observable" }] }, plan: PLAN, bind: BIND, intent: MATCH });
+    const u = user();
+    const { o, ws } = setup(TODO, Array(6).fill(look), u);
+    const s = await o.run();
+    expect(u.asked.length).toBe(0);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+  });
+
+  it("an answer survives a restart: goal and plan are re-derived from the log", async () => {
+    const needUser = byRole({ plan: { nodes: [], outcome: "need_user", question: "加在哪个文件？" } });
+    let replies = 0;
+    const hooks = { after_reply: () => { if (++replies === 3) throw new Crash("after the answer"); } };
+    const { o, ws, gw, log } = setup(TODO, [byRole({ goal: GOAL }), needUser, HAPPY], user(["todo.txt"]), hooks);
+    await expect(o.run()).rejects.toBeInstanceOf(Crash);
+    gw.script = Array(6).fill(HAPPY);
+    const o2 = new Orchestrator(log, ws, gw, user(), fileRegistry());
+    const s = await o2.run();
+    expect(s.counters["calls:goal"]).toBe(1);            // the old goal was dropped by the answer, also on replay
+    expect(s.answers).toEqual(["todo.txt"]);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
   });
 
   it("an approval-kind missing item is not asked as a question", async () => {

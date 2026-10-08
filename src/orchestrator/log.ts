@@ -69,6 +69,7 @@ export class State {
   externalChanges: string[] = [];       // paths another program changed while we were running (facts, not our effects)
   n: Record<string, number> = {};
   skillUsed: string | null = null;
+  planConfirmed = false;                         // the user approved the current plan (plan.confirmed)
   notes: string[] = [];
 
   count(key: string, by = 1) {
@@ -91,7 +92,7 @@ export class State {
         this.startContents = e.contents ?? {};
         break;
       case "goal.update":
-        this.raw = e.raw; this.goal = null; this.plan = null; this.nodes = new Map();
+        this.raw = e.raw; this.goal = null; this.plan = null; this.nodes = new Map(); this.planConfirmed = false;
         this.revs.goal_rev += 1; this.revs.evidence_epoch += 1;
         this.notes.push(`用户改了要求：${e.raw}`);
         break;
@@ -99,7 +100,7 @@ export class State {
         this.goal = e.goal; this.revs.goal_rev += 1; this.revs.evidence_epoch += 1;
         break;
       case "plan.accepted":
-        this.plan = e.plan; this.revs.plan_rev += 1; this.revs.evidence_epoch += 1;
+        this.plan = e.plan; this.revs.plan_rev += 1; this.revs.evidence_epoch += 1; this.planConfirmed = false;
         this.nodes = new Map((e.plan as Plan).nodes.map((n) => [n.id, { node: n, status: "pending", bindings: null, args: null, output: null, operationIds: [], attempts: 0 }]));
         this.skillUsed = e.plan.skill ?? null;
         this.count("replans", e.replan ?? 0);
@@ -124,6 +125,9 @@ export class State {
         if (nd) nd.status = "failed";
         break;
       }
+      case "plan.confirmed":
+        this.planConfirmed = true;
+        break;
       case "env.changed":
         this.revs.evidence_epoch += 1;
         for (const p of (e.paths as string[]) ?? []) if (p !== "gui" && !this.externalChanges.includes(p)) this.externalChanges.push(p);
@@ -133,7 +137,11 @@ export class State {
         break;
       case "interaction.reply": {
         const b = e.body;
-        if (b.kind === "clarify") { this.answers.push({ question: b.question, text: b.text }); this.revs.evidence_epoch += 1; }
+        if (b.kind === "clarify") {
+          // the answer may change what the goal means: goal and plan are re-derived (also when the log is replayed)
+          this.answers.push({ question: b.question, text: b.text }); this.revs.evidence_epoch += 1;
+          this.goal = null; this.plan = null; this.nodes = new Map(); this.planConfirmed = false;
+        }
         else if (b.kind === "authorize") {
           (b.approved ? this.approvals : this.declined).add(b.digest);
           if (!b.approved) this.notes.push(`用户拒绝了：${b.text}`);
