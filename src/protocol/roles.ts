@@ -40,6 +40,10 @@ export const GoalAnswer = z.object({
     /** Candidate answers taken from the evidence (files in the directory, words in the request), 2–6; the runtime
      *  shows them as a numbered list plus 「其他」. 「由你决定」 is a legitimate option when the choice is a preference. */
     options: z.array(z.string().min(1)).max(6).default([]),
+    /** values: the options are facts (files in the directory, words the user said) and are checked against the
+     *  evidence. proposals: the options are ways to handle the situation (keep one copy, add a suffix…); they are
+     *  the user's to pick, so they are shown as written. */
+    options_are: z.enum(["values", "proposals"]).default("values"),
   })),
   feasible: z.enum(["yes", "needs_capability_we_lack", "unclear"]),
   infeasible_reason: z.string().optional(),

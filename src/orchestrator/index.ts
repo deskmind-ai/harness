@@ -211,7 +211,7 @@ export class Orchestrator {
     const g = rep.data!;
     if (g.feasible === "needs_capability_we_lack") return this.finish("failed", "cannot: " + (g.infeasible_reason ?? "需要没有注册的能力"));
     const info = g.missing.filter((m) => m.kind === "information");
-    if (info.length) return this.clarify(info[0]!.question, "goal: " + info[0]!.what, info[0]!.options);
+    if (info.length) return this.clarify(info[0]!.question, "goal: " + info[0]!.what, info[0]!.options, info[0]!.options_are === "values");
     const observable = g.missing.filter((m) => m.kind === "observable");
     if (observable.length) this.emit("note", { text: "这些可以自己查到，计划里先加只读步骤：" + observable.map((m) => m.what).join("；") });
     if (g.missing.some((m) => m.kind === "approval")) this.emit("note", { text: "模型想先要批准；批准由执行前的确认处理：" + g.missing.filter((m) => m.kind === "approval").map((m) => m.what).join("；") });

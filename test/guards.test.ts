@@ -320,6 +320,17 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n");
   });
 
+  it("proposed ways to handle a situation are shown as written; invented values are dropped", async () => {
+    const shown: string[][] = [];
+    const u: User = { clarify(_q, options) { shown.push(options); return null; }, authorize: () => true };
+    const props = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "重名", question: "两份重名，怎么办？", kind: "information", options: ["只留一份", "第二份加后缀"], options_are: "proposals" }], feasible: "yes" } });
+    const vals = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "哪个文件？", kind: "information", options: ["todo.txt", "不存在.txt"] }], feasible: "yes" } });
+    await setup(TODO, [props], u).o.run();
+    await setup(TODO, [vals], u).o.run();
+    expect(shown[0]).toEqual(["只留一份", "第二份加后缀", Orchestrator.DELEGATE]);
+    expect(shown[1]).toEqual(["todo.txt", Orchestrator.DELEGATE]);
+  });
+
   it("something the system can read for itself is not asked", async () => {
     const look = byRole({ goal: { ...GOAL, missing: [{ what: "todo.txt 现在最后一行是什么", question: "todo.txt 最后一行是什么？", kind: "observable" }] }, plan: PLAN, bind: BIND, intent: MATCH });
     const u = user();
