@@ -45,6 +45,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "- 能用代码核验的用 deterministic 并填 name/args；只能看出来对不对的用 semantic；user_confirmation 只用于结果只有用户能判断的要求，不要用它表达「用编辑器做」「不要覆盖」这类过程约束——过程约束放进 constraints。",
     "- 原文缺了只有用户知道的信息（哪个文件、内容、位置），写进 missing，并给一个用户能直接回答的问题；不要用猜的值补。",
     "- 「放到 / 移到 / 归档到 / 整理到」某处，默认是移动（原位置不再有），不要问「移动还是复制」。用户已经回答过的问题不要再问。",
+    "- 删除、覆盖这类有后果的动作，程序会在执行前自己向用户确认；不要把「要不要确认」写进 missing。missing 只放用户没说、程序也看不到的信息。",
     "- 目录里已有的文件名和内容也是证据：需求可以引用目录里看到的文件名。",
     "- 如果所需的事超出了已注册能力（例如发邮件、转格式、OCR），feasible 填 needs_capability_we_lack 并说明；不要用现有能力硬凑。",
     "", "输出格式示例（字段名必须一样）：",
@@ -68,7 +69,7 @@ export function planPrompt(goal: Goal, raw: string, answers: string[], workspace
     "", "要求：", "- 只用列表里的能力 id；要读文件内容才能决定后续时，先放一个只读节点，后面的节点依赖它。",
     "- 一个节点做一件事；需要对多个文件做同一件事就多个节点。", "- 不要加用户没要求的动作；不动无关文件。",
     "- 覆盖每条需求：requirement_ids 写这个节点服务于哪些需求 id。",
-    "- 能力不够做不到就 outcome=cannot 并说明；缺用户信息就 outcome=need_user 并给 question。",
+    "- 能力不够做不到就 outcome=cannot 并说明；缺用户信息就 outcome=need_user 并给 question。有后果的动作（删除、覆盖）由程序在执行前向用户确认，不要用 need_user 去要确认。",
     "", "输出格式示例（字段名必须一样）：",
     J({ nodes: [
       { id: "n1", capability: "fs.mkdir", depends_on: [], purpose: "新建文件夹 归档", requirement_ids: ["r1"] },

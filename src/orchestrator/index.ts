@@ -687,8 +687,26 @@ export class Orchestrator {
   }
 
   // --- interaction --------------------------------------------------------------------------------------------------------
+  /** A model asking "shall I really do X?" is asking for approval, not information: that goes through authorize. */
+  private static isApprovalRequest(q: string): boolean {
+    return /确认|批准|同意|是否要|要不要|可以(删|移|覆盖|执行)|真的要/.test(q) && !/叫什么|哪个|哪一|什么内容|放到哪|写什么|名字/.test(q);
+  }
+
   private clarify(question: string, why = "") {
     const st = this.st;
+    if (Orchestrator.isApprovalRequest(question)) {
+      const digest = sha("approval:" + question);
+      if (!st.approvals.has(digest) && !st.declined.has(digest)) {
+        this.emit("interaction.request", { body: { kind: "authorize", text: question, digest } });
+        const ok = this.user.authorize(question);
+        this.emit("interaction.reply", { body: { kind: "authorize", text: question, digest, approved: ok } });
+        // the answer is recorded as the user's words so the next goal/plan round sees it
+        this.emit("interaction.reply", { body: { kind: "clarify", question, text: ok ? "确认，照做。" : "不要做。" } });
+        st.goal = null; st.plan = null; st.nodes = new Map();
+        if (!ok) this.finish("cancelled", "the user declined");
+        return;
+      }
+    }
     if (st.get("ask:clarify") >= this.budget.asks) return this.finish("waiting_user", "asked the user too often without progress");
     if (st.answers.some((a) => loose(a.question) === loose(question))) return this.finish("waiting_user", "the same question was already answered; not asking again");
     this.emit("interaction.request", { body: { kind: "clarify", question, why } });
