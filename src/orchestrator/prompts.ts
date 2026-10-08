@@ -48,7 +48,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "- missing 的每条带 kind：information = 只有用户知道的信息（哪个文件、什么内容、放哪）；approval = 你已经知道怎么做、只是想要许可。有后果的动作（删除、覆盖）程序会在执行前自己向用户确认，所以 approval 类一般不需要写；写了也不会变成问题去问用户。",
     "- 用户如果回答「随便」「你看着办」，就是把选择交给你：按常理做决定、写进需求，程序会把每个改动先给用户确认。",
     "- 目录里已有的文件名和内容也是证据：需求可以引用目录里看到的文件名。",
-    "- 如果所需的事超出了已注册能力（例如发邮件、转格式、OCR），feasible 填 needs_capability_we_lack 并说明；不要用现有能力硬凑。",
+    "- 如果所需的事超出了已注册能力（例如发邮件、打印、转格式、OCR、上传），feasible 填 needs_capability_we_lack 并说明；不要用现有能力硬凑，也不要把用户的要求改写成现有能力能做的事（「打印」不等于「读出来」，「发给某人」不等于「复制一份」）。",
     "", "输出格式示例（字段名必须一样）：",
     J({ requirements: [
       { id: "r1", statement: "任务目录里有 清单.log", check: { kind: "deterministic", name: "file_exists", args: { path: "清单.log" } }, quotes: ["新建 清单.log"] },
