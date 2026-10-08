@@ -426,11 +426,12 @@ export class Orchestrator {
     }
     const text = describe(cap, args);
     const digest = sha(canon({ cap: cap.id, args }));
-    // Overwriting content this run did not write is consequential: someone else's edit would be lost.
-    const external = !!cap.discards && writes.some((p) => this.externallyEdited(p));
-    if ((cap.requiresConfirmation || external) && !st.approvals.has(digest)) {
+    // Discarding content this run did not create is consequential: the user's (or another program's) data would be
+    // lost. Only content written by this run may be overwritten without asking.
+    const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p));
+    if ((cap.requiresConfirmation || foreign) && !st.approvals.has(digest)) {
       if (st.declined.has(digest)) { this.emit("node.failed", { node_id: node.id, why: "declined by the user" }); return; }
-      const ask = external && !cap.requiresConfirmation ? `${text}（注意：这个文件在任务开始后被别的程序改过，这一步会覆盖那些改动）` : text;
+      const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）` : text;
       this.emit("interaction.request", { body: { kind: "authorize", text: ask, digest } });
       const ok = this.user.authorize(ask);
       this.emit("interaction.reply", { body: { kind: "authorize", text: ask, digest, approved: ok } });
@@ -462,12 +463,12 @@ export class Orchestrator {
     throw new Crash("crash after the effect, before the receipt");
   }
 
-  /** True when the path's current content is neither what the run started with nor something this run wrote. */
-  private externallyEdited(p: string): boolean {
+  /** True when the path's current content was written by this run (so rewriting it loses nothing of anyone else's). */
+  private createdByUs(p: string): boolean {
     const now = this.ws.version(p);
-    if (now === ABSENT || now.startsWith("dir:")) return false;
-    if (now === (this.st.startVersions[p] ?? ABSENT)) return false;
-    return ![...this.st.ops.values()].some((op) => op.state === "ok" && op.receipt?.versions_after?.[p] === now);
+    if (now === ABSENT) return true;
+    if (now.startsWith("dir:")) return false;
+    return [...this.st.ops.values()].some((op) => op.state === "ok" && op.receipt?.versions_after?.[p] === now);
   }
 
   private reconcile(): boolean {
@@ -713,7 +714,15 @@ export class Orchestrator {
     const text = this.user.clarify(question);
     if (text === null) return this.finish("waiting_user", "no answer from the user");
     this.emit("interaction.reply", { body: { kind: "clarify", question, text } });
+    if (Orchestrator.isUninformative(text) && why.startsWith("goal")) {
+      // 「随便」「你看着办」 is not the missing information: the model may not decide for the user (2.0 §8.1)
+      return this.finish("waiting_user", "the user did not supply the missing information; not deciding for them");
+    }
     st.goal = null; st.plan = null; st.nodes = new Map();        // the answer may change what the goal means
+  }
+
+  private static isUninformative(t: string): boolean {
+    return /^(随便|你看着办|你定|都行|无所谓|按我原来说的做|照原话做|按原来的做)/.test(t.trim());
   }
 
   private modelFailed(rep: Reply) {

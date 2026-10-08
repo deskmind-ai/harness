@@ -191,6 +191,35 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶（更新）\n");
   });
 
+  it("rewriting a file this run did not create needs the user's approval (「新建」 on an existing file)", async () => {
+    const GOALR = { requirements: [{ id: "r1", statement: "report.txt 内容是 X", check: { kind: "deterministic", name: "text_equals", args: { path: "report.txt", text: "X" } }, quotes: ["X"] }], constraints: [], missing: [], feasible: "yes" };
+    const PLANR = { nodes: [{ id: "n1", capability: "fs.replace_text", depends_on: [], purpose: "覆盖", requirement_ids: ["r1"] }], outcome: "plan" };
+    const BINDR = { bindings: { target: { kind: "resource_ref", path: "report.txt" }, text: { kind: "source_span", quote: "X", occurrence: 1 } }, unresolved: [] };
+    const over = byRole({ goal: GOALR, plan: PLANR, bind: BINDR, intent: MATCH });
+    const u = user([], false);
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "harness-guard-"));
+    build(root, { "report.txt": "已有内容" });
+    const ws = new Workspace(root);
+    const gw = new Gateway(scriptedTable); gw.script = Array(8).fill(over);
+    const o = new Orchestrator(path.join(root, ".log.jsonl"), ws, gw, u, fileRegistry());
+    o.start("新建 report.txt，内容为「X」");
+    const s = await o.run();
+    expect(s.counters["ask:authorize"]).toBe(1);
+    expect(ws.read("report.txt")).toBe("已有内容");
+    expect(s.status).not.toBe("succeeded");
+  });
+
+  it("「随便」 does not unblock a missing-intent question; the run stops instead of deciding for the user", async () => {
+    const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改名的是哪个文件？" }], feasible: "yes" } });
+    const guess = byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH });
+    const u = user(["你看着办吧"]);
+    const { o, ws } = setup(TODO, [ask, guess, guess, guess, guess], u);
+    const s = await o.run();
+    expect(u.asked.length).toBe(1);
+    expect(s.status).toBe("waiting_user");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
   it("a goal with only 'unchanged' constraints never succeeds without an effect", async () => {
     const triv = byRole({ goal: { ...GOAL, requirements: [{ id: "r1", statement: "不动", check: { kind: "deterministic", name: "unchanged", args: { path: "other.txt" } }, quotes: ["todo.txt"] }] }, plan: { nodes: [], outcome: "plan" } });
     const { o } = setup(TODO, [triv, triv, triv]);
