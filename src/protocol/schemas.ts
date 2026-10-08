@@ -43,7 +43,9 @@ export const Goal = z.object({
   constraints: z.array(z.string()),
   authorized_rewrites: z.array(z.string()).default([]),
   user_delegated: z.boolean().default(false),
-  assumptions: z.array(z.object({ reading: z.string(), because: z.string().default("") })).default([]),
+  /** `backed`: at least one evidence item was found in the observation or the user's answers (checked by code). */
+  /** backed: evidence (or the user's answer) supports the reading. settled: the user chose or stated it. */
+  assumptions: z.array(z.object({ point: z.string(), reading: z.string(), alternatives: z.array(z.string()), evidence: z.array(z.string()), backed: z.boolean(), settled: z.boolean().default(false) })).default([]),
 });
 export type Goal = z.infer<typeof Goal>;
 
@@ -119,6 +121,7 @@ export const ExecutionResult = z.object({
   versions_after: z.record(z.string()),
   why: z.string().optional(),
   note: z.string().optional(),
+  undo: z.record(z.unknown()).optional(),
 });
 export type ExecutionResult = z.infer<typeof ExecutionResult>;
 

@@ -21,16 +21,29 @@ export const GoalAnswer = z.object({
   authorized_rewrites: z.array(z.string()).default([]),
   /** The user handed a choice to us (「随便」「你看着办」「由你决定」). We may decide, and every write is then confirmed first. */
   user_delegated: z.boolean().default(false),
-  /** Where the request can be read more than one way and the model picked a reading: say which, and why. Each
-   *  assumption is put to the user before the first write; evidence-backed readings still need the user's nod. */
-  assumptions: z.array(z.object({ reading: z.string().min(1), because: z.string().default("") })).default([]),
+  /** Each place where the request can be read more than one way *with different results*: which place (point), the
+   *  reading chosen, the other readings, and evidence for the choice — words from the directory listing, file contents
+   *  or the user's later answers (the ambiguous request itself does not count). See docs/ask-policy.md. */
+  assumptions: z.array(z.object({
+    point: z.string().default(""),
+    reading: z.string().min(1),
+    alternatives: z.array(z.string().min(1)).default([]),
+    evidence: z.array(z.string().min(1)).default([]),
+  })).default([]),
   /** kind: information = only the user knows it (which file, what text); approval = permission for an action the
    *  model already knows how to do. The runtime asks for information and confirms actions itself. */
   missing: z.array(z.object({
-    what: z.string(), question: z.string(), kind: z.enum(["information", "approval"]).default("information"),
+    what: z.string(), question: z.string(),
+    /** information: only the user knows it. approval: permission (never asked; the runtime confirms actions).
+     *  observable: the system can find it out by reading files; planned as read-only steps, never asked. */
+    kind: z.enum(["information", "approval", "observable"]).default("information"),
     /** Candidate answers taken from the evidence (files in the directory, words in the request), 2–6; the runtime
      *  shows them as a numbered list plus 「其他」. 「由你决定」 is a legitimate option when the choice is a preference. */
     options: z.array(z.string().min(1)).max(6).default([]),
+    /** values: the options are facts (files in the directory, words the user said) and are checked against the
+     *  evidence. proposals: the options are ways to handle the situation (keep one copy, add a suffix…); they are
+     *  the user's to pick, so they are shown as written. */
+    options_are: z.enum(["values", "proposals"]).default("values"),
   })),
   feasible: z.enum(["yes", "needs_capability_we_lack", "unclear"]),
   infeasible_reason: z.string().optional(),
@@ -51,6 +64,10 @@ export type BindAnswer = z.infer<typeof BindAnswer>;
 export const IntentAnswer = z.object({
   verdict: z.enum(["matches", "mismatch", "insufficient_information", "requires_more_steps"]),
   reason: z.string().default(""),
+  /** With insufficient_information: can the user supply what is missing (then `question` is put to them), or is it
+   *  evidence the system lacks (then the binding is retried, the user is not interrupted). */
+  ask_user: z.boolean().default(false),
+  question: z.string().optional(),
   scores: z.record(z.number()).optional(),          // from a choice-only backend: probability per option
 });
 export type IntentAnswer = z.infer<typeof IntentAnswer>;

@@ -33,11 +33,12 @@ const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的
 能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
 path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
 
-export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string): string {
+export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string, decided: { point: string; reading: string }[] = []): string {
   return [
     "任务：把用户的要求整理成可逐项验收的需求。保留用户的原话；不要替用户决定没说的事。",
     "", `用户原文：${J(raw)}`,
     ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    ...(decided.length ? ["用户已经选定的理解（必须照用；assumptions 里同一处的 reading 原样写用户选的这一项）：", ...decided.map((d) => `- 「${d.point}」：${d.reading}`)] : []),
     `任务目录（用户选定，相对路径的根；用户说的「这个目录」「当前目录」「下载」等指的就是它）：${scope}`, "目录现在的内容：", J(workspace),
     "", "系统已注册的能力（只有这些能被执行）：", J(caps.map((c) => ({ id: c.id, description: c.description }))),
     "", CHECKS_DOC,
@@ -45,9 +46,11 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "- 能用代码核验的用 deterministic 并填 name/args；只能看出来对不对的用 semantic；user_confirmation 只用于结果只有用户能判断的要求，不要用它表达「用编辑器做」「不要覆盖」这类过程约束——过程约束放进 constraints。",
     "- 原文缺了只有用户知道的信息（哪个文件、内容、位置），写进 missing，并给一个用户能直接回答的问题；不要用猜的值补。",
     "- 「放到 / 移到 / 归档到 / 整理到」某处，默认是移动（原位置不再有），不要问「移动还是复制」。用户已经回答过的问题不要再问。",
-    "- missing 的每条带 kind：information = 只有用户知道的信息（哪个文件、什么内容、放哪）；approval = 你已经知道怎么做、只是想要许可。有后果的动作（删除、覆盖）程序会在执行前自己向用户确认，所以 approval 类一般不需要写；写了也不会变成问题去问用户。",
-    "- 用户如果回答「随便」「你看着办」「由你决定」，就是把选择交给你：user_delegated 填 true，按常理做决定、写进需求；程序会把每个改动先给用户确认。",
-    "- assumptions：要求能有不止一种理解、而你选了其中一种时，写出你选的读法和依据（例如「把『岗位』理解为每份简历各自的岗位，因为文件名里带着岗位」）。程序会在第一次改文件前把这些读法给用户确认。读法有把握也要写；完全说不清就放进 missing 去问。",
+    "- missing 的每条带 kind：information = 只有用户知道的信息（哪个文件、什么内容、放哪）；observable = 打开文件或看目录就能查到的事（例如「哪份是最新的」「文件里写的是哪个项目」），程序不会去问用户，会让计划先读；approval = 你已经知道怎么做、只是想要许可。有后果的动作（删除、覆盖）程序会在执行前自己向用户确认，所以 approval 类一般不需要写；写了也不会变成问题去问用户。",
+    "- 用户如果回答「随便」「你看着办」「由你决定」，就是把选择交给你：user_delegated 填 true，按常理做决定、写进需求；程序会在动手前把整个计划给用户过目一次。",
+    "- assumptions：原文某一处能有不止一种说得通的理解时，每处写一条：point = 原文里有歧义的那几个字；reading = 你选的理解；alternatives = 其他说得通的理解（做出来结果一样的不算，不要写）；evidence = 能把几种理解区分开的证据，每条必须原样是下面之一：目录里的一个完整路径、某个文件里完整的一行（或连续几行）、用户后来的一条补充；原文里出现过的词不算证据——有歧义的正是原文。另有一个模型会只看这些证据来判断它们支持哪种理解。",
+    "  程序据此决定：没有证据能区分 → 先把几种理解做成选项问用户；有证据、但计划里有删不掉改不回的动作 → 动手前把计划给用户确认一次；有证据、动作都能撤回 → 直接做，结果里告诉用户你是怎么理解的。只有一种说得通的理解时不要写。",
+    "  例：原文「放『招聘/岗位』，改名『姓名-简历.pdf』」，目录里有「张三-前端.pdf」「李四-后端.pdf」 → { point: \"岗位\", reading: \"每份简历各自的岗位（前端、后端）\", alternatives: [\"一个字面名为「岗位」的文件夹\"], evidence: [\"张三-前端.pdf\"] }。",
     "- authorized_rewrites：用户明确要求改写 / 替换 / 覆盖 / 追加的那些已有文件的路径（例如「把 日志.log 的内容改成…」里的 日志.log）。只有列在这里的文件，程序才会不经确认地丢弃其内容；用户要「新建」的文件不要列（它若已存在属于冲突，要问用户）。",
     "- 目录里已有的文件名和内容也是证据：需求可以引用目录里看到的文件名。",
     "- 如果所需的事超出了已注册能力（例如发邮件、打印、转格式、OCR、上传），feasible 填 needs_capability_we_lack 并说明；不要用现有能力硬凑，也不要把用户的要求改写成现有能力能做的事（「打印」不等于「读出来」，「发给某人」不等于「复制一份」）。",
@@ -56,7 +59,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
       { id: "r1", statement: "任务目录里有 清单.log", check: { kind: "deterministic", name: "file_exists", args: { path: "清单.log" } }, quotes: ["新建 清单.log"] },
       { id: "r2", statement: "清单.log 的内容是「等评审」", check: { kind: "deterministic", name: "text_equals", args: { path: "清单.log", text: "等评审" } }, quotes: ["内容为「等评审」"] },
     ], constraints: ["不动其他文件"], authorized_rewrites: [], user_delegated: false, assumptions: [], missing: [], feasible: "yes" }),
-    "- missing 里尽量给 options：2–6 个来自证据的候选（目录里真有的文件、原文里真有的词），程序会渲染成编号选项加「其他」让用户点选；选择是偏好时可以加一个「由你决定」。",
+    "- missing 里尽量给 options，2–6 个，程序会渲染成编号选项加「其他」让用户点选；选择是偏好时可以加一个「由你决定」。options_are 说明选项是哪一类：values = 证据里真有的值（目录里的文件、原文里的词），程序会逐个核对，编出来的会被删掉；proposals = 处理这件事的几种做法（例如重名时「只留一份」「第二份加后缀」），按原样给用户选。",
     "缺信息时的 missing 示例：", J([{ what: "要改名的是哪个文件", question: "要改名的是哪个文件？", kind: "information", options: ["memo-a.txt", "方案-b.txt"] }]),
   ].join("\n");
 }
@@ -112,16 +115,17 @@ export function bindPrompt(raw: string, answers: string[], node: Omit<PlanNode, 
   ].join("\n");
 }
 
-export function intentPrompt(raw: string, answers: string[], actions: string[], constraints: string[], evidence: Record<string, string>): string {
+export function intentPrompt(raw: string, answers: string[], actions: string[], constraints: string[], evidence: Record<string, string>, decided: { point: string; reading: string }[] = []): string {
   return [
     "任务：独立核对。下面是程序即将执行的动作（人话描述，参数已经取好）。请对照用户原文和给出的证据，判断这些动作是不是用户要的。",
     "", `用户原文：${J(raw)}`, ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    ...(decided.length ? ["用户已经选定的理解（动作必须照这个理解；不照的判 mismatch）：", ...decided.map((d) => `- 「${d.point}」：${d.reading}`)] : []),
     "约束：", J(constraints),
     ...(Object.keys(evidence).length ? ["动作涉及的文件，现在的内容（证据；参数里的值如果来自文件内容，在这里核对）：", J(evidence)] : []),
     "", "即将执行的动作（按顺序）：", ...actions.map((a, i) => `${i + 1}. ${a}`),
     "", "判断：", "- matches：动作忠实于原文，没有改写、对调、漏掉要求，也没有多做。",
     "- mismatch：有参数弄反、文件弄错、内容改写、违反约束等；说明哪里不对。",
-    "- insufficient_information：原文没说清楚，动作里的某个值是猜的。",
+    "- insufficient_information：动作里的某个值是猜的。同时填 ask_user：缺的东西只有用户知道（例如要写什么内容）就填 true，并在 question 里写一个用户能直接回答的短问题；缺的是能从文件里查到的证据就填 false，程序会重新取值，不去打扰用户。",
     "- requires_more_steps：动作对，但只完成了一部分要求。",
   ].join("\n");
 }

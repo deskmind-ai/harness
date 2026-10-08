@@ -34,13 +34,15 @@ interface Spec {
   footprint: (ws: Workspace, a: Args) => Footprint;
   pre: (ws: Workspace, a: Args) => string | null;
   run: (ws: Workspace, a: Args) => ExecResult;
+  /** reversible = this exists (or the capability only observes) */
+  undo?: (ws: Workspace, a: Args, r: ExecResult) => string | null;
 }
 
 /** A capability from a spec, with the shared argument checks (schema, '..', bare names) applied first. */
 function make(sp: Spec): Capability {
   const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
   return {
-    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards,
+    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards, reversible: sp.effect === "observe" || !!sp.undo,
     typecheck(a) {
       const err = schemaCheck(schema, a);
       if (err) return err;
@@ -51,11 +53,18 @@ function make(sp: Spec): Capability {
     footprint: sp.footprint,
     preconditions: sp.pre,
     execute: sp.run,
+    ...(sp.undo ? { undo: sp.undo } : {}),
   };
 }
 
 export const CRASH_FLAG = { crashAfterEffect: false };     // test hook: die after the effect, before the receipt
 const maybeCrash = () => { if (CRASH_FLAG.crashAfterEffect) throw new Crash("crash after the effect, before the receipt"); };
+
+/** An undo may only touch paths still exactly as the action left them. */
+const untouched = (ws: Workspace, r: ExecResult, paths: string[]) => {
+  const moved = paths.filter((q) => q in r.versions_after && ws.version(q) !== r.versions_after[q]);
+  return moved.length ? `changed since the action: ${moved.join(", ")}` : null;
+};
 
 export const fsCreateText = make({
   id: "fs.create_text", description: "在任务目录里新建一个 UTF-8 文本文件并写入正文；目标已存在时失败，不覆盖。", effect: "create",
@@ -64,6 +73,7 @@ export const fsCreateText = make({
   footprint: (_ws, a) => { const q = join(a.parent!, a.name!); return { reads: [], writes: [q], expectAfter: { [q]: sha(a.text!) } }; },
   pre: (ws, a) => { const q = join(a.parent!, a.name!); return ws.exists(q) ? `${q} already exists` : !folderOk(ws, parentOf(q)) ? `folder ${parentOf(q)} does not exist` : null; },
   run: (ws, a) => { const q = join(a.parent!, a.name!); fs.writeFileSync(ws.abs(q), a.text!, { encoding: "utf-8", flag: "wx" }); maybeCrash(); return after(ws, [q], { file: q }); },
+  undo: (ws, a, r) => { const q = join(a.parent!, a.name!); const e = untouched(ws, r, [q]); if (e) return e; fs.unlinkSync(ws.abs(q)); return null; },
 });
 
 export const fsReplaceText = make({
@@ -80,7 +90,8 @@ export const fsAppendLine = make({
   fields: { target: p("要追加的文件"), line: s("追加的那一行文字，不含换行符") }, pathFields: ["target"],
   footprint: (ws, a) => { const q = norm(a.target!); return { reads: [], writes: [q], expectAfter: { [q]: sha(appended(ws.read(q), a.line!)) } }; },
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
-  run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return after(ws, [q]); },
+  run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
+  undo: (ws, a, r) => { const q = norm(a.target!); const e = untouched(ws, r, [q]); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
 });
 
 export const fsMove = make({
@@ -89,6 +100,12 @@ export const fsMove = make({
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [], writes: [src, dst], expectAfter: { [src]: ABSENT, [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]); },
+  undo: (ws, a, r) => {
+    const src = norm(a.source!), dst = norm(a.destination!);
+    const e = untouched(ws, r, [src, dst]); if (e) return e;
+    if (!folderOk(ws, parentOf(src))) return `folder ${parentOf(src)} is gone`;
+    fs.renameSync(ws.abs(dst), ws.abs(src)); return null;
+  },
 });
 
 export const fsCopy = make({
@@ -97,6 +114,7 @@ export const fsCopy = make({
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [src], writes: [dst], expectAfter: { [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.isDir(src) ? `${src} is a folder` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => { const dst = norm(a.destination!); fs.copyFileSync(ws.abs(norm(a.source!)), ws.abs(dst)); maybeCrash(); return after(ws, [dst]); },
+  undo: (ws, a, r) => { const dst = norm(a.destination!); const e = untouched(ws, r, [dst]); if (e) return e; fs.unlinkSync(ws.abs(dst)); return null; },
 });
 
 export const fsMkdir = make({
@@ -109,7 +127,20 @@ export const fsMkdir = make({
     for (let anc = parentOf(q); anc; anc = parentOf(anc)) if (ws.exists(anc) && !ws.isDir(anc)) return `${anc} is a file, not a folder`;
     return null;
   },
-  run: (ws, a) => { const q = norm(a.path!); fs.mkdirSync(ws.abs(q), { recursive: true }); maybeCrash(); return after(ws, [q]); },
+  run: (ws, a) => {
+    const q = norm(a.path!);
+    const made: string[] = [];
+    for (let d = q; d && !ws.exists(d); d = parentOf(d)) made.push(d);            // deepest first
+    fs.mkdirSync(ws.abs(q), { recursive: true }); maybeCrash();
+    return { ...after(ws, [q]), undo: { made } };
+  },
+  undo: (ws, _a, r) => {
+    const made = (r.undo?.made ?? []) as string[];
+    const busy = made.filter((d) => fs.readdirSync(ws.abs(d)).some((x) => !made.includes(d ? `${d}/${x}` : x)));
+    if (busy.length) return `folders not empty: ${busy.join(", ")}`;
+    for (const d of made) fs.rmdirSync(ws.abs(d));
+    return null;
+  },
 });
 
 export const fsTrash = make({
