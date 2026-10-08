@@ -541,7 +541,8 @@ export class Orchestrator {
     }
     const cmd = { operation_id: `op_${randomUUID().replace(/-/g, "").slice(0, 10)}`, node_id: node.id, capability: cap.id, args, reads, writes, versions_before: now, expect_after: expectAfter, context: st.context(), text };
     this.emit("execution.intent", { command: cmd });
-    if (this.opts.hooks?.crash_on_first_effect && st.get("actions") === 0 && cap.effect !== "observe") this.crashNext = true;
+    // test hook: die at the first write of this process (reads before it do not count)
+    if (this.opts.hooks?.crash_on_first_effect && !this.injected && cap.effect !== "observe") { this.crashNext = true; this.injected = true; }
     const result = this.crashNext ? this.executeAndCrash(cap, args) : cap.execute(this.ws, args);   // Crash propagates: no receipt
     this.ws.invalidate();
     const ok = versionsMatch(cmd.expect_after, this.ws);
@@ -551,6 +552,7 @@ export class Orchestrator {
   }
 
   private crashNext = false;
+  private injected = false;
   private lastGuiSig = "";
 
   /** Test hook: run the effect, then die before the receipt (what a power cut at the wrong moment does). */

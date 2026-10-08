@@ -127,6 +127,14 @@ describe("execution guards", () => {
     expect(Object.values(s.ops)).toEqual(["ok"]);
   });
 
+  it("the crash hook fires at the first write even when the plan reads first", async () => {
+    const READ_PLAN = { nodes: [{ id: "n0", capability: "fs.read_text", depends_on: [], purpose: "先读", requirement_ids: ["r1"] }, { ...PLAN.nodes[0], depends_on: ["n0"] }], outcome: "plan" };
+    const g: Scripted = (role) => role === "goal" ? GOAL : role === "plan" ? READ_PLAN : role === "bind" ? (BIND_N++ === 0 ? { bindings: { target: { kind: "resource_ref", path: "todo.txt" } }, unresolved: [] } : BIND) : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    let BIND_N = 0;
+    const { o } = setup(TODO, Array(10).fill(g), user(), { crash_on_first_effect: true });
+    await expect(o.run()).rejects.toBeInstanceOf(Crash);
+  });
+
   it("an unknown effect blocks every later write", async () => {
     const { o, ws, gw, log } = setup(TODO, Array(6).fill(HAPPY), user(), { crash_on_first_effect: true });
     await expect(o.run()).rejects.toBeInstanceOf(Crash);
