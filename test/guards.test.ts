@@ -239,6 +239,16 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n");
   });
 
+  it("a reading the model chose is put to the user before the first write; rejected, nothing changes", async () => {
+    const amb = byRole({ goal: { ...GOAL, assumptions: [{ reading: "把末尾一行理解为最后一行之后", because: "原话说末尾" }] }, plan: PLAN, bind: BIND, intent: MATCH });
+    const u = user([], false);
+    const { o, ws } = setup(TODO, Array(6).fill(amb), u);
+    const s = await o.run();
+    expect(s.counters["ask:authorize"]).toBe(1);
+    expect(s.status).toBe("waiting_user");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
   it("an approval-kind missing item is not asked as a question", async () => {
     const want = byRole({ goal: { ...GOAL, missing: [{ what: "确认追加", question: "可以追加吗？", kind: "approval" }] }, plan: PLAN, bind: BIND, intent: MATCH });
     const u = user();

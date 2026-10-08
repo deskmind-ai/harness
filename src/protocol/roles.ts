@@ -21,6 +21,9 @@ export const GoalAnswer = z.object({
   authorized_rewrites: z.array(z.string()).default([]),
   /** The user handed a choice to us (「随便」「你看着办」「由你决定」). We may decide, and every write is then confirmed first. */
   user_delegated: z.boolean().default(false),
+  /** Where the request can be read more than one way and the model picked a reading: say which, and why. Each
+   *  assumption is put to the user before the first write; evidence-backed readings still need the user's nod. */
+  assumptions: z.array(z.object({ reading: z.string().min(1), because: z.string().default("") })).default([]),
   /** kind: information = only the user knows it (which file, what text); approval = permission for an action the
    *  model already knows how to do. The runtime asks for information and confirms actions itself. */
   missing: z.array(z.object({

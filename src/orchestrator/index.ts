@@ -230,7 +230,7 @@ export class Orchestrator {
     const rewrites = g.authorized_rewrites.filter(named);        // a rewrite authority must point at a file the user named
     if (rewrites.length !== g.authorized_rewrites.length) this.emit("decision.rejected", { why: "goal: authorized_rewrites names a file the user did not: " + JSON.stringify(g.authorized_rewrites.filter((p) => !named(p))) });
     if (g.user_delegated) this.emit("note", { text: "用户把这个选择交给了我们；由此决定的每个改动执行前都先给用户确认" });
-    const goal: Goal = { requirements: g.requirements, constraints: g.constraints, authorized_rewrites: rewrites, user_delegated: g.user_delegated };
+    const goal: Goal = { requirements: g.requirements, constraints: g.constraints, authorized_rewrites: rewrites, user_delegated: g.user_delegated, assumptions: g.assumptions };
     this.emit("goal.accepted", { goal });
   }
 
@@ -452,6 +452,18 @@ export class Orchestrator {
     // lost. Only content written by this run may be overwritten without asking.
     // The request itself authorizes rewriting a file the user named for rewriting (「把 X 的内容改成…」). It does not
     // authorize discarding a file the user asked to *create* (「新建 X」 when X exists) or one the user never named.
+    if (cap.effect !== "observe" && (st.goal!.assumptions ?? []).length && !st.n["assumptions_confirmed"]) {
+      const text = "这个要求可以有不止一种理解，我打算这样做：" + st.goal!.assumptions.map((a) => `${a.reading}${a.because ? `（因为${a.because}）` : ""}`).join("；") + "。可以吗？";
+      const digest = sha("assumptions:" + text);
+      if (st.declined.has(digest)) return this.finish("waiting_user", "the user rejected our reading of the request");
+      if (!st.approvals.has(digest)) {
+        this.emit("interaction.request", { body: { kind: "authorize", text, digest } });
+        const ok = this.user.authorize(text);
+        this.emit("interaction.reply", { body: { kind: "authorize", text, digest, approved: ok } });
+        if (!ok) return this.finish("waiting_user", "the user rejected our reading of the request");
+      }
+      st.n["assumptions_confirmed"] = 1;
+    }
     const authorized = new Set(st.goal!.authorized_rewrites ?? []);
     const foreign = !!cap.discards && writes.some((p) => !this.createdByUs(p) && !authorized.has(p));
     const delegated = !!st.goal!.user_delegated && cap.effect !== "observe";

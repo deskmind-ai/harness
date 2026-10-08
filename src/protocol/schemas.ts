@@ -43,6 +43,7 @@ export const Goal = z.object({
   constraints: z.array(z.string()),
   authorized_rewrites: z.array(z.string()).default([]),
   user_delegated: z.boolean().default(false),
+  assumptions: z.array(z.object({ reading: z.string(), because: z.string().default("") })).default([]),
 });
 export type Goal = z.infer<typeof Goal>;
 
