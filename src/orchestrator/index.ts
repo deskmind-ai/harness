@@ -237,6 +237,7 @@ export class Orchestrator {
     // Ambiguity (docs/ask-policy.md).
     const delegated = g.user_delegated || st.delegatedByAnswer;     // the 「由你决定」 option is structural, not a reading of words
     const assumptions: Goal["assumptions"] = [];
+    const fromAnswer = new Set<number>();
     for (const a of g.assumptions) {
       const s = this.settledFor(a);
       if (s && s.option !== null && s.option < s.readings.length) {
@@ -249,20 +250,24 @@ export class Orchestrator {
         }
         assumptions.push({ ...a, evidence: [s.text], backed: true, settled: true });
       } else if (s) {
-        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: true });   // a free-text answer is the evidence
+        // a free-text answer is evidence, but only the judge below can say whether it picks this reading
+        // (「按我原来说的做」 picks nothing)
+        fromAnswer.add(assumptions.length);
+        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: false });
       } else {
         const evidence = a.evidence.filter((x) => this.isEvidence(x));
         assumptions.push({ ...a, evidence, backed: evidence.length > 0, settled: false });
       }
     }
     // an independent judge decides whether the cited evidence actually tells the readings apart
-    for (const a of assumptions) {
+    for (const [i, a] of assumptions.entries()) {
       if (a.settled || !a.backed || !a.alternatives.length || delegated) continue;
       const opts = [a.reading, ...a.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
       const ids = opts.map((o) => o.id) as [string, ...string[]];
       const rep = await this.askModel("choice", P.choicePrompt(`用户原话里的「${a.point}」指的是哪一种？只根据下面的证据判断；证据区分不了就选「说不清」。`, { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") return this.modelFailed(rep);
-      if (rep.data!.choice !== "r0") {
+      if (rep.data!.choice === "r0") { if (fromAnswer.has(i)) a.settled = true; }
+      else {
         a.backed = false;
         this.emit("note", { text: `核对证据时没有支持「${a.reading}」（选了 ${opts.find((o) => o.id === rep.data!.choice)?.text}）` });
       }

@@ -366,6 +366,26 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
   });
 
+  it("a free-text answer that picks no reading settles nothing: no write, no second identical question", async () => {
+    const asked: string[] = [];
+    const u: User = { clarify(q) { asked.push(q); return { text: "按我原来说的做。" }; }, authorize: () => true };
+    const g = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, choice: { choice: "r2" }, plan: PLAN, bind: BIND, intent: MATCH });
+    const { o, ws } = setup(TODO, Array(8).fill(g), u);
+    const s = await o.run();
+    expect(asked.length).toBe(1);
+    expect(s.status).toBe("waiting_user");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("a free-text answer the judge reads as picking the reading settles it", async () => {
+    const u: User = { clarify: () => ({ text: "另起一行" }), authorize: () => false };
+    const g = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, choice: { choice: "r0" }, plan: PLAN, bind: BIND, intent: MATCH });
+    const { o, ws } = setup(TODO, Array(8).fill(g), u);
+    const s = await o.run();
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+  });
+
   it("words of the request, or fragments of a file, are not evidence", async () => {
     const asked: string[] = [];
     const u: User = { clarify(q) { asked.push(q); return null; }, authorize: () => true };
