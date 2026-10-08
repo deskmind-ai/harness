@@ -26,7 +26,8 @@ import { Log, State, type NodeState } from "./log.js";
 import * as P from "./prompts.js";
 
 export interface User {
-  clarify(question: string): string | null;
+  /** Answer a question. `options` are shown as 1..n plus 「其他（直接输入）」; the answer may be a number or text. */
+  clarify(question: string, options?: string[]): string | null;
   authorize(text: string): boolean;
 }
 
@@ -202,7 +203,7 @@ export class Orchestrator {
     const g = rep.data!;
     if (g.feasible === "needs_capability_we_lack") return this.finish("failed", "cannot: " + (g.infeasible_reason ?? "需要没有注册的能力"));
     const info = g.missing.filter((m) => m.kind !== "approval");
-    if (info.length) return this.clarify(info[0]!.question, "goal: " + info[0]!.what);
+    if (info.length) return this.clarify(info[0]!.question, "goal: " + info[0]!.what, info[0]!.options);
     if (g.missing.length) this.emit("note", { text: "模型想先要批准；批准由执行前的确认处理：" + g.missing.map((m) => m.what).join("；") });
     const bad = g.requirements.filter((r) => r.check.kind === "deterministic" && (!r.check.name || !(C_CHECKS as readonly string[]).includes(r.check.name) || typeof r.check.args !== "object"));
     if (bad.length) {
@@ -705,8 +706,12 @@ export class Orchestrator {
     return /确认|批准|同意|是否要|要不要|可以(删|移|覆盖|执行)|真的要/.test(q) && !/叫什么|哪个|哪一|什么内容|放到哪|写什么|名字/.test(q);
   }
 
-  private clarify(question: string, why = "") {
+  private clarify(question: string, why = "", options: string[] = []) {
     const st = this.st;
+    // options the model offers must exist in the evidence; the rest are dropped (a candidate is a fact, not a guess)
+    const shown = this.ws.listing().entries.map((e) => e.path);
+    const evidence = [st.raw, ...st.answersText(), ...shown].map(loose);
+    const valid = options.filter((o) => /由你决定|你定|都可以/.test(o) || evidence.some((t) => t.includes(loose(o))));
     if (Orchestrator.isApprovalRequest(question)) {
       st.count("approval_regex_fired");                       // the structural path is missing[].kind; this is the backstop
       const digest = sha("approval:" + question);
@@ -723,10 +728,12 @@ export class Orchestrator {
     }
     if (st.get("ask:clarify") >= this.budget.asks) return this.finish("waiting_user", "asked the user too often without progress");
     if (st.answers.some((a) => loose(a.question) === loose(question))) return this.finish("waiting_user", "the same question was already answered; not asking again");
-    this.emit("interaction.request", { body: { kind: "clarify", question, why } });
-    const text = this.user.clarify(question);
+    this.emit("interaction.request", { body: { kind: "clarify", question, why, options: valid } });
+    let text = this.user.clarify(question, valid);
     if (text === null) return this.finish("waiting_user", "no answer from the user");
-    this.emit("interaction.reply", { body: { kind: "clarify", question, text } });
+    const n = /^\s*(\d+)\s*[.．、)]?\s*$/.exec(text);
+    if (n && valid[Number(n[1]) - 1]) text = valid[Number(n[1]) - 1]!;        // a number picks an option
+    this.emit("interaction.reply", { body: { kind: "clarify", question, text, options: valid } });
     if (Orchestrator.isUninformative(text)) {
       // 「随便」「你看着办」 delegates the choice: the model may decide, but every write it then proposes is shown to
       // the user for approval first (a blank cheque it is not)

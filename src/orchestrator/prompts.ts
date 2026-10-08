@@ -54,7 +54,8 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
       { id: "r1", statement: "任务目录里有 清单.log", check: { kind: "deterministic", name: "file_exists", args: { path: "清单.log" } }, quotes: ["新建 清单.log"] },
       { id: "r2", statement: "清单.log 的内容是「等评审」", check: { kind: "deterministic", name: "text_equals", args: { path: "清单.log", text: "等评审" } }, quotes: ["内容为「等评审」"] },
     ], constraints: ["不动其他文件"], missing: [], feasible: "yes" }),
-    "缺信息时的 missing 示例：", J([{ what: "要改名的是哪个文件", question: "要改名的是 memo-a.txt 还是 方案-b.txt？", kind: "information" }]),
+    "- missing 里尽量给 options：2–6 个来自证据的候选（目录里真有的文件、原文里真有的词），程序会渲染成编号选项加「其他」让用户点选；选择是偏好时可以加一个「由你决定」。",
+    "缺信息时的 missing 示例：", J([{ what: "要改名的是哪个文件", question: "要改名的是哪个文件？", kind: "information", options: ["memo-a.txt", "方案-b.txt"] }]),
   ].join("\n");
 }
 

@@ -18,7 +18,12 @@ export const GoalAnswer = z.object({
   constraints: z.array(z.string()),
   /** kind: information = only the user knows it (which file, what text); approval = permission for an action the
    *  model already knows how to do. The runtime asks for information and confirms actions itself. */
-  missing: z.array(z.object({ what: z.string(), question: z.string(), kind: z.enum(["information", "approval"]).default("information") })),
+  missing: z.array(z.object({
+    what: z.string(), question: z.string(), kind: z.enum(["information", "approval"]).default("information"),
+    /** Candidate answers taken from the evidence (files in the directory, words in the request), 2–6; the runtime
+     *  shows them as a numbered list plus 「其他」. 「由你决定」 is a legitimate option when the choice is a preference. */
+    options: z.array(z.string().min(1)).max(6).default([]),
+  })),
   feasible: z.enum(["yes", "needs_capability_we_lack", "unclear"]),
   infeasible_reason: z.string().optional(),
 });

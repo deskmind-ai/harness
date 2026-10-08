@@ -135,7 +135,7 @@ export const Verification = z.object({
 // --- interaction ----------------------------------------------------------------------------------------------------------
 
 export const Interaction = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("clarify"), question: z.string(), why: z.string().optional(), text: z.string().optional() }),
+  z.object({ kind: z.literal("clarify"), question: z.string(), why: z.string().optional(), options: z.array(z.string()).optional(), text: z.string().optional() }),
   z.object({ kind: z.literal("authorize"), text: z.string(), digest: z.string(), approved: z.boolean().optional() }),
 ]);
 export type Interaction = z.infer<typeof Interaction>;

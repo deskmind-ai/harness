@@ -25,7 +25,13 @@ class SimUser implements User {
   asked: string[] = [];
   private answers: string[];
   constructor(private readonly task: Task) { this.answers = [...(task.answers ?? [])]; }
-  clarify(q: string) { this.asked.push(q); return this.answers.shift() ?? "按我原来说的做。"; }
+  clarify(q: string, options: string[] = []) {
+    this.asked.push(options.length ? `${q} [${options.map((o, i) => `${i + 1}.${o}`).join(" ")}]` : q);
+    const a = this.answers.shift() ?? "按我原来说的做。";
+    // the scripted user may name an option by its text; return the option so the run exercises the numbered path
+    const hit = options.findIndex((o) => a.includes(o));
+    return hit >= 0 ? String(hit + 1) : a;
+  }
   authorize() { return this.task.approve ?? false; }
 }
 
