@@ -57,8 +57,6 @@ export interface Hooks {
 }
 
 export const BUDGET = { model_calls: 40, actions: 30, replans: 2, asks: 3, rebinds: 2 };
-/** More write steps than this, taken on a reading the user has not confirmed, are shown to the user first. */
-export const BATCH_CONFIRM = 5;
 
 const canon = (x: unknown) => JSON.stringify(x, Object.keys(x as object).sort());
 
@@ -98,7 +96,7 @@ export class Orchestrator {
     readonly gw: Gateway,
     readonly user: User,
     readonly registry: Registry,
-    readonly opts: { skills?: SkillLibrary; gui?: GuiApp; hooks?: Hooks; budget?: Partial<typeof BUDGET> } = {},
+    readonly opts: { skills?: SkillLibrary; gui?: GuiApp; hooks?: Hooks; budget?: Partial<typeof BUDGET>; history?: string[] } = {},
   ) {
     this.log = new Log(logPath);
     this.budget = { ...BUDGET, ...(opts.budget ?? {}) };
@@ -166,7 +164,11 @@ export class Orchestrator {
       const nodes = [...st.nodes.values()];
       const ready = nodes.filter((n) => n.status === "pending" && n.node.depends_on.every((d) => st.nodes.get(d)?.status === "verified"));
       const bound = nodes.filter((n) => n.status === "ready");
-      if (bound.length) { this.doExecute(bound[0]!); continue; }
+      if (bound.length) {
+        // before the first write: show the plan first, or act and report (docs/ask-policy.md)
+        if (this.cap(bound[0]!.node.capability).effect !== "observe" && !st.planConfirmed && (await this.planNeedsConfirmation())) { this.confirmPlan(); continue; }
+        this.doExecute(bound[0]!); continue;
+      }
       if (ready.length) {
         const boundNow: NodeState[] = [];
         for (const n of ready) {
@@ -521,8 +523,6 @@ export class Orchestrator {
     // lost. Only content written by this run may be overwritten without asking.
     // The request itself authorizes rewriting a file the user named for rewriting (「把 X 的内容改成…」). It does not
     // authorize discarding a file the user asked to *create* (「新建 X」 when X exists) or one the user never named.
-    // the plan is shown once, at the first write, when every step that can be bound already is (docs/ask-policy.md)
-    if (cap.effect !== "observe" && !st.planConfirmed && this.planNeedsConfirmation()) return this.confirmPlan();
     // Per-action confirmation, independent of ambiguity: consequential capabilities, and discarding content this run
     // did not write unless the user named that file for rewriting (docs/ask-policy.md)
     const authorized = new Set(st.goal!.authorized_rewrites ?? []);
@@ -565,13 +565,34 @@ export class Orchestrator {
 
   /** docs/ask-policy.md: the plan is shown once before the first write when the user delegated a choice, or when it
    *  acts on a reading the user has not confirmed and either contains a step without undo or is a large batch. */
-  private planNeedsConfirmation(): boolean {
+  private async planNeedsConfirmation(): Promise<boolean> {
     const st = this.st, g = st.goal!, plan = st.plan!;
     const writes = plan.nodes.filter((n) => this.registry.get(n.capability)?.effect !== "observe");
     if (!writes.length) return false;
+    // guards, not judgements: the user asked us to decide (they see the proposal), or a step cannot be taken back
     if (g.user_delegated) return true;
-    if (!g.assumptions.some((a) => !a.settled)) return false;
-    return writes.some((n) => !this.registry.get(n.capability)?.reversible) || writes.length > BATCH_CONFIRM;
+    const open = g.assumptions.filter((a) => !a.settled);
+    if (!open.length) return false;
+    if (writes.some((n) => !this.registry.get(n.capability)?.reversible)) return true;
+    // everything can be undone: whether to interrupt the user first is a judgement, made once per plan and logged
+    if (st.askDecision) return st.askDecision === "confirm";
+    const steps = writes.map((n) => { const a = st.nodes.get(n.id)?.args; return a ? describe(this.cap(n.capability), a) : n.purpose; });
+    const paths = new Set(writes.flatMap((n) => { const a = st.nodes.get(n.id)?.args; return a ? this.cap(n.capability).footprint(this.ws, a).writes : []; }));
+    const opts = [
+      { id: "act", text: "直接做，做完告诉用户我是怎么理解的；理解错了用户可以一键撤回" },
+      { id: "confirm", text: "先把计划给用户看，用户同意了再做" },
+    ];
+    const ctx = {
+      用户原文: st.raw, 用户后来补充: st.answersText(),
+      我的理解: open.map((a) => ({ 哪一处: a.point, 我选的: a.reading, 其他说得通的: a.alternatives, 依据: a.evidence })),
+      计划要做的改动: steps, 已知会改到的文件和文件夹数: paths.size, 还没定下具体文件的步骤数: writes.filter((n) => !st.nodes.get(n.id)?.args).length,
+      能不能撤回: "每一步都能撤回",
+      ...(this.opts.history?.length ? { 这位用户以前的反应: this.opts.history.slice(-10) } : {}),
+    };
+    const rep = await this.askModel("choice", P.choicePrompt("动手前要不要先打断用户、给他看计划？权衡两件事：理解错了的话，用户要发现并撤回有多麻烦（改动多、分散、不显眼就更麻烦）；问一句会打断用户（理解有把握、改动少而集中就没必要问）。", ctx, opts), R.choiceAnswer(["act", "confirm"]));
+    if (rep.outcome !== "answered") return true;                     // no judgement available: the careful side
+    this.emit("ask.decided", { decision: rep.data!.choice, reason: rep.data!.reason ?? "", steps: writes.length, paths: paths.size });
+    return rep.data!.choice === "confirm";
   }
 
   private confirmPlan() {

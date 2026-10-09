@@ -73,7 +73,8 @@ export class State {
   /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
    *  readings, or null for free text). They bind every later goal. */
   settled: { point: string; readings: string[]; text: string; option: number | null }[] = [];
-  delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
+  delegatedByAnswer = false;
+  askDecision: "act" | "confirm" | null = null;   // the judgement for the current plan (ask.decided)                     // the user picked 「由你决定」 on some question
   notes: string[] = [];
 
   count(key: string, by = 1) {
@@ -104,7 +105,7 @@ export class State {
         this.goal = e.goal; this.revs.goal_rev += 1; this.revs.evidence_epoch += 1;
         break;
       case "plan.accepted":
-        this.plan = e.plan; this.revs.plan_rev += 1; this.revs.evidence_epoch += 1; this.planConfirmed = false;
+        this.plan = e.plan; this.revs.plan_rev += 1; this.revs.evidence_epoch += 1; this.planConfirmed = false; this.askDecision = null;
         this.nodes = new Map((e.plan as Plan).nodes.map((n) => [n.id, { node: n, status: "pending", bindings: null, args: null, output: null, operationIds: [], attempts: 0 }]));
         this.skillUsed = e.plan.skill ?? null;
         this.count("replans", e.replan ?? 0);
@@ -129,6 +130,9 @@ export class State {
         if (nd) nd.status = "failed";
         break;
       }
+      case "ask.decided":
+        this.askDecision = e.decision;
+        break;
       case "goal.retry":                         // one shared re-derivation per run when a goal ignores the user's choice
         this.count("goal_retry");
         break;
