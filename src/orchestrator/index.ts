@@ -530,9 +530,9 @@ export class Orchestrator {
     if ((cap.requiresConfirmation || foreign) && !st.approvals.has(digest)) {
       if (st.declined.has(digest)) { this.emit("node.failed", { node_id: node.id, why: "declined by the user" }); return; }
       const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）` : text;
-      this.emit("interaction.request", { body: { kind: "authorize", text: ask, digest } });
+      this.emit("interaction.request", { body: { kind: "authorize", purpose: "action", text: ask, digest } });
       const ok = this.user.authorize(ask);
-      this.emit("interaction.reply", { body: { kind: "authorize", text: ask, digest, approved: ok } });
+      this.emit("interaction.reply", { body: { kind: "authorize", purpose: "action", text: ask, digest, approved: ok } });
       if (!ok) {
         this.emit("node.failed", { node_id: node.id, why: "declined by the user" });
         this.emit("note", { text: `用户不同意：${ask}。要换一种不需要这一步的做法。` });
@@ -589,9 +589,9 @@ export class Orchestrator {
     const digest = sha("plan:" + canon({ nodes: writes.map((n) => [n.capability, n.purpose, st.nodes.get(n.id)?.args ?? null]), readings: open.map((a) => a.reading) }));
     if (st.declined.has(digest)) return this.finish("waiting_user", "the user declined the plan; their choice is needed");
     if (!st.approvals.has(digest)) {
-      this.emit("interaction.request", { body: { kind: "authorize", text, digest } });
+      this.emit("interaction.request", { body: { kind: "authorize", purpose: "plan", text, digest } });
       const ok = this.user.authorize(text);
-      this.emit("interaction.reply", { body: { kind: "authorize", text, digest, approved: ok } });
+      this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: ok } });
       // the user rejected our proposal: proposing another guess is not useful, the user has to choose
       if (!ok) return this.finish("waiting_user", "the user declined the plan; their choice is needed");
     }
@@ -722,9 +722,9 @@ export class Orchestrator {
         // only the user can judge this one: ask once, remember the answer (never the verify model)
         const digest = sha("confirm:" + r.statement);
         if (!st.approvals.has(digest) && !st.declined.has(digest)) {
-          this.emit("interaction.request", { body: { kind: "authorize", text: r.statement, digest } });
+          this.emit("interaction.request", { body: { kind: "authorize", purpose: "result", text: r.statement, digest } });
           const ok = this.user.authorize(r.statement);
-          this.emit("interaction.reply", { body: { kind: "authorize", text: r.statement, digest, approved: ok } });
+          this.emit("interaction.reply", { body: { kind: "authorize", purpose: "result", text: r.statement, digest, approved: ok } });
         }
         const ok = st.approvals.has(digest);
         results[r.id] = { passed: ok, evidence: ok ? "用户确认" : "用户未确认" };
@@ -816,9 +816,9 @@ export class Orchestrator {
     if (el?.consequential) {                        // the app profile marks effects the user did not ask for
       const digest = sha(text);
       if (!st.approvals.has(digest)) {
-        this.emit("interaction.request", { body: { kind: "authorize", text, digest } });
+        this.emit("interaction.request", { body: { kind: "authorize", purpose: "action", text, digest } });
         const ok = this.user.authorize(text);
-        this.emit("interaction.reply", { body: { kind: "authorize", text, digest, approved: ok } });
+        this.emit("interaction.reply", { body: { kind: "authorize", purpose: "action", text, digest, approved: ok } });
         if (!ok) { this.emit("note", { text: `用户不同意：${text}` }); return; }
       }
     }
