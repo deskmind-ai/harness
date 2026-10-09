@@ -287,7 +287,7 @@ describe("execution guards", () => {
     expect(texts[0]).toContain("整个文件只剩 X");
     expect(texts[0]).toContain("日志.log");                // the concrete file and text, not only the purpose
     expect(s.counters.actions ?? 0).toBe(0);
-    expect(s.status).toBe("waiting_user");
+    expect(s.status).toBe("cancelled");
     expect(ws.read("日志.log")).toBe("旧内容");
   });
 
@@ -318,7 +318,7 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
   });
 
-  it("「随便」 then declining the proposed plan stops and waits; nothing changes", async () => {
+  it("「随便」 then declining the proposed plan stops; nothing changes", async () => {
     const ask = byRole({ goal: { requirements: [], constraints: [], missing: [{ what: "哪个文件", question: "要改的是哪个文件？", kind: "information" }], feasible: "yes" } });
     const guess = byRole({ goal: { ...GOAL, user_delegated: true }, plan: PLAN, bind: BIND, intent: MATCH });
     const u = user(["你看着办吧"], false);
@@ -326,7 +326,7 @@ describe("execution guards", () => {
     const s = await o.run();
     expect(u.asked.length).toBe(1);
     expect(s.counters["ask:authorize"]).toBe(1);
-    expect(s.status).toBe("waiting_user");
+    expect(s.status).toBe("cancelled");
     expect(ws.read("todo.txt")).toBe("交房租\n");
   });
 

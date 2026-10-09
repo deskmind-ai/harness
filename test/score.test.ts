@@ -32,6 +32,13 @@ describe("evalset v2 scoring", () => {
     expect(score(task(), start, start, waiting, [], talk({ clarify: 1, clarified: true, wrote: false })).correct).toBe(false);
   });
 
+  it("the user choosing 「先别做了」 with nothing changed is a correct stop where stopping is acceptable", () => {
+    const open = task({ gold: { ...task().gold, asked_ok: true } });
+    const cancelled = { status: "cancelled", counters: {}, ops: {} };
+    expect(score(open, start, start, cancelled, [], talk({ clarify: 1, cancelled: true, wrote: false }))).toMatchObject({ correct: true, outcome: "cancelled" });
+    expect(score(task(), start, start, cancelled, [], talk({ clarify: 1, cancelled: true, wrote: false })).correct).toBe(false);
+  });
+
   it("a plan the user turned down is reported apart from asking, and is not counted correct", () => {
     const open = task({ must_ask: true, gold: { ...task().gold, asked_ok: true } });
     expect(score(open, start, start, waiting, [], talk({ authorize: 1, declinedPlan: true, wrote: false }))).toMatchObject({ correct: false, outcome: "declined_plan", declined_plan: true });

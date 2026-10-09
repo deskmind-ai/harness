@@ -73,7 +73,8 @@ export class State {
   /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
    *  readings, or null for free text). They bind every later goal. */
   settled: { point: string; readings: string[]; text: string; option: number | null }[] = [];
-  delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
+  delegatedByAnswer = false;
+  preferences: string[] = [];                    // what the user said about being asked (preference events)                     // the user picked 「由你决定」 on some question
   notes: string[] = [];
 
   count(key: string, by = 1) {
@@ -131,6 +132,19 @@ export class State {
       }
       case "goal.retry":                         // one shared re-derivation per run when a goal ignores the user's choice
         this.count("goal_retry");
+        break;
+      case "plan.revise":                        // the user dropped a step: plan the rest again
+        this.plan = null; this.nodes = new Map(); this.planConfirmed = false;
+        break;
+      case "execution.undone": {
+        const op = this.ops.get(e.operation_id);
+        if (op) op.state = "undone";
+        Object.assign(this.lastVersions, e.versions); this.seen(e.versions);
+        this.effects.push(`撤回：${e.text}`);
+        break;
+      }
+      case "preference":
+        this.preferences.push(e.text);
         break;
       case "ambiguity.settled":                  // the judge read a free-text answer as picking one of the readings
         this.settled.push({ point: e.point, readings: e.readings, text: e.text, option: e.option });

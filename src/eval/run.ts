@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { CONFIGS, Gateway, withOverrides } from "../gateway/index.js";
-import { Orchestrator, type Answer, type Hooks, type User } from "../orchestrator/index.js";
+import { Orchestrator, cardUser, type Answer, type Card, type CardUser, type Hooks } from "../orchestrator/index.js";
 import { Crash, Registry } from "../registry/capability.js";
 import { RENAMES, fileRegistry } from "../registry/fs.js";
 import { guiRegistry } from "../gui/sim.js";
@@ -57,63 +57,84 @@ function simJudge(prompt: string, stats: { calls: number; cached: number; fallba
   return merged[key]!;
 }
 
-class SimUser implements User {
+class SimUser implements CardUser {
   asked: string[] = [];
-  clarifies = 0;
-  authorizes = 0;
-  approvals: { text: string; approved: boolean }[] = [];
+  clarifies = 0;                                             // blocking questions (missing, ambiguity, can't-do)
+  authorizes = 0;                                            // blocking confirmations (plan, action, result)
+  approvals: { text: string; approved: boolean; picked?: string }[] = [];
   sim = { calls: 0, cached: 0, fallbacks: 0 };              // the simulated user's model: answered, from cache, failed
   private answers: string[];
-  constructor(private readonly task: Task) { this.answers = [...(task.answers ?? [])]; }
-  clarify(q: string, options: string[]): Answer {
-    this.clarifies++;
-    this.asked.push(options.length ? `${q} [${options.map((o, i) => `${i + 1}.${o}`).join(" ")}]` : q);
-    const f = this.task.user_facts;
-    if (!f) {                                                  // v1 tasks: the scripted answers
-      const a = this.answers.shift() ?? "按我原来说的做。";
-      const hit = options.findIndex((o) => a.trim() === o.trim());
-      return hit >= 0 ? { option: hit } : { text: a };
+  private legacy: CardUser;
+  constructor(private readonly task: Task) {
+    this.answers = [...(task.answers ?? [])];
+    // v1 tasks: the scripted answers and a fixed yes / no, seen through cards
+    this.legacy = cardUser({
+      clarify: (_q, options) => {
+        const a = this.answers.shift() ?? "按我原来说的做。";
+        const hit = options.findIndex((o) => a.trim() === o.trim());
+        return hit >= 0 ? { option: hit } : { text: a };
+      },
+      authorize: () => this.task.approve ?? false,
+    });
+  }
+
+  ask(card: Card): Answer | null {
+    const question = ["missing", "ambiguity", "cannot"].includes(card.kind);
+    if (question) { this.clarifies++; this.asked.push(`${card.text} [${card.options.map((o, i) => `${i + 1}.${o.text}`).join(" ")}]`); }
+    else if (card.blocking) this.authorizes++;
+    const a = this.answer(card);
+    if (!question && card.blocking) {
+      const picked = a && "option" in a ? card.options[a.option]?.kind : "other";
+      this.approvals.push({ text: card.text.slice(0, 200), approved: picked === "approve", picked });
     }
-    // v2: an option naming what the user wants (the task's own acceptable answers) is picked directly
-    const wanted = (f.choice_texts ?? []).map(loose).filter(Boolean);
-    const exact = options.findIndex((o) => wanted.includes(loose(o)));
-    const hit = exact >= 0 ? exact : options.findIndex((o) => wanted.some((c) => loose(o).includes(c)));
-    if (hit >= 0) return { option: hit };
+    return a;
+  }
+
+  private answer(card: Card): Answer | null {
+    const f = this.task.user_facts;
+    if (!f) return this.legacy.ask(card);
+    const at = (k: string) => card.options.findIndex((o) => o.kind === k);
+    if (at("approve") >= 0 && f.approve === "yes") return { option: at("approve") };
+    if (card.kind === "missing" || card.kind === "ambiguity") {
+      // an option naming what the user wants (the task's own acceptable answers) is picked directly
+      const wanted = (f.choice_texts ?? []).map(loose).filter(Boolean);
+      const exact = card.options.findIndex((o) => wanted.includes(loose(o.text)));
+      const hit = exact >= 0 ? exact : card.options.findIndex((o) => ["value", "proposal", "reading"].includes(o.kind) && wanted.some((c) => loose(o.text).includes(c)));
+      if (hit >= 0) return { option: hit };
+    }
     const r = simJudge([
       "你在扮演一位用户。你心里真正的意思是：" + f.intent,
       "被问到时你会这样说：" + f.answer,
-      `助手问你：${q}`,
-      options.length ? "选项：\n" + options.map((o, i) => `${i}. ${o}`).join("\n") : "（没有选项）",
-      "如果某个选项完全符合你的意思（不丢掉你在意的细节），就选它；否则用你自己的话回答，尽量照你会说的原话。不要选「由你决定」，除非你心里的意思就是让助手决定。",
+      ...(f.approve === "no" ? ["你不同意助手照现在这样做。"] : []),
+      `助手说：${card.text}`,
+      "选项：\n" + card.options.map((o, i) => `${i}. ${o.text}`).join("\n"),
+      "选最符合你心里意思的那一项：确认的内容完全是你要的（结果对、没有多做）才选「可以」；助手把你的意思理解错了，就选说对了的那一项；不想做了才选「先别做了」；都不合适就用你自己的话回答。不要选「由你决定」，除非你心里的意思就是让助手决定。",
       '只输出 JSON：{"option": 编号} 或 {"text": "你的回答"}',
     ].join("\n"), this.sim);
-    if (r && typeof r.option === "number" && r.option >= 0 && r.option < options.length) return { option: r.option };
-    if (r && typeof r.text === "string" && r.text.trim()) return { text: r.text };
-    if (r) this.sim.fallbacks++;                               // parsed, but neither a valid option nor text
-    return { text: f.answer };
+    if (r && typeof r.option === "number" && r.option >= 0 && r.option < card.options.length) return { option: r.option };
+    if (r && typeof r.text === "string" && r.text.trim() && card.free_text) return { text: r.text };
+    if (r) this.sim.fallbacks++;                               // parsed, but neither a valid option nor usable text
+    if (at("approve") >= 0) return at("cancel") >= 0 ? { option: at("cancel") } : null;   // no judgement: do not approve
+    return card.free_text ? { text: f.answer } : null;
   }
-  authorize(text: string) {
-    this.authorizes++;
+
+  /** The result card is not blocking: the user looks at the result and may undo it. */
+  review(card: Card, effects: string[]): Answer | null {
     const f = this.task.user_facts;
-    let ok: boolean;
-    if (!f) ok = this.task.approve ?? false;
-    else if (f.approve === "yes") ok = true;
-    else if (f.approve === "no") ok = false;
-    else {
-      const r = simJudge([
-        "你在扮演一位用户。你心里真正的意思是：" + f.intent,
-        "助手请你确认下面要做的事。符合你的意思（结果是你要的，没有多做别的）就同意，否则不同意。",
-        text,
-        '只输出 JSON：{"approve": true} 或 {"approve": false}',
-      ].join("\n"), this.sim);
-      if (r && typeof r.approve !== "boolean") this.sim.fallbacks++;
-      ok = r?.approve === true;
-    }
-    this.approvals.push({ text: text.slice(0, 200), approved: ok });
-    return ok;
+    if (!f) return null;
+    const r = simJudge([
+      "你在扮演一位用户。你心里真正的意思是：" + f.intent,
+      `助手做完了，并告诉你：${card.text}`,
+      "它做了这些改动：\n" + effects.slice(-12).join("\n"),
+      "选项：\n" + card.options.map((o, i) => `${i}. ${o.text}`).join("\n"),
+      "结果是你要的就选「好的」；理解错了就选撤回（如果有「撤回，改成…」正好是你的意思，就选它）。",
+      '只输出 JSON：{"option": 编号}',
+    ].join("\n"), this.sim);
+    if (r && typeof r.option === "number" && r.option >= 0 && r.option < card.options.length) return { option: r.option };
+    if (r) this.sim.fallbacks++;
+    return null;
   }
 }
-
 
 function capsFor(task: Task): Registry {
   if (task.caps === "gui") return guiRegistry();
@@ -166,6 +187,16 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
     orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills });
     summ = await orch.run();
   }
+  // the result card is shown with the result: the simulated user may undo, or undo and pick another reading
+  let resultResponse: string | null = null;
+  if (summ.result_card) {
+    const a = user.review(summ.result_card, summ.effects);
+    if (a && "option" in a) {
+      resultResponse = summ.result_card.options[a.option]?.kind ?? null;
+      orch.respond(summ.result_card, a);
+      summ = resultResponse === "undo_and_reading" ? await orch.run() : orch.summary();
+    }
+  }
   let taught: unknown = null;
   if (library && task.group === 5 && task.stage === "teach" && summ.status === "succeeded" && !summ.skill) {
     const filesBefore = Object.entries(start).filter(([, v]) => v !== null).map(([p]) => p);
@@ -181,7 +212,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
-    category: task.category, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, sim: user.sim, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
+    category: task.category, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, result_response: resultResponse, sim: user.sim, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
   fs.writeFileSync(path.join(runDir, "result.json"), JSON.stringify(rec, null, 1));
   fs.rmSync(root, { recursive: true, force: true });
