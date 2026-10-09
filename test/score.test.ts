@@ -66,6 +66,12 @@ describe("what counts as asking before the first write", () => {
     expect(talkOf([plan, write], u).askedBeforeFirstWrite).toBe(true);
     expect(talkOf([question, write], u).askedBeforeFirstWrite).toBe(true);
   });
+  it("the outcome is what the run stopped on: a question answered earlier, then a declined plan, is a declined plan", () => {
+    const q = { kind: "interaction.reply", body: { kind: "clarify", text: "x" } };
+    const no = { kind: "interaction.reply", body: { kind: "authorize", purpose: "plan", approved: false } };
+    expect(talkOf([q, no], u)).toMatchObject({ clarified: false, declinedPlan: true });
+    expect(talkOf([no, q], u)).toMatchObject({ clarified: true, declinedPlan: false });
+  });
   it("the first write is the first intent with writes, so a crash after it still counts", () => {
     const question = { kind: "interaction.request", body: { kind: "clarify" } };
     expect(talkOf([write, question], u)).toMatchObject({ wrote: true, askedBeforeFirstWrite: false });

@@ -29,27 +29,32 @@ const loose = (t: string) => t.replace(/\s+/g, "").toLowerCase();
  *  question or plan. This is the evaluation's stand-in for a person, not part of the harness. */
 // Answers are cached by prompt, so the same question gets the same answer in every run and arm (a model's
 // answer can vary between calls). The cache lives next to the task file.
-let simCache: Record<string, Record<string, unknown>> | null = null;
 let simCachePath = "";
-export function setSimCache(p: string) { simCachePath = p; try { simCache = JSON.parse(fs.readFileSync(p, "utf-8")); } catch { simCache = {}; } }
+type Cache = Record<string, Record<string, unknown>>;
+/** The file is the shared truth between parallel processes: read it fresh, let entries already there win, and replace
+ *  it atomically (write a temp file, then rename). A file that exists but does not parse stops the run instead of
+ *  being silently overwritten. */
+function readCache(): Cache {
+  if (!simCachePath || !fs.existsSync(simCachePath)) return {};
+  const raw = fs.readFileSync(simCachePath, "utf-8");
+  try { return JSON.parse(raw); } catch { throw new Error(`simulated-user cache ${simCachePath} does not parse; refusing to overwrite it`); }
+}
+export function setSimCache(p: string) { simCachePath = p; readCache(); }
 function simJudge(prompt: string, stats: { calls: number; cached: number; fallbacks: number }): Record<string, unknown> | null {
   const key = crypto.createHash("sha256").update(prompt).digest("hex").slice(0, 32);
-  if (simCache?.[key]) { stats.cached++; return simCache[key]!; }
+  const hit = readCache()[key];
+  if (hit) { stats.cached++; return hit; }
   stats.calls++;
   const p = spawnSync("claude", ["-p", "--model", "haiku"], { input: prompt, encoding: "utf-8", timeout: 120_000 });
   const out = p.stdout ?? "";
-  try {
-    const r = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
-    if (simCache && simCachePath) {
-      // re-read before writing: parallel processes share the file; first answer for a key wins
-      let merged: Record<string, Record<string, unknown>> = simCache;
-      try { merged = { ...JSON.parse(fs.readFileSync(simCachePath, "utf-8")), ...simCache }; } catch { /* first write */ }
-      if (!merged[key]) merged[key] = r;
-      simCache = merged;
-      fs.writeFileSync(simCachePath, JSON.stringify(merged));
-    }
-    return simCache?.[key] ?? r;
-  } catch { stats.fallbacks++; return null; }
+  let r: Record<string, unknown>;
+  try { r = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1)); } catch { stats.fallbacks++; return null; }
+  if (!simCachePath) return r;
+  const merged: Cache = { [key]: r, ...readCache() };        // an answer another process stored first wins
+  const tmp = `${simCachePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(merged));
+  fs.renameSync(tmp, simCachePath);
+  return merged[key]!;
 }
 
 class SimUser implements User {
@@ -84,6 +89,7 @@ class SimUser implements User {
     ].join("\n"), this.sim);
     if (r && typeof r.option === "number" && r.option >= 0 && r.option < options.length) return { option: r.option };
     if (r && typeof r.text === "string" && r.text.trim()) return { text: r.text };
+    if (r) this.sim.fallbacks++;                               // parsed, but neither a valid option nor text
     return { text: f.answer };
   }
   authorize(text: string) {
@@ -100,6 +106,7 @@ class SimUser implements User {
         text,
         '只输出 JSON：{"approve": true} 或 {"approve": false}',
       ].join("\n"), this.sim);
+      if (r && typeof r.approve !== "boolean") this.sim.fallbacks++;
       ok = r?.approve === true;
     }
     this.approvals.push({ text: text.slice(0, 200), approved: ok });

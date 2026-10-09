@@ -85,7 +85,8 @@ export function talkOf(events: readonly Record<string, any>[], user: { clarifies
   const firstAsk = events.findIndex(aboutRequest);
   const firstWrite = events.findIndex((e) => e.kind === "execution.intent" && (e.command?.writes ?? []).length > 0);
   const replies = events.filter((e) => e.kind === "interaction.reply");
-  const declinedPlan = replies.some((e) => e.body?.kind === "authorize" && e.body?.purpose === "plan" && e.body?.approved === false);
+  const last = replies.at(-1);
+  const declinedPlan = last?.body?.kind === "authorize" && last?.body?.purpose === "plan" && last?.body?.approved === false;
   return { clarify: user.clarifies, authorize: user.authorizes, wrote: firstWrite >= 0, askedBeforeFirstWrite: firstAsk >= 0 && (firstWrite < 0 || firstAsk < firstWrite),
-    clarified: replies.some((e) => e.body?.kind === "clarify"), declinedPlan };
+    clarified: replies.at(-1)?.body?.kind === "clarify", declinedPlan };       // what the run stopped on: the last exchange
 }
