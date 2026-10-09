@@ -102,15 +102,23 @@ class SimUser implements CardUser {
       const hit = exact >= 0 ? exact : card.options.findIndex((o) => ["value", "proposal", "reading"].includes(o.kind) && wanted.some((c) => loose(o.text).includes(c)));
       if (hit >= 0) return { option: hit };
     }
-    const r = simJudge([
+    const question = card.kind === "missing" || card.kind === "ambiguity" || card.kind === "cannot";
+    const r = simJudge((question ? [
+      // questions: the same wording as before cards, so an option is picked only when it loses nothing the user cares about
       "你在扮演一位用户。你心里真正的意思是：" + f.intent,
       "被问到时你会这样说：" + f.answer,
-      ...(f.approve === "no" ? ["你不同意助手照现在这样做。"] : []),
-      `助手说：${card.text}`,
+      `助手问你：${card.text}`,
       "选项：\n" + card.options.map((o, i) => `${i}. ${o.text}`).join("\n"),
-      "选最符合你心里意思的那一项：确认的内容完全是你要的（结果对、没有多做）才选「可以」；助手把你的意思理解错了，就选说对了的那一项；不想做了才选「先别做了」；都不合适就用你自己的话回答。不要选「由你决定」，除非你心里的意思就是让助手决定。",
+      "如果某个选项完全符合你的意思（不丢掉你在意的细节），就选它；否则用你自己的话回答，尽量照你会说的原话。不要选「由你决定」，除非你心里的意思就是让助手决定。只有你根本不想让助手做这件事时，才选「先别做了」。",
       '只输出 JSON：{"option": 编号} 或 {"text": "你的回答"}',
-    ].join("\n"), this.sim);
+    ] : [
+      "你在扮演一位用户。你心里真正的意思是：" + f.intent,
+      ...(f.approve === "no" ? ["你不同意助手照现在这样做。"] : []),
+      `助手请你确认：${card.text}`,
+      "选项：\n" + card.options.map((o, i) => `${i}. ${o.text}`).join("\n"),
+      "确认的内容完全是你要的（结果对、没有多做、不丢掉你在意的细节）才选「可以」；助手把你的意思理解错了，而某个选项正好说对了，就选那一项；不想做了才选「先别做了」；都不合适就用你自己的话说清楚你要什么。",
+      '只输出 JSON：{"option": 编号} 或 {"text": "你的回答"}',
+    ]).join("\n"), this.sim);
     if (r && typeof r.option === "number" && r.option >= 0 && r.option < card.options.length) return { option: r.option };
     if (r && typeof r.text === "string" && r.text.trim() && card.free_text) return { text: r.text };
     if (r) this.sim.fallbacks++;                               // parsed, but neither a valid option nor usable text
