@@ -1,0 +1,51 @@
+/** Evalset v2 scoring: acceptable-outcome sets, asking as a correct stop, guessing on an open ambiguity. */
+import { describe, expect, it } from "vitest";
+import { score, type Task } from "../src/eval/score.js";
+
+const start = { "简历-产品岗-赵敏.pdf": "x", "简历模板.docx": "t" };
+const asWritten = { "招聘": null, "招聘/产品": null, "招聘/产品/赵敏-简历.pdf": "x", "简历模板.docx": "t" };
+const spelled = { "招聘": null, "招聘/产品岗": null, "招聘/产品岗/赵敏-简历.pdf": "x", "简历模板.docx": "t" };
+const allowed = ["简历-产品岗-赵敏.pdf", "招聘", "招聘/产品", "招聘/产品/赵敏-简历.pdf", "招聘/产品岗", "招聘/产品岗/赵敏-简历.pdf"];
+const task = (over: Partial<Task> = {}): Task => ({
+  id: "t", group: 7, split: "check", raw: "简历放「招聘/岗位」", files: start, category: "ambiguous",
+  gold: { expect: "succeeded", tree: asWritten, allowed, outcomes: [{ name: "role", tree: asWritten, allowed }, { name: "role_with_岗", tree: spelled, allowed }] },
+  ...over,
+});
+const ok = { status: "succeeded", counters: { actions: 3 }, ops: { a: "ok" } };
+const waiting = { status: "waiting_user", counters: {}, ops: {} };
+const talk = (o: Partial<{ clarify: number; authorize: number; askedBeforeFirstWrite: boolean; wrote: boolean }> = {}) => ({ clarify: 0, authorize: 0, askedBeforeFirstWrite: false, wrote: true, ...o });
+
+describe("evalset v2 scoring", () => {
+  it("any listed outcome is correct, and the matched one is reported", () => {
+    expect(score(task(), start, asWritten, ok, [], talk())).toMatchObject({ correct: true, outcome: "role", wrong_effect: false });
+    expect(score(task(), start, spelled, ok, [], talk())).toMatchObject({ correct: true, outcome: "role_with_岗" });
+  });
+
+  it("a literal 「岗位」 folder is outside every outcome: wrong action and false success", () => {
+    const literal = { "招聘": null, "招聘/岗位": null, "招聘/岗位/赵敏-简历.pdf": "x", "简历模板.docx": "t" };
+    expect(score(task(), start, literal, ok, [], talk())).toMatchObject({ correct: false, wrong_effect: true, false_success: true });
+  });
+
+  it("asking and stopping with nothing changed is correct only where asked_ok", () => {
+    const open = task({ must_ask: true, gold: { ...task().gold, asked_ok: true } });
+    expect(score(open, start, start, waiting, [], talk({ clarify: 1, wrote: false }))).toMatchObject({ correct: true, outcome: "asked" });
+    expect(score(task(), start, start, waiting, [], talk({ clarify: 1, wrote: false })).correct).toBe(false);
+  });
+
+  it("writing before any question on an open ambiguity is a wrong action even when the guess was right", () => {
+    const open = task({ must_ask: true, gold: { ...task().gold, asked_ok: true } });
+    expect(score(open, start, asWritten, ok, [], talk({ askedBeforeFirstWrite: false }))).toMatchObject({ correct: false, wrong_effect: true, guessed: true });
+    expect(score(open, start, asWritten, ok, [], talk({ clarify: 1, askedBeforeFirstWrite: true }))).toMatchObject({ correct: true, guessed: false });
+  });
+
+  it("interruptions on a task that needs none are counted as unnecessary", () => {
+    const r = score(task({ interaction: "none" }), start, asWritten, ok, [], talk({ clarify: 1, authorize: 1, askedBeforeFirstWrite: true }));
+    expect(r).toMatchObject({ interruptions: 2, unnecessary: 2 });
+    expect(score(task({ interaction: "needed" }), start, asWritten, ok, [], talk({ clarify: 1 })).unnecessary).toBe(0);
+  });
+
+  it("v1 tasks (no outcomes, no talk) score as before", () => {
+    const v1: Task = { id: "v1", group: 1, split: "dev", raw: "r", files: start, gold: { expect: "succeeded", tree: asWritten, allowed } };
+    expect(score(v1, start, asWritten, ok)).toMatchObject({ correct: true, wrong_effect: false, false_success: false });
+  });
+});
