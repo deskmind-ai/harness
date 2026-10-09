@@ -7,6 +7,7 @@
  *   pnpm eval -- --report runs/B0-luna-dev/results.jsonl
  *
  */
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,16 +21,35 @@ import { Workspace, build } from "../registry/workspace.js";
 import { EditorSim } from "../gui/sim.js";
 import { Library } from "../skills/library.js";
 import { spawnSync } from "node:child_process";
-import { score, type Task, type Talk } from "./score.js";
+import { score, talkOf, type Task } from "./score.js";
 
 const loose = (t: string) => t.replace(/\s+/g, "").toLowerCase();
 
 /** The simulated user's own judgement: a small model reads what the user really means (task.user_facts) and the
  *  question or plan. This is the evaluation's stand-in for a person, not part of the harness. */
-function simJudge(prompt: string): Record<string, unknown> | null {
+// Answers are cached by prompt, so the same question gets the same answer in every run and arm (a model's
+// answer can vary between calls). The cache lives next to the task file.
+let simCache: Record<string, Record<string, unknown>> | null = null;
+let simCachePath = "";
+export function setSimCache(p: string) { simCachePath = p; try { simCache = JSON.parse(fs.readFileSync(p, "utf-8")); } catch { simCache = {}; } }
+function simJudge(prompt: string, stats: { calls: number; cached: number; fallbacks: number }): Record<string, unknown> | null {
+  const key = crypto.createHash("sha256").update(prompt).digest("hex").slice(0, 32);
+  if (simCache?.[key]) { stats.cached++; return simCache[key]!; }
+  stats.calls++;
   const p = spawnSync("claude", ["-p", "--model", "haiku"], { input: prompt, encoding: "utf-8", timeout: 120_000 });
   const out = p.stdout ?? "";
-  try { return JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1)); } catch { return null; }
+  try {
+    const r = JSON.parse(out.slice(out.indexOf("{"), out.lastIndexOf("}") + 1));
+    if (simCache && simCachePath) {
+      // re-read before writing: parallel processes share the file; first answer for a key wins
+      let merged: Record<string, Record<string, unknown>> = simCache;
+      try { merged = { ...JSON.parse(fs.readFileSync(simCachePath, "utf-8")), ...simCache }; } catch { /* first write */ }
+      if (!merged[key]) merged[key] = r;
+      simCache = merged;
+      fs.writeFileSync(simCachePath, JSON.stringify(merged));
+    }
+    return simCache?.[key] ?? r;
+  } catch { stats.fallbacks++; return null; }
 }
 
 class SimUser implements User {
@@ -37,6 +57,7 @@ class SimUser implements User {
   clarifies = 0;
   authorizes = 0;
   approvals: { text: string; approved: boolean }[] = [];
+  sim = { calls: 0, cached: 0, fallbacks: 0 };              // the simulated user's model: answered, from cache, failed
   private answers: string[];
   constructor(private readonly task: Task) { this.answers = [...(task.answers ?? [])]; }
   clarify(q: string, options: string[]): Answer {
@@ -50,7 +71,8 @@ class SimUser implements User {
     }
     // v2: an option naming what the user wants (the task's own acceptable answers) is picked directly
     const wanted = (f.choice_texts ?? []).map(loose).filter(Boolean);
-    const hit = options.findIndex((o) => wanted.some((c) => loose(o) === c || loose(o).includes(c)));
+    const exact = options.findIndex((o) => wanted.includes(loose(o)));
+    const hit = exact >= 0 ? exact : options.findIndex((o) => wanted.some((c) => loose(o).includes(c)));
     if (hit >= 0) return { option: hit };
     const r = simJudge([
       "你在扮演一位用户。你心里真正的意思是：" + f.intent,
@@ -59,7 +81,7 @@ class SimUser implements User {
       options.length ? "选项：\n" + options.map((o, i) => `${i}. ${o}`).join("\n") : "（没有选项）",
       "如果某个选项完全符合你的意思（不丢掉你在意的细节），就选它；否则用你自己的话回答，尽量照你会说的原话。不要选「由你决定」，除非你心里的意思就是让助手决定。",
       '只输出 JSON：{"option": 编号} 或 {"text": "你的回答"}',
-    ].join("\n"));
+    ].join("\n"), this.sim);
     if (r && typeof r.option === "number" && r.option >= 0 && r.option < options.length) return { option: r.option };
     if (r && typeof r.text === "string" && r.text.trim()) return { text: r.text };
     return { text: f.answer };
@@ -77,7 +99,7 @@ class SimUser implements User {
         "助手请你确认下面要做的事。符合你的意思（结果是你要的，没有多做别的）就同意，否则不同意。",
         text,
         '只输出 JSON：{"approve": true} 或 {"approve": false}',
-      ].join("\n"));
+      ].join("\n"), this.sim);
       ok = r?.approve === true;
     }
     this.approvals.push({ text: text.slice(0, 200), approved: ok });
@@ -85,12 +107,6 @@ class SimUser implements User {
   }
 }
 
-/** From the run's log: did the user hear from us before the first write? */
-function talkOf(events: readonly Record<string, any>[], user: SimUser): Talk {
-  const firstAsk = events.findIndex((e) => e.kind === "interaction.request");
-  const firstWrite = events.findIndex((e) => e.kind === "execution.receipt" && e.result?.status === "ok" && Object.keys(e.result?.versions_after ?? {}).length > 0);
-  return { clarify: user.clarifies, authorize: user.authorizes, wrote: firstWrite >= 0, askedBeforeFirstWrite: firstAsk >= 0 && (firstWrite < 0 || firstAsk < firstWrite) };
-}
 
 function capsFor(task: Task): Registry {
   if (task.caps === "gui") return guiRegistry();
@@ -158,7 +174,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
-    category: task.category, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
+    category: task.category, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, sim: user.sim, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
   fs.writeFileSync(path.join(runDir, "result.json"), JSON.stringify(rec, null, 1));
   fs.rmSync(root, { recursive: true, force: true });
@@ -182,12 +198,12 @@ function mergeSummaries(prev: any, cur: any) {
 function reportV2(rows: any[]) {
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = `${r.config}|${r.category}`; by.set(k, [...(by.get(k) ?? []), r]); }
-  console.log("config | category | n | correct | wrong action | of which guessed | false success | errored | interruptions | unnecessary | outcomes | s/task");
+  console.log("config | category | n | correct | wrong action | of which guessed | false success | errored | interruptions | unnecessary | declined plan | sim fallbacks | outcomes | s/task");
   const pct: Record<string, number[]> = {};
   for (const [k, rs] of [...by].sort()) {
     const n = rs.length, f = (key: string) => rs.filter((r) => r[key]).length;
     const outs = Object.entries(rs.reduce((a: Record<string, number>, r) => { if (r.correct) a[r.outcome ?? "?"] = (a[r.outcome ?? "?"] ?? 0) + 1; return a; }, {})).map(([o, c]) => `${o}:${c}`).join(" ");
-    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
+    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${f("declined_plan")} | ${rs.reduce((a, r) => a + (r.sim?.fallbacks ?? 0), 0)} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
     const cfg = k.split("|")[0]!;
     (pct[cfg] ??= []).push(f("correct") / n);
   }
@@ -222,6 +238,7 @@ async function main() {
   const groups = new Set(a.groups!.split(",").map(Number));
   const only = a.only ? new Set(a.only.split(",")) : null;
   let tasks: Task[] = JSON.parse(fs.readFileSync(a.tasks, "utf-8"));
+  setSimCache(path.join(path.dirname(path.resolve(a.tasks)), "sim-cache.json"));
   tasks = tasks.filter((t) => groups.has(t.group) && t.split === a.split && (!only || only.has(t.id)));
   if (a.limit) tasks = tasks.slice(0, Number(a.limit));
   const out = path.resolve("runs", a.out ?? `${a.config}${a.role!.length ? "+" + a.role!.map((r) => r.split("=")[0]).join("+") : ""}-${a.split}`);
