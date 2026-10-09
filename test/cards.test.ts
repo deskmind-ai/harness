@@ -315,4 +315,50 @@ describe("interaction cards", () => {
     const reply = fs.readFileSync(log, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.kind === "interaction.reply" && e.body.picked === "reading");
     expect(reply.body).toMatchObject({ kind: "clarify", purpose: "plan" });
   });
+
+  // --- re-review: a run that writes the same path more than once (screenspot, harness#4) ------------------------------
+  it("undo after appending twice to the same file restores it", async () => {
+    const two = { nodes: [{ id: "n1", capability: "fs.append_line", depends_on: [], purpose: "第一行", requirement_ids: ["r1"] }, { id: "n2", capability: "fs.append_line", depends_on: ["n1"], purpose: "第二行", requirement_ids: ["r1"] }], outcome: "plan" };
+    const goal = { ...GOAL, requirements: [{ id: "r1", statement: "todo.txt 末行是 买鸡蛋", check: { kind: "deterministic", name: "last_line_is", args: { path: "todo.txt", line: "买鸡蛋" } }, quotes: ["买鸡蛋"] }] };
+    let binds = 0;
+    const sc: Scripted = (role) => role === "goal" ? goal : role === "plan" ? two : role === "intent" ? MATCH
+      : role === "bind" ? { bindings: { target: { kind: "resource_ref", path: "todo.txt" }, line: { kind: "source_span", quote: binds++ === 0 ? "买牛奶" : "买鸡蛋", occurrence: 1 } }, unresolved: [] } : { outcome: "error", error: "none" };
+    const { o, ws } = setup(TODO, Array(12).fill(sc), picker(), "在 todo.txt 末尾加两行「买牛奶」「买鸡蛋」");
+    const s = await o.run();
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n买鸡蛋\n");
+    expect(o.undoRun()).toMatchObject({ undone: 2, total: 2, refused: null });
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("undo after a move chain A→B→C puts the file back at A", async () => {
+    const chain = { nodes: [{ id: "n1", capability: "fs.move", depends_on: [], purpose: "先挪到 b", requirement_ids: ["r1"] }, { id: "n2", capability: "fs.move", depends_on: ["n1"], purpose: "再挪到 c", requirement_ids: ["r1"] }], outcome: "plan" };
+    const goal = { requirements: [{ id: "r1", statement: "c.txt 存在", check: { kind: "deterministic", name: "file_exists", args: { path: "c.txt" } }, quotes: ["c.txt"] }], constraints: [], missing: [], feasible: "yes" };
+    let binds = 0;
+    const sc: Scripted = (role) => role === "goal" ? goal : role === "plan" ? chain : role === "intent" ? MATCH
+      : role === "bind" ? (binds++ === 0 ? { bindings: { source: { kind: "resource_ref", path: "a.txt" }, destination: { kind: "source_span", quote: "b.txt", occurrence: 1 } }, unresolved: [] }
+        : { bindings: { source: { kind: "source_span", quote: "b.txt", occurrence: 1 }, destination: { kind: "source_span", quote: "c.txt", occurrence: 1 } }, unresolved: [] }) : { outcome: "error", error: "none" };
+    const { o, ws } = setup({ "a.txt": "内容" }, Array(12).fill(sc), picker(), "把 a.txt 先改名 b.txt，再改名 c.txt");
+    const s = await o.run();
+    expect(s.status).toBe("succeeded");
+    expect(ws.exists("c.txt")).toBe(true);
+    expect(o.undoRun()).toMatchObject({ undone: 2, total: 2, refused: null });
+    expect(ws.read("a.txt")).toBe("内容");
+    expect(ws.exists("b.txt") || ws.exists("c.txt")).toBe(false);
+  });
+
+  it("undo after making a folder and moving files into it removes both", async () => {
+    const plan = { nodes: [{ id: "n1", capability: "fs.mkdir", depends_on: [], purpose: "建文件夹", requirement_ids: ["r1"] }, { id: "n2", capability: "fs.move", depends_on: ["n1"], purpose: "移进去", requirement_ids: ["r1"] }], outcome: "plan" };
+    const goal = { requirements: [{ id: "r1", statement: "归档/a.txt 存在", check: { kind: "deterministic", name: "file_exists", args: { path: "归档/a.txt" } }, quotes: ["归档"] }], constraints: [], missing: [], feasible: "yes" };
+    let binds = 0;
+    const sc: Scripted = (role) => role === "goal" ? goal : role === "plan" ? plan : role === "intent" ? MATCH
+      : role === "bind" ? (binds++ === 0 ? { bindings: { path: { kind: "source_span", quote: "归档", occurrence: 1 } }, unresolved: [] }
+        : { bindings: { source: { kind: "resource_ref", path: "a.txt" }, destination: { kind: "derived", value: "归档/a.txt", from_paths: ["a.txt"], how: "放进归档" } }, unresolved: [] }) : { outcome: "error", error: "none" };
+    const { o, ws } = setup({ "a.txt": "内容" }, Array(12).fill(sc), picker(), "把 a.txt 放进新建的「归档」");
+    const s = await o.run();
+    expect(s.status).toBe("succeeded");
+    expect(o.undoRun()).toMatchObject({ undone: 2, total: 2, refused: null });
+    expect(ws.read("a.txt")).toBe("内容");
+    expect(ws.exists("归档")).toBe(false);
+  });
 });

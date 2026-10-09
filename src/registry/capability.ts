@@ -48,8 +48,10 @@ export interface Capability {
   /** What undo needs that only the state before the action knows (e.g. a file's length before an append). Recorded
    *  in the execution intent, so a step reconciled after a crash (no receipt) can still be undone. */
   prepareUndo?(ws: Workspace, args: Args): Record<string, unknown>;
-  /** Can this step be undone now, without changing anything? `ours`: every path this run wrote, which earlier steps
-   *  of the same undo will take back (so a folder holding only our files counts as empty). */
+  /** What else (beyond "nothing changed the paths since") this step's undo needs, checked without changing anything.
+   *  Whether the paths are as the step left them is checked by the runtime along the chain of steps, because a later
+   *  step of the same run may have written the same path. `ours`: every path this run wrote, which later steps'
+   *  undos take back first (so a folder holding only our files counts as empty). */
   undoCheck?(ws: Workspace, args: Args, receipt: ExecResult, ours: ReadonlySet<string>): string | null;
   /** The action discards existing content of a written path (replace, trash). Overwriting content this run did not
    *  write then needs the user's approval; an append or a move does not discard anything. */

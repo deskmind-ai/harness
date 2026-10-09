@@ -754,11 +754,24 @@ export class Orchestrator {
     // what each step left (its receipt, or the versions found when it was reconciled after a crash) and what undo
     // needs from before it (receipt, or the intent's record)
     const record = (op: (typeof done)[number][1]) => op.receipt?.versions_after ? { ...op.receipt, undo: op.receipt.undo ?? op.intent.undo_prep } as never : null;
-    // check every step first: nothing is touched unless all of them can be taken back
+    // check every step first: nothing is touched unless all of them can be taken back. Walking from the newest step
+    // back, each written path must be exactly as that step left it, given that the later steps' undos have run:
+    // expected[p] starts at the current version and becomes the version before each step (a run may append to the
+    // same file twice, or move A→B→C).
+    const expected: Record<string, string> = {};
     for (const [id, op] of done) {
       const cap = this.registry.get(op.intent.capability);
-      const rec = record(op);
-      const why = !cap?.undo ? `${op.intent.capability} has no undo` : !rec ? `no record of what「${op.intent.text}」left` : cap.undoCheck?.(this.ws, op.intent.args, rec, ours) ?? null;
+      const rec = record(op) as { versions_after: Record<string, string> } | null;
+      let why = !cap?.undo ? `${op.intent.capability} has no undo` : !rec ? `no record of what「${op.intent.text}」left` : null;
+      if (!why) for (const p of op.intent.writes) {
+        const now = p in expected ? expected[p]! : this.ws.version(p);
+        // a folder's version follows its contents, which later steps (and their undos) change; folders are checked
+        // by the capability (mkdir: holds nothing but ours)
+        const left = rec!.versions_after[p];
+        if (left !== undefined && !left.startsWith("dir:") && left !== now) { why = `changed since the action: ${p}`; break; }
+        expected[p] = op.intent.versions_before[p] ?? ABSENT;
+      }
+      why ??= cap!.undoCheck?.(this.ws, op.intent.args, rec as never, ours) ?? null;
       if (why) { this.emit("execution.undo_refused", { operation_id: id, why, checked_first: true }); return { undone: 0, total: done.length, refused: why }; }
     }
     let undone = 0;

@@ -78,7 +78,6 @@ export const fsCreateText = make({
   footprint: (_ws, a) => { const q = join(a.parent!, a.name!); return { reads: [], writes: [q], expectAfter: { [q]: sha(a.text!) } }; },
   pre: (ws, a) => { const q = join(a.parent!, a.name!); return ws.exists(q) ? `${q} already exists` : !folderOk(ws, parentOf(q)) ? `folder ${parentOf(q)} does not exist` : null; },
   run: (ws, a) => { const q = join(a.parent!, a.name!); fs.writeFileSync(ws.abs(q), a.text!, { encoding: "utf-8", flag: "wx" }); maybeCrash(); return after(ws, [q], { file: q }); },
-  check: (ws, a, r) => untouched(ws, r, [join(a.parent!, a.name!)]),
   undo: (ws, a, r) => { const q = join(a.parent!, a.name!); const e = untouched(ws, r, [q]); if (e) return e; fs.unlinkSync(ws.abs(q)); return null; },
 });
 
@@ -98,7 +97,7 @@ export const fsAppendLine = make({
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
   run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
   prep: (ws, a) => ({ bytes: Buffer.byteLength(ws.read(norm(a.target!)), "utf-8") }),
-  check: (ws, a, r) => typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : untouched(ws, r, [norm(a.target!)]),
+  check: (_ws, _a, r) => typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : null,
   undo: (ws, a, r) => { const q = norm(a.target!); const e = typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : untouched(ws, r, [q]); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
 });
 
@@ -108,10 +107,7 @@ export const fsMove = make({
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [], writes: [src, dst], expectAfter: { [src]: ABSENT, [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]); },
-  check: (ws, a, r) => {
-    const src = norm(a.source!), dst = norm(a.destination!);
-    return untouched(ws, r, [src, dst]) ?? (folderOk(ws, parentOf(src)) ? null : `folder ${parentOf(src)} is gone`);
-  },
+  check: (ws, a) => (folderOk(ws, parentOf(norm(a.source!))) ? null : `folder ${parentOf(norm(a.source!))} is gone`),
   undo: (ws, a, r) => {
     const src = norm(a.source!), dst = norm(a.destination!);
     const e = untouched(ws, r, [src, dst]); if (e) return e;
@@ -126,7 +122,6 @@ export const fsCopy = make({
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [src], writes: [dst], expectAfter: { [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.isDir(src) ? `${src} is a folder` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => { const dst = norm(a.destination!); fs.copyFileSync(ws.abs(norm(a.source!)), ws.abs(dst)); maybeCrash(); return after(ws, [dst]); },
-  check: (ws, a, r) => untouched(ws, r, [norm(a.destination!)]),
   undo: (ws, a, r) => { const dst = norm(a.destination!); const e = untouched(ws, r, [dst]); if (e) return e; fs.unlinkSync(ws.abs(dst)); return null; },
 });
 
