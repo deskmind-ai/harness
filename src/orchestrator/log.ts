@@ -76,6 +76,11 @@ export class State {
   delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
   askDecision: "act" | "confirm" | null = null;   // the judgement for the current plan (ask.decided)
   preferences: string[] = [];                    // what the user said about being asked (preference events)
+  /** Steps the user dropped on a plan card (plan.revise): never planned again for the same purpose, never run with
+   *  the same arguments. */
+  skipped: { capability: string | null; purpose: string | null; key: string | null }[] = [];
+  /** Budgets count from here: a redo after the user changed the reading (run.redo) starts fresh. */
+  budgetBase = { actions: 0, model_calls: 0 };
   notes: string[] = [];
 
   count(key: string, by = 1) {
@@ -139,6 +144,11 @@ export class State {
         break;
       case "plan.revise":                        // the user dropped a step: plan the rest again
         this.plan = null; this.nodes = new Map(); this.planConfirmed = false;
+        this.skipped.push({ capability: e.capability ?? null, purpose: e.purpose ?? null, key: e.key ?? null });
+        this.count("plan_revisions");
+        break;
+      case "run.redo":
+        this.budgetBase = { actions: e.actions, model_calls: e.model_calls };
         break;
       case "execution.undone": {
         const op = this.ops.get(e.operation_id);
@@ -203,7 +213,11 @@ export class State {
       case "reconciliation": {
         const op = this.ops.get(e.operation_id)!;
         op.state = ({ happened: "ok", not_happened: "not_executed" } as Record<string, string>)[e.finding] ?? "unknown";
-        if (e.finding === "happened") { Object.assign(this.lastVersions, e.versions); this.seen(e.versions); this.effects.push(e.text); this.count("actions"); }
+        if (e.finding === "happened") {
+          Object.assign(this.lastVersions, e.versions); this.seen(e.versions); this.effects.push(e.text); this.count("actions");
+          // no receipt was written; what the step left is what reconciliation found (undo needs it)
+          op.receipt = { status: "ok", output: {}, versions_after: Object.fromEntries(op.intent.writes.map((p) => [p, e.versions?.[p] ?? ""])) };
+        }
         if (this.status === "needs_reconciliation" && this.unknownOps().length === 0) this.status = "running";
         this.revs.evidence_epoch += 1;
         break;

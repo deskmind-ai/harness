@@ -207,4 +207,112 @@ describe("interaction cards", () => {
     expect(s.status).toBe("succeeded");
     expect(ws.read("日志.log")).toBe("旧内容\nX\n");
   });
+
+  const RAW_TWO = "在 todo.txt 末尾加一行「买牛奶」，再在 记录.txt 里记一笔「买牛奶」";
+  const GOAL_TWO = { ...GOAL, requirements: [...GOAL.requirements, { id: "r2", statement: "记录.txt 存在", check: { kind: "deterministic", name: "file_exists", args: { path: "记录.txt" } }, quotes: ["记录.txt"] }] };
+  // --- review fixes (screenspot, harness#4) ---------------------------------------------------------------------------
+  it("a step reconciled after a crash (no receipt) can still be undone; nothing throws", async () => {
+    const h = byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH });
+    const { o, ws, gw, log } = setup(TODO, Array(6).fill(h), picker(), "在 todo.txt 末尾加一行「买牛奶」", { crash_on_first_effect: true });
+    await expect(o.run()).rejects.toBeInstanceOf(Crash);
+    gw.script = Array(6).fill(h);
+    const o2 = new Orchestrator(log, ws, gw, picker(), fileRegistry());
+    const s = await o2.run();
+    expect(s.status).toBe("succeeded");
+    expect(Object.values(s.ops)).toEqual(["ok"]);
+    const r = o2.undoRun();
+    expect(r).toMatchObject({ undone: 1, refused: null });
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("undo checks every step first: if one cannot be taken back, nothing is touched", async () => {
+    const two = { nodes: [{ id: "n1", capability: "fs.append_line", depends_on: [], purpose: "追加", requirement_ids: ["r1"] }, { id: "n2", capability: "fs.create_text", depends_on: [], purpose: "记一笔", requirement_ids: ["r1"] }], outcome: "plan" };
+    let binds = 0;
+    const sc: Scripted = (role) => role === "goal" ? GOAL_TWO : role === "plan" ? two : role === "bind" ? (binds++ % 2 === 0 ? BIND : { bindings: { parent: { kind: "literal", value: ".", authority: "任务目录" }, name: { kind: "source_span", quote: "记录.txt", occurrence: 1 }, text: { kind: "source_span", quote: "买牛奶", occurrence: 1 } }, unresolved: [] }) : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    const { o, ws, log } = setup(TODO, Array(12).fill(sc), picker(), RAW_TWO);
+    await o.run();
+    expect(ws.exists("记录.txt")).toBe(true);
+    fs.writeFileSync(ws.abs("记录.txt"), "别人改过"); ws.invalidate();
+    const r = o.undoRun();
+    expect(r.undone).toBe(0);
+    expect(r.refused).toBeTruthy();
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");                // the other step was not undone either
+  });
+
+  it("an undo that stops part-way gets its own status, saying how far it got", async () => {
+    const two = { nodes: [{ id: "n1", capability: "fs.append_line", depends_on: [], purpose: "追加", requirement_ids: ["r1"] }, { id: "n2", capability: "fs.create_text", depends_on: [], purpose: "记一笔", requirement_ids: ["r1"] }], outcome: "plan" };
+    let binds = 0, choices = 0;
+    const sc: Scripted = (role) => role === "goal" ? { ...GOAL_TWO, assumptions: [{ ...AMB, evidence: ["交房租"] }] } : role === "choice" ? (choices++ === 0 ? { choice: "r0" } : { choice: "act" }) : role === "plan" ? two
+      : role === "bind" ? (binds++ % 2 === 0 ? BIND : { bindings: { parent: { kind: "literal", value: ".", authority: "任务目录" }, name: { kind: "source_span", quote: "记录.txt", occurrence: 1 }, text: { kind: "source_span", quote: "买牛奶", occurrence: 1 } }, unresolved: [] }) : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    const { o, ws } = setup(TODO, Array(12).fill(sc), picker(), RAW_TWO);
+    const s = await o.run();
+    // the newest step is undone first; make the older one fail only when it is reached (after the check passed)
+    const reg = (o as any).registry;
+    const append = reg.get("fs.append_line");
+    const orig = append.undo;
+    append.undo = () => "disk said no";
+    try { o.respond(s.result_card!, { option: s.result_card!.options.findIndex((x) => x.kind === "undo") }); } finally { append.undo = orig; }
+    const after = o.summary();
+    expect(after.status).toBe("partially_undone");
+    expect(after.reason).toContain("undid 1 of 2");
+    expect(ws.exists("记录.txt")).toBe(false);
+  });
+
+  it("undo and another reading: if the undo cannot happen, the user's reading is still kept", async () => {
+    let choices = 0;
+    const sc: Scripted = (role) => role === "goal" ? { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] } : role === "choice" ? (choices++ === 0 ? { choice: "r0" } : { choice: "act" })
+      : role === "plan" ? PLAN : role === "bind" ? BIND : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    const { o, ws, log } = setup(TODO, Array(10).fill(sc), picker(), "在 todo.txt 末尾加一行「买牛奶」");
+    const s = await o.run();
+    fs.appendFileSync(ws.abs("todo.txt"), "别人加的\n"); ws.invalidate();
+    o.respond(s.result_card!, { option: s.result_card!.options.findIndex((x) => x.kind === "undo_and_reading") });
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n别人加的\n");
+    const events = fs.readFileSync(log, "utf-8");
+    expect(events).toContain('"kind":"ambiguity.settled"');
+    expect(events).not.toContain('"kind":"run.redo"');
+  });
+
+  it("undo and another reading: the redo starts with fresh budgets", async () => {
+    let choices = 0;
+    const sc: Scripted = (role) => role === "goal" ? { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] } : role === "choice" ? (choices++ === 0 ? { choice: "r0" } : { choice: "act" })
+      : role === "plan" ? PLAN : role === "bind" ? BIND : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    const { o, log } = setup(TODO, Array(10).fill(sc), picker(), "在 todo.txt 末尾加一行「买牛奶」");
+    const s = await o.run();
+    o.respond(s.result_card!, { option: s.result_card!.options.findIndex((x) => x.kind === "undo_and_reading") });
+    const redo = fs.readFileSync(log, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.kind === "run.redo");
+    expect(redo.actions).toBeGreaterThanOrEqual(1);
+    expect((o as any).st.budgetBase.actions).toBe(redo.actions);
+  });
+
+  it("a dropped step is refused by code: the planner may not bring it back, and it is never run", async () => {
+    const u = picker("skip_step", "approve", "approve");
+    const two = { nodes: [{ id: "n1", capability: "fs.replace_text", depends_on: [], purpose: "改写", requirement_ids: ["r1"] }, { id: "n2", capability: "fs.append_line", depends_on: [], purpose: "追加", requirement_ids: ["r2"] }], outcome: "plan" };
+    const GOAL2 = { ...GOALW, requirements: [...GOALW.requirements, { id: "r2", statement: "todo.txt 末行是 买牛奶", check: { kind: "deterministic", name: "last_line_is", args: { path: "todo.txt", line: "买牛奶" } }, quotes: ["买牛奶"] }] };
+    let plans = 0, binds = 0;
+    // the planner keeps proposing the dropped step
+    const sc: Scripted = (role) => role === "goal" ? { ...GOAL2, assumptions: [AMBW] } : role === "choice" ? { choice: "r0" } : role === "plan" ? (plans++, two)
+      : role === "bind" ? (binds++ % 2 === 0 ? BINDW : BIND) : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    const { o, ws, log } = setup({ ...LOG, ...TODO }, Array(30).fill(sc), u, "把 日志.log 的内容改成「X」，在 todo.txt 末尾加一行「买牛奶」");
+    await o.run();
+    expect(fs.readFileSync(log, "utf-8")).toContain("includes a step the user dropped");
+    expect(ws.read("日志.log")).toBe("旧内容");
+  });
+
+  it("plan revisions are counted from the log, so a restart does not reset them", async () => {
+    const u = picker("skip_step");
+    const sc = byRole({ goal: { ...GOALW, assumptions: [AMBW] }, choice: { choice: "r0" }, plan: PLANW, bind: BINDW, intent: MATCH });
+    const { o, ws, gw, log } = setup(LOG, Array(6).fill(sc), u, "把 日志.log 的内容改成「X」");
+    await o.run();
+    const o2 = new Orchestrator(log, ws, gw, picker(), fileRegistry());
+    expect((o2 as any).st.get("plan_revisions")).toBe(1);
+  });
+
+  it("a reading picked on a plan card is recorded with purpose plan", async () => {
+    const u = picker("reading");
+    const first = byRole({ goal: { ...GOALW, assumptions: [AMBW] }, choice: { choice: "r0" }, plan: PLANW, bind: BINDW, intent: MATCH });
+    const { o, log } = setup(LOG, [first, first, first, first, first], u, "把 日志.log 的内容改成「X」");
+    await o.run().catch(() => undefined);
+    const reply = fs.readFileSync(log, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.kind === "interaction.reply" && e.body.picked === "reading");
+    expect(reply.body).toMatchObject({ kind: "clarify", purpose: "plan" });
+  });
 });

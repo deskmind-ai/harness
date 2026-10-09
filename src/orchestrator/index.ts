@@ -50,7 +50,9 @@ export type User = CardUser | LegacyUser;
 
 /** A two-method user seen through cards. A question shows only its values / readings / 「由你决定」; a confirmation is
  *  yes or no, and no means: plan → stop (cancel), single action → skip it, result → undo. Can't-do cards were never
- *  shown to such users: no answer. */
+ *  shown to such users: no answer.
+ *  The mapping is lossy: a plain "no" to a plan cannot say which reading or step was wrong, so it can only mean stop;
+ *  card users say which (another reading, drop a step, their own words). */
 export function cardUser(u: User): CardUser {
   if ("ask" in u && typeof u.ask === "function") return u;
   const l = u as LegacyUser;
@@ -196,7 +198,7 @@ export class Orchestrator {
         if (!this.reconcile()) break;
         continue;
       }
-      if (st.get("model_calls") > this.budget.model_calls) { this.finish("failed", "budget: model calls"); break; }
+      if (st.get("model_calls") - st.budgetBase.model_calls > this.budget.model_calls) { this.finish("failed", "budget: model calls"); break; }
       if (!st.goal) { await this.doGoal(); continue; }
       if (this.opts.gui) { await this.doGuiStep(); continue; }
       if (!st.plan) { await this.doPlan(); continue; }
@@ -364,6 +366,9 @@ export class Orchestrator {
   private checkPlan(nodes: Omit<PlanNode, "args">[]): string | null {
     const ids = nodes.map((n) => n.id);
     if (!ids.length) return "no nodes";
+    // the user dropped a step on a plan card: the same capability for the same purpose may not come back
+    const dropped = nodes.find((n) => this.st.skipped.some((s) => s.capability === n.capability && s.purpose === n.purpose));
+    if (dropped) return `includes a step the user dropped: ${dropped.purpose}`;
     if (new Set(ids).size !== ids.length) return "duplicate node ids";
     for (const n of nodes) {
       if (!this.registry.has(n.capability)) return `unknown capability ${n.capability}`;
@@ -531,7 +536,7 @@ export class Orchestrator {
   private doExecute(nd: NodeState) {
     const st = this.st, node = nd.node, cap = this.cap(node.capability), args = nd.args!;
     if (st.unknownOps().length) { this.emit("decision.rejected", { why: "unverified effect pending" }); return; }
-    if (st.get("actions") >= this.budget.actions) return this.finish("failed", "budget: actions");
+    if (st.get("actions") - st.budgetBase.actions >= this.budget.actions) return this.finish("failed", "budget: actions");
     const rev = `${st.revs.goal_rev}/${st.revs.plan_rev}`;
     this.hook("before_execute");
     if (`${st.revs.goal_rev}/${st.revs.plan_rev}` !== rev || !st.nodes.has(node.id)) { this.emit("decision.rejected", { why: "stale: the goal or plan changed before execution" }); return; }
@@ -572,7 +577,15 @@ export class Orchestrator {
       const ask = foreign && !cap.requiresConfirmation ? `${text}（注意：这个文件不是本次任务新建的，这一步会丢掉它现在的内容）` : text;
       return this.confirmAction(ask, digest, node.id);
     }
-    const cmd = { operation_id: `op_${randomUUID().replace(/-/g, "").slice(0, 10)}`, node_id: node.id, capability: cap.id, args, reads, writes, versions_before: now, expect_after: expectAfter, context: st.context(), text };
+    // a step the user dropped on a plan card is never run, whatever the planner proposes again
+    const key = canon({ cap: cap.id, args });
+    if (st.skipped.some((s) => s.key === key)) {
+      this.emit("decision.rejected", { why: `a step the user dropped: ${text}` });
+      this.emit("node.failed", { node_id: node.id, why: "the user dropped this step" });
+      return;
+    }
+    const undo_prep = cap.prepareUndo?.(this.ws, args);          // recorded before acting: undo still works after a crash
+    const cmd = { operation_id: `op_${randomUUID().replace(/-/g, "").slice(0, 10)}`, node_id: node.id, capability: cap.id, args, reads, writes, versions_before: now, expect_after: expectAfter, context: st.context(), text, ...(undo_prep ? { undo_prep } : {}) };
     this.emit("execution.intent", { command: cmd });
     // test hook: die at the first write of this process (reads before it do not count)
     if (this.opts.hooks?.crash_on_first_effect && !this.injected && cap.effect !== "observe") { this.crashNext = true; this.injected = true; }
@@ -657,7 +670,7 @@ export class Orchestrator {
       if (got === null) return this.finish("waiting_user", "no answer from the user");
       const pick = got.option;
       if (pick?.kind === "approve") this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: true, picked: "approve" } });
-      else if (pick?.kind === "reading") return this.settleReading(text, pick);
+      else if (pick?.kind === "reading") return this.settleReading(text, pick, "plan");
       else if (pick?.kind === "skip_step") {
         this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: false, picked: "skip_step" } });
         return this.reviseWithout(pick);
@@ -688,8 +701,10 @@ export class Orchestrator {
 
   /** The user picked another reading on a card: it becomes their choice (as if answered to a question) and the goal is
    *  derived again. */
-  private settleReading(question: string, pick: CardOption) {
-    this.emit("interaction.reply", { body: { kind: "clarify", question, text: pick.readings![pick.reading_index!]!, options: pick.readings, option: pick.reading_index, delegated: false, point: pick.point, readings: pick.readings, picked: pick.kind } });
+  /** Recorded as a clarify reply (purpose says which card it came from), so it re-derives the goal on replay too. It
+   *  counts against the asks budget like any answered question. */
+  private settleReading(question: string, pick: CardOption, purpose: "plan" | "result") {
+    this.emit("interaction.reply", { body: { kind: "clarify", purpose, question, text: pick.readings![pick.reading_index!]!, options: pick.readings, option: pick.reading_index, delegated: false, point: pick.point, readings: pick.readings, picked: pick.kind } });
   }
 
   /** The user's own words on a card: recorded as an answer; the goal is derived again with it. */
@@ -702,10 +717,11 @@ export class Orchestrator {
   private reviseWithout(pick: CardOption) {
     const st = this.st;
     if (st.get("plan_revisions") >= this.budget.replans) return this.finish("waiting_user", "the user keeps declining steps; their choice is needed");
-    st.count("plan_revisions");
     const node = st.plan?.nodes.find((n) => n.id === pick.node_id);
+    const args = pick.node_id ? st.nodes.get(pick.node_id)?.args ?? null : null;
     this.emit("note", { text: `用户不要这一步：${node?.purpose ?? pick.text}。重新规划时去掉它，其余照做。` });
-    this.emit("plan.revise", { node_id: pick.node_id ?? null });
+    this.emit("plan.revise", { node_id: pick.node_id ?? null, capability: node?.capability ?? null, purpose: node?.purpose ?? null,
+      key: node && args ? canon({ cap: node.capability, args }) : null });
   }
 
   /** Nothing registered can do this (or the planner says so). The user can say it differently, or let it be. */
@@ -731,21 +747,40 @@ export class Orchestrator {
 
   /** Take back what this run wrote, newest first, using each capability's undo. Stops at the first step that cannot be
    *  undone (no undo, or a path changed since), and says which. */
-  undoRun(): { undone: number; refused: string | null } {
+  undoRun(): { undone: number; total: number; refused: string | null } {
     const st = this.st;
     const done = [...st.ops].filter(([, v]) => v.state === "ok" && (v.intent.writes ?? []).length > 0).reverse();
-    let undone = 0;
+    const ours = new Set(done.flatMap(([, op]) => op.intent.writes));
+    // what each step left (its receipt, or the versions found when it was reconciled after a crash) and what undo
+    // needs from before it (receipt, or the intent's record)
+    const record = (op: (typeof done)[number][1]) => op.receipt?.versions_after ? { ...op.receipt, undo: op.receipt.undo ?? op.intent.undo_prep } as never : null;
+    // check every step first: nothing is touched unless all of them can be taken back
     for (const [id, op] of done) {
       const cap = this.registry.get(op.intent.capability);
-      const err = !cap?.undo ? `${op.intent.capability} has no undo` : cap.undo(this.ws, op.intent.args, op.receipt as never);
+      const rec = record(op);
+      const why = !cap?.undo ? `${op.intent.capability} has no undo` : !rec ? `no record of what「${op.intent.text}」left` : cap.undoCheck?.(this.ws, op.intent.args, rec, ours) ?? null;
+      if (why) { this.emit("execution.undo_refused", { operation_id: id, why, checked_first: true }); return { undone: 0, total: done.length, refused: why }; }
+    }
+    let undone = 0;
+    for (const [id, op] of done) {
+      const err = this.registry.get(op.intent.capability)!.undo!(this.ws, op.intent.args, record(op)!);
       this.ws.invalidate();
-      if (err) { this.emit("execution.undo_refused", { operation_id: id, why: err }); return { undone, refused: err }; }
+      if (err) { this.emit("execution.undo_refused", { operation_id: id, why: err, undone }); return { undone, total: done.length, refused: err }; }
       const versions: Record<string, string> = {};
       for (const p of op.intent.writes) versions[p] = this.ws.version(p);
       this.emit("execution.undone", { operation_id: id, text: op.intent.text ?? op.intent.capability, versions });
       undone++;
     }
-    return { undone, refused: null };
+    return { undone, total: done.length, refused: null };
+  }
+
+  /** After an undo the user asked for: all taken back, nothing touched (then the result stands and the user is told),
+   *  or stopped part-way (a status of its own, saying how far it got). Returns true when everything was undone. */
+  private afterUndo(u: { undone: number; total: number; refused: string | null }, what: string): boolean {
+    if (!u.refused) return true;
+    if (u.undone === 0) { this.emit("note", { text: `没有撤回：${u.refused}。文件保持${what}后的样子。` }); return false; }
+    this.finish("partially_undone", `undid ${u.undone} of ${u.total} steps; stopped at: ${u.refused}`);
+    return false;
   }
 
   /** The non-blocking card shown with a result that rests on a reading the user has not confirmed. */
@@ -768,11 +803,18 @@ export class Orchestrator {
     this.emit("result.response", { picked: pick.kind, text: pick.text });
     if (pick.kind === "never_ask_this") this.emit("preference", { text: `${card.text}——用户说这种以后不用告诉他` });
     if (pick.kind === "undo" || pick.kind === "undo_and_reading") {
-      const u = this.undoRun();
-      if (u.refused) { this.emit("note", { text: `撤回没有做完：${u.refused}` }); return; }
-      if (pick.kind === "undo") return this.finish("cancelled", "the user undid the result");
+      const ok = this.afterUndo(this.undoRun(), "完成");
+      if (pick.kind === "undo") { if (ok) this.finish("cancelled", "the user undid the result"); return; }
+      if (!ok) {
+        // the undo did not go through, but the user's reading is theirs: keep it for anything that follows
+        this.emit("ambiguity.settled", { point: pick.point, readings: pick.readings, option: pick.reading_index, text: pick.readings![pick.reading_index!] });
+        this.emit("note", { text: `记下了你的理解：${pick.readings![pick.reading_index!]}；但没有重做，因为撤回没有完成。` });
+        return;
+      }
+      // redo from a clean state: the budgets count from here, so the redo is not cut short by the first attempt
+      this.emit("run.redo", { actions: this.st.get("actions"), model_calls: this.st.get("model_calls") });
       this.emit("run.status", { status: "running", reason: "the user changed the reading after the result" });
-      this.settleReading(card.text, pick);
+      this.settleReading(card.text, pick, "result");
     }
   }
 
@@ -906,8 +948,8 @@ export class Orchestrator {
           if (got === null) { this.finish("waiting_user", "no answer from the user"); return true; }
           if (got.option?.kind === "undo") {
             this.emit("interaction.reply", { body: { kind: "authorize", purpose: "result", text: r.statement, digest, approved: false, picked: "undo" } });
-            const u = this.undoRun();
-            this.finish("cancelled", "the user rejected the result" + (u.refused ? `; undo stopped: ${u.refused}` : "; changes undone"));
+            if (this.afterUndo(this.undoRun(), "确认前")) this.finish("cancelled", "the user rejected the result; changes undone");
+            else if (!TERMINAL.has(this.st.status)) this.finish("waiting_user", "the user rejected the result and it could not be undone");
             return true;
           }
           if (!got.option) { this.answerAsText(r.statement, got.text, "result"); return false; }

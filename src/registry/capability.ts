@@ -45,6 +45,12 @@ export interface Capability {
   /** Take a finished action back from its receipt. Refuses (returns the reason) when a written path changed since
    *  the receipt, so an undo never destroys someone else's later work. Required when reversible and not observe. */
   undo?(ws: Workspace, args: Args, receipt: ExecResult): string | null;
+  /** What undo needs that only the state before the action knows (e.g. a file's length before an append). Recorded
+   *  in the execution intent, so a step reconciled after a crash (no receipt) can still be undone. */
+  prepareUndo?(ws: Workspace, args: Args): Record<string, unknown>;
+  /** Can this step be undone now, without changing anything? `ours`: every path this run wrote, which earlier steps
+   *  of the same undo will take back (so a folder holding only our files counts as empty). */
+  undoCheck?(ws: Workspace, args: Args, receipt: ExecResult, ours: ReadonlySet<string>): string | null;
   /** The action discards existing content of a written path (replace, trash). Overwriting content this run did not
    *  write then needs the user's approval; an append or a move does not discard anything. */
   readonly discards?: boolean;
@@ -83,6 +89,8 @@ export function renamed(c: Capability, map: Record<string, string>, suffix = ".a
     preconditions: (ws, a) => base.preconditions(ws, inv(a)),
     execute: (ws, a) => base.execute(ws, inv(a)),
     ...(base.undo ? { undo: (ws: Workspace, a: Args, r: ExecResult) => base.undo!(ws, inv(a), r) } : {}),
+    ...(base.prepareUndo ? { prepareUndo: (ws: Workspace, a: Args) => base.prepareUndo!(ws, inv(a)) } : {}),
+    ...(base.undoCheck ? { undoCheck: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => base.undoCheck!(ws, inv(a), r, ours) } : {}),
   };
 }
 

@@ -112,6 +112,7 @@ export const ExecutionCommand = z.object({
   context: Context,
   text: z.string(),
   observation_epoch: z.number().int().optional(),
+  undo_prep: z.record(z.unknown()).optional(),     // what undo needs from before the action (capability.prepareUndo)
 });
 export type ExecutionCommand = z.infer<typeof ExecutionCommand>;
 
@@ -150,6 +151,7 @@ export type Interaction = z.infer<typeof Interaction>;
 
 export const RunStatus = z.enum([
   "received", "running", "waiting_user", "needs_reconciliation", "succeeded", "failed", "cancelled",
+  "partially_undone",            // the user asked to undo and only some steps could be taken back (the reason says where it stopped)
 ]);
 export type RunStatus = z.infer<typeof RunStatus>;
-export const TERMINAL: ReadonlySet<RunStatus> = new Set(["succeeded", "failed", "cancelled"]);
+export const TERMINAL: ReadonlySet<RunStatus> = new Set(["succeeded", "failed", "cancelled", "partially_undone"]);
