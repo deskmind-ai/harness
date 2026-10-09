@@ -156,8 +156,8 @@ describe("interaction cards", () => {
 
   it("result card: shown when the result rests on an unconfirmed reading; undo takes the writes back", async () => {
     const u = picker();
-    let choices = 0;
-    const sc: Scripted = (role) => role === "goal" ? { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] } : role === "choice" ? (choices++, { choice: "r0" })
+    let choices = 0;     // the evidence judge, then the ask decision (harness#2): act and report
+    const sc: Scripted = (role) => role === "goal" ? { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] } : role === "choice" ? (choices++ === 0 ? { choice: "r0" } : { choice: "act" })
       : role === "plan" ? PLAN : role === "bind" ? BIND : role === "intent" ? MATCH : { outcome: "error", error: "none" };
     const { o, ws } = setup(TODO, Array(10).fill(sc), u, "在 todo.txt 末尾加一行「买牛奶」");
     const s = await o.run();
@@ -171,7 +171,8 @@ describe("interaction cards", () => {
   });
 
   it("result card: 「这种以后不用告诉我」 is kept as the user's preference", async () => {
-    const sc: Scripted = (role) => role === "goal" ? { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] } : role === "choice" ? { choice: "r0" }
+    let choices = 0;
+    const sc: Scripted = (role) => role === "goal" ? { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] } : role === "choice" ? (choices++ === 0 ? { choice: "r0" } : { choice: "act" })
       : role === "plan" ? PLAN : role === "bind" ? BIND : role === "intent" ? MATCH : { outcome: "error", error: "none" };
     const { o } = setup(TODO, Array(10).fill(sc), picker(), "在 todo.txt 末尾加一行「买牛奶」");
     const s = await o.run();

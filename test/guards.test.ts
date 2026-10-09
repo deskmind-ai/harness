@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { Gateway, type Scripted } from "../src/gateway/index.js";
-import { BATCH_CONFIRM, Orchestrator, type Answer, type User } from "../src/orchestrator/index.js";
+import { Orchestrator, type Answer, type User } from "../src/orchestrator/index.js";
 import { Crash } from "../src/registry/capability.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
@@ -237,6 +237,16 @@ describe("execution guards", () => {
 
   // --- when to ask (docs/ask-policy.md) ---------------------------------------------------------------------------
   const AMB = { point: "末尾", reading: "最后一行之后另起一行", alternatives: ["接在最后一行的文字后面"] };
+  // whether to interrupt before acting on an unconfirmed reading is a judgement (choice role), not a step count
+  const manyAppends = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `n${i}`, capability: "fs.append_line", depends_on: i ? [`n${i - 1}`] : [], purpose: `追加 ${i}`, requirement_ids: ["r1"] }));
+  function judged(decision: "act" | "confirm", n = 8) {
+    let choices = 0;
+    const sc: Scripted = (role) => role === "goal" ? { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] }
+      : role === "choice" ? (choices++ === 0 ? { choice: "r0" } : { choice: decision, reason: "test" })      // evidence judge, then the ask decision
+      : role === "plan" ? { nodes: manyAppends(n), outcome: "plan" } : role === "bind" ? BIND : role === "intent" ? MATCH : { outcome: "error", error: "none" };
+    return sc;
+  }
+
 
   it("ambiguity nothing observed can settle is asked before planning, with the readings as options", async () => {
     const asked: { q: string; options: string[] }[] = [];
@@ -254,9 +264,8 @@ describe("execution guards", () => {
   });
 
   it("a reading backed by what is in the directory, with only reversible steps, is acted on and reported", async () => {
-    const backed = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] }, choice: { choice: "r0" }, plan: PLAN, bind: BIND, intent: MATCH });
     const u = user([], false);
-    const { o, ws } = setup(TODO, Array(6).fill(backed), u);
+    const { o, ws } = setup(TODO, Array(8).fill(judged("act", 1)), u);
     const s = await o.run();
     expect(u.asked.length).toBe(0);
     expect(s.counters["ask:authorize"] ?? 0).toBe(0);
@@ -435,14 +444,31 @@ describe("execution guards", () => {
     expect(s.status).toBe("waiting_user");
   });
 
-  it("a large batch on an unconfirmed reading is shown first, even when every step can be undone", async () => {
-    const nodes = Array.from({ length: BATCH_CONFIRM + 1 }, (_, i) => ({ id: `n${i}`, capability: "fs.append_line", depends_on: i ? [`n${i - 1}`] : [], purpose: `追加 ${i}`, requirement_ids: ["r1"] }));
-    const g = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] }, choice: { choice: "r0" }, plan: { nodes, outcome: "plan" }, bind: BIND, intent: MATCH });
+  it("the model judges an unconfirmed reading worth showing first: one confirmation, nothing written when declined", async () => {
     const texts: string[] = [];
-    const { o } = setup(TODO, Array(40).fill(g), { clarify: () => null, authorize: (t) => { texts.push(t); return false; } });
+    const { o } = setup(TODO, Array(60).fill(judged("confirm")), { clarify: () => null, authorize: (t) => { texts.push(t); return false; } });
     const s = await o.run();
     expect(texts.length).toBe(1);
     expect(s.counters.actions ?? 0).toBe(0);
+  });
+
+  it("the model judges it fine to act: many undoable steps run without interrupting, the reading is reported", async () => {
+    const texts: string[] = [];
+    const { o, log } = setup(TODO, Array(60).fill(judged("act")), { clarify: () => null, authorize: (t) => { texts.push(t); return false; } });
+    const s = await o.run();
+    expect(texts.length).toBe(0);
+    expect(s.status).toBe("succeeded");
+    expect(s.assumptions).toEqual([AMB.reading]);
+    expect(fs.readFileSync(log, "utf-8")).toContain('"kind":"ask.decided"');          // the judgement is on the record
+  });
+
+  it("a step that cannot be undone is shown first whatever the model would judge", async () => {
+    const w = byRole({ goal: { ...GOALW, assumptions: [{ point: "内容", reading: "整个文件只剩 X", alternatives: ["把旧内容里的某处换成 X"], evidence: ["旧内容"] }] }, choice: { choice: "r0" }, plan: PLANW, bind: BINDW, intent: MATCH });
+    const texts: string[] = [];
+    const { o } = rewrite(Array(6).fill(w), { clarify: () => null, authorize: (t) => { texts.push(t); return false; } });
+    const s = await o.run();
+    expect(texts.length).toBe(1);
+    expect(s.counters["calls:choice"]).toBe(1);                 // only the evidence judge; no ask judgement was needed
   });
 
   it("an approved plan survives a crash: no second question after restart", async () => {

@@ -220,7 +220,9 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
-    category: task.category, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, result_response: resultResponse, sim: user.sim, seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
+    category: task.category, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, result_response: resultResponse, sim: user.sim,
+    ask_decisions: orch.log.events.filter((e: any) => e.kind === "ask.decided").map((e: any) => e.decision),
+    first_outcome: task.gold.outcomes?.[0]?.name ?? "gold", seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
   fs.writeFileSync(path.join(runDir, "result.json"), JSON.stringify(rec, null, 1));
   fs.rmSync(root, { recursive: true, force: true });
@@ -244,12 +246,12 @@ function mergeSummaries(prev: any, cur: any) {
 function reportV2(rows: any[]) {
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = `${r.config}|${r.category}`; by.set(k, [...(by.get(k) ?? []), r]); }
-  console.log("config | category | n | correct | wrong action | of which guessed | false success | errored | interruptions | unnecessary | declined plan | sim fallbacks | outcomes | s/task");
+  console.log("config | category | n | correct | wrong action | of which guessed | false success | errored | interruptions | unnecessary | declined plan | sim fallbacks | acted on own reading | of which not the first outcome | outcomes | s/task");
   const pct: Record<string, number[]> = {};
   for (const [k, rs] of [...by].sort()) {
     const n = rs.length, f = (key: string) => rs.filter((r) => r[key]).length;
     const outs = Object.entries(rs.reduce((a: Record<string, number>, r) => { if (r.correct) a[r.outcome ?? "?"] = (a[r.outcome ?? "?"] ?? 0) + 1; return a; }, {})).map(([o, c]) => `${o}:${c}`).join(" ");
-    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${f("declined_plan")} | ${rs.reduce((a, r) => a + (r.sim?.fallbacks ?? 0), 0)} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
+    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${f("declined_plan")} | ${rs.reduce((a, r) => a + (r.sim?.fallbacks ?? 0), 0)} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act")).length} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act") && r.outcome && r.outcome !== r.first_outcome).length} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
     const cfg = k.split("|")[0]!;
     (pct[cfg] ??= []).push(f("correct") / n);
   }
