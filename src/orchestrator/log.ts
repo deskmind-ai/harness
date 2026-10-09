@@ -73,8 +73,8 @@ export class State {
   /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
    *  readings, or null for free text). They bind every later goal. */
   settled: { point: string; readings: string[]; text: string; option: number | null }[] = [];
-  delegatedByAnswer = false;
-  askDecision: "act" | "confirm" | null = null;   // the judgement for the current plan (ask.decided)                     // the user picked 「由你决定」 on some question
+  delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
+  askDecision: "act" | "confirm" | null = null;   // the judgement for the current plan (ask.decided)
   notes: string[] = [];
 
   count(key: string, by = 1) {

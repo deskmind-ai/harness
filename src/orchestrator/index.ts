@@ -579,7 +579,7 @@ export class Orchestrator {
     const steps = writes.map((n) => { const a = st.nodes.get(n.id)?.args; return a ? describe(this.cap(n.capability), a) : n.purpose; });
     const paths = new Set(writes.flatMap((n) => { const a = st.nodes.get(n.id)?.args; return a ? this.cap(n.capability).footprint(this.ws, a).writes : []; }));
     const opts = [
-      { id: "act", text: "直接做，做完告诉用户我是怎么理解的；理解错了用户可以一键撤回" },
+      { id: "act", text: "直接做，做完告诉用户我是怎么理解的；每一步系统都能撤回，但目前要用户发现错了、提出来才会撤回" },
       { id: "confirm", text: "先把计划给用户看，用户同意了再做" },
     ];
     const ctx = {
