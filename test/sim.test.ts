@@ -41,6 +41,10 @@ describe("simulated user", () => {
     expect(readPick({ fact: "正式纪要放「项目/项目名/纪要」", left_out: "", option: 1 }, how, sort)).toEqual({ option: 1 });
     // on a confirmation, what is left out is what the user says
     expect(readPick({ fact: "正式纪要放「项目/项目名/纪要」", left_out: "草稿要放进「草稿箱」", option: 0 }, { ...plan, options: plan.options }, sort)).toEqual({ text: "草稿要放进「草稿箱」" });
+    // a reading answers one narrow point: taken on its fact alone
+    const which: Card = { kind: "ambiguity", text: "「这些纪要」指哪些？", free_text: true, blocking: true, options: [
+      { kind: "reading", text: "只指具体会议的纪要" }, { kind: "reading", text: "模板也算" }, { kind: "delegate", text: "由你决定" }, { kind: "cancel", text: "先别做了" }] };
+    expect(readPick({ fact: "正式纪要放「项目/项目名/纪要」", left_out: "带「草稿」的放「草稿箱」", option: 0 }, which, sort)).toEqual({ option: 0 });
     // stopping carries no content: nothing can be left out
     expect(readPick({ fact: "那就算了", left_out: "不想覆盖", option: 3 }, conflict, facts)).toEqual({ option: 3 });
   });
