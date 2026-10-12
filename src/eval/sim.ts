@@ -53,7 +53,11 @@ export function questionPrompt(f: UserFacts, card: Card): string {
     ...listed(f, card).map((x) => `- ${x}`),
     `助手问你：${card.text}`,
     options(card),
-    "某个选项和你会说的话意思一样（不只是不违背你的意思，也不丢掉你在意的细节），才选它；否则用你自己的话回答，尽量照你会说的原话。不要选「交给助手决定」，除非你心里的意思就是让助手决定。",
+    // a reading interprets the user's own words, so it may be inferred from what they mean; a value or a way of doing
+    // it is new content, which has to be what they would say
+    card.kind === "ambiguity"
+      ? "这是在问你原话的意思。按你真正的意思能判断出是哪一种理解，就选它；判断不了，就用你自己的话回答。不要选「交给助手决定」，除非你心里的意思就是让助手决定。"
+      : "某个选项和你会说的话意思一样（不只是不违背你的意思，也不丢掉你在意的细节），才选它；否则用你自己的话回答，尽量照你会说的原话。不要选「交给助手决定」，除非你心里的意思就是让助手决定。",
     "选了选项，就在 fact 里原样抄出你依据的那条事实（上面列的一条，或其中一段），在 left_out 里写出你会说、但这个选项没说到的部分。" + LEFT_OUT,
     REPLY,
   ].join("\n");

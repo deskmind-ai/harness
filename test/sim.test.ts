@@ -17,6 +17,10 @@ describe("simulated user", () => {
     expect(p).toContain("[停下，这件事不做了] 先别做了");
     expect(p).toContain("[按这个做法做] 保留现有的 notes.txt");
     expect(p).toContain("被问到时你会说：那就算了");
+    // a reading may be inferred from what the user means; a value or a way must be what they would say
+    expect(p).toContain("和你会说的话意思一样");
+    const amb: Card = { ...conflict, kind: "ambiguity", options: [{ kind: "reading", text: "那五个录音文件" }, { kind: "cancel", text: "先别做了" }] };
+    expect(questionPrompt(facts, amb)).toContain("按你真正的意思能判断出是哪一种理解");
     // a confirmation does not carry the question's answer, but does carry a 'no' the user holds
     expect(confirmPrompt(facts, plan)).not.toContain("那就算了");
     expect(confirmPrompt(facts, plan)).toContain("你不同意助手照现在这样做");
