@@ -126,10 +126,12 @@ class SimUser implements CardUser {
     return card.free_text ? { text: f.answer } : null;
   }
 
-  /** The result card is not blocking: the user looks at the result and may undo it. */
+  /** The result card is not blocking: the user looks at the result and may undo it. A can't-do card is read like the
+   *  question it used to be (same wording), but it did not stop the run, so it is no interruption. */
   review(card: Card, effects: string[]): Answer | null {
     const f = this.task.user_facts;
     if (!f) return null;
+    if (card.kind === "cannot") return this.answer(card);
     const r = simJudge([
       "你在扮演一位用户。你心里真正的意思是：" + f.intent,
       `助手做完了，并告诉你：${card.text}`,
@@ -195,15 +197,18 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
     orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills });
     summ = await orch.run();
   }
-  // the result card is shown with the result: the simulated user may undo, or undo and pick another reading
+  // the result card is shown with the result: the simulated user may undo, or undo and pick another reading; on a
+  // can't-do card it may say it differently, which starts the run again (and may end on another can't-do card)
   let resultResponse: string | null = null;
-  if (summ.result_card) {
-    const a = user.review(summ.result_card, summ.effects);
-    if (a && "option" in a) {
-      resultResponse = summ.result_card.options[a.option]?.kind ?? null;
-      orch.respond(summ.result_card, a);
-      summ = resultResponse === "undo_and_reading" ? await orch.run() : orch.summary();
-    }
+  for (let looks = 0; summ.result_card && looks < 4; looks++) {
+    const card = summ.result_card;
+    const a = user.review(card, summ.effects);
+    if (!a) break;
+    resultResponse = "option" in a ? card.options[a.option]?.kind ?? null : "other";
+    orch.respond(card, a);
+    if (orch.st.status !== "running") { summ = orch.summary(); break; }      // answered: ok, undone, let it be
+    summ = await orch.run();
+    if (card.kind !== "cannot") break;                            // one look at a redone result, as before
   }
   let taught: unknown = null;
   if (library && task.group === 5 && task.stage === "teach" && summ.status === "succeeded" && !summ.skill) {
