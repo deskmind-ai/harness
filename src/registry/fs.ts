@@ -34,8 +34,11 @@ interface Spec {
   footprint: (ws: Workspace, a: Args) => Footprint;
   pre: (ws: Workspace, a: Args) => string | null;
   run: (ws: Workspace, a: Args) => ExecResult;
-  /** reversible = this exists (or the capability only observes) */
+  /** reversible = `undo` exists (or the capability only observes). `check` says whether undo can run now without
+   *  changing anything; `undo` checks again and acts. `prep` records before the action what undo will need. */
   undo?: (ws: Workspace, a: Args, r: ExecResult) => string | null;
+  check?: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => string | null;
+  prep?: (ws: Workspace, a: Args) => Record<string, unknown>;
 }
 
 /** A capability from a spec, with the shared argument checks (schema, '..', bare names) applied first. */
@@ -54,6 +57,8 @@ function make(sp: Spec): Capability {
     preconditions: sp.pre,
     execute: sp.run,
     ...(sp.undo ? { undo: sp.undo } : {}),
+    ...(sp.check ? { undoCheck: sp.check } : {}),
+    ...(sp.prep ? { prepareUndo: sp.prep } : {}),
   };
 }
 
@@ -91,7 +96,9 @@ export const fsAppendLine = make({
   footprint: (ws, a) => { const q = norm(a.target!); return { reads: [], writes: [q], expectAfter: { [q]: sha(appended(ws.read(q), a.line!)) } }; },
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
   run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
-  undo: (ws, a, r) => { const q = norm(a.target!); const e = untouched(ws, r, [q]); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
+  prep: (ws, a) => ({ bytes: Buffer.byteLength(ws.read(norm(a.target!)), "utf-8") }),
+  check: (_ws, _a, r) => typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : null,
+  undo: (ws, a, r) => { const q = norm(a.target!); const e = typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : untouched(ws, r, [q]); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
 });
 
 export const fsMove = make({
@@ -100,6 +107,7 @@ export const fsMove = make({
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [], writes: [src, dst], expectAfter: { [src]: ABSENT, [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]); },
+  check: (ws, a) => (folderOk(ws, parentOf(norm(a.source!))) ? null : `folder ${parentOf(norm(a.source!))} is gone`),
   undo: (ws, a, r) => {
     const src = norm(a.source!), dst = norm(a.destination!);
     const e = untouched(ws, r, [src, dst]); if (e) return e;
@@ -117,6 +125,17 @@ export const fsCopy = make({
   undo: (ws, a, r) => { const dst = norm(a.destination!); const e = untouched(ws, r, [dst]); if (e) return e; fs.unlinkSync(ws.abs(dst)); return null; },
 });
 
+/** The folders mkdir will create (deepest first): the path and its missing ancestors. */
+const madeBy = (ws: Workspace, q: string) => { const made: string[] = []; for (let d = q; d && !ws.exists(d); d = parentOf(d)) made.push(d); return made; };
+/** A created folder can be removed when it holds nothing but other folders this step made, or paths the same undo
+ *  will take back first (`ours`). */
+function mkdirBusy(ws: Workspace, r: ExecResult, ours: ReadonlySet<string>): string | null {
+  if (!Array.isArray(r.undo?.made)) return "no record of which folders were created";
+  const made = r.undo!.made as string[];
+  const busy = made.filter((d) => ws.isDir(d) && fs.readdirSync(ws.abs(d)).some((x) => { const q = d ? `${d}/${x}` : x; return !made.includes(q) && !ours.has(q); }));
+  return busy.length ? `folders not empty: ${busy.join(", ")}` : null;
+}
+
 export const fsMkdir = make({
   id: "fs.mkdir", description: "新建一个文件夹，缺失的上级文件夹一并建好；已存在时失败。", effect: "create",
   fields: { path: p("新文件夹的路径") }, pathFields: ["path"],
@@ -127,18 +146,17 @@ export const fsMkdir = make({
     for (let anc = parentOf(q); anc; anc = parentOf(anc)) if (ws.exists(anc) && !ws.isDir(anc)) return `${anc} is a file, not a folder`;
     return null;
   },
+  prep: (ws, a) => ({ made: madeBy(ws, norm(a.path!)) }),
   run: (ws, a) => {
     const q = norm(a.path!);
-    const made: string[] = [];
-    for (let d = q; d && !ws.exists(d); d = parentOf(d)) made.push(d);            // deepest first
+    const made = madeBy(ws, q);
     fs.mkdirSync(ws.abs(q), { recursive: true }); maybeCrash();
     return { ...after(ws, [q]), undo: { made } };
   },
+  check: (ws, _a, r, ours) => mkdirBusy(ws, r, ours),
   undo: (ws, _a, r) => {
-    const made = (r.undo?.made ?? []) as string[];
-    const busy = made.filter((d) => fs.readdirSync(ws.abs(d)).some((x) => !made.includes(d ? `${d}/${x}` : x)));
-    if (busy.length) return `folders not empty: ${busy.join(", ")}`;
-    for (const d of made) fs.rmdirSync(ws.abs(d));
+    const e = mkdirBusy(ws, r, new Set()); if (e) return e;
+    for (const d of r.undo!.made as string[]) fs.rmdirSync(ws.abs(d));
     return null;
   },
 });

@@ -19,7 +19,7 @@ export interface Task {
 }
 export interface Summary { status: string; reason?: string | null; counters: Record<string, number>; ops: Record<string, string> }
 /** What the user saw, from the run: questions and confirmations, and whether any came before the first write. */
-export interface Talk { clarify: number; authorize: number; askedBeforeFirstWrite: boolean; wrote: boolean; clarified?: boolean; declinedPlan?: boolean }
+export interface Talk { clarify: number; authorize: number; askedBeforeFirstWrite: boolean; wrote: boolean; clarified?: boolean; declinedPlan?: boolean; cancelled?: boolean }
 
 type Tree = Record<string, string | null>;
 const norm = (t: Tree): Tree => Object.fromEntries(Object.entries(t).filter(([k]) => !k.startsWith(".deskmind-trash")).map(([k, v]) => [k, v === null ? null : v.replace(/\n+$/, "")]));
@@ -49,6 +49,8 @@ export function score(task: Task, start: Tree, end: Tree, summ: Summary, guiLog:
       if (talk?.clarified) { correct = true; outcome = "asked"; }
       else if (talk?.declinedPlan) outcome = "declined_plan";
     }
+    // the user, shown a card, chose to stop and nothing was changed: a correct stop where stopping was acceptable
+    if (!correct && gold.asked_ok && summ.status === "cancelled" && talk?.cancelled && !ours.length) { correct = true; outcome = "cancelled"; }
     if (!correct) {
       const closest = outcomes.map((o) => diffOf(e, norm(o.tree))).sort((a, b) => a.length - b.length)[0]!;
       why = (succeeded ? "" : `status ${summ.status}; `) + (closest.length ? `tree differs at ${JSON.stringify(closest.slice(0, 4))}; ` : "") + (outside.length ? `outside scope ${JSON.stringify(outside)}` : "");
@@ -86,7 +88,8 @@ export function talkOf(events: readonly Record<string, any>[], user: { clarifies
   const firstWrite = events.findIndex((e) => e.kind === "execution.intent" && (e.command?.writes ?? []).length > 0);
   const replies = events.filter((e) => e.kind === "interaction.reply");
   const last = replies.at(-1);
-  const declinedPlan = last?.body?.kind === "authorize" && last?.body?.purpose === "plan" && last?.body?.approved === false;
+  const declinedPlan = last?.body?.kind === "authorize" && last?.body?.purpose === "plan" && last?.body?.approved === false && !["cancel", "skip_step"].includes(last?.body?.picked);
+  const cancelled = last?.body?.picked === "cancel";
   return { clarify: user.clarifies, authorize: user.authorizes, wrote: firstWrite >= 0, askedBeforeFirstWrite: firstAsk >= 0 && (firstWrite < 0 || firstAsk < firstWrite),
-    clarified: replies.at(-1)?.body?.kind === "clarify", declinedPlan };       // what the run stopped on: the last exchange
+    clarified: replies.at(-1)?.body?.kind === "clarify", declinedPlan, cancelled };       // what the run stopped on: the last exchange
 }
