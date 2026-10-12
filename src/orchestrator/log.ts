@@ -76,6 +76,7 @@ export class State {
   delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
   askDecision: "act" | "confirm" | null = null;   // the judgement for the current plan (ask.decided)
   preferences: string[] = [];                    // what the user said about being asked (preference events)
+  cannot: string | null = null;                  // why the run stopped as can't-do (run.status), shown on the result's card
   /** Steps the user dropped on a plan card (plan.revise): never planned again for the same purpose, never run with
    *  the same arguments. */
   skipped: { capability: string | null; purpose: string | null; key: string | null }[] = [];
@@ -230,7 +231,7 @@ export class State {
         this.count("rejected"); this.count("rejected:" + String(e.why).split(":")[0]);
         break;
       case "run.status":
-        this.status = e.status; this.reason = e.reason ?? null;
+        this.status = e.status; this.reason = e.reason ?? null; this.cannot = e.cannot ?? null;
         break;
       case "note":
         this.notes.push(e.text);

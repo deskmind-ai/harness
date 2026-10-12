@@ -143,15 +143,39 @@ describe("interaction cards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n");
   });
 
-  it("can't-do card: the user may say it differently; 「好的，先这样」 ends it", async () => {
+  it("can't-do card comes with the result, stopping nothing; the user may say it differently or let it be", async () => {
     const lack = byRole({ goal: { requirements: [], constraints: [], missing: [], feasible: "needs_capability_we_lack", infeasible_reason: "没有打印能力" } });
-    const u1 = picker("cancel");
-    const s1 = await setup(TODO, [lack], u1, "把 todo.txt 打印出来").o.run();
-    expect(u1.cards[0]!.kind).toBe("cannot");
+    const u1 = picker();
+    const r1 = setup(TODO, [lack], u1, "把 todo.txt 打印出来");
+    const s1 = await r1.o.run();
+    expect(u1.cards).toEqual([]);                                   // nobody was asked: the run just ended
     expect(s1.status).toBe("failed");
-    const u2 = picker({ text: "那就在末尾加一行「买牛奶」" });
-    const s2 = await setup(TODO, [lack, byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH }), byRole({ plan: PLAN }), byRole({ bind: BIND }), byRole({ intent: MATCH })], u2, "把 todo.txt 打印出来").o.run();
+    const card = s1.result_card!;
+    expect(card).toMatchObject({ kind: "cannot", blocking: false, free_text: true });
+    expect(card.options.map((x) => x.kind)).toEqual(["cancel"]);
+    r1.o.respond(card, { option: 0 });                              // 「好的，先这样」
+    expect(r1.o.summary().status).toBe("failed");
+
+    const u2 = picker();
+    const { o, ws } = setup(TODO, [lack, byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH }), byRole({ plan: PLAN }), byRole({ bind: BIND }), byRole({ intent: MATCH })], u2, "把 todo.txt 打印出来");
+    const first = await o.run();
+    o.respond(first.result_card!, { text: "那就在末尾加一行「买牛奶」" });
+    const s2 = await o.run();
     expect(s2.answers).toContain("那就在末尾加一行「买牛奶」");
+    expect(s2.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+    expect(u2.cards).toEqual([]);
+  });
+
+  it("can't-do card: once the asks budget is spent, only 「好的，先这样」 is left", async () => {
+    const lack = byRole({ goal: { requirements: [], constraints: [], missing: [], feasible: "needs_capability_we_lack", infeasible_reason: "没有打印能力" } });
+    const { o } = setup(TODO, Array(6).fill(lack), picker(), "把 todo.txt 打印出来");
+    let s = await o.run();
+    for (const t of ["打印", "还是打印", "就打印"]) { o.respond(s.result_card!, { text: t }); s = await o.run(); }
+    expect(s.status).toBe("failed");
+    expect(s.result_card!.free_text).toBe(false);
+    o.respond(s.result_card!, { text: "再试" });                     // not taken
+    expect(o.summary().status).toBe("failed");
   });
 
   it("result card: shown when the result rests on an unconfirmed reading; undo takes the writes back", async () => {

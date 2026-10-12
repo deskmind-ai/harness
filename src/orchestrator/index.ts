@@ -243,8 +243,8 @@ export class Orchestrator {
     return this.summary();
   }
 
-  finish(status: RunStatus, reason: string) {
-    this.emit("run.status", { status, reason });
+  finish(status: RunStatus, reason: string, extra: Record<string, unknown> = {}) {
+    this.emit("run.status", { status, reason, ...extra });
   }
 
   // --- goal -------------------------------------------------------------------------------------------------------
@@ -724,16 +724,10 @@ export class Orchestrator {
       key: node && args ? canon({ cap: node.capability, args }) : null });
   }
 
-  /** Nothing registered can do this (or the planner says so). The user can say it differently, or let it be. */
+  /** Nothing registered can do this (or the planner says so). The run stops here; the can't-do card comes with the
+   *  result (resultCard), where the user can say it differently or let it be. Nothing waits on the user. */
   private cannot(reason: string) {
-    const card: Card = { kind: "cannot", text: `这件事我做不到：${reason}`, free_text: true, blocking: true, options: [{ kind: "cancel", text: "好的，先这样" }] };
-    if (this.st.get("ask:clarify") >= this.budget.asks) return this.finish("failed", "cannot: " + reason);
-    const got = this.ask(card, { kind: "clarify", question: card.text, why: "cannot", options: [] });
-    if (got === null || got.option?.kind === "cancel") {
-      if (got) this.emit("interaction.reply", { body: { kind: "cannot", text: card.text, picked: "cancel" } });
-      return this.finish("failed", "cannot: " + reason);
-    }
-    return this.answerAsText(card.text, got.text, "cannot");
+    return this.finish("failed", "cannot: " + reason, { cannot: reason });
   }
 
   /** Show a card; returns the option picked (null for free text) and its text, or null when there is no answer. */
@@ -799,6 +793,11 @@ export class Orchestrator {
   /** The non-blocking card shown with a result that rests on a reading the user has not confirmed. */
   resultCard(): Card | null {
     const st = this.st, g = st.goal;
+    if (st.status === "failed" && st.cannot !== null) {
+      // can't do it: say so with the result. Saying it differently starts again, while the asks budget lasts.
+      return { kind: "cannot", text: `这件事我做不到：${st.cannot}`, options: [{ kind: "cancel", text: "好的，先这样" }],
+        free_text: st.get("ask:clarify") < this.budget.asks, blocking: false };
+    }
     if (st.status !== "succeeded" || !g || !st.effects.length) return null;
     const open = g.assumptions.filter((a) => !a.settled);
     if (!open.length) return null;
@@ -808,9 +807,16 @@ export class Orchestrator {
     return { kind: "result", text: "我是这样理解的：" + open.map((a) => a.reading).join("；"), options, free_text: false, blocking: false };
   }
 
-  /** The user's response to the result card. undo_and_reading leaves the run ready to go again (call run()). */
+  /** The user's response to the result card. undo_and_reading, and saying a can't-do differently, leave the run ready
+   *  to go again (call run()). */
   respond(card: Card, answer: Answer): void {
-    if (!("option" in answer)) return;
+    if (!("option" in answer)) {
+      // the user's own words on the can't-do card: an answer like any other; the goal is derived again with it
+      if (card.kind !== "cannot" || !card.free_text) return;
+      this.emit("result.response", { picked: "other", text: answer.text });
+      this.emit("run.status", { status: "running", reason: "the user said it differently" });
+      return this.answerAsText(card.text, answer.text, "cannot");
+    }
     const pick = card.options[answer.option];
     if (!pick) return;
     this.emit("result.response", { picked: pick.kind, text: pick.text });
