@@ -33,6 +33,18 @@ describe("simulated user", () => {
     expect(readPick({ option: 9, fact: "那就算了" }, conflict, facts)).toBe("unsupported");
   });
 
+  it("a content pick that leaves out what the user would say becomes their own words", () => {
+    const sort: UserFacts = { intent: "正式纪要放「项目/项目名/纪要」；带「草稿」的放「草稿箱」", answer: "正式纪要放「项目/项目名/纪要」；带「草稿」的放「草稿箱」", choice_texts: [], approve: "if_matches" };
+    const how: Card = { kind: "missing", text: "纪要怎么归类？", free_text: true, blocking: true, options: [
+      { kind: "proposal", text: "全放一个文件夹" }, { kind: "proposal", text: "按项目分文件夹" }, { kind: "delegate", text: "由你决定" }, { kind: "cancel", text: "先别做了" }] };
+    expect(readPick({ fact: "正式纪要放「项目/项目名/纪要」", left_out: "带「草稿」的放「草稿箱」", option: 1 }, how, sort)).toEqual({ text: sort.answer });
+    expect(readPick({ fact: "正式纪要放「项目/项目名/纪要」", left_out: "", option: 1 }, how, sort)).toEqual({ option: 1 });
+    // on a confirmation, what is left out is what the user says
+    expect(readPick({ fact: "正式纪要放「项目/项目名/纪要」", left_out: "草稿要放进「草稿箱」", option: 0 }, { ...plan, options: plan.options }, sort)).toEqual({ text: "草稿要放进「草稿箱」" });
+    // stopping carries no content: nothing can be left out
+    expect(readPick({ fact: "那就算了", left_out: "不想覆盖", option: 3 }, conflict, facts)).toEqual({ option: 3 });
+  });
+
   it("free text where the card takes it; nothing parsed is no answer", () => {
     expect(readPick({ text: "那就算了" }, conflict, facts)).toEqual({ text: "那就算了" });
     expect(readPick({ text: "那就算了" }, { ...conflict, free_text: false }, facts)).toBe("unsupported");
