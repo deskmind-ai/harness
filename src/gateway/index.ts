@@ -12,7 +12,7 @@
 import { spawnSync } from "node:child_process";
 import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import type { Role } from "../protocol/roles.js";
+import { ROLES, type Role } from "../protocol/roles.js";
 
 /**
  * openrouter   chat completions with json_schema
@@ -26,7 +26,7 @@ export type Backend = "openrouter" | "local_chat" | "systemone" | "claude_cli" |
 export type RoleTable = Record<Role, { backend: Backend; model: string }>;
 
 const all = (backend: Backend, model: string): RoleTable =>
-  Object.fromEntries((["goal", "plan", "bind", "intent", "choice", "skill", "verify"] as Role[]).map((r) => [r, { backend, model }])) as RoleTable;
+  Object.fromEntries(ROLES.map((r) => [r, { backend, model }])) as RoleTable;
 
 export const CONFIGS: Record<string, RoleTable> = {
   "B0-luna": all("openrouter", "openai/gpt-6-luna"),

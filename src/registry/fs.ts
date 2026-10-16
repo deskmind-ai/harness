@@ -4,72 +4,12 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Crash, Registry, schemaCheck, type Args, type Capability, type Effect, type ExecResult, type FieldSchema, type Footprint } from "./capability.js";
+import { Registry, type ExecResult } from "./capability.js";
 import { ABSENT, TRASH, Workspace, sha } from "./workspace.js";
+import { CRASH_FLAG, after, folderOk, join, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
+import { TOOL_CAPABILITIES } from "./tools.js";
 
-const s = (description: string): FieldSchema => ({ type: "string", minLength: 1, description });
-const p = (description: string): FieldSchema => s(description + "。相对任务目录的路径，'/' 分隔，不能含 '..'");
-
-export const norm = (x: string) => (x.trim() === "." || x.trim() === "./" ? "" : x.trim().replace(/^(\.\/)+/, "").replace(/^\/+|\/+$/g, ""));
-export const join = (parent: string, name: string) => (norm(parent) === "" ? name : `${norm(parent)}/${name}`);
-export const parentOf = (q: string) => (q.includes("/") ? q.slice(0, q.lastIndexOf("/")) : "");
-const folderOk = (ws: Workspace, d: string) => d === "" || ws.isDir(d);
-
-/** Receipt versions: every written path and its parent folder. */
-function after(ws: Workspace, writes: string[], output: Record<string, unknown> = {}): ExecResult {
-  const parents = new Set(writes.filter((w) => w.includes("/")).map(parentOf));
-  const versions_after: Record<string, string> = {};
-  for (const k of [...writes, ...parents]) versions_after[k] = ws.version(k);
-  return { status: "ok", output, versions_after };
-}
-
-interface Spec {
-  id: string;
-  description: string;
-  fields: Record<string, FieldSchema>;
-  effect: Effect;
-  confirm?: boolean;
-  discards?: boolean;
-  pathFields?: string[];
-  footprint: (ws: Workspace, a: Args) => Footprint;
-  pre: (ws: Workspace, a: Args) => string | null;
-  run: (ws: Workspace, a: Args) => ExecResult;
-  /** reversible = `undo` exists (or the capability only observes). `check` says whether undo can run now without
-   *  changing anything; `undo` checks again and acts. `prep` records before the action what undo will need. */
-  undo?: (ws: Workspace, a: Args, r: ExecResult) => string | null;
-  check?: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => string | null;
-  prep?: (ws: Workspace, a: Args) => Record<string, unknown>;
-}
-
-/** A capability from a spec, with the shared argument checks (schema, '..', bare names) applied first. */
-function make(sp: Spec): Capability {
-  const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
-  return {
-    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards, reversible: sp.effect === "observe" || !!sp.undo,
-    typecheck(a) {
-      const err = schemaCheck(schema, a);
-      if (err) return err;
-      for (const k of sp.pathFields ?? []) if (a[k]!.split("/").includes("..")) return `bad path ${a[k]}`;
-      if ("name" in a && (a.name!.includes("/") || a.name === "." || a.name === "..")) return "name must be a bare file name";
-      return null;
-    },
-    footprint: sp.footprint,
-    preconditions: sp.pre,
-    execute: sp.run,
-    ...(sp.undo ? { undo: sp.undo } : {}),
-    ...(sp.check ? { undoCheck: sp.check } : {}),
-    ...(sp.prep ? { prepareUndo: sp.prep } : {}),
-  };
-}
-
-export const CRASH_FLAG = { crashAfterEffect: false };     // test hook: die after the effect, before the receipt
-const maybeCrash = () => { if (CRASH_FLAG.crashAfterEffect) throw new Crash("crash after the effect, before the receipt"); };
-
-/** An undo may only touch paths still exactly as the action left them. */
-const untouched = (ws: Workspace, r: ExecResult, paths: string[]) => {
-  const moved = paths.filter((q) => q in r.versions_after && ws.version(q) !== r.versions_after[q]);
-  return moved.length ? `changed since the action: ${moved.join(", ")}` : null;
-};
+export { CRASH_FLAG, join, norm, parentOf };
 
 export const fsCreateText = make({
   id: "fs.create_text", description: "在任务目录里新建一个 UTF-8 文本文件并写入正文；目标已存在时失败，不覆盖。", effect: "create",
@@ -173,7 +113,7 @@ export const fsReadText = make({
   id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe",
   fields: { target: p("要读的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [norm(a.target!)], writes: [], expectAfter: {} }),
-  pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
+  pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : !ws.isTextFile(q) ? `${q} is not a text file (an image, a PDF or an archive)` : null; },
   run: (ws, a) => ({ status: "ok", output: { text: ws.read(norm(a.target!)) }, versions_after: {} }),
 });
 
@@ -186,14 +126,15 @@ export const fsList = make({
     // the drill-down the bounded listing points at: one folder's direct members, itself bounded and self-describing
     const q = norm(a.path!), limit = 200;
     const members = Object.entries(ws.entries()).filter(([p]) => parentOf(p) === q);
-    const entries = members.slice(0, limit).map(([p, v]) => (v === "dir" ? { path: p, kind: "folder" } : { path: p, kind: "file", preview: ws.read(p).slice(0, 80) }));
+    const entries = members.slice(0, limit).map(([p, v]) => (v === "dir" ? { path: p, kind: "folder" } : ws.isTextFile(p) ? { path: p, kind: "file", preview: ws.read(p).slice(0, 80) } : { path: p, kind: "file", binary: true }));
     return { status: "ok", output: { entries, total: members.length, truncated: members.length > limit }, versions_after: {} };
   },
 });
 
 export const FS_CAPABILITIES = [fsCreateText, fsReplaceText, fsAppendLine, fsMove, fsCopy, fsMkdir, fsTrash, fsReadText, fsList];
 
-export const fileRegistry = () => FS_CAPABILITIES.reduce((r, c) => r.register(c), new Registry());
+/** The file capabilities and the tools that make files (tools.ts): what a file task may use. */
+export const fileRegistry = () => [...FS_CAPABILITIES, ...TOOL_CAPABILITIES].reduce((r, c) => r.register(c), new Registry());
 
 /** Field renames for the dynamic-schema evaluation group. */
 export const RENAMES: Record<string, Record<string, string>> = {

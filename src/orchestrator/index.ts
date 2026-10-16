@@ -457,6 +457,16 @@ export class Orchestrator {
       nd.attempts += 1;
       return this.doBind(nd, res.error, deferIntent);
     }
+    if (cap.derive) {
+      // the value a model makes from the bound arguments (a rewritten text): asked once, then part of the arguments,
+      // so the intent check reads it and the execution intent records it
+      const pre = cap.preconditions(this.ws, res.args);
+      if (pre) { this.emit("node.failed", { node_id: node.id, why: pre }); return false; }
+      const d = cap.derive(this.ws, res.args);
+      const rep = await this.askModel("transform", P.transformPrompt(st.raw, d.instruction, d.source), R.TransformAnswer);
+      if (rep.outcome !== "answered") { this.modelFailed(rep); return false; }
+      res.args[d.field] = rep.data!.text;
+    }
     this.emit("node.bound", { node_id: node.id, bindings: b.bindings, args: res.args });
     if (deferIntent) return true;
     await this.intentCheck([nd]);
@@ -605,10 +615,12 @@ export class Orchestrator {
     if (this.opts.hooks?.crash_on_first_effect && !this.injected && cap.effect !== "observe") { this.crashNext = true; this.injected = true; }
     const result = this.crashNext ? this.executeAndCrash(cap, args) : cap.execute(this.ws, args);   // Crash propagates: no receipt
     this.ws.invalidate();
-    const ok = versionsMatch(cmd.expect_after, this.ws);
-    this.emit("execution.receipt", { operation_id: cmd.operation_id, result: { ...result, status: ok ? "ok" : "post_mismatch" }, text });
+    // a tool that checks its own output reports failed (with why) and leaves nothing behind
+    const refused = result.status === "failed";
+    const ok = !refused && versionsMatch(cmd.expect_after, this.ws);
+    this.emit("execution.receipt", { operation_id: cmd.operation_id, result: { ...result, status: ok ? "ok" : refused ? "failed" : "post_mismatch" }, text });
     if (ok) this.emit("node.verified", { node_id: node.id, output: result.output });
-    else this.emit("node.failed", { node_id: node.id, why: "postcondition mismatch" });
+    else this.emit("node.failed", { node_id: node.id, why: refused ? result.why ?? "the tool failed" : "postcondition mismatch" });
   }
 
   private crashNext = false;

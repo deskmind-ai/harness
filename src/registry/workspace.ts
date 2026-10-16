@@ -11,7 +11,14 @@ export const TRASH = ".deskmind-trash";
 
 export const sha = (b: string | Buffer) => "sha256:" + createHash("sha256").update(b).digest("hex").slice(0, 16);
 
-export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string; preview_truncated?: boolean }
+export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string; preview_truncated?: boolean; binary?: boolean }
+
+/** Text a model can be shown: valid UTF-8 without NUL bytes. A zip, a PDF or an image is not, and decoded as UTF-8
+ *  it is noise in a prompt. */
+export function isText(b: Buffer): boolean {
+  if (b.subarray(0, 8192).includes(0)) return false;
+  try { new TextDecoder("utf-8", { fatal: true }).decode(b); return true; } catch { return false; }
+}
 
 /** What a model is shown of a directory: a bounded projection that says what it left out (2.0 §5.4). */
 export interface Listing { entries: Entry[]; total: number; truncated: boolean; omitted: number; note?: string }
@@ -87,6 +94,15 @@ export class Workspace {
     return fs.readFileSync(this.abs(p), "utf-8");
   }
 
+  readBytes(p: string): Buffer {
+    return fs.readFileSync(this.abs(p));
+  }
+
+  /** A file whose content is text (see isText). */
+  isTextFile(p: string): boolean {
+    return this.exists(p) && !this.isDir(p) && isText(this.readBytes(p));
+  }
+
   exists(p: string): boolean {
     return this.version(p) !== ABSENT;
   }
@@ -108,8 +124,10 @@ export class Workspace {
     for (const [p, v] of all.slice(0, maxFiles)) {
       if (v === "dir") entries.push({ path: p, kind: "folder" });
       else {
-        const t = this.read(p);
-        entries.push({ path: p, kind: "file", bytes: Buffer.byteLength(t), preview: t.slice(0, peek), ...(t.length > peek ? { preview_truncated: true } : {}) });
+        const b = this.readBytes(p);
+        if (!isText(b)) { entries.push({ path: p, kind: "file", bytes: b.length, binary: true }); continue; }
+        const t = b.toString("utf-8");
+        entries.push({ path: p, kind: "file", bytes: b.length, preview: t.slice(0, peek), ...(t.length > peek ? { preview_truncated: true } : {}) });
       }
     }
     const omitted = Math.max(0, all.length - maxFiles);

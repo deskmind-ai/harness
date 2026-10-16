@@ -53,7 +53,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "  例：原文「放『招聘/岗位』，改名『姓名-简历.pdf』」，目录里有「张三-前端.pdf」「李四-后端.pdf」 → { point: \"岗位\", reading: \"每份简历各自的岗位（前端、后端）\", alternatives: [\"一个字面名为「岗位」的文件夹\"], evidence: [\"张三-前端.pdf\"] }。",
     "- authorized_rewrites：用户明确要求改写 / 替换 / 覆盖 / 追加的那些已有文件的路径（例如「把 日志.log 的内容改成…」里的 日志.log）。只有列在这里的文件，程序才会不经确认地丢弃其内容；用户要「新建」的文件不要列（它若已存在属于冲突，要问用户）。",
     "- 目录里已有的文件名和内容也是证据：需求可以引用目录里看到的文件名。",
-    "- 如果所需的事超出了已注册能力（例如发邮件、打印、转格式、OCR、上传），feasible 填 needs_capability_we_lack 并说明；不要用现有能力硬凑，也不要把用户的要求改写成现有能力能做的事（「打印」不等于「读出来」，「发给某人」不等于「复制一份」）。",
+    "- 如果所需的事超出了已注册能力（例如发邮件、打印、上传到网盘），feasible 填 needs_capability_we_lack 并说明；先对照上面的能力清单，清单里有能做到的（例如改写或翻译文字、压缩、转 PDF、识别图片文字）就是能做。不要用现有能力硬凑，也不要把用户的要求改写成现有能力能做的事（「打印」不等于「读出来」，「发给某人」不等于「复制一份」）。",
     "", "输出格式示例（字段名必须一样）：",
     J({ requirements: [
       { id: "r1", statement: "任务目录里有 清单.log", check: { kind: "deterministic", name: "file_exists", args: { path: "清单.log" } }, quotes: ["新建 清单.log"] },
@@ -159,4 +159,13 @@ export function choicePrompt(question: string, context: unknown, options: Option
 
 export function verifyPrompt(requirement: unknown, raw: string, evidence: unknown): string {
   return ["任务：根据证据判断一条需求是否满足。证据不足就 unknown，不要猜。", "", `用户原文：${J(raw)}`, `需求：${J(requirement)}`, "证据：", J(evidence)].join("\n");
+}
+
+/** transform: rewrite a text as the planner's instruction says (fs.transform_text). The answer is written as is. */
+export function transformPrompt(raw: string, instruction: string, source: string): string {
+  return [
+    "任务：按说明改写下面的原文，只输出改写后的全文，写在 text 字段里；它会原样写进一个新文件。",
+    "不要加解释、标题或「以下是…」之类的话；原文的结构（行、列、分隔符、编号）在说明没要求改变时保持不变。",
+    "", `用户原话：${J(raw)}`, `改写说明：${J(instruction)}`, "", "原文：", source,
+  ].join("\n");
 }
