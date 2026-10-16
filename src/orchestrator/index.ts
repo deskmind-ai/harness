@@ -98,6 +98,16 @@ export interface Hooks {
 
 export const BUDGET = { model_calls: 40, actions: 30, replans: 2, asks: 3, rebinds: 2 };
 
+/** Policy choices that are a matter of judgement, not correctness: switches, so a run says which it used and an
+ *  experiment can compare them instead of the code deciding.
+ *  - cannot: when nothing can do the task, "ask" stops and asks (the user can say it differently or let it be);
+ *    "report" ends the run and puts the same choice on the result's card, without stopping (harness#6).
+ *  - evidence: the wording the evidence judge is asked with (prompts.EVIDENCE_WORDINGS); "v2" lets a marker the
+ *    user's words point to count and refuses a pick among bare candidates by association (harness#7), "v1" is the
+ *    wording before it. */
+export const POLICY = { cannot: "ask" as "ask" | "report", evidence: "v2" as P.EvidenceWording };
+export type Policy = typeof POLICY;
+
 const canon = (x: unknown) => JSON.stringify(x, Object.keys(x as object).sort());
 
 const WIDTH: Record<string, string> = { "（": "(", "）": ")", "：": ":", "，": ",", "；": ";", "！": "!", "？": "?", "「": '"', "」": '"', "“": '"', "”": '"', "‘": "'", "’": "'", "、": "," };
@@ -130,6 +140,7 @@ export class Orchestrator {
   readonly user: CardUser;
   readonly st = new State();
   readonly budget: typeof BUDGET;
+  readonly policy: Policy;
 
   constructor(
     logPath: string,
@@ -137,11 +148,12 @@ export class Orchestrator {
     readonly gw: Gateway,
     user: User,
     readonly registry: Registry,
-    readonly opts: { skills?: SkillLibrary; gui?: GuiApp; hooks?: Hooks; budget?: Partial<typeof BUDGET>; history?: string[] } = {},
+    readonly opts: { skills?: SkillLibrary; gui?: GuiApp; hooks?: Hooks; budget?: Partial<typeof BUDGET>; policy?: Partial<Policy>; history?: string[] } = {},
   ) {
     this.user = cardUser(user);
     this.log = new Log(logPath);
     this.budget = { ...BUDGET, ...(opts.budget ?? {}) };
+    this.policy = { ...POLICY, ...(opts.policy ?? {}) };
     for (const ev of this.log.events) this.st.apply(ev);
     const inFlight = [...this.st.ops].filter(([, v]) => v.state === "in_flight").map(([k]) => k);
     if (inFlight.length) this.emit("run.recovered", { unknown: inFlight });
@@ -243,8 +255,8 @@ export class Orchestrator {
     return this.summary();
   }
 
-  finish(status: RunStatus, reason: string) {
-    this.emit("run.status", { status, reason });
+  finish(status: RunStatus, reason: string, extra: Record<string, unknown> = {}) {
+    this.emit("run.status", { status, reason, ...extra });
   }
 
   // --- goal -------------------------------------------------------------------------------------------------------
@@ -316,7 +328,7 @@ export class Orchestrator {
       const ids = opts.map((o) => o.id) as [string, ...string[]];
       // evidence counts only when it shows the very feature the user named; a common-sense guess about which one the
       // user more likely means is not evidence (owner 10-12, harness#5)
-      const rep = await this.askModel("choice", P.choicePrompt(P.evidenceQuestion(a.point), { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
+      const rep = await this.askModel("choice", P.choicePrompt(P.evidenceQuestion(a.point, this.policy.evidence), { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") return this.modelFailed(rep);
       const k = Number(rep.data!.choice.slice(1));
       if (k === 0) { if (fromAnswer.has(i)) a.settled = true; }
@@ -726,8 +738,10 @@ export class Orchestrator {
       key: node && args ? canon({ cap: node.capability, args }) : null });
   }
 
-  /** Nothing registered can do this (or the planner says so). The user can say it differently, or let it be. */
+  /** Nothing registered can do this (or the planner says so). The user can say it differently, or let it be: asked
+   *  now (policy.cannot "ask"), or on the result's card without stopping the run ("report", see resultCard). */
   private cannot(reason: string) {
+    if (this.policy.cannot === "report") return this.finish("failed", "cannot: " + reason, { cannot: reason });
     const card: Card = { kind: "cannot", text: `这件事我做不到：${reason}`, free_text: true, blocking: true, options: [{ kind: "cancel", text: "好的，先这样" }] };
     if (this.st.get("ask:clarify") >= this.budget.asks) return this.finish("failed", "cannot: " + reason);
     const got = this.ask(card, { kind: "clarify", question: card.text, why: "cannot", options: [] });
@@ -801,6 +815,11 @@ export class Orchestrator {
   /** The non-blocking card shown with a result that rests on a reading the user has not confirmed. */
   resultCard(): Card | null {
     const st = this.st, g = st.goal;
+    if (st.status === "failed" && st.cannot !== null) {
+      // can't do it: say so with the result. Saying it differently starts again, while the asks budget lasts.
+      return { kind: "cannot", text: `这件事我做不到：${st.cannot}`, options: [{ kind: "cancel", text: "好的，先这样" }],
+        free_text: st.get("ask:clarify") < this.budget.asks, blocking: false };
+    }
     if (st.status !== "succeeded" || !g || !st.effects.length) return null;
     const open = g.assumptions.filter((a) => !a.settled);
     if (!open.length) return null;
@@ -810,10 +829,21 @@ export class Orchestrator {
     return { kind: "result", text: "我是这样理解的：" + open.map((a) => a.reading).join("；"), options, free_text: false, blocking: false };
   }
 
-  /** The user's response to the result card. undo_and_reading leaves the run ready to go again (call run()). */
+  /** The user's response to the result card. undo_and_reading, and saying a can't-do differently, leave the run ready
+   *  to go again (call run()). */
   respond(card: Card, answer: Answer): void {
-    if (!("option" in answer)) return;
-    const pick = card.options[answer.option];
+    // Only the card the run shows now is answered: a stale card (kept from an earlier result, or answered twice) would
+    // otherwise restart a finished run or spend an ask the budget no longer has.
+    const live = this.resultCard();
+    if (!live || live.kind !== card.kind || live.text !== card.text) return;
+    if (!("option" in answer)) {
+      // the user's own words on the can't-do card: an answer like any other; the goal is derived again with it
+      if (live.kind !== "cannot" || !live.free_text || !answer.text.trim()) return;
+      this.emit("result.response", { picked: "other", text: answer.text });
+      this.emit("run.status", { status: "running", reason: "the user said it differently" });
+      return this.answerAsText(live.text, answer.text, "cannot");
+    }
+    const pick = live.options[answer.option];
     if (!pick) return;
     this.emit("result.response", { picked: pick.kind, text: pick.text });
     if (pick.kind === "never_ask_this") this.emit("preference", { text: `${card.text}——用户说这种以后不用告诉他` });
@@ -1140,7 +1170,7 @@ export class Orchestrator {
       ops: Object.fromEntries([...st.ops].map(([k, v]) => [k, v.state])), effects: st.effects, skill: st.skillUsed,
       nodes: Object.fromEntries([...st.nodes].map(([k, v]) => [k, v.status])), answers: st.answersText(), run_id: st.runId,
       assumptions: st.goal?.assumptions?.map((a) => a.reading) ?? [],        // shown to the user with the result
-      result_card: this.resultCard(), preferences: [...st.preferences],
+      result_card: this.resultCard(), preferences: [...st.preferences], policy: { ...this.policy },
     };
   }
 }
