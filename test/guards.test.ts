@@ -405,15 +405,40 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
   });
 
-  it("a free-text answer that picks no reading settles nothing: no write, no second identical question", async () => {
+  it("a free-text answer that picks no reading: no second identical question, no dead end; the leading reading is done and reported with undo", async () => {
     const asked: string[] = [];
     const u: User = { clarify(q) { asked.push(q); return { text: "按我原来说的做。" }; }, authorize: () => true };
     const g = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, choice: { choice: "r2" }, plan: PLAN, bind: BIND, intent: MATCH });
-    const { o, ws } = setup(TODO, Array(8).fill(g), u);
+    const { o, ws, log } = setup(TODO, Array(8).fill(g), u);
     const s = await o.run();
     expect(asked.length).toBe(1);
-    expect(s.status).toBe("waiting_user");
-    expect(ws.read("todo.txt")).toBe("交房租\n");
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+    expect(s.result_card).toMatchObject({ kind: "result", blocking: false });
+    expect(s.result_card!.text).toContain("问过你，回答里没有选哪一种");
+    expect(s.result_card!.options.map((x) => x.kind)).toContain("undo");
+    expect(fs.readFileSync(log, "utf-8")).not.toContain('"kind":"ask.decided"');   // asked once already: not judged again
+  });
+
+  it("a free-text answer that picks no reading, with a step that cannot be undone: the plan is shown first, nothing written when declined", async () => {
+    const w = byRole({ goal: { ...GOALW, assumptions: [{ point: "内容", reading: "整个文件只剩 X", alternatives: ["把旧内容里的某处换成 X"], evidence: [] }] }, choice: { choice: "r2" }, plan: PLANW, bind: BINDW, intent: MATCH });
+    const asked: string[] = [], texts: string[] = [];
+    const { o } = rewrite(Array(8).fill(w), { clarify: (q) => { asked.push(q); return { text: "按我原来说的做。" }; }, authorize: (t) => { texts.push(t); return false; } });
+    const s = await o.run();
+    expect(asked.length).toBe(1);
+    expect(texts.length).toBe(1);
+    expect(s.counters.actions ?? 0).toBe(0);
+  });
+
+  it("the evidence judge also sees the other files in the cited items' folders", async () => {
+    let judged = "";
+    const files = { "录音/录音_0901.m4a": "a", "录音/录音笔说明书.pdf": "b", "todo.txt": "交房租\n" };
+    const amb = { point: "录音", reading: "只有 录音_日期.m4a 是录音", alternatives: ["录音文件夹里的所有文件"], evidence: ["录音/录音_0901.m4a"] };
+    const g: Scripted = (role, _s, user) => { if (role === "choice") { judged ||= user; return { choice: "r0" }; } return ({ goal: { ...GOAL, assumptions: [amb] }, plan: PLAN, bind: BIND, intent: MATCH } as any)[role] ?? { outcome: "error", error: "none" }; };
+    await setup(files, Array(10).fill(g), user()).o.run();
+    expect(judged).toContain("相关目录里的文件");
+    expect(judged).toContain("录音/录音笔说明书.pdf");
+    expect(judged).not.toContain("todo.txt\"");
   });
 
   it("a free-text answer the judge reads as picking the reading settles it", async () => {

@@ -312,15 +312,15 @@ export class Orchestrator {
           if (st.get("goal_retry") < 1) { this.emit("goal.retry", {}); return; }        // goal stays empty: derived again
           return this.finish("failed", "goal: kept ignoring the user's choice");
         }
-        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: true });
+        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: true, unpicked: false });
       } else if (s) {
         // a free-text answer is evidence, but only the judge below can say whether it picks this reading
         // (「按我原来说的做」 picks nothing)
         fromAnswer.add(assumptions.length);
-        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: false });
+        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: false, unpicked: false });
       } else {
         const evidence = a.evidence.filter((x) => this.isEvidence(x));
-        assumptions.push({ ...a, evidence, backed: evidence.length > 0, settled: false });
+        assumptions.push({ ...a, evidence, backed: evidence.length > 0, settled: false, unpicked: false });
       }
     }
     // a goal that silently drops an ambiguity the user settled has nothing to check it against: treated like ignoring it
@@ -337,10 +337,20 @@ export class Orchestrator {
       const ids = opts.map((o) => o.id) as [string, ...string[]];
       // evidence counts only when it shows the very feature the user named; a common-sense guess about which one the
       // user more likely means is not evidence (owner 10-12, harness#5)
-      const rep = await this.askModel("choice", P.choicePrompt(P.evidenceQuestion(a.point, this.policy.evidence), { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
+      // the files next to the cited ones, so a reading the names in view settle (「说明书.pdf 不是录音」) can be seen
+      const nearby = this.nearby(a.evidence);
+      const rep = await this.askModel("choice", P.choicePrompt(P.evidenceQuestion(a.point, this.policy.evidence), { 用户原文: st.raw, 证据: a.evidence, ...(nearby.length ? { 相关目录里的文件: nearby } : {}) }, opts), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") return this.modelFailed(rep);
       const k = Number(rep.data!.choice.slice(1));
       if (k === 0) { if (fromAnswer.has(i)) a.settled = true; }
+      else if (fromAnswer.has(i) && k === a.alternatives.length + 1) {
+        // asked, and the answer picks none of the readings: asking the same again is refused (clarify), and stopping
+        // here left the run with nothing to do. Go on with the leading reading and say so with the result, where the
+        // user can undo it or pick another (owner 10-09: report in the result, with undo, is fine). A plan with a step
+        // that cannot be taken back is still shown first (planNeedsConfirmation).
+        a.unpicked = true;
+        this.emit("note", { text: `问过用户「${a.point || a.reading}」，回答里没有选哪一种；先按「${a.reading}」做，结果里说明，可以撤回或改成另一种` });
+      }
       else if (fromAnswer.has(i) && k <= a.alternatives.length) {
         // the user's own words pick another reading: record it as their choice and derive the goal again
         this.emit("ambiguity.settled", { point: a.point, readings: [a.reading, ...a.alternatives], option: k, text: assumptions[i]!.evidence[0] ?? "" });
@@ -667,6 +677,9 @@ export class Orchestrator {
     const open = g.assumptions.filter((a) => !a.settled);
     if (!open.length) return false;
     if (writes.some((n) => !this.registry.get(n.capability)?.reversible)) return true;
+    // the user was already asked about every open reading and picked none: everything can be undone, so act and report
+    // it with the result rather than ask a second time
+    if (open.every((a) => a.unpicked)) return false;
     // everything can be undone: whether to interrupt the user first is a judgement, made once per plan and logged
     if (st.askDecision) return st.askDecision === "confirm";
     const steps = writes.map((n) => { const a = st.nodes.get(n.id)?.args; return a ? describe(this.cap(n.capability), a) : n.purpose; });
@@ -861,7 +874,7 @@ export class Orchestrator {
     const options: CardOption[] = [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }];
     for (const a of open) a.alternatives.forEach((alt, k) => options.push({ kind: "undo_and_reading", text: `撤回，改成：${alt}`, point: a.point || a.reading, readings: [a.reading, ...a.alternatives], reading_index: k + 1 }));
     options.push({ kind: "never_ask_this", text: "这种以后不用告诉我" });
-    return { kind: "result", text: (updated ? updated + "。" : "") + "我是这样理解的：" + open.map((a) => a.reading).join("；"), options, free_text: false, blocking: false };
+    return { kind: "result", text: (updated ? updated + "。" : "") + "我是这样理解的：" + open.map((a) => a.reading + (a.unpicked ? "（问过你，回答里没有选哪一种）" : "")).join("；"), options, free_text: false, blocking: false };
   }
 
   /** The user's response to the result card. undo_and_reading, and saying a can't-do differently, leave the run ready
@@ -1159,6 +1172,18 @@ export class Orchestrator {
     return out;
   }
 
+
+  /** Listing entries in the folders of the cited items (a cited path, or an entry named in a cited line), capped: data
+   *  for the evidence judge, beside what the goal model cited. */
+  private nearby(evidence: string[], cap = 60): string[] {
+    const entries = this.ws.listing().entries;
+    const folder = (p: string) => p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+    const base = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+    // a cited path, or a file named in a cited line (a folder's name inside a path is not a citation of the folder)
+    const cited = entries.filter((e) => evidence.some((x) => x === e.path || (e.kind === "file" && base(e.path).length > 1 && x.includes(base(e.path)))));
+    const folders = new Set(cited.map((e) => folder(e.path)));
+    return entries.filter((e) => folders.has(folder(e.path))).map((e) => e.kind === "folder" ? e.path + "/" : e.path).slice(0, cap);
+  }
 
   // --- interaction --------------------------------------------------------------------------------------------------------
   static readonly DELEGATE = "由你决定";
