@@ -476,7 +476,7 @@ describe("execution guards", () => {
     const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
     // the evidence judge answers from the words it is shown; the ask-first judgement wants the plan shown
     const g: Scripted = (role, _s, user) => role !== "choice" ? answers[role] ?? { outcome: "error", error: "none" }
-      : user.includes("要不要先打断用户") ? { choice: "confirm" } : user.includes("先别改") ? { choice: "r5" } : { choice: "r2" };
+      : user.includes("要不要先打断用户") ? { choice: "confirm" } : user.includes("打了一段字") ? { choice: "change" } : user.includes("先别改") ? { choice: "r5" } : { choice: "r2" };
     const { o, ws } = setup(TODO, Array(20).fill(g), u);
     const s = await o.run();
     expect(plans).toBe(1);
@@ -492,7 +492,7 @@ describe("execution guards", () => {
     } };
     const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
     const g: Scripted = (role, _s, user) => role !== "choice" ? answers[role] ?? { outcome: "error", error: "none" }
-      : user.includes("要不要先打断用户") ? { choice: "confirm" } : { choice: "r2" };          // go by the original words
+      : user.includes("要不要先打断用户") ? { choice: "confirm" } : user.includes("打了一段字") ? { choice: "approve" } : { choice: "r2" };
     const { o, ws } = setup(TODO, Array(40).fill(g), u);
     const s = await o.run();
     expect(plans).toBe(1);
@@ -508,6 +508,7 @@ describe("execution guards", () => {
     const g: Scripted = (role, _s, user) => {
       if (role !== "choice") return answers[role] ?? { outcome: "error", error: "none" };
       if (user.includes("要不要先打断用户")) return { choice: "confirm" };
+      if (user.includes("打了一段字")) return { choice: "change" };
       judged.push(user);
       return user.includes("之后在卡片上说的话") ? { choice: "r6" } : { choice: "r0" };     // r6: not about this point
     };
@@ -521,6 +522,71 @@ describe("execution guards", () => {
     expect(judged[card + 1]).toContain("说不清：这些证据区分不了");
     expect(s.status).toBe("waiting_user");                                 // the same plan card is not shown again
     expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("card words the goal cites as evidence do not count once judged not about the point: the user is asked", async () => {
+    const kinds: string[] = [];
+    const words = "顺便把 other.txt 也看一下";
+    const u: CardUser = { ask(card) { kinds.push(card.kind); return card.kind === "plan" ? { text: words } : null; } };
+    let goals = 0;
+    const g: Scripted = (role, _s, user) => {
+      if (role === "goal") return { ...GOAL, assumptions: [{ ...AMB, evidence: [++goals === 1 ? "交房租" : words] }] };
+      if (role !== "choice") return ({ plan: PLAN, bind: BIND, intent: MATCH } as Record<string, unknown>)[role] ?? { outcome: "error", error: "none" };
+      if (user.includes("要不要先打断用户")) return { choice: "confirm" };
+      if (user.includes("打了一段字")) return { choice: "change" };
+      return user.includes("之后在卡片上说的话") ? { choice: "r6" } : { choice: "r0" };
+    };
+    const { o, ws } = setup(TODO, Array(30).fill(g), u);
+    await o.run();
+    expect(kinds).toEqual(["plan", "ambiguity"]);
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  describe("words typed on a plan card are judged at the card", () => {
+    const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
+    // the evidence judge: an answer that picks none goes ahead; words on the card are not about the point. The card
+    // judge answers `card`.
+    const script = (card: string, more: Record<string, unknown> = {}): Scripted => (role, _s, user) => {
+      if (role !== "choice") return { ...answers, ...more }[role] ?? { outcome: "error", error: "none" };
+      if (user.includes("要不要先打断用户")) return { choice: "confirm" };
+      if (user.includes("打了一段字")) return { choice: card };
+      return user.includes("之后在卡片上说的话") ? { choice: "r6" } : { choice: "r2" };
+    };
+    const typing = (words: string, count: { plans: number }): CardUser => ({ ask(card) {
+      if (card.kind === "plan") { count.plans++; return { text: words }; }
+      return card.kind === "ambiguity" ? { text: "按我原来说的做。" } : null;
+    } });
+
+    it("a refusal typed on the plan card stops with nothing written, even where the evidence judge would go ahead", async () => {
+      const n = { plans: 0 };
+      const { o, ws } = setup(TODO, Array(30).fill(script("refuse")), typing("等等，先别加，我要先看看 other.txt", n));
+      const s = await o.run();
+      expect(n.plans).toBe(1);
+      expect(s.status).toBe("waiting_user");
+      expect(ws.read("todo.txt")).toBe("交房租\n");
+    });
+
+    it("a delegated choice: agreement typed on the always-shown plan card approves it; written once", async () => {
+      const n = { plans: 0 };
+      const { o, ws } = setup(TODO, Array(30).fill(script("approve", { goal: { ...GOAL, user_delegated: true, assumptions: [] } })), typing("可以，就这样做", n));
+      const s = await o.run();
+      expect(n.plans).toBe(1);
+      expect(s.status).toBe("succeeded");
+      expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+    });
+
+    it("agreement approves the card as shown: no re-plan, so a planner that words it differently is never asked", async () => {
+      const n = { plans: 0 };
+      let k = 0;
+      const base = script("approve");
+      const reworded: Scripted = (role, sys, user) => role === "plan" ? { ...PLAN, nodes: PLAN.nodes.map((x) => ({ ...x, purpose: `${x.purpose}（第 ${++k} 版）` })) } : base(role, sys, user);
+      const { o, ws } = setup(TODO, Array(30).fill(reworded), typing("行，就这么办", n));
+      const s = await o.run();
+      expect(n.plans).toBe(1);
+      expect(k).toBe(1);
+      expect(s.status).toBe("succeeded");
+      expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+    });
   });
 
   describe("through the GUI (its actions cannot be undone)", () => {
@@ -554,6 +620,22 @@ describe("execution guards", () => {
       expect(texts.length).toBe(1);
       expect(texts[0]).toContain(GUIAMB.reading);
       expect(s.status).toBe("cancelled");
+      expect(read()).toBe("交房租");
+    });
+
+    it("a refusal typed on the confirmation stops with nothing written", async () => {
+      let cards = 0;
+      const base = editor("r2");
+      const g: Scripted = (role, sys, user) => role === "choice" && user.includes("打了一段字") ? { choice: "refuse" }
+        : role === "choice" && user.includes("之后在卡片上说的话") ? { choice: "r6" } : base(role, sys, user);
+      const u: CardUser = { ask(card) {
+        if (card.kind === "plan") { cards++; return { text: "等等，先别动，我要先看看" }; }
+        return card.kind === "ambiguity" ? { text: "你看着办吧，按我原来说的。" } : null;
+      } };
+      const { o, read } = gsetup(g, u);
+      const s = await o.run();
+      expect(cards).toBe(1);
+      expect(s.status).toBe("waiting_user");
       expect(read()).toBe("交房租");
     });
 

@@ -230,7 +230,7 @@ export class Orchestrator {
       const bound = nodes.filter((n) => n.status === "ready");
       if (bound.length) {
         // before the first write: show the plan first, or act and report (docs/ask-policy.md)
-        if (this.cap(bound[0]!.node.capability).effect !== "observe" && !st.planConfirmed && (await this.planNeedsConfirmation())) { this.confirmPlan(); continue; }
+        if (this.cap(bound[0]!.node.capability).effect !== "observe" && !st.planConfirmed && (await this.planNeedsConfirmation())) { await this.confirmPlan(); continue; }
         this.doExecute(bound[0]!); continue;
       }
       if (ready.length) {
@@ -338,7 +338,11 @@ export class Orchestrator {
       const { answer, card } = src[i]!;
       let v = await this.judgeEvidence(a, answer, card), words = card ?? answer;
       // words on a plan card about something else: the reading stands on what it stood on before
-      if (v?.kind === "not_about") { words = answer; v = a.evidence.length ? await this.judgeEvidence(a, answer, null) : { kind: "cant_tell" }; }
+      if (v?.kind === "not_about") {
+        // the goal may have cited the card's words as evidence: they are not about this point, so they do not count
+        words = answer; a.evidence = a.evidence.filter((x) => loose(x) !== loose(card!.text));
+        v = a.evidence.length ? await this.judgeEvidence(a, answer, null) : { kind: "cant_tell" };
+      }
       if (!v) return;                                                  // the judge's call failed; the run has stopped
       const where = a.point || a.reading, readings = [a.reading, ...a.alternatives];
       if (v.kind === "reading" && v.k === 0) { if (words) a.settled = true; }
@@ -351,10 +355,8 @@ export class Orchestrator {
         // the answer leaves it to us: asking the same again is refused (clarify), and stopping left the run with
         // nothing to do. Go on with the leading reading and say so with the result, where the user can undo it or
         // pick another (owner 10-09: report in the result, with undo, is fine). A plan with a step that cannot be
-        // taken back is still shown first (planNeedsConfirmation; in the GUI, confirmGui). Words typed on a plan card
-        // that go ahead approve that card.
+        // taken back is still shown first (planNeedsConfirmation; in the GUI, confirmGui).
         a.unpicked = true;
-        if (card?.digest) this.emit("plan.approved", { digest: card.digest });
         this.emit("note", { text: `问过用户「${where}」，回答里没有选哪一种；先按「${a.reading}」做，结果里说明，可以撤回或改成另一种` });
       } else if (v.kind === "unclear") {
         // ask once more, in other words (a second identical question is refused, and the run stops there)
@@ -712,7 +714,7 @@ export class Orchestrator {
     return rep.data!.choice === "confirm";
   }
 
-  private confirmPlan() {
+  private async confirmPlan() {
     const st = this.st, g = st.goal!, plan = st.plan!;
     const writes = plan.nodes.filter((n) => this.registry.get(n.capability)?.effect !== "observe");
     // each step as concretely as it is known: the bound action (files and text), else the purpose
@@ -750,7 +752,7 @@ export class Orchestrator {
       } else if (pick?.kind === "cancel") {
         this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: false, picked: "cancel" } });
         return this.finish("cancelled", "the user stopped the task");
-      } else return this.answerAsText(text, got.text, "plan", digest);
+      } else return await this.cardWords(text, got.text, digest);
     }
     this.emit("plan.confirmed", {});
   }
@@ -1136,7 +1138,7 @@ export class Orchestrator {
       if (await this.rootCheck(true)) return;
     }
     if (st.get("actions") >= this.budget.actions) return this.finish("failed", "budget: actions");
-    if (this.guiNeedsConfirmation()) return this.confirmGui();
+    if (this.guiNeedsConfirmation()) return await this.confirmGui();
     this.hook("before_gui_step");
     const obs = gui.observe();
     this.emit("observation", { versions: st.lastVersions, gui_epoch: obs.observation_epoch });
@@ -1266,7 +1268,7 @@ export class Orchestrator {
     return this.st.goal!.assumptions.filter((a) => !a.settled && !this.st.delegatedPoints.some((d) => this.sameAmbiguity(a, d)));
   }
 
-  private confirmGui() {
+  private async confirmGui() {
     const st = this.st, g = st.goal!, digest = this.guiDigest();
     if (st.declined.has(digest)) return this.finish("waiting_user", "the user declined the plan; their choice is needed");
     if (st.textAnsweredPlans.has(digest)) return this.finish("waiting_user", "the same plan card would show again after the user's words");
@@ -1287,7 +1289,20 @@ export class Orchestrator {
       this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: false, picked: "cancel" } });
       return this.finish("cancelled", "the user stopped the task");
     }
-    return this.answerAsText(text, got.text, "plan", digest);
+    return await this.cardWords(text, got.text, digest);
+  }
+
+  /** Words typed on a plan card (or the GUI's confirmation), judged when they arrive by what they do to this card:
+   *  go ahead with it (approved, nothing re-derived), change something (an answer like any other: goal and readings
+   *  are derived again with it), or stop (declined, nothing written). */
+  private async cardWords(question: string, text: string, digest: string) {
+    if (!text.trim()) return this.finish("waiting_user", "empty answer");
+    const rep = await this.askModel("choice", P.choicePrompt(P.CARD_WORDS_QUESTION, { 卡片: question, 用户打的字: text }, [...P.CARD_WORDS_OPTIONS]), R.choiceAnswer(["approve", "change", "refuse"]));
+    if (rep.outcome !== "answered") return this.modelFailed(rep);
+    const c = rep.data!.choice;
+    if (c === "change") return this.answerAsText(question, text, "plan", digest);
+    this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text: question, digest, approved: c === "approve", picked: "words", words: text } });
+    if (c === "refuse") return this.finish("waiting_user", "the user's words on the plan card declined it; nothing written");
   }
 
   /** Listing entries in the folders of the cited items (a cited path, or an entry named in a cited line), capped: data

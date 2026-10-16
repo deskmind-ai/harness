@@ -175,9 +175,6 @@ export class State {
       case "preference":
         this.preferences.push(e.text);
         break;
-      case "plan.approved":                      // the judge read the user's words on this plan card as going ahead
-        this.approvals.add(e.digest);
-        break;
       case "ambiguity.not_meant":
         this.notMeant.push({ point: e.point, readings: e.readings, text: e.text });
         break;

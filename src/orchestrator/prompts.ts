@@ -150,7 +150,15 @@ export const EVIDENCE_WORDINGS = {
 export type EvidenceWording = keyof typeof EVIDENCE_WORDINGS;
 
 /** Added to the evidence question when the evidence is the user's answer to our question about this very point. */
-export const EVIDENCE_FROM_ANSWER = "材料里有用户的回答和它回答的那个问题或卡片。回答没有选哪一种，而是让我们按原话做、交给我们、或者同意卡片上的做法，选「按原话做」；看不出回答是什么意思，选「说不清」；回答说的是上面没有的另一种意思，选「另一种意思」；回答否定了这些理解，或者不让改，选「不让做」。";
+export const EVIDENCE_FROM_ANSWER = "材料里有用户的回答和它回答的那个问题或卡片。回答没有选哪一种，而是让我们按原话做、交给我们，选「按原话做」；看不出回答是什么意思，选「说不清」；回答说的是上面没有的另一种意思，选「另一种意思」；回答否定了这些理解，或者不让改，选「不让做」。";
+/** Words typed on a plan card, judged when they arrive: go ahead with the card, change something, or stop. */
+export const CARD_WORDS_QUESTION = "用户看到下面这张卡片后，没有点选项，而是打了一段字。这段字是同意卡片上的做法、要改点什么，还是不让做？只看用户打的字，不要替用户决定；拿不准是不是同意时，不要选同意。";
+export const CARD_WORDS_OPTIONS = [
+  { id: "approve", text: "同意：就按卡片上说的做" },
+  { id: "change", text: "要改：换一种理解、改某一步、补充或修改要求" },
+  { id: "refuse", text: "不让做：不要这样做，或者要先停下" },
+] as const;
+
 /** Added when the user's words were typed on a plan card: they may be about another point, or about something else. */
 export const EVIDENCE_FROM_CARD = "「之后在卡片上说的话」是用户看到那张卡片后打的字，可能说的是这一处，也可能说的是别的事；说的不是这一处时，选「不相关」。";
 export const NOT_ABOUT = "不相关：卡片上的这句话说的不是这一处";
