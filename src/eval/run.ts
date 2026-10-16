@@ -239,7 +239,8 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
       teacherCalls: (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0), confirmed, declined,
       corrected, noticeShown }, user, summ.run_id);
   }
-  const sc = score(task, start, ws.tree(), summ, gui?.log ?? [], talkOf(orch.log.events as any, user));
+  const bytesAt = (p: string) => { try { return fs.readFileSync(path.join(root, p)); } catch { return null; } };   // a zip or a PDF is checked on its bytes
+  const sc = score(task, start, ws.tree(), summ, gui?.log ?? [], talkOf(orch.log.events as any, user), bytesAt);
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
@@ -269,17 +270,17 @@ function mergeSummaries(prev: any, cur: any) {
 function reportV2(rows: any[]) {
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = `${r.config}|${r.category}`; by.set(k, [...(by.get(k) ?? []), r]); }
-  console.log("config | category | n | correct | wrong action | of which guessed | false success | errored | interruptions | unnecessary | declined plan | sim fallbacks | acted on own reading | of which not the first outcome | outcomes | s/task");
+  console.log("config | category | n | correct | capability gaps | wrong action | of which guessed | false success | errored | interruptions | unnecessary | declined plan | sim fallbacks | acted on own reading | of which not the first outcome | outcomes | s/task");
   const pct: Record<string, number[]> = {};
   for (const [k, rs] of [...by].sort()) {
     const n = rs.length, f = (key: string) => rs.filter((r) => r[key]).length;
     const outs = Object.entries(rs.reduce((a: Record<string, number>, r) => { if (r.correct) a[r.outcome ?? "?"] = (a[r.outcome ?? "?"] ?? 0) + 1; return a; }, {})).map(([o, c]) => `${o}:${c}`).join(" ");
-    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${f("declined_plan")} | ${rs.reduce((a, r) => a + (r.sim?.fallbacks ?? 0), 0)} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act")).length} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act") && r.outcome && r.outcome !== r.first_outcome).length} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
+    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("gap")} | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${f("declined_plan")} | ${rs.reduce((a, r) => a + (r.sim?.fallbacks ?? 0), 0)} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act")).length} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act") && r.outcome && r.outcome !== r.first_outcome).length} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
     const cfg = k.split("|")[0]!;
     (pct[cfg] ??= []).push(f("correct") / n);
   }
-  for (const [cfg, ps] of Object.entries(pct)) console.log(`${cfg}: lowest category ${Math.round(100 * Math.min(...ps))}%, unweighted mean ${Math.round((100 * ps.reduce((a, b) => a + b, 0)) / ps.length)}%`);
-  for (const [k, rs] of [...by].sort()) for (const r of rs.filter((r) => !r.correct)) console.log(`  ✗ ${k} ${r.task}: ${r.status} (${(r.reason ?? "").slice(0, 70)}) ${r.why.slice(0, 160)}`);
+  for (const [cfg, ps] of Object.entries(pct)) console.log(`${cfg}: lowest category ${Math.round(100 * Math.min(...ps))}%, unweighted mean ${Math.round((100 * ps.reduce((a, b) => a + b, 0)) / ps.length)}% (a capability gap — an honest stop on a request we lack the means for — counts as not correct)`);
+  for (const [k, rs] of [...by].sort()) for (const r of rs.filter((r) => !r.correct)) console.log(`  ${r.gap ? "◌" : "✗"} ${k} ${r.task}: ${r.status} (${(r.reason ?? "").slice(0, 70)}) ${r.why.slice(0, 160)}`);
 }
 
 function report(paths: string[]) {
