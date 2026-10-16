@@ -19,7 +19,7 @@ import { RENAMES, fileRegistry } from "../registry/fs.js";
 import { guiRegistry } from "../gui/sim.js";
 import { Workspace, build } from "../registry/workspace.js";
 import { EditorSim } from "../gui/sim.js";
-import { Library, movesBetween, useSignals } from "../skills/library.js";
+import { Library, movesBetween, useApproved, useOutcome, useSignals } from "../skills/library.js";
 import { spawnSync } from "node:child_process";
 import { score, talkOf, type Task } from "./score.js";
 
@@ -205,6 +205,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   // the result card is shown with the result: the simulated user may undo, or undo and pick another reading; on a
   // can't-do card it may say it differently, which starts the run again (and may end on another can't-do card)
   let resultResponse: string | null = null;
+  let noticeShown = !!summ.skill_notice;
   for (let looks = 0; summ.result_card && looks <= orch.budget.asks; looks++) {     // a new wording spends an ask
     const card = summ.result_card;
     const a = user.review(card, summ.effects);
@@ -213,6 +214,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
     orch.respond(card, a);
     if (orch.st.status !== "running") { summ = orch.summary(); break; }      // answered: ok, undone, let it be
     summ = await runOrRecover();
+    noticeShown ||= !!summ.skill_notice;
     if (card.kind !== "cannot") break;                            // one look at a redone result, as before
   }
   let taught: unknown = null;
@@ -225,12 +227,16 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   }
   let learned: unknown = null;
   if (library && summ.skill) {
-    // the use, and what it teaches the skill: a run that ended right (succeeded, not undone) gives the right moves
-    const signals = useSignals(orch.log.events as any);
+    // the use, and what it teaches the skill: a run that ended succeeded gives the right moves (an undo leaves it
+    // cancelled; undo and another reading, redone, is the user's correction)
+    const events = orch.log.events as any;
+    const signals = useSignals(events);
     const files = Object.entries(start).filter(([, v]) => v !== null).map(([p]) => p);
-    const right = summ.status === "succeeded" && !signals.includes("undone");
-    library.recordUse(summ.skill, summ.status === "succeeded", (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0), signals);
-    learned = await library.learn(gw, summ.skill, { files, contents: Object.fromEntries(files.map((f) => [f, start[f]!])), final: right ? movesBetween(start, ws.tree()) : null, signals, corrected: signals.includes("declined") }, user, summ.run_id);
+    const { right, corrected } = useOutcome(summ.status, resultResponse, signals);
+    learned = await library.learn(gw, summ.skill, { files, contents: Object.fromEntries(files.map((f) => [f, start[f]!])),
+      final: right ? movesBetween(start, ws.tree()) : null, signals, ok: summ.status === "succeeded",
+      teacherCalls: (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0), approved: useApproved(events),
+      corrected, noticeShown }, user, summ.run_id);
   }
   const sc = score(task, start, ws.tree(), summ, gui?.log ?? [], talkOf(orch.log.events as any, user));
   const rec = {

@@ -94,8 +94,10 @@ export type SkillRule = z.infer<typeof SkillRule>;
 /** What a skill's result must look like, checked by code (skills/rules.ts checkExpect): which files are this skill's
  *  kind (covers: ext, and a name or content pattern), the file name a placed file must end up with (name), and that
  *  files of other kinds stay where they are (untouched). */
+const nonEmpty = (x: string | string[] | undefined) => (x === undefined ? [] : typeof x === "string" ? [x] : x).some((v) => v.trim() !== "");
 export const SkillExpect = z.object({
-  covers: z.object({ ext: strOrList.optional(), name: strOrList.optional(), content: strOrList.optional() }),
+  covers: z.object({ ext: strOrList.optional(), name: strOrList.optional(), content: strOrList.optional() })
+    .refine((c) => nonEmpty(c.ext) || nonEmpty(c.name) || nonEmpty(c.content), "covers needs an extension, a name or a content pattern"),
   name: strOrList.optional(),
   untouched: z.boolean().default(true),
 });

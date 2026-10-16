@@ -1173,6 +1173,7 @@ export class Orchestrator {
       nodes: Object.fromEntries([...st.nodes].map(([k, v]) => [k, v.status])), answers: st.answersText(), run_id: st.runId,
       assumptions: st.goal?.assumptions?.map((a) => a.reading) ?? [],        // shown to the user with the result
       result_card: this.resultCard(), preferences: [...st.preferences], policy: { ...this.policy },
+      skill_notice: st.skillNotice && this.resultCard() ? st.skillNotice : null,   // said on this result's card
     };
   }
 }

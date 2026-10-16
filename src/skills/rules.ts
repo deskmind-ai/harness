@@ -64,8 +64,10 @@ function hit(rule: SkillRule, c: Compiled, name: string, text: string): Record<s
 
 export interface Skill { rules: SkillRule[] }
 
-/** Where every file goes under the skill, and the files it could not decide (two rules, or a template error). */
-export function runSkill(skill: Skill, files: string[], contents: Record<string, string> = {}): { where: Record<string, string>; unsure: string[] } {
+/** Where every file goes under the skill, the files it could not decide (two rules, or a template error), and the files
+ *  a rule matched at all: a file already where its rule puts it stays put, and is still the rule's (where alone cannot
+ *  tell it from a file no rule knows). */
+export function runSkill(skill: Skill, files: string[], contents: Record<string, string> = {}): { where: Record<string, string>; unsure: string[]; matched: string[] } {
   if (!Array.isArray(skill.rules) || !skill.rules.length) throw new SkillError("no rules");
   const compiled: [SkillRule, Compiled][] = skill.rules.map((r) => [r, { names: list(r.match).map(compile), contents: list(r.content).map(compile), nots: list(r.not).map(compile) }]);
   const where: Record<string, string> = {}, unsure: string[] = [], hits = new Map<string, [SkillRule, Record<string, string>]>();
@@ -102,12 +104,13 @@ export function runSkill(skill: Skill, files: string[], contents: Record<string,
       where[f] = folder ? `${folder}/${name}` : name;
     } catch { unsure.push(f); }
   }
-  return { where, unsure };
+  return { where, unsure, matched: [...hits.keys()] };
 }
 
 /** Whether a file is the kind the skill is for (expect.covers): its extension, when listed, and its name or its text,
  *  when patterns are given. */
 export function ofKind(covers: SkillExpect["covers"], name: string, text = ""): boolean {
+  if (!coversSomething(covers)) throw new SkillError("expect.covers names no extension, name or content");
   const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
   const exts = list(covers.ext).map((e) => e.toLowerCase().replace(/^\./, ""));
   if (exts.length && !exts.includes(ext)) return false;
@@ -116,22 +119,27 @@ export function ofKind(covers: SkillExpect["covers"], name: string, text = ""): 
   return names.some((rx) => rx.test(name)) || contents.some((rx) => rx.test(text));
 }
 
+/** covers has to say something (an extension, a name or a content pattern): an empty one checks nothing. */
+export const coversSomething = (covers: SkillExpect["covers"] | undefined) => !!covers && [covers.ext, covers.name, covers.content].some((x) => list(x).some((v) => v.trim()));
+
 export interface ExpectReport {
   uncovered: string[];        // of the skill's kind, but no rule placed it
   misnamed: string[];         // placed, but its new name is not what expect.name says
   touched: string[];          // not of the skill's kind, yet moved
 }
 
-/** The skill's own checks on one result (where: file → new path, unsure: files the rules could not decide). */
-export function checkExpect(expect: SkillExpect, files: string[], contents: Record<string, string>, where: Record<string, string>, unsure: string[] = []): ExpectReport {
+/** The skill's own checks on one result (where: file → new path, unsure: files the rules could not decide, matched:
+ *  files a rule took). matched null: a result no rules produced (the right answer), where "uncovered" means nothing. */
+export function checkExpect(expect: SkillExpect, files: string[], contents: Record<string, string>, where: Record<string, string>, unsure: string[] = [], matched: string[] | null = null): ExpectReport {
   const names = list(expect.name).map(compile);
   const base = (p: string) => p.slice(p.lastIndexOf("/") + 1);
   const r: ExpectReport = { uncovered: [], misnamed: [], touched: [] };
   for (const f of files) {
     const moved = (where[f] ?? f) !== f;
     const kind = ofKind(expect.covers, base(f), contents[f] ?? "");
-    if (kind && !moved && !unsure.includes(f)) r.uncovered.push(f);
-    if (moved && kind && names.length && !names.some((rx) => rx.test(base(where[f]!)))) r.misnamed.push(f);
+    const taken = matched ? matched.includes(f) : moved;
+    if (matched && kind && !taken && !unsure.includes(f)) r.uncovered.push(f);
+    if (taken && kind && !unsure.includes(f) && names.length && !names.some((rx) => rx.test(base(where[f] ?? f)))) r.misnamed.push(f);
     if (moved && !kind && expect.untouched !== false) r.touched.push(f);
   }
   return r;

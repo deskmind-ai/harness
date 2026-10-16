@@ -7,7 +7,7 @@ import { Orchestrator, type Answer, type Card, type CardUser } from "../src/orch
 import type { SkillExpect, SkillRule } from "../src/protocol/roles.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
-import { Library, useSignals, type Example, type StoredSkill } from "../src/skills/library.js";
+import { Library, movesBetween, useApproved, useOutcome, useSignals, type Example, type StoredSkill } from "../src/skills/library.js";
 import { checkExpect } from "../src/skills/rules.js";
 
 const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
@@ -41,8 +41,8 @@ const T013 = { files: ["电子发票-山姆-2026.08.13-99.00元.pdf", "电子发
   want: { "电子发票-山姆-2026.08.13-99.00元.pdf": "财务/发票/2026-08/20260813-山姆-99.pdf", "电子发票-携程-2026.03.12-1024.00元.pdf": "财务/发票/2026-03/20260312-携程-1024.pdf" } };
 
 const ex = (id: string, c: { files: string[]; want: Record<string, string> }, source: Example["source"] = "use"): Example => ({ id, source, files: c.files, contents: contentsOf(c.files), want: c.want, confirmed: source !== "variant", t });
-function stored(lib: Library, family: string, rules: SkillRule[], expectation: SkillExpect, teach: { files: string[]; want: Record<string, string> }): StoredSkill {
-  const sk: StoredSkill = { id: "S001", family, status: "probation", created: t, version: 1, title: family, applies_when: family, rules, variants: [], expect: expectation, examples: [ex("E1", teach, "teach")], admission: {} };
+function stored(lib: Library, family: string, rules: SkillRule[], expectation: SkillExpect, teach: { files: string[]; want: Record<string, string> }, more: Example[] = []): StoredSkill {
+  const sk: StoredSkill = { id: "S001", family, status: "probation", created: t, version: 1, title: family, applies_when: family, rules, variants: [], expect: expectation, examples: [ex("E1", teach, "teach"), ...more], admission: {} };
   lib.skills.push(sk);
   return sk;
 }
@@ -52,8 +52,27 @@ describe("skill checks (expect)", () => {
   it("reports files of the kind no rule placed, a placed file under the wrong name, and a file of another kind moved", () => {
     const files = ["电子发票-山姆-2026.08.13-99.00元.pdf", "发票_盒马_20260304_256元.pdf", "INVOICE.pdf", "readme.txt"];
     const where = { "电子发票-山姆-2026.08.13-99.00元.pdf": "财务/发票/2026-08/电子发票-山姆-2026.08.13-99.00元.pdf", "发票_盒马_20260304_256元.pdf": "财务/发票/2026-03/20260304-盒马-256.pdf", "readme.txt": "财务/readme.txt" };
-    expect(checkExpect(INV_EXPECT, files, {}, where)).toEqual({ uncovered: [], misnamed: ["电子发票-山姆-2026.08.13-99.00元.pdf"], touched: ["readme.txt"] });
-    expect(checkExpect({ ...INV_EXPECT, covers: { ext: ["pdf"], name: ["发票", "invoice"] } }, files, {}, where).uncovered).toEqual(["INVOICE.pdf"]);
+    const matched = Object.keys(where);
+    expect(checkExpect(INV_EXPECT, files, {}, where, [], matched)).toEqual({ uncovered: [], misnamed: ["电子发票-山姆-2026.08.13-99.00元.pdf"], touched: ["readme.txt"] });
+    expect(checkExpect({ ...INV_EXPECT, covers: { ext: ["pdf"], name: ["发票", "invoice"] } }, files, {}, where, [], matched).uncovered).toEqual(["INVOICE.pdf"]);
+  });
+
+  it("a file already where its rule puts it is the rule's, not unrecognised (review 1)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
+    const files = ["录音/2026-01/New Recording 2026-01-27.m4a", "New Recording 2025-10-13.m4a", ...OTHER];
+    expect(lib.plan(sk, files, contentsOf(files)).report).toEqual({ uncovered: [], misnamed: [], touched: [] });
+    const gw = gateway();
+    const r = await lib.learn(gw, "S001", { files, contents: contentsOf(files), final: { "New Recording 2025-10-13.m4a": "录音/2025-10/New Recording 2025-10-13.m4a" }, signals: [] });
+    expect(r).toEqual({ signals: [], example: "E2" });
+    expect(gw.calls).toBe(0);
+  });
+
+  it("covers has to name something: an empty one is not admitted (review 5)", async () => {
+    const lib = library();
+    const answer = { title: "录音", applies_when: "整理录音", rules: REC_V1, variants: [], expect: { covers: {}, untouched: false } };
+    const rec = await lib.teach(gateway(() => answer, () => answer), "录音整理一下", T008.files, contentsOf(T008.files), T008.want, "recordings");
+    expect(rec.status).toBe("rejected");
   });
 
   it("admission needs expect, and it must hold on the right answer and on the rules' result", async () => {
@@ -113,24 +132,73 @@ describe("revision: champion and challenger (design table: 009, 010, 013)", () =
     expect(sk.examples!.map((e) => e.id)).toEqual(["E1", "E2"]);
     // 010 under v2: right first time, so it is one more example and nothing is revised (the script would be unused)
     const gw = gateway();
-    const r2 = await lib.learn(gw, "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [] });
+    const r2 = await lib.learn(gw, "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [], noticeShown: true });
     expect(r2).toEqual({ signals: [], example: "E3" });
     expect(gw.calls).toBe(0);
     expect(sk.notice).toBeNull();                 // said once, with the use after the revision
   });
 
-  it("013: a revision that breaks the teaching example is not taken; two in a row disable the skill", async () => {
+  it("the notice stays until a result card has shown it (review 12)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V2, REC_EXPECT, T008);
+    sk.notice = "现在也认得全角数字";
+    await lib.learn(gateway(), "S001", { files: T010.files, contents: contentsOf(T010.files), final: null, signals: ["goal"], ok: false });
+    expect(sk.notice).toBe("现在也认得全角数字");
+    await lib.learn(gateway(), "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [], noticeShown: true });
+    expect(sk.notice).toBeNull();
+  });
+
+  it("013: a version wrong on the counterexample is not taken; two such in a row disable the skill", async () => {
     const lib = library();
     const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
-    const breaks: SkillRule[] = [INV_V2[1]!];     // the electronic spelling only: 012's 发票_… no longer placed
-    const one = await lib.learn(gateway(revision(breaks, INV_EXPECT, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: ["declined"], corrected: true });
+    const one = await lib.learn(gateway(revision(INV_V1, INV_EXPECT, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: ["declined"], corrected: true });
     expect(one.revision).toBe("kept");
     expect(sk).toMatchObject({ version: 1, status: "probation", failed_revisions: 1 });
-    expect(sk.rules).toEqual(INV_V1);
     expect(sk.examples!.at(-1)).toMatchObject({ source: "correction", confirmed: true });
-    const two = await lib.learn(gateway(revision(breaks, INV_EXPECT, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: ["declined"], corrected: true });
-    expect(two.revision).toBe("kept");
+    expect((await lib.learn(gateway(revision(INV_V1, INV_EXPECT, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: ["declined"], corrected: true })).revision).toBe("kept");
     expect(sk.status).toBe("disabled");
+  });
+
+  it("a model timeout or nobody to ask is not a failed revision; only a version that lost the replay is (review 8)", async () => {
+    const lib = library();
+    const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
+    const timeout = () => ({ outcome: "timeout", error: "slow" });
+    for (let i = 0; i < 2; i++) expect((await lib.learn(gateway(timeout), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: [], approved: true })).revision).toBe("kept");
+    expect(sk.status).toBe("probation");
+    expect(sk.failed_revisions ?? 0).toBe(0);
+    expect(sk.revisions!.map((x) => x.counted)).toEqual([false, false]);
+  });
+
+  it("an invalid pattern in the new version's checks keeps the old version instead of crashing (review 4)", async () => {
+    const lib = library();
+    const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
+    const r = await lib.learn(gateway(revision(INV_V2, { ...INV_EXPECT, name: ["(unclosed"] }, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: [], approved: true });
+    expect(r.revision).toBe("kept");
+    expect(sk.revisions!.at(-1)).toMatchObject({ ok: false, why: "invalid expect", counted: true });
+    expect(sk.rules).toEqual(INV_V1);
+  });
+
+  it("a version that breaks the teaching example gets one more try; the second keeps both and replaces, nobody asked (review 7)", async () => {
+    const lib = library();
+    const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
+    const u = user(1);
+    const breaks: SkillRule[] = [INV_V2[1]!];     // the electronic spelling only: 012's 发票_… no longer placed
+    const r = await lib.learn(gateway(revision(breaks, INV_EXPECT, "x"), revision(INV_V2, INV_EXPECT, "现在也会改名")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: ["declined"], corrected: true }, u);
+    expect(r.revision).toBe("replaced");
+    expect(u.cards).toEqual([]);
+    expect(sk).toMatchObject({ version: 2, notice: "现在也会改名" });
+  });
+
+  it("a kept confirmed counterexample binds later versions (review 14)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008, [{ ...ex("E2", T009, "correction") }]);   // kept: v1 is wrong on it
+    // the new version fixes 010 but still gets 009 wrong: not taken, even though v1 was wrong on 009 too
+    const only010: SkillRule[] = [{ name: "rec", match: ["new recording\\s*(?P<y>\\d{4})\\s*-\\s*(?P<m>\\d{2})\\s*-\\s*(?P<d>\\d{2})", "录音_(?P<y>[0-9０-９]{4})(?P<m>[0-9０-９]{2})"], ext: ["m4a"], to: "录音/{y|04}-{m|02}" }];
+    expect(Library.replay({ rules: only010, expect: REC_EXPECT }, ex("x", T010))).toBe(true);
+    expect(Library.replay({ rules: only010, expect: REC_EXPECT }, ex("x", T009))).toBe(false);
+    const r = await lib.learn(gateway(revision(only010, REC_EXPECT, "x"), revision(only010, REC_EXPECT, "x")), "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [], approved: true });
+    expect(r.revision).toBe("kept");
+    expect(sk.version).toBe(1);
   });
 
   it("013 with a good revision: replaced, and the next result says what changed, with undo", async () => {
@@ -165,19 +233,48 @@ describe("revision: asking only on a conflict with what the user confirmed", () 
   const BY_YEAR: SkillRule[] = [{ ...REC_V2[0]!, to: "录音/{y|04}" }];
   const T_YEAR = { files: ["New Recording 2026-02-14.m4a", ...OTHER], want: { "New Recording 2026-02-14.m4a": "录音/2026/New Recording 2026-02-14.m4a" } };
 
-  it("the new version cannot keep both: one question 「以前是 A，这次是 B，以后按哪个？」; the answer decides", async () => {
+  it("the new version cannot keep both, even after one more try: one question 「以前是 A，这次是 B，以后按哪个？」; the answer decides", async () => {
     for (const [pick, outcome, version, to] of [[1, "replaced", 2, "录音/{y|04}"], [0, "asked_kept", 1, "录音/{y}-{m}"]] as const) {
       const lib = library();
       const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
       const u = user(pick);
-      const r = await lib.learn(gateway(revision(BY_YEAR, REC_EXPECT, "按年归档", "E1")), "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true }, u);
+      const twice = revision(BY_YEAR, REC_EXPECT, "按年归档", null);         // the model does not even say it conflicts
+      const r = await lib.learn(gateway(twice, twice), "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true }, u);
       expect(r.revision).toBe(outcome);
       expect(u.cards).toHaveLength(1);
       expect(u.cards[0]!.text).toMatch(/^整理这类文件，以前是「.+录音\/20\d\d-\d\d\/.+」，这次是「.+录音\/2026\/.+」，以后按哪个？$/);
       expect(sk.version).toBe(version);
       expect(sk.rules![0]!.to).toBe(to);
+      expect(sk.failed_revisions ?? 0).toBe(0);
       if (pick === 1) expect(sk.examples!.map((e) => e.id)).not.toContain("E1");   // the old way is retired
     }
+  });
+
+  it("the new way, once chosen, retires every example of the old way it breaks, imagined variants included (review 2)", async () => {
+    const lib = library();
+    const oldVariant: Example = { id: "E2", source: "variant", files: ["New Recording 2024-02-03.m4a"], contents: contentsOf(["New Recording 2024-02-03.m4a"]), want: { "New Recording 2024-02-03.m4a": "录音/2024-02/New Recording 2024-02-03.m4a" }, confirmed: false, t };
+    const oldUse = ex("E3", { files: ["New Recording 2025-03-01.m4a"], want: { "New Recording 2025-03-01.m4a": "录音/2025-03/New Recording 2025-03-01.m4a" } });
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008, [oldVariant, oldUse]);
+    const twice = revision(BY_YEAR, REC_EXPECT, "按年归档", "E1");
+    const r = await lib.learn(gateway(twice, twice), "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true }, user(1));
+    expect(r.revision).toBe("replaced");
+    expect(sk.examples!.map((e) => e.id)).toEqual(["E4"]);
+    expect(sk.revisions!.at(-1)).toMatchObject({ ok: true, asked: true, retired: ["E1", "E3", "E2"] });
+  });
+
+  it("a correction that contradicts only an imagined variant is taken without asking; the variant is dropped (review 3)", async () => {
+    const lib = library();
+    // the teacher imagined that a voice memo is not a recording; the user's run filed one
+    const memo: Example = { id: "E2", source: "variant", files: ["Voice Memo 2024-02-03.m4a"], contents: contentsOf(["Voice Memo 2024-02-03.m4a"]), want: {}, confirmed: false, t };
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008, [memo]);
+    const withMemo: SkillRule[] = [{ ...REC_V1[0]!, match: [...(REC_V1[0]!.match as string[]), "^Voice Memo (?P<y>\\d{4})-(?P<m>\\d{2})-(?P<d>\\d{2})"] }];
+    const memoExpect: SkillExpect = { ...REC_EXPECT, covers: { ext: ["m4a"], name: ["录音", "recording", "memo"] } };
+    const T_MEMO = { files: ["Voice Memo 2025-01-01.m4a", ...OTHER], want: { "Voice Memo 2025-01-01.m4a": "录音/2025-01/Voice Memo 2025-01-01.m4a" } };
+    const u = user(0);
+    const r = await lib.learn(gateway(revision(withMemo, memoExpect, "现在也整理语音备忘录")), "S001", { files: T_MEMO.files, contents: contentsOf(T_MEMO.files), final: T_MEMO.want, signals: ["declined"], corrected: true }, u);
+    expect(r.revision).toBe("replaced");
+    expect(u.cards).toEqual([]);
+    expect(sk.examples!.map((e) => e.id)).not.toContain("E2");
   });
 
   it("a conflict the model claims but the replay does not show is not asked about", async () => {
@@ -187,5 +284,64 @@ describe("revision: asking only on a conflict with what the user confirmed", () 
     const r = await lib.learn(gateway(revision(REC_V2, REC_EXPECT, "认得更多写法", "E1")), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [] }, u);
     expect(r.revision).toBe("replaced");
     expect(u.cards).toEqual([]);
+  });
+});
+
+describe("review fixes around a use", () => {
+  it("a file the skill moved by mistake stays in the example, so the mistake is revised (review 6)", async () => {
+    const lib = library();
+    const loose: SkillRule[] = [{ name: "rec", match: ["录音"], to: "录音" }];                // no ext: takes the manual too
+    const tight: SkillRule[] = [{ name: "rec", match: ["录音"], ext: ["m4a"], to: "录音" }];
+    const teach = { files: ["录音_1.m4a"], want: { "录音_1.m4a": "录音/录音_1.m4a" } };
+    const sk = stored(lib, "recordings", loose, { covers: { ext: ["m4a"] }, untouched: true }, teach);
+    const files = ["录音_2.m4a", "录音笔说明书.pdf"];
+    const r = await lib.learn(gateway(revision(tight, { covers: { ext: ["m4a"] }, untouched: true }, "不再动说明书")), "S001", { files, contents: contentsOf(files), final: { "录音_2.m4a": "录音/录音_2.m4a" }, signals: [], approved: true });
+    expect(r).toMatchObject({ signals: ["touched"], revision: "replaced" });
+    expect(sk.rules).toEqual(tight);
+  });
+
+  it("the new version is held to the old version's checks too, unless this right answer breaks them (review 5)", () => {
+    const narrow: SkillExpect = { covers: { ext: ["m4a"], name: ["recording"] }, untouched: true };
+    const E = ex("E9", { files: ["New Recording 2026-01-27.m4a", "录音笔铃声.m4a"], want: { "New Recording 2026-01-27.m4a": "录音/2026-01/New Recording 2026-01-27.m4a" } });
+    const challenger = { rules: REC_V2, expect: narrow };
+    expect(Library.replay(challenger, E)).toBe(true);                   // fine by its own, narrower checks
+    const counter = ex("C", T009);
+    expect(Library.judge({ rules: REC_V1, expect: REC_EXPECT }, counter)(challenger, E)).toBe(false);   // not by the old ones
+    // when the right answer itself leaves a file the old checks call theirs (the old checks were wrong), they do not bind
+    expect(Library.judge({ rules: REC_V1, expect: REC_EXPECT }, E)(challenger, E)).toBe(true);
+  });
+
+  it("confirmed only when the user approved or corrected the run (review 10)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V2, REC_EXPECT, T008);
+    await lib.learn(gateway(), "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [] });
+    await lib.learn(gateway(), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], approved: true });
+    expect(sk.examples!.slice(1).map((e) => e.confirmed)).toEqual([false, true]);
+  });
+
+  it("the use is recorded inside learn, with the skill's own check signals (review 11)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
+    await lib.learn(gateway(() => ({ outcome: "timeout", error: "slow" })), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], ok: true });
+    expect(sk.uses).toEqual([expect.objectContaining({ ok: true, signals: ["uncovered"] })]);
+  });
+
+  it("another reading or the user's own words on the skill's plan card are signals; approving it is not (review 9)", () => {
+    const plan = { kind: "plan.accepted", plan: { source: "skill", skill: "S001", nodes: [{ id: "mv0" }] } };
+    expect(useSignals([plan, { kind: "interaction.reply", body: { kind: "clarify", purpose: "plan", picked: "reading" } }])).toEqual(["declined"]);
+    expect(useSignals([plan, { kind: "interaction.reply", body: { kind: "clarify", picked: "other", card: "plan" } }])).toEqual(["declined"]);
+    expect(useSignals([plan, { kind: "interaction.reply", body: { kind: "authorize", purpose: "plan", approved: true } }])).toEqual([]);
+    expect(useApproved([plan, { kind: "interaction.reply", body: { kind: "authorize", purpose: "plan", approved: true } }])).toBe(true);
+    expect(useApproved([plan])).toBe(false);
+  });
+
+  it("undo and another reading, redone right, is a correction that ended right (review 9)", () => {
+    expect(useOutcome("succeeded", "undo_and_reading", ["undone"])).toEqual({ right: true, corrected: true });
+    expect(useOutcome("cancelled", "undo", ["undone"])).toEqual({ right: false, corrected: false });
+    expect(useOutcome("succeeded", null, [])).toEqual({ right: true, corrected: false });
+  });
+
+  it("moves pair files by name before content, never crosswise (review 13)", () => {
+    expect(movesBetween({ "a.txt": "x", "b.txt": "x" }, { "B/b.txt": "x", "A/a.txt": "x" })).toEqual({ "a.txt": "A/a.txt", "b.txt": "B/b.txt" });
   });
 });
