@@ -639,13 +639,28 @@ describe("execution guards", () => {
       expect(read()).toBe("交房租");
     });
 
-    it("a reading the user handed to us by clicking 由你决定 is not confirmed again", async () => {
+    it("a reading the user handed to us by clicking 由你决定: one confirmation before the irreversible action", async () => {
       const texts: string[] = [];
-      const { o, read } = gsetup(editor("r2"), { clarify: (_q, opts) => ({ option: opts.indexOf("由你决定") }), authorize: (t) => { texts.push(t); return false; } });
+      const { o, read } = gsetup(editor("r2"), { clarify: (_q, opts) => ({ option: opts.indexOf("由你决定") }), authorize: (t) => { texts.push(t); return true; } });
       const s = await o.run();
-      expect(texts).toEqual([]);
+      expect(texts.length).toBe(1);
       expect(s.status).toBe("succeeded");
       expect(read()).toBe("买牛奶");
+    });
+
+    it("a request handed to us in words, then 由你决定 clicked on an unrelated question: still confirmed before acting", async () => {
+      const texts: string[] = [];
+      let goals = 0;
+      const base = editor("r0");
+      const missing = [{ what: "改完后要不要另存一份", question: "改完后要不要另存一份？", kind: "information", options: ["另存一份", "不用"], options_are: "proposals" }];
+      const g: Scripted = (role, sys, user) => role === "goal"
+        ? { ...GUIGOAL, user_delegated: true, assumptions: [], missing: ++goals === 1 ? missing : [] }
+        : base(role, sys, user);
+      const { o, read } = gsetup(g, { clarify: (_q, opts) => ({ option: opts.indexOf("由你决定") }), authorize: (t) => { texts.push(t); return false; } });
+      await o.run();
+      expect(goals).toBeGreaterThan(1);
+      expect(texts.length).toBe(1);
+      expect(read()).toBe("交房租");
     });
 
     it("a request read as handing the choice to us is confirmed once before the first action, which cannot be undone", async () => {

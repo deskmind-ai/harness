@@ -1248,13 +1248,13 @@ export class Orchestrator {
   }
 
   /** Before the first GUI action, which cannot be taken back: the user confirms once when the run decides something
-   *  for them, as planNeedsConfirmation does for a plan with a step without undo. That is when the goal role read the
-   *  request as handing the choice to us (an explicit 「由你决定」 click is its own confirmation), or when it acts on a
-   *  reading the user has not settled. */
+   *  for them, as planNeedsConfirmation does for a plan with a step without undo. That is when the choice was handed to
+   *  us (in words or by a 「由你决定」 click: a click on one question says nothing about what else the run decides, and
+   *  one more confirmation is unnecessary, not wrong), or when it acts on a reading the user has not settled. */
   private guiNeedsConfirmation(): boolean {
     const st = this.st, g = st.goal!;
     if (!this.guiCannotUndo() || st.get("actions") > 0) return false;
-    const decides = (g.user_delegated && !st.delegatedByAnswer) || this.guiOpen().length > 0;
+    const decides = g.user_delegated || this.guiOpen().length > 0;
     return decides && !st.approvals.has(this.guiDigest());
   }
 
