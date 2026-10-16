@@ -5,7 +5,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { Gateway, type Scripted } from "../src/gateway/index.js";
-import { Orchestrator, type Answer, type Card, type CardUser, type OptionKind } from "../src/orchestrator/index.js";
+import { Orchestrator, type Answer, type Card, type CardUser, type OptionKind, type Policy } from "../src/orchestrator/index.js";
+import { evidenceQuestion } from "../src/orchestrator/prompts.js";
 import { Crash } from "../src/registry/capability.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
@@ -29,13 +30,13 @@ function picker(...picks: (OptionKind | { text: string } | ((c: Card) => Answer 
   };
 }
 
-function setup(files: Record<string, string | null>, script: Scripted[], u: CardUser, raw: string, hooks: any = {}) {
+function setup(files: Record<string, string | null>, script: Scripted[], u: CardUser, raw: string, hooks: any = {}, policy: Partial<Policy> = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "harness-cards-"));
   build(root, files);
   const ws = new Workspace(root);
   const gw = new Gateway(table); gw.script = script;
   const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "harness-cards-log-")), "log.jsonl");
-  const o = new Orchestrator(log, ws, gw, u, fileRegistry(), { hooks });
+  const o = new Orchestrator(log, ws, gw, u, fileRegistry(), { hooks, policy });
   o.start(raw);
   return { o, ws, gw, log };
 }
@@ -143,10 +144,23 @@ describe("interaction cards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n");
   });
 
-  it("can't-do card comes with the result, stopping nothing; the user may say it differently or let it be", async () => {
+  it("can't-do, policy \"ask\" (default): the user may say it differently; 「好的，先这样」 ends it", async () => {
+    const lack = byRole({ goal: { requirements: [], constraints: [], missing: [], feasible: "needs_capability_we_lack", infeasible_reason: "没有打印能力" } });
+    const u1 = picker("cancel");
+    const s1 = await setup(TODO, [lack], u1, "把 todo.txt 打印出来").o.run();
+    expect(u1.cards[0]!.kind).toBe("cannot");
+    expect(s1.status).toBe("failed");
+    expect(s1.result_card).toBeNull();
+    expect(s1.policy).toEqual({ cannot: "ask", evidence: "v2" });
+    const u2 = picker({ text: "那就在末尾加一行「买牛奶」" });
+    const s2 = await setup(TODO, [lack, byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH }), byRole({ plan: PLAN }), byRole({ bind: BIND }), byRole({ intent: MATCH })], u2, "把 todo.txt 打印出来").o.run();
+    expect(s2.answers).toContain("那就在末尾加一行「买牛奶」");
+  });
+
+  it("can't-do, policy \"report\": the card comes with the result, stopping nothing; the user may say it differently or let it be", async () => {
     const lack = byRole({ goal: { requirements: [], constraints: [], missing: [], feasible: "needs_capability_we_lack", infeasible_reason: "没有打印能力" } });
     const u1 = picker();
-    const r1 = setup(TODO, [lack], u1, "把 todo.txt 打印出来");
+    const r1 = setup(TODO, [lack], u1, "把 todo.txt 打印出来", {}, { cannot: "report" });
     const s1 = await r1.o.run();
     expect(u1.cards).toEqual([]);                                   // nobody was asked: the run just ended
     expect(s1.status).toBe("failed");
@@ -157,7 +171,7 @@ describe("interaction cards", () => {
     expect(r1.o.summary().status).toBe("failed");
 
     const u2 = picker();
-    const { o, ws } = setup(TODO, [lack, byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH }), byRole({ plan: PLAN }), byRole({ bind: BIND }), byRole({ intent: MATCH })], u2, "把 todo.txt 打印出来");
+    const { o, ws } = setup(TODO, [lack, byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH }), byRole({ plan: PLAN }), byRole({ bind: BIND }), byRole({ intent: MATCH })], u2, "把 todo.txt 打印出来", {}, { cannot: "report" });
     const first = await o.run();
     o.respond(first.result_card!, { text: "那就在末尾加一行「买牛奶」" });
     const s2 = await o.run();
@@ -167,15 +181,46 @@ describe("interaction cards", () => {
     expect(u2.cards).toEqual([]);
   });
 
-  it("can't-do card: once the asks budget is spent, only 「好的，先这样」 is left", async () => {
+  it("can't-do, policy \"report\": once the asks budget is spent, only 「好的，先这样」 is left", async () => {
     const lack = byRole({ goal: { requirements: [], constraints: [], missing: [], feasible: "needs_capability_we_lack", infeasible_reason: "没有打印能力" } });
-    const { o } = setup(TODO, Array(6).fill(lack), picker(), "把 todo.txt 打印出来");
+    const { o } = setup(TODO, Array(6).fill(lack), picker(), "把 todo.txt 打印出来", {}, { cannot: "report" });
     let s = await o.run();
     for (const t of ["打印", "还是打印", "就打印"]) { o.respond(s.result_card!, { text: t }); s = await o.run(); }
     expect(s.status).toBe("failed");
     expect(s.result_card!.free_text).toBe(false);
     o.respond(s.result_card!, { text: "再试" });                     // not taken
     expect(o.summary().status).toBe("failed");
+  });
+
+  it("can't-do, policy \"report\": a stale card or an empty answer starts nothing (review of harness#6)", async () => {
+    const lack = byRole({ goal: { requirements: [], constraints: [], missing: [], feasible: "needs_capability_we_lack", infeasible_reason: "没有打印能力" } });
+    // a card kept from the first result, answered after the user's new wording already succeeded: no second run
+    const { o, ws } = setup(TODO, [lack, byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH }), byRole({ plan: PLAN }), byRole({ bind: BIND }), byRole({ intent: MATCH })], picker(), "把 todo.txt 打印出来", {}, { cannot: "report" });
+    const kept = (await o.run()).result_card!;
+    o.respond(kept, { text: "那就在末尾加一行「买牛奶」" });
+    expect((await o.run()).status).toBe("succeeded");
+    o.respond(kept, { text: "那就在末尾加一行「买牛奶」" });
+    expect(o.summary().status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+    // an empty answer leaves the can't-do result as it was
+    const r = setup(TODO, [lack], picker(), "把 todo.txt 打印出来", {}, { cannot: "report" });
+    const card = (await r.o.run()).result_card!;
+    r.o.respond(card, { text: "   " });
+    expect(r.o.summary()).toMatchObject({ status: "failed", result_card: { kind: "cannot" } });
+    // a card kept while the budget lasted is not taken once it is spent
+    const b = setup(TODO, Array(6).fill(lack), picker(), "把 todo.txt 打印出来", {}, { cannot: "report" });
+    let s = await b.o.run();
+    const early = s.result_card!;
+    for (const t of ["打印", "还是打印", "就打印"]) { b.o.respond(s.result_card!, { text: t }); s = await b.o.run(); }
+    b.o.respond(early, { text: "再试" });
+    expect(b.o.summary().status).toBe("failed");
+    expect(b.o.st.get("ask:clarify")).toBe(3);
+  });
+
+  it("evidence wording: v1 is the question before harness#7 word for word, v2 adds the criteria", () => {
+    expect(evidenceQuestion("那份笔记", "v1")).toBe("用户原话里的「那份笔记」指的是哪一种？只根据下面的证据判断；证据区分不了就选「说不清」。");
+    expect(evidenceQuestion("那份笔记")).toBe(evidenceQuestion("那份笔记", "v2"));
+    expect(evidenceQuestion("那份笔记", "v2")).toContain("只是几个候选并列");
   });
 
   it("result card: shown when the result rests on an unconfirmed reading; undo takes the writes back", async () => {

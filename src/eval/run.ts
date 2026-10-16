@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { CONFIGS, Gateway, withOverrides } from "../gateway/index.js";
-import { Orchestrator, cardUser, type Answer, type Card, type CardUser, type Hooks } from "../orchestrator/index.js";
+import { Orchestrator, POLICY, cardUser, type Answer, type Card, type CardUser, type Hooks, type Policy } from "../orchestrator/index.js";
 import { Crash, Registry } from "../registry/capability.js";
 import { RENAMES, fileRegistry } from "../registry/fs.js";
 import { guiRegistry } from "../gui/sim.js";
@@ -59,7 +59,7 @@ function simJudge(prompt: string, stats: { calls: number; cached: number; fallba
 
 class SimUser implements CardUser {
   asked: string[] = [];
-  clarifies = 0;                                             // blocking questions (missing, ambiguity, can't-do)
+  clarifies = 0;                                             // blocking questions (missing, ambiguity; can't-do under policy.cannot "ask")
   authorizes = 0;                                            // blocking confirmations (plan, action, result)
   approvals: { text: string; approved: boolean; picked?: string }[] = [];
   sim = { calls: 0, cached: 0, fallbacks: 0 };              // the simulated user's model: answered, from cache, failed
@@ -126,8 +126,9 @@ class SimUser implements CardUser {
     return card.free_text ? { text: f.answer } : null;
   }
 
-  /** The result card is not blocking: the user looks at the result and may undo it. A can't-do card is read like the
-   *  question it used to be (same wording), but it did not stop the run, so it is no interruption. */
+  /** The result card is not blocking: the user looks at the result and may undo it. A can't-do card (policy.cannot
+   *  "report") is read like the question it is under "ask" (same wording), but it did not stop the run, so it is no
+   *  interruption. */
   review(card: Card, effects: string[]): Answer | null {
     const f = this.task.user_facts;
     if (!f) return null;
@@ -151,7 +152,7 @@ function capsFor(task: Task): Registry {
   return task.caps === "alt" ? fileRegistry().withRenamed(RENAMES) : fileRegistry();
 }
 
-async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean, library: Library | null, rep = 0) {
+async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean, library: Library | null, rep = 0, policy: Partial<Policy> = {}) {
   const runDir = path.join(outDir, `rep${rep}`, task.id);          // one directory per repetition: logs are never overwritten
   fs.rmSync(runDir, { recursive: true, force: true });
   fs.mkdirSync(runDir, { recursive: true });
@@ -183,31 +184,35 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   const t0 = Date.now();
   const calls0 = gw.calls, spent0 = gw.spentUsd;
   const logPath = path.join(runDir, "log.jsonl");
-  let orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills });
+  let orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills, policy });
   orch.start(task.raw);
   let crashed = false;
-  let summ;
-  try {
-    summ = await orch.run();
-  } catch (e) {
-    if (!(e instanceof Crash)) throw e;
-    crashed = true;
-    if (h.after_crash_set) build(root, h.after_crash_set);
-    delete hooks.crash_on_first_effect;
-    orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills });
-    summ = await orch.run();
-  }
+  // A crash task crashes on the first effect of whichever run() gets there: after a can't-do card, that can be the
+  // run started again by the user's new wording, so every run() recovers the same way.
+  const runOrRecover = async () => {
+    try {
+      return await orch.run();
+    } catch (e) {
+      if (!(e instanceof Crash)) throw e;
+      crashed = true;
+      if (h.after_crash_set) build(root, h.after_crash_set);
+      delete hooks.crash_on_first_effect;
+      orch = new Orchestrator(logPath, ws, gw, user, capsFor(task), { hooks, gui, skills, policy });
+      return await orch.run();
+    }
+  };
+  let summ = await runOrRecover();
   // the result card is shown with the result: the simulated user may undo, or undo and pick another reading; on a
   // can't-do card it may say it differently, which starts the run again (and may end on another can't-do card)
   let resultResponse: string | null = null;
-  for (let looks = 0; summ.result_card && looks < 4; looks++) {
+  for (let looks = 0; summ.result_card && looks <= orch.budget.asks; looks++) {     // a new wording spends an ask
     const card = summ.result_card;
     const a = user.review(card, summ.effects);
     if (!a) break;
     resultResponse = "option" in a ? card.options[a.option]?.kind ?? null : "other";
     orch.respond(card, a);
     if (orch.st.status !== "running") { summ = orch.summary(); break; }      // answered: ok, undone, let it be
-    summ = await orch.run();
+    summ = await runOrRecover();
     if (card.kind !== "cannot") break;                            // one look at a redone result, as before
   }
   let taught: unknown = null;
@@ -225,7 +230,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
-    category: task.category, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, result_response: resultResponse, sim: user.sim,
+    category: task.category, policy: summ.policy, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, result_response: resultResponse, sim: user.sim,
     ask_decisions: orch.log.events.filter((e: any) => e.kind === "ask.decided").map((e: any) => e.decision),
     first_outcome: task.gold.outcomes?.[0]?.name ?? "gold", seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
@@ -278,6 +283,18 @@ function report(paths: string[]) {
   for (const [k, rs] of [...by].sort()) for (const r of rs.filter((r) => !r.correct)) console.log(`  ✗ ${k} ${r.task}: ${r.status} (${(r.reason ?? "").slice(0, 80)}) ${r.why.slice(0, 160)}`);
 }
 
+/** --policy name=value, for the switches in orchestrator POLICY; an unknown name or value stops the run. */
+function parsePolicy(args: string[]): Partial<Policy> {
+  const choices: Record<string, string[]> = { cannot: ["ask", "report"], evidence: ["v1", "v2"] };
+  const out: Record<string, string> = {};
+  for (const arg of args) {
+    const [k, v] = arg.split("=");
+    if (!k || !(k in POLICY) || !v || !choices[k]?.includes(v)) throw new Error(`--policy ${arg}: expected one of ${Object.entries(choices).map(([n, vs]) => `${n}=${vs.join("|")}`).join(", ")}`);
+    out[k] = v;
+  }
+  return out as Partial<Policy>;
+}
+
 async function main() {
   const { values: a } = parseArgs({ args: process.argv.slice(2).filter((x) => x !== "--"), allowPositionals: true, options: {
     tasks: { type: "string" }, config: { type: "string", default: "B0-luna" }, split: { type: "string", default: "dev" },
@@ -285,6 +302,7 @@ async function main() {
     out: { type: "string" }, v: { type: "boolean", default: false }, report: { type: "string", multiple: true },
     role: { type: "string", multiple: true, default: [] },
     repeat: { type: "string", default: "1" },
+    policy: { type: "string", multiple: true, default: [] },     // e.g. --policy cannot=report --policy evidence=v1
   } });
   if (a.report?.length) return report(a.report);
   if (!a.tasks) throw new Error("--tasks <path to tasks.json> is required");
@@ -294,7 +312,8 @@ async function main() {
   setSimCache(path.join(path.dirname(path.resolve(a.tasks)), "sim-cache.json"));
   tasks = tasks.filter((t) => groups.has(t.group) && t.split === a.split && (!only || only.has(t.id)));
   if (a.limit) tasks = tasks.slice(0, Number(a.limit));
-  const out = path.resolve("runs", a.out ?? `${a.config}${a.role!.length ? "+" + a.role!.map((r) => r.split("=")[0]).join("+") : ""}-${a.split}`);
+  const policy = parsePolicy(a.policy!);
+  const out = path.resolve("runs", a.out ?? `${a.config}${a.role!.length ? "+" + a.role!.map((r) => r.split("=")[0]).join("+") : ""}${Object.entries(policy).map(([k, v]) => `+${k}-${v}`).join("")}-${a.split}`);
   fs.mkdirSync(out, { recursive: true });
   const callsLog = fs.openSync(path.join(out, "model_calls.jsonl"), "a");
   const table = a.role!.length ? withOverrides(CONFIGS[a.config!]!, a.role!) : a.config!;
@@ -308,7 +327,7 @@ async function main() {
     for (const t of tasks) {
       if (done.has(`${t.id}#${rep}`)) continue;
       if (a.v) console.log(`\n=== ${t.id} (${t.split}, rep ${rep}): ${t.raw}`);
-      const r = { ...(await runTask(t, gw, out, a.v!, library, rep)), rep };
+      const r = { ...(await runTask(t, gw, out, a.v!, library, rep, policy)), rep };
       fs.appendFileSync(resPath, JSON.stringify(r) + "\n");
       console.log(`${r.correct ? "✓" : "✗"} ${t.id}#${rep} ${r.status} (${(r.reason ?? "").slice(0, 60)}) calls=${r.model_calls} $${r.cost_usd.toFixed(4)} ${r.seconds}s ${r.correct ? "" : r.why.slice(0, 80)}`);
       if (gw.spentUsd >= Number(a["max-cost"])) { console.log("cost cap reached, stopping"); break outer; }
