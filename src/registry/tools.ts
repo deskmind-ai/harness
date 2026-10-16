@@ -1,39 +1,48 @@
 /**
- * Capabilities that make a new file with a tool: a model rewriting text (translate, summarise, rewrite), and macOS
- * built-ins (PDF, OCR) or Node's own zlib (zip). Requests like these were refused as "needs a capability we lack" although the means were
- * on the Mac (evalset v2's lack tasks, 10-16): each closes one such gap. Every one only creates its output file, so
- * undo deletes it, and each checks its own output before reporting success: a tool that ran but made the wrong thing
- * leaves nothing behind and the step fails with the reason.
+ * Capabilities that make a new file with a tool: a model rewriting text (translate, summarise, rewrite), macOS
+ * built-ins (PDF, OCR), and Node's own zlib (zip). Requests like these were refused as "needs a capability we lack"
+ * although the means were on the Mac (evalset v2's lack tasks, 10-16): each closes one such gap.
+ *
+ * Every one only creates its output file, so undo deletes it. The output is made and checked in a temporary file
+ * first (under the workspace's trash folder: same volume, never listed), then linked into place, which is atomic and
+ * never replaces anything. A crash therefore leaves either no output or a complete, checked one, and a tool that ran
+ * but made the wrong thing leaves nothing behind: the step fails with the reason.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { Capability, ExecResult } from "./capability.js";
-import { IS_MAC, ask, helper, run } from "./mac.js";
+import { IS_MAC, ask, helperBin, helperProblem, prepareHelper, run } from "./mac.js";
 import { after, folderOk, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
-import { ABSENT, isText, sha, type Workspace } from "./workspace.js";
+import { ABSENT, NOT_UTF8_EN, TRASH, isText, sha, type Workspace } from "./workspace.js";
 import { readZip, writeZip } from "./zip.js";
-
-/** The longest source a model rewrites in one step; a longer file is refused up front rather than cut. */
-const TRANSFORM_MAX_CHARS = 40_000;
 
 const pathsOf = (list: string) => list.split("\n").map(norm).filter(Boolean);
 const badPath = (q: string) => q.split("/").includes("..");
+const failed = (why: string): ExecResult => ({ status: "failed", why, output: {}, versions_after: {} });
 
 /** The destination is new, in an existing folder, with the extension the tool writes (when it writes one). */
 function newFile(ws: Workspace, dst: string, ext?: string): string | null {
   if (ext && path.extname(dst).toLowerCase() !== ext) return `${dst} must end with ${ext}`;
-  if (ws.exists(dst)) return `${dst} already exists`;
+  if (ws.exists(dst) || fs.existsSync(ws.abs(dst)) || isLink(ws.abs(dst))) return `${dst} already exists`;
   return folderOk(ws, parentOf(dst)) ? null : `folder ${parentOf(dst)} does not exist`;
 }
+const isLink = (full: string) => { try { return fs.lstatSync(full).isSymbolicLink(); } catch { return false; } };
 
-/** Write a tool's output as a new file and report it; refuses (nothing written) when the check fails. */
-function wrote(ws: Workspace, dst: string, data: Buffer | string, check: () => string | null, output: Record<string, unknown> = {}): ExecResult {
-  fs.writeFileSync(ws.abs(dst), data, { flag: "wx" });
-  const err = check();
-  if (err) {
-    fs.unlinkSync(ws.abs(dst));
-    return { status: "failed", why: err, output: {}, versions_after: { [dst]: ABSENT } };
+/** Put a tool's output at `dst`: written to a temporary file, checked there (`check` gets its path), then linked into
+ *  place. Refuses, leaving nothing, when the check fails or `dst` appeared meanwhile (a link never replaces a file). */
+export function wrote(ws: Workspace, dst: string, data: Buffer | string, check: (file: string) => string | null, output: Record<string, unknown> = {}): ExecResult {
+  const dir = ws.abs(TRASH);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.tmp-${randomUUID()}${path.extname(dst)}`);
+  try {
+    fs.writeFileSync(tmp, data, { flag: "wx" });
+    const err = check(tmp);
+    if (err) return { ...failed(err), versions_after: { [dst]: ABSENT } };
+    try { fs.linkSync(tmp, ws.abs(dst)); } catch (e) { return failed(`cannot create ${dst}: ${(e as NodeJS.ErrnoException).code ?? String(e)}`); }
+  } finally {
+    fs.rmSync(tmp, { force: true });
   }
   maybeCrash();
   return after(ws, [dst], { file: dst, ...output });
@@ -51,22 +60,32 @@ export const fsTransformText = make({
     destination: p("新文件的完整路径（含文件名）；不能是已有文件"),
   },
   pathFields: ["source", "destination"],
-  derive: { field: "text", from: (ws, a) => ({ instruction: a.instruction!, source: ws.read(norm(a.source!)) }) },
+  // text: the rewrite; text_of: the version of the source it was made from, so a source changed before this step runs
+  // (an earlier step of the same plan appended to it) fails the precondition and the node is bound and rewritten again
+  derive: {
+    fields: ["text", "text_of"],
+    from: (ws, a) => ({ field: "text", instruction: a.instruction!, source: ws.read(norm(a.source!)), also: { text_of: ws.version(norm(a.source!)) } }),
+  },
   footprint: (_ws, a) => { const dst = norm(a.destination!); return { reads: [norm(a.source!)], writes: [dst], expectAfter: { [dst]: typeof a.text === "string" ? sha(a.text) : "file:*" } }; },
   pre: (ws, a) => {
     const src = norm(a.source!);
     if (!ws.exists(src) || ws.isDir(src)) return `${src} is not an existing file`;
-    if (!ws.isTextFile(src)) return `${src} is not a text file`;
-    if (ws.read(src).length > TRANSFORM_MAX_CHARS) return `${src} is longer than ${TRANSFORM_MAX_CHARS} characters, too long to rewrite in one step`;
+    if (!ws.isTextFile(src)) return `${src} ${NOT_UTF8_EN}`;
+    if (a.text_of !== undefined && ws.version(src) !== a.text_of) return `${src} changed after it was rewritten: rewrite it again`;
     return newFile(ws, norm(a.destination!));
   },
   run: (ws, a) => {
-    const dst = norm(a.destination!);
-    if (typeof a.text !== "string") return { status: "failed", why: "the rewritten text was never produced", output: {}, versions_after: {} };
-    return wrote(ws, dst, a.text, () => null);
+    if (typeof a.text !== "string" || !a.text) return failed("the rewritten text was never produced");
+    return wrote(ws, norm(a.destination!), a.text, () => null);
   },
   undo: (ws, a, r) => removeOutput(ws, norm(a.destination!), r),
 });
+
+/** Finder's folder settings: never something the user asked to compress. */
+const JUNK = new Set([".DS_Store"]);
+/** What one archive may hold: zip's own limits without zip64 (65,535 entries, 4 GiB), and the archive is built in
+ *  memory, so its total is kept to 1 GiB. A guard, refused up front with the reason. */
+export const ZIP_LIMITS = { entries: 65_535, totalBytes: 1024 ** 3 };
 
 /** Every file and folder under the given paths, as zip entry names (folders end with "/"), in the listing's order. */
 function entriesUnder(ws: Workspace, sources: string[]): string[] {
@@ -75,9 +94,34 @@ function entriesUnder(ws: Workspace, sources: string[]): string[] {
   for (const q of sources) {
     if (!ws.isDir(q)) { out.push(q); continue; }
     out.push(q + "/");
-    for (const [p, v] of all) if (p.startsWith(q + "/")) out.push(v === "dir" ? p + "/" : p);
+    for (const [p, v] of all) if (p.startsWith(q + "/") && !JUNK.has(path.basename(p))) out.push(v === "dir" ? p + "/" : p);
   }
   return [...new Set(out)];
+}
+
+const sizeOf = (ws: Workspace, names: string[]) => names.filter((n) => !n.endsWith("/")).reduce((t, n) => t + fs.statSync(ws.abs(n)).size, 0);
+
+/** The archive as other programs see it: our reader gives exactly these entries with these bytes, and on a Mac the
+ *  system unzip extracts the same files (all at once; given no names, it treats none as a pattern). */
+function zipMatches(ws: Workspace, file: string, names: string[]): string | null {
+  let got: { name: string; data: Buffer }[];
+  try { got = readZip(fs.readFileSync(file)); } catch (e) { return "the archive cannot be read back: " + String(e); }
+  if (got.map((e) => e.name).join("\n") !== names.join("\n")) return "the archive's entries differ from the files";
+  for (const e of got) if (!e.name.endsWith("/") && !e.data.equals(ws.readBytes(e.name))) return `${e.name} in the archive differs from the file`;
+  if (!fs.existsSync("/usr/bin/unzip")) return null;
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "harness-unzip-"));
+  try {
+    const u = run("/usr/bin/unzip", ["-q", file, "-d", out], { timeoutMs: 300_000 });
+    if (!u.ok) return "the system unzip cannot extract the archive: " + u.stderr.slice(0, 200);
+    for (const e of got) {
+      if (e.name.endsWith("/")) continue;
+      const x = path.join(out, e.name);
+      if (!fs.existsSync(x) || !fs.readFileSync(x).equals(e.data)) return `the system unzip extracts ${e.name} differently`;
+    }
+    return null;
+  } finally {
+    fs.rmSync(out, { recursive: true, force: true });
+  }
 }
 
 export const fsZipFiles = make({
@@ -99,26 +143,16 @@ export const fsZipFiles = make({
     if (missing.length) return `${missing.join(", ")} does not exist`;
     const dst = norm(a.destination!);
     if (srcs.some((q) => dst === q || dst.startsWith(q + "/"))) return `${dst} would be inside what it compresses`;
+    const names = entriesUnder(ws, srcs);
+    if (names.length > ZIP_LIMITS.entries) return `${names.length} entries: more than a zip without zip64 can hold (${ZIP_LIMITS.entries})`;
+    const total = sizeOf(ws, names);
+    if (total > ZIP_LIMITS.totalBytes) return `${total} bytes to compress: more than ${ZIP_LIMITS.totalBytes} in one archive`;
     return newFile(ws, dst, ".zip");
   },
   run: (ws, a) => {
     const dst = norm(a.destination!), names = entriesUnder(ws, pathsOf(a.sources!));
     const data = writeZip(names.map((n) => ({ name: n, data: n.endsWith("/") ? Buffer.alloc(0) : ws.readBytes(n) })));
-    // Read back: exactly these entries, each byte for byte (and, on a Mac, as the system's unzip extracts it).
-    return wrote(ws, dst, data, () => {
-      let got: { name: string; data: Buffer }[];
-      try { got = readZip(ws.readBytes(dst)); } catch (e) { return "the archive cannot be read back: " + String(e); }
-      if (got.map((e) => e.name).join("\n") !== names.join("\n")) return "the archive's entries differ from the files";
-      for (const e of got) {
-        if (e.name.endsWith("/")) continue;
-        if (!e.data.equals(ws.readBytes(e.name))) return `${e.name} in the archive differs from the file`;
-        if (fs.existsSync("/usr/bin/unzip")) {
-          const u = run("/usr/bin/unzip", ["-p", ws.abs(dst), e.name]);
-          if (!u.ok || !u.stdout.equals(e.data)) return `the system unzip reads ${e.name} differently`;
-        }
-      }
-      return null;
-    }, { entries: names.filter((n) => !n.endsWith("/")) });
+    return wrote(ws, dst, data, (file) => zipMatches(ws, file, names), { entries: names.filter((n) => !n.endsWith("/")) });
   },
   undo: (ws, a, r) => removeOutput(ws, norm(a.destination!), r),
 });
@@ -136,7 +170,8 @@ export const fsConvertToPdf = make({
   footprint: (_ws, a) => ({ reads: [norm(a.source!)], writes: [norm(a.destination!)], expectAfter: { [norm(a.destination!)]: "file:*" } }),
   pre: (ws, a) => {
     const src = norm(a.source!);
-    if (!IS_MAC) return "needs macOS";
+    const h = helperProblem();                     // the result is checked with PDFKit, through the helper
+    if (h) return h;
     if (!ws.exists(src) || ws.isDir(src)) return `${src} is not an existing file`;
     if (!TEXTUTIL.has(path.extname(src).toLowerCase()) && !ws.isTextFile(src)) return `${src} is not a document this can convert`;
     return newFile(ws, norm(a.destination!), ".pdf");
@@ -145,20 +180,26 @@ export const fsConvertToPdf = make({
     const src = norm(a.source!), dst = norm(a.destination!);
     let text: string;
     if (TEXTUTIL.has(path.extname(src).toLowerCase())) {
-      const t = run("/usr/bin/textutil", ["-convert", "txt", "-stdout", ws.abs(src)]);
-      if (!t.ok) return { status: "failed", why: "textutil failed: " + t.stderr.slice(0, 200), output: {}, versions_after: {} };
+      // -noload: never fetch what an HTML or Word file links to
+      const t = run("/usr/bin/textutil", ["-noload", "-convert", "txt", "-stdout", ws.abs(src)], { maxBytes: 256 * 1024 * 1024 });
+      if (!t.ok) return failed("textutil failed: " + t.stderr.slice(0, 200));
       text = t.stdout.toString("utf-8");
     } else text = ws.read(src);
     // cupsfilter reads a file; the plain text goes through a temporary one outside the task folder
-    const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "harness-pdf-")), "in.txt");
-    fs.writeFileSync(tmp, text, "utf-8");
-    const c = run("/usr/sbin/cupsfilter", ["-m", "application/pdf", tmp]);
-    fs.rmSync(path.dirname(tmp), { recursive: true, force: true });
-    if (!c.ok || c.stdout.length === 0) return { status: "failed", why: "cupsfilter failed: " + c.stderr.split("\n").filter((l) => !l.startsWith("DEBUG")).join(" ").slice(0, 200), output: {}, versions_after: {} };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-pdf-"));
+    let pdf: Buffer;
+    try {
+      fs.writeFileSync(path.join(dir, "in.txt"), text, "utf-8");
+      const c = run("/usr/sbin/cupsfilter", ["-m", "application/pdf", path.join(dir, "in.txt")], { maxBytes: 512 * 1024 * 1024, timeoutMs: 300_000 });
+      if (!c.ok || c.stdout.length === 0) return failed("cupsfilter failed: " + c.stderr.split("\n").filter((l) => !l.startsWith("DEBUG")).join(" ").slice(0, 200));
+      pdf = c.stdout;
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
     // A PDF that PDFKit opens, with the document's text in it (its first line at least, ignoring line breaks).
-    return wrote(ws, dst, c.stdout, () => {
-      if (!c.stdout.subarray(0, 5).equals(Buffer.from("%PDF-"))) return "the output is not a PDF";
-      const info = ask("pdf", ws.abs(dst));
+    return wrote(ws, dst, pdf, (file) => {
+      if (!pdf.subarray(0, 5).equals(Buffer.from("%PDF-"))) return "the output is not a PDF";
+      const info = ask("pdf", file);
       if ("error" in info) return String(info.error);
       if (!(Number(info.pages) >= 1)) return "the PDF has no pages";
       const first = squash(text.split("\n").find((l) => l.trim()) ?? "").slice(0, 20);
@@ -179,24 +220,26 @@ export const fsOcrImage = make({
   footprint: (_ws, a) => ({ reads: [norm(a.source!)], writes: [norm(a.destination!)], expectAfter: { [norm(a.destination!)]: "file:*" } }),
   pre: (ws, a) => {
     const src = norm(a.source!);
-    if (!IS_MAC) return "needs macOS";
+    const h = helperProblem();
+    if (h) return h;
     if (!ws.exists(src) || ws.isDir(src)) return `${src} is not an existing file`;
     if (!IMAGES.has(path.extname(src).toLowerCase()) || isText(ws.readBytes(src))) return `${src} is not an image`;
-    const h = helper();
-    if ("error" in h) return h.error;
     return newFile(ws, norm(a.destination!));
   },
   run: (ws, a) => {
-    const dst = norm(a.destination!);
     const got = ask("ocr", ws.abs(norm(a.source!)));
-    if ("error" in got) return { status: "failed", why: String(got.error), output: {}, versions_after: {} };
+    if ("error" in got) return failed(String(got.error));
     const lines = (got.lines as string[] | undefined) ?? [];
-    if (!lines.length) return { status: "failed", why: "no text was found in the image", output: {}, versions_after: {} };
-    return wrote(ws, dst, lines.join("\n") + "\n", () => null, { lines: lines.length });
+    if (!lines.length) return failed("no text was found in the image");
+    return wrote(ws, norm(a.destination!), lines.join("\n") + "\n", () => null, { lines: lines.length });
   },
   undo: (ws, a, r) => removeOutput(ws, norm(a.destination!), r),
 });
 
-/** The text rewrite and zip work anywhere; PDF and OCR need macOS's tools and are offered only on a Mac. */
-export const TOOL_CAPABILITIES: Capability[] = [fsTransformText, fsZipFiles, ...(IS_MAC ? [fsConvertToPdf, fsOcrImage] : [])];
-
+/** What a registry offers now. The text rewrite and zip work anywhere. PDF and OCR need the macOS helper and are
+ *  offered only once it is built and answers, so a goal or plan never counts on a tool that cannot run; the first call
+ *  on a Mac starts the build in the background (await prepareHelper() to have them from the start). */
+export function toolCapabilities(): Capability[] {
+  if (IS_MAC && !helperBin()) void prepareHelper();
+  return [fsTransformText, fsZipFiles, ...(helperBin() ? [fsConvertToPdf, fsOcrImage] : [])];
+}

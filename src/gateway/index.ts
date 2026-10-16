@@ -23,7 +23,19 @@ import { ROLES, type Role } from "../protocol/roles.js";
  * scripted     tests
  */
 export type Backend = "openrouter" | "local_chat" | "systemone" | "claude_cli" | "scripted";
-export type RoleTable = Record<Role, { backend: Backend; model: string }>;
+/** maxOutputTokens: the most a role's model may write in one answer (local_chat sends it as max_tokens); unset, the
+ *  backend's default below. */
+export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutputTokens?: number }>;
+
+/** What a backend can write in one answer, and how fast, when the table does not say: the basis of outputBudget. A
+ *  choice-only backend writes nothing; tests (scripted) are not limited. */
+const OUTPUT_DEFAULTS: Record<Backend, { maxTokens: number; tokensPerSecond: number; timeoutMs: number }> = {
+  openrouter: { maxTokens: 16_000, tokensPerSecond: 40, timeoutMs: 120_000 },
+  local_chat: { maxTokens: 2_000, tokensPerSecond: 15, timeoutMs: 300_000 },
+  systemone: { maxTokens: 0, tokensPerSecond: 0, timeoutMs: 120_000 },
+  claude_cli: { maxTokens: 32_000, tokensPerSecond: 40, timeoutMs: 180_000 },
+  scripted: { maxTokens: Infinity, tokensPerSecond: Infinity, timeoutMs: Infinity },
+};
 
 const all = (backend: Backend, model: string): RoleTable =>
   Object.fromEntries(ROLES.map((r) => [r, { backend, model }])) as RoleTable;
@@ -140,6 +152,16 @@ export class Gateway {
     }
   }
 
+  /** How many characters a role's model can write back in one answer: the smaller of its output limit and what it
+   *  writes before the call times out. A Chinese character can be a token of its own, so tokens count as characters.
+   *  Used to refuse up front a rewrite the model could only return cut short (fs.transform_text). */
+  outputBudget(role: Role): number {
+    const { backend, maxOutputTokens } = this.table[role];
+    const d = OUTPUT_DEFAULTS[backend];
+    const timeoutMs = this.opts.timeoutMs ?? d.timeoutMs;
+    return Math.min(maxOutputTokens ?? d.maxTokens, (timeoutMs / 1000) * d.tokensPerSecond);
+  }
+
   async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = ""): Promise<Reply<z.infer<S>>> {
     const { backend, model } = this.table[role];
     const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" });
@@ -151,7 +173,7 @@ export class Gateway {
     } else {
       const t0 = performance.now();
       let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema)
-        : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema)
+        : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, this.table[role].maxOutputTokens ?? OUTPUT_DEFAULTS.local_chat.maxTokens)
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user)
         : this.scripted(role, sys, user);
@@ -238,8 +260,8 @@ export class Gateway {
   }
 
   /** An OpenAI-compatible local server (mlx_lm.server): same shape as OpenRouter, no key, no cost. */
-  private async localChat(model: string, system: string, user: string, jsonSchema: unknown): Promise<Partial<Reply>> {
-    const body = { model: localModelName(model), temperature: 0, max_tokens: 2000,
+  private async localChat(model: string, system: string, user: string, jsonSchema: unknown, maxTokens: number): Promise<Partial<Reply>> {
+    const body = { model: localModelName(model), temperature: 0, max_tokens: maxTokens,
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       response_format: { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } };
     const t0 = performance.now();

@@ -3,7 +3,7 @@
  * builds a capability from a short spec with the common argument checks.
  */
 import * as fs from "node:fs";
-import { Crash, schemaCheck, type Args, type Capability, type Effect, type ExecResult, type FieldSchema, type Footprint } from "./capability.js";
+import { Crash, schemaCheck, type Args, type Capability, type Derivation, type Effect, type ExecResult, type FieldSchema, type Footprint } from "./capability.js";
 import { Workspace } from "./workspace.js";
 
 export const s = (description: string): FieldSchema => ({ type: "string", minLength: 1, description });
@@ -33,8 +33,8 @@ export interface Spec {
   footprint: (ws: Workspace, a: Args) => Footprint;
   pre: (ws: Workspace, a: Args) => string | null;
   run: (ws: Workspace, a: Args) => ExecResult;
-  /** A value a model produces after binding (Capability.derive); its field is left out of the schema check. */
-  derive?: { field: string; from: (ws: Workspace, a: Args) => { instruction: string; source: string } };
+  /** Values a model produces after binding (Capability.derive); their fields are left out of the schema check. */
+  derive?: { fields: string[]; from: (ws: Workspace, a: Args) => Derivation };
   /** reversible = `undo` exists (or the capability only observes). `check` says whether undo can run now without
    *  changing anything; `undo` checks again and acts. `prep` records before the action what undo will need. */
   undo?: (ws: Workspace, a: Args, r: ExecResult) => string | null;
@@ -48,7 +48,7 @@ export function make(sp: Spec): Capability {
   return {
     id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards, reversible: sp.effect === "observe" || !!sp.undo,
     typecheck(a) {
-      if (sp.derive && sp.derive.field in a) { const { [sp.derive.field]: _, ...rest } = a; a = rest; }
+      if (sp.derive) a = Object.fromEntries(Object.entries(a).filter(([k]) => !sp.derive!.fields.includes(k)));
       const err = schemaCheck(schema, a);
       if (err) return err;
       for (const k of sp.pathFields ?? []) if (a[k]!.split("/").includes("..")) return `bad path ${a[k]}`;
@@ -61,7 +61,7 @@ export function make(sp: Spec): Capability {
     ...(sp.undo ? { undo: sp.undo } : {}),
     ...(sp.check ? { undoCheck: sp.check } : {}),
     ...(sp.prep ? { prepareUndo: sp.prep } : {}),
-    ...(sp.derive ? { derive: (ws: Workspace, a: Args) => ({ field: sp.derive!.field, ...sp.derive!.from(ws, a) }) } : {}),
+    ...(sp.derive ? { derive: sp.derive.from } : {}),
   };
 }
 

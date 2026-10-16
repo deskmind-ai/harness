@@ -11,14 +11,19 @@ export const TRASH = ".deskmind-trash";
 
 export const sha = (b: string | Buffer) => "sha256:" + createHash("sha256").update(b).digest("hex").slice(0, 16);
 
-export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string; preview_truncated?: boolean; binary?: boolean }
+export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string; preview_truncated?: boolean; not_utf8?: boolean }
 
-/** Text a model can be shown: valid UTF-8 without NUL bytes. A zip, a PDF or an image is not, and decoded as UTF-8
- *  it is noise in a prompt. */
+/** Text a model can be shown: valid UTF-8 without NUL bytes. A zip, a PDF or an image is not, and neither is text in
+ *  another encoding (GBK, UTF-16); decoded as UTF-8 either is noise in a prompt. */
 export function isText(b: Buffer): boolean {
   if (b.subarray(0, 8192).includes(0)) return false;
   try { new TextDecoder("utf-8", { fatal: true }).decode(b); return true; } catch { return false; }
 }
+
+/** What to call a file that is not UTF-8 text, without guessing which it is. */
+export const NOT_UTF8 = "不是 UTF-8 文本（可能是图片、PDF、压缩包等二进制文件，或 GBK、UTF-16 等别的编码）";
+/** The same, in the runtime's own (English) voice, for a refused precondition. */
+export const NOT_UTF8_EN = "is not UTF-8 text (a binary file such as an image, PDF or archive, or text in another encoding such as GBK or UTF-16)";
 
 /** What a model is shown of a directory: a bounded projection that says what it left out (2.0 §5.4). */
 export interface Listing { entries: Entry[]; total: number; truncated: boolean; omitted: number; note?: string }
@@ -43,7 +48,7 @@ export class Workspace {
       for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
         if (d.name === TRASH || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
-        const st = fs.statSync(full);
+        const st = fs.lstatSync(full);              // a link (even a dangling one) is not followed
         parts.push(`${full}:${st.mtimeMs}:${st.size}`);
         if (d.isDirectory()) walk(full);
       }
@@ -103,6 +108,12 @@ export class Workspace {
     return this.exists(p) && !this.isDir(p) && isText(this.readBytes(p));
   }
 
+  /** A file's text for a prompt, at most `max` characters; a file that is not UTF-8 text is named, never decoded. */
+  readForModel(p: string, max: number): string {
+    const b = this.readBytes(p);
+    return isText(b) ? b.toString("utf-8").slice(0, max) : `（${NOT_UTF8}，${b.length} 字节，不显示内容）`;
+  }
+
   exists(p: string): boolean {
     return this.version(p) !== ABSENT;
   }
@@ -125,7 +136,7 @@ export class Workspace {
       if (v === "dir") entries.push({ path: p, kind: "folder" });
       else {
         const b = this.readBytes(p);
-        if (!isText(b)) { entries.push({ path: p, kind: "file", bytes: b.length, binary: true }); continue; }
+        if (!isText(b)) { entries.push({ path: p, kind: "file", bytes: b.length, not_utf8: true }); continue; }
         const t = b.toString("utf-8");
         entries.push({ path: p, kind: "file", bytes: b.length, preview: t.slice(0, peek), ...(t.length > peek ? { preview_truncated: true } : {}) });
       }

@@ -5,9 +5,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Registry, type ExecResult } from "./capability.js";
-import { ABSENT, TRASH, Workspace, sha } from "./workspace.js";
+import { ABSENT, NOT_UTF8_EN, TRASH, Workspace, sha } from "./workspace.js";
 import { CRASH_FLAG, after, folderOk, join, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
-import { TOOL_CAPABILITIES } from "./tools.js";
+import { toolCapabilities } from "./tools.js";
 
 export { CRASH_FLAG, join, norm, parentOf };
 
@@ -113,7 +113,7 @@ export const fsReadText = make({
   id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe",
   fields: { target: p("要读的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [norm(a.target!)], writes: [], expectAfter: {} }),
-  pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : !ws.isTextFile(q) ? `${q} is not a text file (an image, a PDF or an archive)` : null; },
+  pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : !ws.isTextFile(q) ? `${q} ${NOT_UTF8_EN}` : null; },
   run: (ws, a) => ({ status: "ok", output: { text: ws.read(norm(a.target!)) }, versions_after: {} }),
 });
 
@@ -126,7 +126,7 @@ export const fsList = make({
     // the drill-down the bounded listing points at: one folder's direct members, itself bounded and self-describing
     const q = norm(a.path!), limit = 200;
     const members = Object.entries(ws.entries()).filter(([p]) => parentOf(p) === q);
-    const entries = members.slice(0, limit).map(([p, v]) => (v === "dir" ? { path: p, kind: "folder" } : ws.isTextFile(p) ? { path: p, kind: "file", preview: ws.read(p).slice(0, 80) } : { path: p, kind: "file", binary: true }));
+    const entries = members.slice(0, limit).map(([p, v]) => (v === "dir" ? { path: p, kind: "folder" } : ws.isTextFile(p) ? { path: p, kind: "file", preview: ws.read(p).slice(0, 80) } : { path: p, kind: "file", not_utf8: true }));
     return { status: "ok", output: { entries, total: members.length, truncated: members.length > limit }, versions_after: {} };
   },
 });
@@ -134,7 +134,7 @@ export const fsList = make({
 export const FS_CAPABILITIES = [fsCreateText, fsReplaceText, fsAppendLine, fsMove, fsCopy, fsMkdir, fsTrash, fsReadText, fsList];
 
 /** The file capabilities and the tools that make files (tools.ts): what a file task may use. */
-export const fileRegistry = () => [...FS_CAPABILITIES, ...TOOL_CAPABILITIES].reduce((r, c) => r.register(c), new Registry());
+export const fileRegistry = () => [...FS_CAPABILITIES, ...toolCapabilities()].reduce((r, c) => r.register(c), new Registry());
 
 /** Field renames for the dynamic-schema evaluation group. */
 export const RENAMES: Record<string, Record<string, string>> = {

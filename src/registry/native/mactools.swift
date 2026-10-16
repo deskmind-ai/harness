@@ -2,6 +2,7 @@
 // swiftc into a cache folder (src/registry/mac.ts); everything runs on this Mac.
 //   mactools ocr <image>   ->  {"lines": [...]}   text lines read by Vision (zh-Hans, en), top to bottom
 //   mactools pdf <file>    ->  {"pages": n, "text": "..."}   what PDFKit reads from a PDF (to check one we wrote)
+//   mactools ping -        ->  {"ok": true}   a cached build checks itself before it is trusted
 // The OCR is the same Vision request hands uses for screens (hands tools/native/ocr.swift), without its per-segment
 // splitting, which only matters for clicking.
 import Foundation
@@ -48,6 +49,8 @@ case "ocr":
         abs(a.0.midY - b.0.midY) < min(a.0.height, b.0.height) / 2 ? a.0.minX < b.0.minX : a.0.midY > b.0.midY
     }
     out(["lines": sorted.map { $0.1 }])
+case "ping":
+    out(["ok": true])
 case "pdf":
     guard let doc = PDFDocument(url: URL(fileURLWithPath: path)) else { fail("not a PDF: \(path)") }
     out(["pages": doc.pageCount, "text": doc.string ?? ""])

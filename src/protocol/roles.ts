@@ -122,4 +122,4 @@ export type SkillRevision = z.infer<typeof SkillRevision>;
 
 /** transform: the new text a text-transforming capability writes (fs.transform_text), from the source text and the
  *  instruction the planner bound. `text` is written as is. */
-export const TransformAnswer = z.object({ text: z.string() });
+export const TransformAnswer = z.object({ text: z.string().min(1) });
