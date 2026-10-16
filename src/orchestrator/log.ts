@@ -69,6 +69,7 @@ export class State {
   externalChanges: string[] = [];       // paths another program changed while we were running (facts, not our effects)
   n: Record<string, number> = {};
   skillUsed: string | null = null;
+  skillNotice: string | null = null;              // what the used skill's last revision changed (plan.accepted)
   planConfirmed = false;                         // the user approved the current plan (plan.confirmed)
   /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
    *  readings, or null for free text). They bind every later goal. */
@@ -114,7 +115,8 @@ export class State {
       case "plan.accepted":
         this.plan = e.plan; this.revs.plan_rev += 1; this.revs.evidence_epoch += 1; this.planConfirmed = false; this.askDecision = null;
         this.nodes = new Map((e.plan as Plan).nodes.map((n) => [n.id, { node: n, status: "pending", bindings: null, args: null, output: null, operationIds: [], attempts: 0 }]));
-        this.skillUsed = e.plan.skill ?? null;
+        this.skillUsed = e.plan.skill ?? this.skillUsed;                 // a skill used stays used after the planner takes over
+        if (e.plan.skill) this.skillNotice = e.plan.notice ?? null;
         this.count("replans", e.replan ?? 0);
         break;
       case "node.bound": {

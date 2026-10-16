@@ -19,7 +19,7 @@ import { RENAMES, fileRegistry } from "../registry/fs.js";
 import { guiRegistry } from "../gui/sim.js";
 import { Workspace, build } from "../registry/workspace.js";
 import { EditorSim } from "../gui/sim.js";
-import { Library } from "../skills/library.js";
+import { Library, movesBetween, useConfirmation, useOutcome, useSignals } from "../skills/library.js";
 import { spawnSync } from "node:child_process";
 import { score, talkOf, type Task } from "./score.js";
 
@@ -205,6 +205,7 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   // the result card is shown with the result: the simulated user may undo, or undo and pick another reading; on a
   // can't-do card it may say it differently, which starts the run again (and may end on another can't-do card)
   let resultResponse: string | null = null;
+  let noticeShown = !!summ.skill_notice;
   for (let looks = 0; summ.result_card && looks <= orch.budget.asks; looks++) {     // a new wording spends an ask
     const card = summ.result_card;
     const a = user.review(card, summ.effects);
@@ -213,24 +214,36 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
     orch.respond(card, a);
     if (orch.st.status !== "running") { summ = orch.summary(); break; }      // answered: ok, undone, let it be
     summ = await runOrRecover();
+    noticeShown ||= !!summ.skill_notice;
     if (card.kind !== "cannot") break;                            // one look at a redone result, as before
   }
   let taught: unknown = null;
   if (library && task.group === 5 && task.stage === "teach" && summ.status === "succeeded" && !summ.skill) {
     const filesBefore = Object.entries(start).filter(([, v]) => v !== null).map(([p]) => p);
     const contents = Object.fromEntries(Object.entries(start).filter(([, v]) => v !== null)) as Record<string, string>;
-    const end = ws.tree();
-    const moves: Record<string, string> = {};
-    for (const p of filesBefore) if (!(p in end)) { const dst = Object.entries(end).find(([q, v]) => v === start[p] && !(q in start) && !Object.values(moves).includes(q))?.[0]; if (dst) moves[p] = dst; }
+    const moves = movesBetween(start, ws.tree());
     const rec = await library.teach(gw, task.raw + "\n用户说过：" + (task.answers ?? []).join(" "), filesBefore, contents, moves, task.family!, summ.run_id);
     taught = { id: rec.id, status: rec.status, admission: rec.admission };
   }
-  if (library && summ.skill) library.recordUse(summ.skill, summ.status === "succeeded", (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0));
+  let learned: unknown = null;
+  if (library && summ.skill) {
+    // the use, and what it teaches the skill: the right moves of a run that ended right (useOutcome), and how much of
+    // it the user stood behind (useConfirmation; the simulated user approves most plans, so most uses are confirmed)
+    const events = orch.log.events as any;
+    const signals = useSignals(events);
+    const files = Object.entries(start).filter(([, v]) => v !== null).map(([p]) => p);
+    const { right, corrected } = useOutcome(summ.status, events, signals);
+    const { confirmed, declined } = useConfirmation(events, resultResponse !== null || !!summ.result_card);
+    learned = await library.learn(gw, summ.skill, { files, contents: Object.fromEntries(files.map((f) => [f, start[f]!])),
+      final: right ? movesBetween(start, ws.tree()) : null, signals, ok: summ.status === "succeeded",
+      teacherCalls: (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0), confirmed, declined,
+      corrected, noticeShown }, user, summ.run_id);
+  }
   const sc = score(task, start, ws.tree(), summ, gui?.log ?? [], talkOf(orch.log.events as any, user));
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: gw.name, status: summ.status, reason: summ.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
-    category: task.category, policy: summ.policy, skill: summ.skill, taught, asked: user.asked, approvals: user.approvals, result_response: resultResponse, sim: user.sim,
+    category: task.category, policy: summ.policy, skill: summ.skill, taught, learned, asked: user.asked, approvals: user.approvals, result_response: resultResponse, sim: user.sim,
     ask_decisions: orch.log.events.filter((e: any) => e.kind === "ask.decided").map((e: any) => e.decision),
     first_outcome: task.gold.outcomes?.[0]?.name ?? "gold", seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
