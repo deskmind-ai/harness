@@ -33,12 +33,13 @@ const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的
 能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
 path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
 
-export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string, decided: { point: string; reading: string }[] = []): string {
+export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string, decided: { point: string; reading: string }[] = [], notMeant: { point: string; readings: string[]; text: string }[] = []): string {
   return [
     "任务：把用户的要求整理成可逐项验收的需求。保留用户的原话；不要替用户决定没说的事。",
     "", `用户原文：${J(raw)}`,
     ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
     ...(decided.length ? ["用户已经选定的理解（必须照用；assumptions 里同一处的 reading 原样写用户选的这一项）：", ...decided.map((d) => `- 「${d.point}」：${d.reading}`)] : []),
+    ...(notMeant.length ? ["用户的回答说的不是这些理解（按回答重新理解这一处，不要再用它们）：", ...notMeant.map((d) => `- 「${d.point}」：不是 ${d.readings.join(" / ")}；用户回答：${d.text}`)] : []),
     `任务目录（用户选定，相对路径的根；用户说的「这个目录」「当前目录」「下载」等指的就是它）：${scope}`, "目录现在的内容：", J(workspace),
     "", "系统已注册的能力（只有这些能被执行）：", J(caps.map((c) => ({ id: c.id, description: c.description }))),
     "", CHECKS_DOC,
@@ -149,7 +150,9 @@ export const EVIDENCE_WORDINGS = {
 export type EvidenceWording = keyof typeof EVIDENCE_WORDINGS;
 
 /** Added to the evidence question when the evidence is the user's answer to our question about this very point. */
-export const EVIDENCE_FROM_ANSWER = "这里的证据是用户对这个问题的回答：回答把选择留给我们、让按原话做，选「说不清」那一项；回答否定了这些理解、不让改，或者说的是另一种意思，选最后一项。";
+export const EVIDENCE_FROM_ANSWER = "这里的证据是用户最近一次的回答。回答没有选哪一种，而是让我们按原话做、交给我们，选「按原话做」；看不出回答是什么意思，选「说不清」；回答说的是上面没有的另一种意思，选「另一种意思」；回答否定了这些理解，或者不让改，选「不让做」。";
+/** The closing options of the evidence judge when the evidence is the user's answer; their order is the code's. */
+export const ANSWER_OPTIONS = ["按原话做：回答没有选哪一种，让我们按用户原话去做", "说不清：看不出回答是什么意思", "另一种意思：回答说的是上面没有列出的另一种理解", "不让做：回答否定了这些理解，或者不让改"] as const;
 
 export function evidenceQuestion(point: string, wording: EvidenceWording = "v2"): string {
   const ask = `用户原话里的「${point}」指的是哪一种？只根据下面的证据判断`;

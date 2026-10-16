@@ -181,9 +181,11 @@ export class Gateway {
 
   /** One call, asked again once when it timed out on the CLI or came back unreadable: a hung `claude -p` and a reply
    *  with broken JSON are one-off (10-16: a goal call hung 181 s; a goal reply had a missing comma), and both used to
-   *  end the run. Only sampled cloud backends (claude_cli, openrouter): a local model runs at temperature 0 and would
-   *  give the same bad JSON again; a cut-off answer would be cut again. Both attempts are logged; the second says it
-   *  is a retry. */
+   *  end the run. Only the cloud backends (claude_cli, openrouter): a hosted model's reply varies between calls even at
+   *  temperature 0 (batching, routing across servers), and their transport fails now and then; the local server is one
+   *  process decoding greedily, so the same prompt gives the same bad JSON again. A cut-off answer would be cut again.
+   *  Both attempts are logged; the second says it is a retry. A retry is not counted against the run's model-call
+   *  budget (the orchestrator sees one reply). */
   async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = ""): Promise<Reply<z.infer<S>>> {
     const first = await this.askOnce(role, system, user, schema, runId, null);
     const { backend } = this.table[role];

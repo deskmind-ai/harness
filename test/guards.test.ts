@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { Gateway, type Scripted } from "../src/gateway/index.js";
-import { Orchestrator, type Answer, type User } from "../src/orchestrator/index.js";
+import { Orchestrator, type Answer, type CardUser, type User } from "../src/orchestrator/index.js";
 import { Crash } from "../src/registry/capability.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { EditorSim, guiRegistry } from "../src/gui/sim.js";
@@ -430,13 +430,57 @@ describe("execution guards", () => {
     let judged = "";
     const u: User = { clarify(q) { asked.push(q); return { text: "两个都不对，先别改。" }; }, authorize: () => true };
     const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
-    const g: Scripted = (role, _s, user) => role === "choice" ? (judged = user, { choice: "r3" }) : answers[role] ?? { outcome: "error", error: "none" };
+    const g: Scripted = (role, _s, user) => role === "choice" ? (judged = user, { choice: "r5" }) : answers[role] ?? { outcome: "error", error: "none" };
     const { o, ws } = setup(TODO, Array(10).fill(g), u);
     const s = await o.run();
-    expect(judged).toContain("回答否定了这些理解、不让做");
+    expect(judged).toContain("不让做：回答否定了这些理解");
     expect(asked.length).toBe(1);
     expect(s.status).toBe("waiting_user");
     expect(s.reason).not.toContain("already answered");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("an answer that cannot be made out is asked once more in other words; nothing is written", async () => {
+    const asked: string[] = [];
+    const u: User = { clarify(q) { asked.push(q); return { text: "嗯……" }; }, authorize: () => true };
+    const g = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, choice: { choice: "r3" }, plan: PLAN, bind: BIND, intent: MATCH });
+    const { o, ws } = setup(TODO, Array(10).fill(g), u);
+    const s = await o.run();
+    expect(asked.length).toBe(2);
+    expect(asked[1]).not.toBe(asked[0]);
+    expect(s.status).toBe("waiting_user");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("an answer that means a reading not listed: the goal is derived again without those readings, then it stops", async () => {
+    const asked: string[] = [], goals: string[] = [];
+    const u: User = { clarify(q) { asked.push(q); return { text: "都不是，我是要放到最前面。" }; }, authorize: () => true };
+    const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
+    const g: Scripted = (role, _s, user) => { if (role === "goal") goals.push(user); return role === "choice" ? { choice: "r4" } : answers[role] ?? { outcome: "error", error: "none" }; };
+    const { o, ws } = setup(TODO, Array(12).fill(g), u);
+    const s = await o.run();
+    expect(goals.at(-1)).toContain("用户的回答说的不是这些理解");
+    expect(goals.at(-1)).toContain("我是要放到最前面");
+    expect(asked.length).toBe(1);
+    expect(s.status).toBe("waiting_user");
+    expect(s.reason).not.toContain("already answered");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  it("words typed on the plan card are the latest answer about the open reading: a refusal there stops, nothing written", async () => {
+    let plans = 0;
+    const u: CardUser = { ask(card) {
+      if (card.kind === "plan") { plans++; return { text: "不对，先别改。" }; }
+      return card.kind === "ambiguity" ? { text: "按我原来说的做。" } : null;
+    } };
+    const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
+    // the evidence judge answers from the words it is shown; the ask-first judgement wants the plan shown
+    const g: Scripted = (role, _s, user) => role !== "choice" ? answers[role] ?? { outcome: "error", error: "none" }
+      : user.includes("要不要先打断用户") ? { choice: "confirm" } : user.includes("先别改") ? { choice: "r5" } : { choice: "r2" };
+    const { o, ws } = setup(TODO, Array(20).fill(g), u);
+    const s = await o.run();
+    expect(plans).toBe(1);
+    expect(s.status).toBe("waiting_user");
     expect(ws.read("todo.txt")).toBe("交房租\n");
   });
 
@@ -445,13 +489,13 @@ describe("execution guards", () => {
     const GUIAMB = { point: "改成", reading: "整个文件只剩 买牛奶", alternatives: ["在末尾加上 买牛奶"] };
     const pick = (user: string, re: RegExp) => user.split("\n").find((l) => l.startsWith("- ") && re.test(l))!.slice(2).split(": ")[0]!;
     // the editor: set the text, then save
-    const editor = (judge: string): Scripted => (role, _s, user) => {
-      if (role === "goal") return { ...GUIGOAL, assumptions: [{ ...GUIAMB, evidence: judge === "r0" ? ["交房租"] : [] }] };
+    const editor = (judge: string, goal: Record<string, unknown> = {}): Scripted => (role, _s, user) => {
+      if (role === "goal") return { ...GUIGOAL, assumptions: [{ ...GUIAMB, evidence: judge === "r0" ? ["交房租"] : [] }], ...goal };
       if (role !== "choice") return { outcome: "error", error: "none" };
       if (!user.includes("下一步做什么")) return { choice: judge };
       return { choice: user.includes('"value": "买牛奶"') ? pick(user, /点「保存」/) : pick(user, /「正文」的内容设为「买牛奶」/) };
     };
-    function gsetup(script: Scripted, u: User) {
+    function gsetup(script: Scripted, u: User | CardUser) {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "harness-gui-"));
       build(root, { "todo.txt": "交房租" });
       const gui = new EditorSim(root);
@@ -471,6 +515,42 @@ describe("execution guards", () => {
       expect(asked[1]).not.toBe(asked[0]);
       expect(s.status).toBe("waiting_user");
       expect(read()).toBe("交房租");
+    });
+
+    it("a request read as handing the choice to us is confirmed once before the first action, which cannot be undone", async () => {
+      const texts: string[] = [];
+      const { o, read } = gsetup(editor("r0", { user_delegated: true, assumptions: [] }), { clarify: () => null, authorize: (t) => { texts.push(t); return false; } });
+      const s = await o.run();
+      expect(texts.length).toBe(1);
+      expect(texts[0]).toContain("撤不回");
+      expect(s.status).toBe("cancelled");
+      expect(read()).toBe("交房租");
+    });
+
+    it("a reading the evidence backs but the user never confirmed is confirmed before the first action", async () => {
+      const texts: string[] = [];
+      const { o, read } = gsetup(editor("r0"), { clarify: () => null, authorize: (t) => { texts.push(t); return false; } });
+      await o.run();
+      expect(texts.length).toBe(1);
+      expect(texts[0]).toContain(GUIAMB.reading);
+      expect(read()).toBe("交房租");
+    });
+
+    it("a result only the user can judge is not offered undo, and undo refuses, when the steps were GUI actions", async () => {
+      const shown: string[][] = [];
+      const confirm = { id: "r2", statement: "用户认可改后的内容", check: { kind: "user_confirmation", args: {} }, quotes: ["买牛奶"] };
+      const u: CardUser = { ask(card) {
+        if (card.kind === "result_check") { shown.push(card.options.map((x) => x.kind)); return { option: 0 }; }
+        return card.kind === "plan" ? { option: 0 } : null;
+      } };
+      const { o, read } = gsetup(editor("r0", { requirements: [...GUIGOAL.requirements, confirm] }), u);
+      const s = await o.run();
+      expect(read()).toBe("买牛奶");
+      expect(s.status).toBe("succeeded");
+      expect(shown).toEqual([["approve", "cancel"]]);
+      expect(o.undoRun()).toMatchObject({ undone: 0 });
+      expect(o.undoRun().refused).toBeTruthy();
+      expect(read()).toBe("买牛奶");
     });
 
     it("the result card offers no undo the run cannot do", async () => {

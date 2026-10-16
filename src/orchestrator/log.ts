@@ -74,6 +74,9 @@ export class State {
   /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
    *  readings, or null for free text). They bind every later goal. */
   settled: { point: string; readings: string[]; text: string; option: number | null }[] = [];
+  /** Readings the judge found the user's answer did not mean (it meant something else): the goal is derived again
+   *  without them. */
+  notMeant: { point: string; readings: string[]; text: string }[] = [];
   delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
   askDecision: "act" | "confirm" | null = null;   // the judgement for the current plan (ask.decided)
   preferences: string[] = [];                    // what the user said about being asked (preference events)
@@ -162,6 +165,9 @@ export class State {
       }
       case "preference":
         this.preferences.push(e.text);
+        break;
+      case "ambiguity.not_meant":
+        this.notMeant.push({ point: e.point, readings: e.readings, text: e.text });
         break;
       case "ambiguity.settled":                  // the judge read a free-text answer as picking one of the readings
         this.settled.push({ point: e.point, readings: e.readings, text: e.text, option: e.option });
