@@ -5,7 +5,7 @@
 import { z } from "zod";
 import { BindingProposal, Check, PlanNode } from "./schemas.js";
 
-export const ROLES = ["goal", "plan", "bind", "intent", "choice", "skill", "verify"] as const;
+export const ROLES = ["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"] as const;
 export type Role = (typeof ROLES)[number];
 
 export const GoalAnswer = z.object({
@@ -119,3 +119,7 @@ export const SkillRevision = SkillAnswer.extend({
   conflicts_with: z.string().nullable().default(null),
 });
 export type SkillRevision = z.infer<typeof SkillRevision>;
+
+/** transform: the new text a text-transforming capability writes (fs.transform_text), from the source text and the
+ *  instruction the planner bound. `text` is written as is. */
+export const TransformAnswer = z.object({ text: z.string().min(1) });

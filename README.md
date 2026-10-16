@@ -11,7 +11,7 @@ DeskMind 能力编排运行时的 TypeScript 实现：按《能力编排架构�
 |---|---|
 | `src/protocol/` | 协议对象与各角色回答的 zod schema。类型、运行时校验、JSON Schema 三者同源 |
 | `src/gateway/` | 模型网关：OpenRouter（json_schema 输出、按 usage.cost 记账）、`claude -p`（本地开发）、脚本化（测试）；回复结果 answered / refusal / invalid / error / timeout |
-| `src/registry/` | 工作目录（资源版本）与文件能力（描述、输入 schema、效果类、前置条件、执行、丢回执后的核实） |
+| `src/registry/` | 工作目录（资源版本）与文件能力（描述、输入 schema、效果类、前置条件、执行、丢回执后的核实）；`tools.ts` 是用工具生成新文件的能力：模型改写文字（翻译、总结）、压缩成 zip、转 PDF、识别图片文字（后两个用 macOS 自带的工具，`native/mactools.swift` 首次使用时编译） |
 | `src/orchestrator/` | 运行日志（追加、fsync、状态从日志折叠）、编排器、提示词 |
 | `src/skills/` | 教材：skills2 规则语言（正则 + 模板，模型写规则、代码执行），自带检查（expect：哪些文件归它管、新文件名什么样、别的文件不动）；教材库、教学与准入；每次使用都记下，用错但最后做对的成了反例，强模型写新版，新旧两版在全部例子上由程序重放，新版不弄坏旧例子才换；只有用户这次的纠正和以前确认过的做法冲突时才问一句 |
 | `src/gui/` | 受控的模拟编辑器（AX 风格元素、焦点 / 弹窗 / 布局干扰、适配器侧焦点守卫） |

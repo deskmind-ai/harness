@@ -12,7 +12,7 @@
 import { spawnSync } from "node:child_process";
 import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import type { Role } from "../protocol/roles.js";
+import { ROLES, type Role } from "../protocol/roles.js";
 
 /**
  * openrouter   chat completions with json_schema
@@ -23,10 +23,31 @@ import type { Role } from "../protocol/roles.js";
  * scripted     tests
  */
 export type Backend = "openrouter" | "local_chat" | "systemone" | "claude_cli" | "scripted";
-export type RoleTable = Record<Role, { backend: Backend; model: string }>;
+/** Per role, beyond backend and model: maxOutputTokens, the most it may write in one answer (sent as max_tokens);
+ *  contextTokens, how much it can read; timeoutMs, how long one call may take. Unset, the backend's defaults below. */
+export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutputTokens?: number; contextTokens?: number; timeoutMs?: number }>;
+
+/** What a backend's models can read in one call and how long a call may take, when the table does not say. The
+ *  context sizes are those of the models we configure (gpt-6 family 128k, Claude 200k, local MLX models 32k); a choice-only
+ *  backend reads a state but writes no text; tests (scripted) are not limited. */
+const BACKEND_DEFAULTS: Record<Backend, { contextTokens: number; timeoutMs: number }> = {
+  openrouter: { contextTokens: 128_000, timeoutMs: 120_000 },
+  local_chat: { contextTokens: 32_000, timeoutMs: 300_000 },
+  systemone: { contextTokens: 8_000, timeoutMs: 120_000 },
+  claude_cli: { contextTokens: 200_000, timeoutMs: 180_000 },
+  scripted: { contextTokens: Infinity, timeoutMs: Infinity },
+};
+
+/** Rewriting a whole document (fs.transform_text) writes far more than a decision does: it gets more time. */
+const TRANSFORM_TIMEOUT_MS = 600_000;
+/** What a local chat server is asked to write at most when the table does not say: a decision is short; a rewritten
+ *  document (transform) can be as long as the 32k context leaves room for after reading its source. */
+const LOCAL_MAX_TOKENS = 2_000, LOCAL_TRANSFORM_MAX_TOKENS = 16_000;
+/** A reply the model stopped because it hit its output limit: never parsed, whatever JSON it happens to hold. */
+export const TRUNCATED = "truncated: the answer hit the model's output limit";
 
 const all = (backend: Backend, model: string): RoleTable =>
-  Object.fromEntries((["goal", "plan", "bind", "intent", "choice", "skill", "verify"] as Role[]).map((r) => [r, { backend, model }])) as RoleTable;
+  Object.fromEntries(ROLES.map((r) => [r, { backend, model, ...(r === "transform" ? { timeoutMs: TRANSFORM_TIMEOUT_MS } : {}) }])) as RoleTable;
 
 export const CONFIGS: Record<string, RoleTable> = {
   "B0-luna": all("openrouter", "openai/gpt-6-luna"),
@@ -42,7 +63,9 @@ export function withOverrides(base: RoleTable, overrides: string[]): RoleTable {
     if (!m) throw new Error(`bad --role ${o}; expected role=backend:model`);
     const [, role, backend, model] = m;
     if (!(role! in t)) throw new Error(`unknown role ${role}`);
-    t[role as Role] = { backend: backend as Backend, model: model! };
+    // a different model for the role; what the role itself needs (the rewrite's longer time limit) stays
+    const { timeoutMs } = base[role as Role];
+    t[role as Role] = { backend: backend as Backend, model: model!, ...(timeoutMs ? { timeoutMs } : {}) };
   }
   return t;
 }
@@ -140,6 +163,20 @@ export class Gateway {
     }
   }
 
+  /** How much a role's model can read in one call, in tokens. A Chinese character can be a token of its own, so a
+   *  text of n characters is taken to need up to n tokens. Used to refuse up front a document the model cannot even
+   *  read (fs.transform_text); whether its answer was cut short is the reply's own finish reason (truncated). */
+  contextBudget(role: Role): number {
+    const { backend, contextTokens } = this.table[role];
+    return contextTokens ?? BACKEND_DEFAULTS[backend].contextTokens;
+  }
+
+  /** How long one call of this role may take: the role's own setting, else the gateway's, else the backend's. */
+  timeoutFor(role: Role): number {
+    const { backend, timeoutMs } = this.table[role];
+    return timeoutMs ?? this.opts.timeoutMs ?? BACKEND_DEFAULTS[backend].timeoutMs;
+  }
+
   async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = ""): Promise<Reply<z.infer<S>>> {
     const { backend, model } = this.table[role];
     const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" });
@@ -150,14 +187,15 @@ export class Gateway {
       rep = { ...base, outcome: "error", error: "budget: gateway cost cap reached" };
     } else {
       const t0 = performance.now();
-      let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema)
-        : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema)
-        : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema)
-        : backend === "claude_cli" ? this.claudeCli(model, sys, user)
+      const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens;
+      let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens)
+        : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? (role === "transform" ? LOCAL_TRANSFORM_MAX_TOKENS : LOCAL_MAX_TOKENS))
+        : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
+        : backend === "claude_cli" ? this.claudeCli(model, sys, user, timeoutMs)
         : this.scripted(role, sys, user);
       for (let i = 0; i < 2 && backend === "openrouter" && (partial.outcome === "error" || partial.outcome === "timeout") && !/HTTP 4/.test(partial.error ?? ""); i++) {
         await new Promise((r) => setTimeout(r, 2000));                 // transient network failure: retry, then report
-        partial = await this.openrouter(model, sys, user, jsonSchema);
+        partial = await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens);
       }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;
       rep.latencyMs ||= performance.now() - t0;
@@ -199,7 +237,7 @@ export class Gateway {
     return { config: this.name, calls: this.calls, spent_usd: Number(this.spentUsd.toFixed(4)), roles };
   }
 
-  private async openrouter(model: string, system: string, user: string, jsonSchema: unknown): Promise<Partial<Reply>> {
+  private async openrouter(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
     const key = process.env.OPENROUTER_API_KEY;
     if (!key) return { outcome: "error", error: "OPENROUTER_API_KEY not set" };
     const body = {
@@ -207,6 +245,7 @@ export class Gateway {
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       response_format: { type: "json_schema", json_schema: { name: "answer", strict: false, schema: jsonSchema } },
       usage: { include: true },
+      ...(maxTokens ? { max_tokens: maxTokens } : {}),
     };
     const t0 = performance.now();
     let res: Response;
@@ -215,7 +254,7 @@ export class Gateway {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}`, "HTTP-Referer": "https://github.com/deskmind-ai", "X-Title": "DeskMind harness" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
@@ -230,6 +269,7 @@ export class Gateway {
       const usage = out.usage ?? {};
       const rep: Partial<Reply> = { outcome: "answered", tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, costUsd: Number(usage.cost ?? 0), latencyMs };
       if (ch.message?.refusal || ch.finish_reason === "content_filter") return { ...rep, outcome: "refusal", error: String(ch.message?.refusal ?? "content_filter").slice(0, 300) };
+      if (ch.finish_reason === "length") return { ...rep, outcome: "invalid", error: TRUNCATED };
       rep.data = extractJson(ch.message?.content ?? "");
       return rep;
     } catch (e) {
@@ -238,14 +278,14 @@ export class Gateway {
   }
 
   /** An OpenAI-compatible local server (mlx_lm.server): same shape as OpenRouter, no key, no cost. */
-  private async localChat(model: string, system: string, user: string, jsonSchema: unknown): Promise<Partial<Reply>> {
-    const body = { model: localModelName(model), temperature: 0, max_tokens: 2000,
+  private async localChat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens: number): Promise<Partial<Reply>> {
+    const body = { model: localModelName(model), temperature: 0, max_tokens: maxTokens,
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       response_format: { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } };
     const t0 = performance.now();
     let res: Response;
     try {
-      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(this.opts.timeoutMs ?? 300_000) });
+      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       return { outcome: msg.includes("Timeout") ? "timeout" : "error", error: msg.slice(0, 300) };
@@ -255,7 +295,9 @@ export class Gateway {
     try {
       const out = JSON.parse(raw);
       const usage = out.usage ?? {};
-      return { outcome: "answered", data: extractJson(out.choices[0].message.content ?? ""), tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, latencyMs };
+      const counts = { tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, latencyMs };
+      if (out.choices[0].finish_reason === "length") return { outcome: "invalid", error: TRUNCATED, ...counts };
+      return { outcome: "answered", data: extractJson(out.choices[0].message.content ?? ""), ...counts };
     } catch (e) {
       return { outcome: "invalid", error: `bad reply: ${e instanceof Error ? e.message : e}: ${raw.slice(0, 300)}`, latencyMs };
     }
@@ -266,7 +308,7 @@ export class Gateway {
    * intent, verify): the enum values become the options, the state is the user prompt, and the reply carries the
    * probabilities so the orchestrator can apply a calibrated floor later.
    */
-  private async systemone(model: string, system: string, user: string, jsonSchema: unknown): Promise<Partial<Reply>> {
+  private async systemone(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number): Promise<Partial<Reply>> {
     const sch = jsonSchema as { properties?: Record<string, { enum?: string[] }> };
     const field = Object.entries(sch.properties ?? {}).find(([, v]) => Array.isArray(v.enum));
     if (!field) return { outcome: "error", error: "systemone backend needs a role whose answer is one enum field" };
@@ -277,7 +319,7 @@ export class Gateway {
     const t0 = performance.now();
     let res: Response;
     try {
-      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/systemone", { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(this.opts.timeoutMs ?? 120_000) });
+      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/systemone", { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       return { outcome: "error", error: (e instanceof Error ? e.message : String(e)).slice(0, 300) };
     }
@@ -292,8 +334,8 @@ export class Gateway {
     }
   }
 
-  private claudeCli(model: string, system: string, user: string): Partial<Reply> {
-    const p = spawnSync("claude", ["-p", "--model", model, "--append-system-prompt", system], { input: user, encoding: "utf-8", timeout: this.opts.timeoutMs ?? 180_000 });
+  private claudeCli(model: string, system: string, user: string, timeoutMs: number): Partial<Reply> {
+    const p = spawnSync("claude", ["-p", "--model", model, "--append-system-prompt", system], { input: user, encoding: "utf-8", timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
     if (p.error) return { outcome: (p.error as NodeJS.ErrnoException).code === "ETIMEDOUT" ? "timeout" : "error", error: p.error.message };
     if (p.status !== 0) return { outcome: "error", error: (p.stderr ?? "").slice(0, 300) };
     try {

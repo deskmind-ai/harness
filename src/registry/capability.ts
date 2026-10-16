@@ -56,6 +56,12 @@ export interface Capability {
   /** The action discards existing content of a written path (replace, trash). Overwriting content this run did not
    *  write then needs the user's approval; an append or a move does not discard anything. */
   readonly discards?: boolean;
+  /** A value the action needs that a model produces from the bound arguments (fs.transform_text: the new text). The
+   *  runtime asks the `transform` role once after binding and stores the answer under `field` in the arguments, with
+   *  `also` (e.g. the version of the source it was made from), so the execution intent records them and execute,
+   *  footprint, a replay after a crash and undo all see the same values. These fields are not in the schema: the
+   *  binder never fills them. */
+  derive?(ws: Workspace, args: Args): Derivation;
   /** Set on a renamed variant: variant field -> base field. The runtime maps before calling the implementation. */
   readonly rename?: Record<string, string>;
   /** Argument checks beyond the schema (paths without '..', bare file names). Returns an error or null. */
@@ -66,6 +72,10 @@ export interface Capability {
 }
 
 export class Crash extends Error {}
+
+/** What a model is asked to make for an action (Capability.derive): `instruction` applied to `source`, the answer
+ *  stored under `field`; `also` is stored with it. */
+export interface Derivation { field: string; instruction: string; source: string; also?: Record<string, string> }
 
 /** A capability's self-description for prompts: never the implementation. */
 export const describeCapability = (c: Capability) => ({ id: c.id, description: c.description, effect: c.effect, input: c.schema.properties, required: c.schema.required });
@@ -93,6 +103,7 @@ export function renamed(c: Capability, map: Record<string, string>, suffix = ".a
     ...(base.undo ? { undo: (ws: Workspace, a: Args, r: ExecResult) => base.undo!(ws, inv(a), r) } : {}),
     ...(base.prepareUndo ? { prepareUndo: (ws: Workspace, a: Args) => base.prepareUndo!(ws, inv(a)) } : {}),
     ...(base.undoCheck ? { undoCheck: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => base.undoCheck!(ws, inv(a), r, ours) } : {}),
+    ...(base.derive ? { derive: (ws: Workspace, a: Args) => base.derive!(ws, inv(a)) } : {}),
   };
 }
 
@@ -154,5 +165,6 @@ export function contract(c: Capability): string | null {
   for (const m of ["typecheck", "footprint", "preconditions", "execute"] as const) if (typeof c[m] !== "function") return `${m} missing`;
   if (typeof c.reversible !== "boolean") return "reversible must be declared";
   if (c.reversible && c.effect !== "observe" && typeof c.undo !== "function") return "reversible but has no undo";
+  if (c.derive && typeof c.derive !== "function") return "derive must be a function";
   return null;
 }

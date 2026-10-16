@@ -5,6 +5,7 @@ export function matches(expected: Record<string, string>, ws: Workspace): boolea
   for (const [k, v] of Object.entries(expected)) {
     const now = ws.version(k);
     if (v === "dir:*") { if (!now.startsWith("dir:")) return false; }
+    else if (v === "file:*") { if (now === "absent" || now.startsWith("dir:")) return false; }     // made by a tool: content not known before
     else if (now !== v) return false;
   }
   return true;

@@ -8,10 +8,28 @@ import * as path from "node:path";
 
 export const ABSENT = "absent";
 export const TRASH = ".deskmind-trash";
+/** Tools' outputs while they are checked (tools.ts wrote): their own hidden folder at the root, on the same volume as
+ *  the task's files and never listed. Nothing a user owns is ever put there (a trashed file goes to TRASH, under its
+ *  own name, whatever that name is), so sweeping it can never delete the user's data. */
+export const TMP = ".deskmind-tmp";
+/** A temporary output older than this is left by a process that died, not one still being checked. */
+const STALE_TEMP_MS = 10 * 60_000;
 
 export const sha = (b: string | Buffer) => "sha256:" + createHash("sha256").update(b).digest("hex").slice(0, 16);
 
-export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string; preview_truncated?: boolean }
+export interface Entry { path: string; kind: "file" | "folder"; bytes?: number; preview?: string; preview_truncated?: boolean; not_utf8?: boolean }
+
+/** Text a model can be shown: valid UTF-8 without NUL bytes. A zip, a PDF or an image is not, and neither is text in
+ *  another encoding (GBK, UTF-16); decoded as UTF-8 either is noise in a prompt. */
+export function isText(b: Buffer): boolean {
+  if (b.subarray(0, 8192).includes(0)) return false;
+  try { new TextDecoder("utf-8", { fatal: true }).decode(b); return true; } catch { return false; }
+}
+
+/** What to call a file that is not UTF-8 text, without guessing which it is. */
+export const NOT_UTF8 = "不是 UTF-8 文本（可能是图片、PDF、压缩包等二进制文件，或 GBK、UTF-16 等别的编码）";
+/** The same, in the runtime's own (English) voice, for a refused precondition. */
+export const NOT_UTF8_EN = "is not UTF-8 text (a binary file such as an image, PDF or archive, or text in another encoding such as GBK or UTF-16)";
 
 /** What a model is shown of a directory: a bounded projection that says what it left out (2.0 §5.4). */
 export interface Listing { entries: Entry[]; total: number; truncated: boolean; omitted: number; note?: string }
@@ -24,6 +42,19 @@ export class Workspace {
     this.root = path.resolve(root);
   }
 
+  /** Remove tools' temporary outputs a crashed process left in TMP: only there, and only old ones, so another run
+   *  checking its output right now keeps it. */
+  sweepTemp() {
+    const dir = path.join(this.root, TMP);
+    let names: string[] = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    const cutoff = Date.now() - STALE_TEMP_MS;
+    for (const n of names) {
+      const full = path.join(dir, n);
+      try { if (fs.lstatSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true }); } catch { /* raced, or next time */ }
+    }
+  }
+
   /** Forget the cached snapshot (after our own effect or a known external change). */
   invalidate() {
     this.cache = null;
@@ -34,9 +65,9 @@ export class Workspace {
     const parts: string[] = [];
     const walk = (dir: string) => {
       for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (d.name === TRASH || d.name === ".keep") continue;
+        if (d.name === TRASH || d.name === TMP || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
-        const st = fs.statSync(full);
+        const st = fs.lstatSync(full);              // a link (even a dangling one) is not followed
         parts.push(`${full}:${st.mtimeMs}:${st.size}`);
         if (d.isDirectory()) walk(full);
       }
@@ -58,7 +89,7 @@ export class Workspace {
     const out: Record<string, string> = {};
     const walk = (dir: string, rel: string) => {
       const names = fs.readdirSync(dir, { withFileTypes: true });
-      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH).map((d) => d.name).sort();
+      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP).map((d) => d.name).sort();
       const files = names.filter((d) => d.isFile() && d.name !== ".keep").map((d) => d.name).sort();
       for (const d of dirs) out[rel ? `${rel}/${d}` : d] = "dir";
       for (const f of files) out[rel ? `${rel}/${f}` : f] = sha(fs.readFileSync(path.join(dir, f)));
@@ -87,6 +118,21 @@ export class Workspace {
     return fs.readFileSync(this.abs(p), "utf-8");
   }
 
+  readBytes(p: string): Buffer {
+    return fs.readFileSync(this.abs(p));
+  }
+
+  /** A file whose content is text (see isText). */
+  isTextFile(p: string): boolean {
+    return this.exists(p) && !this.isDir(p) && isText(this.readBytes(p));
+  }
+
+  /** A file's text for a prompt, at most `max` characters; a file that is not UTF-8 text is named, never decoded. */
+  readForModel(p: string, max: number): string {
+    const b = this.readBytes(p);
+    return isText(b) ? b.toString("utf-8").slice(0, max) : `（${NOT_UTF8}，${b.length} 字节，不显示内容）`;
+  }
+
   exists(p: string): boolean {
     return this.version(p) !== ABSENT;
   }
@@ -108,8 +154,10 @@ export class Workspace {
     for (const [p, v] of all.slice(0, maxFiles)) {
       if (v === "dir") entries.push({ path: p, kind: "folder" });
       else {
-        const t = this.read(p);
-        entries.push({ path: p, kind: "file", bytes: Buffer.byteLength(t), preview: t.slice(0, peek), ...(t.length > peek ? { preview_truncated: true } : {}) });
+        const b = this.readBytes(p);
+        if (!isText(b)) { entries.push({ path: p, kind: "file", bytes: b.length, not_utf8: true }); continue; }
+        const t = b.toString("utf-8");
+        entries.push({ path: p, kind: "file", bytes: b.length, preview: t.slice(0, peek), ...(t.length > peek ? { preview_truncated: true } : {}) });
       }
     }
     const omitted = Math.max(0, all.length - maxFiles);
