@@ -484,6 +484,45 @@ describe("execution guards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n");
   });
 
+  it("agreement typed on the plan card goes ahead once, instead of showing the same card until the budget runs out", async () => {
+    let plans = 0;
+    const u: CardUser = { ask(card) {
+      if (card.kind === "plan") { plans++; return { text: "就按我原来说的做吧。" }; }
+      return card.kind === "ambiguity" ? { text: "按我原来说的做。" } : null;
+    } };
+    const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
+    const g: Scripted = (role, _s, user) => role !== "choice" ? answers[role] ?? { outcome: "error", error: "none" }
+      : user.includes("要不要先打断用户") ? { choice: "confirm" } : { choice: "r2" };          // go by the original words
+    const { o, ws } = setup(TODO, Array(40).fill(g), u);
+    const s = await o.run();
+    expect(plans).toBe(1);
+    expect(s.status).toBe("succeeded");
+    expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
+    expect(s.counters.model_calls).toBeLessThan(20);
+  });
+
+  it("words on the plan card about something else leave the reading's evidence as it was", async () => {
+    const judged: string[] = [];
+    const u: CardUser = { ask: (card) => card.kind === "plan" ? { text: "顺便把 other.txt 也看一下" } : null };
+    const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: ["交房租"] }] }, plan: PLAN, bind: BIND, intent: MATCH };
+    const g: Scripted = (role, _s, user) => {
+      if (role !== "choice") return answers[role] ?? { outcome: "error", error: "none" };
+      if (user.includes("要不要先打断用户")) return { choice: "confirm" };
+      judged.push(user);
+      return user.includes("之后在卡片上说的话") ? { choice: "r6" } : { choice: "r0" };     // r6: not about this point
+    };
+    const { o, ws } = setup(TODO, Array(40).fill(g), u);
+    const s = await o.run();
+    const card = judged.findIndex((j) => j.includes("之后在卡片上说的话"));
+    expect(card).toBeGreaterThan(0);
+    expect(judged[card]).toContain("交房租");                               // the earlier evidence is still there
+    expect(judged[card]).toContain("不相关");
+    expect(judged[card + 1]).toContain("交房租");                           // judged again on it alone
+    expect(judged[card + 1]).toContain("说不清：这些证据区分不了");
+    expect(s.status).toBe("waiting_user");                                 // the same plan card is not shown again
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
   describe("through the GUI (its actions cannot be undone)", () => {
     const GUIGOAL = { requirements: [{ id: "r1", statement: "todo.txt 内容是 买牛奶", check: { kind: "deterministic", name: "text_equals", args: { path: "todo.txt", text: "买牛奶" } }, quotes: ["买牛奶"] }], constraints: [], authorized_rewrites: ["todo.txt"], missing: [], feasible: "yes" };
     const GUIAMB = { point: "改成", reading: "整个文件只剩 买牛奶", alternatives: ["在末尾加上 买牛奶"] };
@@ -507,14 +546,24 @@ describe("execution guards", () => {
       return { o, read: () => fs.readFileSync(path.join(root, "todo.txt"), "utf-8") };
     }
 
-    it("an answer that picks no reading: asked once more in other words, nothing written", async () => {
-      const asked: string[] = [];
-      const { o, read } = gsetup(editor("r2"), { clarify(q) { asked.push(q); return { text: "你看着办吧，按我原来说的。" }; }, authorize: () => true });
+    it("an answer that picks no reading: no second question; the one confirmation before acting stands in for it", async () => {
+      const asked: string[] = [], texts: string[] = [];
+      const { o, read } = gsetup(editor("r2"), { clarify(q) { asked.push(q); return { text: "你看着办吧，按我原来说的。" }; }, authorize: (t) => { texts.push(t); return false; } });
       const s = await o.run();
-      expect(asked.length).toBe(2);
-      expect(asked[1]).not.toBe(asked[0]);
-      expect(s.status).toBe("waiting_user");
+      expect(asked.length).toBe(1);
+      expect(texts.length).toBe(1);
+      expect(texts[0]).toContain(GUIAMB.reading);
+      expect(s.status).toBe("cancelled");
       expect(read()).toBe("交房租");
+    });
+
+    it("a reading the user handed to us by clicking 由你决定 is not confirmed again", async () => {
+      const texts: string[] = [];
+      const { o, read } = gsetup(editor("r2"), { clarify: (_q, opts) => ({ option: opts.indexOf("由你决定") }), authorize: (t) => { texts.push(t); return false; } });
+      const s = await o.run();
+      expect(texts).toEqual([]);
+      expect(s.status).toBe("succeeded");
+      expect(read()).toBe("买牛奶");
     });
 
     it("a request read as handing the choice to us is confirmed once before the first action, which cannot be undone", async () => {

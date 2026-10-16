@@ -150,7 +150,10 @@ export const EVIDENCE_WORDINGS = {
 export type EvidenceWording = keyof typeof EVIDENCE_WORDINGS;
 
 /** Added to the evidence question when the evidence is the user's answer to our question about this very point. */
-export const EVIDENCE_FROM_ANSWER = "这里的证据是用户最近一次的回答。回答没有选哪一种，而是让我们按原话做、交给我们，选「按原话做」；看不出回答是什么意思，选「说不清」；回答说的是上面没有的另一种意思，选「另一种意思」；回答否定了这些理解，或者不让改，选「不让做」。";
+export const EVIDENCE_FROM_ANSWER = "材料里有用户的回答和它回答的那个问题或卡片。回答没有选哪一种，而是让我们按原话做、交给我们、或者同意卡片上的做法，选「按原话做」；看不出回答是什么意思，选「说不清」；回答说的是上面没有的另一种意思，选「另一种意思」；回答否定了这些理解，或者不让改，选「不让做」。";
+/** Added when the user's words were typed on a plan card: they may be about another point, or about something else. */
+export const EVIDENCE_FROM_CARD = "「之后在卡片上说的话」是用户看到那张卡片后打的字，可能说的是这一处，也可能说的是别的事；说的不是这一处时，选「不相关」。";
+export const NOT_ABOUT = "不相关：卡片上的这句话说的不是这一处";
 /** The closing options of the evidence judge when the evidence is the user's answer; their order is the code's. */
 export const ANSWER_OPTIONS = ["按原话做：回答没有选哪一种，让我们按用户原话去做", "说不清：看不出回答是什么意思", "另一种意思：回答说的是上面没有列出的另一种理解", "不让做：回答否定了这些理解，或者不让改"] as const;
 
