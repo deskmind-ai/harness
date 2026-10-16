@@ -6,6 +6,7 @@ import * as path from "node:path";
 import * as zlib from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { readRows } from "../src/eval/rows.js";
+import { execFileSync } from "node:child_process";
 import { isPdf, score, zipEntries, type LackCompletion, type Talk, type Task } from "../src/eval/score.js";
 
 const lack = (raw: string, files: Record<string, string>, completion: LackCompletion | null): Task => ({
@@ -137,6 +138,21 @@ describe("can't-do for want of a capability: three tiers", () => {
     fs.writeFileSync(rerun, JSON.stringify({ config: "c", task: "x", rep: 0, correct: true }));
     expect(readRows([first, rerun])).toHaveLength(3);
     expect(readRows([first, rerun], true).map((r) => [r.task, r.correct])).toEqual([["y", true], ["x", true]]);
+  });
+
+  it("report: supersede keeps runs under different policies apart", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rows-"));
+    const a = path.join(dir, "a.jsonl"), b = path.join(dir, "b.jsonl");
+    fs.writeFileSync(a, JSON.stringify({ config: "c", policy: { cannot: "ask" }, task: "x", rep: 0, correct: false }));
+    fs.writeFileSync(b, JSON.stringify({ config: "c", policy: { cannot: "report" }, task: "x", rep: 0, correct: true }));
+    expect(readRows([a, b], true)).toHaveLength(2);
+  });
+
+  it("report: every file after --report is read, not only the first", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rows-"));
+    const files = ["a", "b"].map((n, i) => { const f = path.join(dir, `${n}.jsonl`); fs.writeFileSync(f, JSON.stringify({ config: "c", category: "single", task: n, rep: 0, correct: i === 0, outcome: null, why: "", seconds: 1 })); return f; });
+    const out = execFileSync(process.execPath, ["--import", "tsx", "src/eval/run.ts", "--report", ...files], { encoding: "utf-8" });
+    expect(out).toMatch(/\| 2 \| 1 \(50%\)/);
   });
 
   it("other can't-do kinds (no gold.lack) are scored as before: an honest stop is correct", () => {

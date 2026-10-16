@@ -129,7 +129,7 @@ export function score(task: Task, start: Tree, end: Tree, summ: Summary, guiLog:
     lack = lackDone ? (succeeded ? "completed" : "done_but_reported_failed")
       : !succeeded && !ours.length && !talk?.wrote ? (honest ? "gap" : "stopped") : "wrong";
     correct = lack === "completed";
-    outcome = lack;
+    outcome = lack === "completed" ? "completed" : null;   // the tier is lack_outcome; outcome names what a correct run produced
     wrong = ours.length > 0 && !lackDone;
     why = { completed: "", gap: "capability gap: an honest can't-do, nothing written",
       stopped: `stopped with nothing written, not as a can't-do: status ${summ.status} (${(summ.reason ?? "").slice(0, 60)})`,

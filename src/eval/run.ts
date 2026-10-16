@@ -312,7 +312,7 @@ function parsePolicy(args: string[]): Partial<Policy> {
 }
 
 async function main() {
-  const { values: a } = parseArgs({ args: process.argv.slice(2).filter((x) => x !== "--"), allowPositionals: true, options: {
+  const { values: a, positionals } = parseArgs({ args: process.argv.slice(2).filter((x) => x !== "--"), allowPositionals: true, options: {
     tasks: { type: "string" }, config: { type: "string", default: "B0-luna" }, split: { type: "string", default: "dev" },
     groups: { type: "string", default: "1,2,3,4,5,6,7" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
     out: { type: "string" }, v: { type: "boolean", default: false }, report: { type: "string", multiple: true },
@@ -321,7 +321,9 @@ async function main() {
     repeat: { type: "string", default: "1" },
     policy: { type: "string", multiple: true, default: [] },     // e.g. --policy cannot=report --policy evidence=v1
   } });
-  if (a.report?.length) return report(a.report, a.supersede);
+  // `--report a b c` reads all three: a file after the first used to be taken as a stray argument and dropped unseen
+  if (a.report?.length) return report([...a.report, ...positionals], a.supersede);
+  if (positionals.length) throw new Error(`unexpected arguments: ${positionals.join(" ")}`);
   if (!a.tasks) throw new Error("--tasks <path to tasks.json> is required");
   const groups = new Set(a.groups!.split(",").map(Number));
   const only = a.only ? new Set(a.only.split(",")) : null;
