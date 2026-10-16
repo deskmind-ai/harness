@@ -12,7 +12,7 @@
  * (?P<x>) translated to JavaScript (?<x>). When both match and content are given both must hit and their fields merge
  * (the content's win on a clash).
  */
-import type { SkillRule } from "../protocol/roles.js";
+import type { SkillExpect, SkillRule } from "../protocol/roles.js";
 
 export class SkillError extends Error {}
 
@@ -105,6 +105,40 @@ export function runSkill(skill: Skill, files: string[], contents: Record<string,
   return { where, unsure };
 }
 
+/** Whether a file is the kind the skill is for (expect.covers): its extension, when listed, and its name or its text,
+ *  when patterns are given. */
+export function ofKind(covers: SkillExpect["covers"], name: string, text = ""): boolean {
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  const exts = list(covers.ext).map((e) => e.toLowerCase().replace(/^\./, ""));
+  if (exts.length && !exts.includes(ext)) return false;
+  const names = list(covers.name).map(compile), contents = list(covers.content).map(compile);
+  if (!names.length && !contents.length) return exts.length > 0;
+  return names.some((rx) => rx.test(name)) || contents.some((rx) => rx.test(text));
+}
+
+export interface ExpectReport {
+  uncovered: string[];        // of the skill's kind, but no rule placed it
+  misnamed: string[];         // placed, but its new name is not what expect.name says
+  touched: string[];          // not of the skill's kind, yet moved
+}
+
+/** The skill's own checks on one result (where: file → new path, unsure: files the rules could not decide). */
+export function checkExpect(expect: SkillExpect, files: string[], contents: Record<string, string>, where: Record<string, string>, unsure: string[] = []): ExpectReport {
+  const names = list(expect.name).map(compile);
+  const base = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+  const r: ExpectReport = { uncovered: [], misnamed: [], touched: [] };
+  for (const f of files) {
+    const moved = (where[f] ?? f) !== f;
+    const kind = ofKind(expect.covers, base(f), contents[f] ?? "");
+    if (kind && !moved && !unsure.includes(f)) r.uncovered.push(f);
+    if (moved && kind && names.length && !names.some((rx) => rx.test(base(where[f]!)))) r.misnamed.push(f);
+    if (moved && !kind && expect.untouched !== false) r.touched.push(f);
+  }
+  return r;
+}
+
+export const failed = (r: ExpectReport) => r.uncovered.length + r.misnamed.length + r.touched.length > 0;
+
 export const DSL_HELP = `教材写成可以由程序执行的规则（JSON）。程序照规则移动文件，小模型只负责选用哪份教材、判断某个文件归不归它管。
 **规则要能认出同一类文件的各种叫法，不能只认这一次的写法。**
 {"title": "<一句话>", "applies_when": "<什么样的请求、什么样的文件适用>",
@@ -121,4 +155,9 @@ export const DSL_HELP = `教材写成可以由程序执行的规则（JSON）。
   全角数字、带「最终版 / (2) / 副本 / final」等后缀；关键词用中英两种说法（截屏 / Screenshot、录音 / Recording、发票 / invoice）。
 - 日期、金额等字段分别取（年 y、月 m、日 d），模板里再拼，不要把整段日期原样搬过去。
 - 文件名看不出类别的，用 content 在内容里认（例如内容里有「发票」「价税合计」）。
-- 用 not 排除名字像、但不该动的文件。`;
+- 用 not 排除名字像、但不该动的文件。
+另外写 expect：做完应当是什么样，由程序检查。
+"expect": {"covers": {"ext": ["pdf"], "name": ["<正则>", ...], "content": ["<正则>", ...]},   // 哪些文件属于这一类（这一类的都要被规则认出来）
+           "name": ["<正则>", ...],      // 规则处理过的文件，新文件名要符合其一（例如 ^\\d{8}-.+-\\d+\\.pdf$）
+           "untouched": true}            // 不属于这一类的文件不能动
+covers 写这一类文件「本来是什么」，不要照抄 match：match 写错了，covers 才能把漏掉的文件报出来。`;

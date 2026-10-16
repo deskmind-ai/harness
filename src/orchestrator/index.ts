@@ -77,7 +77,7 @@ export function cardUser(u: User): CardUser {
 /** A skill library: candidates for a task, instantiation into nodes, use bookkeeping. */
 export interface SkillLibrary {
   candidates(raw: string, ws: Workspace): { id: string; title: string; applies_when: string }[];
-  instantiate(skillId: string, ws: Workspace): { nodes: PlanNode[]; unsure: string[] };
+  instantiate(skillId: string, ws: Workspace): { nodes: PlanNode[]; unsure: string[]; notice?: string | null };
 }
 
 export interface GuiApp {
@@ -413,10 +413,10 @@ export class Orchestrator {
     const ids = options.map((o) => o.id) as [string, ...string[]];
     const rep = await this.askModel("choice", P.choicePrompt("哪份已有的教材适用于这个任务？", { 用户原文: st.raw, 目录: this.ws.listing() }, options), R.choiceAnswer(ids));
     if (rep.outcome !== "answered" || rep.data!.choice === "none") return false;
-    const { nodes, unsure } = lib.instantiate(rep.data!.choice, this.ws);
+    const { nodes, unsure, notice } = lib.instantiate(rep.data!.choice, this.ws);
     if (unsure.length) this.emit("note", { text: `教材 ${rep.data!.choice} 处理不了：${JSON.stringify(unsure)}` });
     if (!nodes.length) { this.emit("note", { text: `教材 ${rep.data!.choice} 选中但没有产生任何动作` }); return false; }
-    this.emit("plan.accepted", { plan: { nodes, source: "skill", skill: rep.data!.choice, unsure } });
+    this.emit("plan.accepted", { plan: { nodes, source: "skill", skill: rep.data!.choice, unsure, ...(notice ? { notice } : {}) } });
     return true;
   }
 
@@ -822,11 +822,13 @@ export class Orchestrator {
     }
     if (st.status !== "succeeded" || !g || !st.effects.length) return null;
     const open = g.assumptions.filter((a) => !a.settled);
-    if (!open.length) return null;
+    // a skill revised since its last use says what changed, once, with the result; the user can undo it
+    const updated = st.skillNotice ? `按教材整理（已更新：${st.skillNotice}）` : "";
+    if (!open.length) return updated ? { kind: "result", text: updated, options: [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }], free_text: false, blocking: false } : null;
     const options: CardOption[] = [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }];
     for (const a of open) a.alternatives.forEach((alt, k) => options.push({ kind: "undo_and_reading", text: `撤回，改成：${alt}`, point: a.point || a.reading, readings: [a.reading, ...a.alternatives], reading_index: k + 1 }));
     options.push({ kind: "never_ask_this", text: "这种以后不用告诉我" });
-    return { kind: "result", text: "我是这样理解的：" + open.map((a) => a.reading).join("；"), options, free_text: false, blocking: false };
+    return { kind: "result", text: (updated ? updated + "。" : "") + "我是这样理解的：" + open.map((a) => a.reading).join("；"), options, free_text: false, blocking: false };
   }
 
   /** The user's response to the result card. undo_and_reading, and saying a can't-do differently, leave the run ready

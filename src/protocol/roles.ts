@@ -91,10 +91,29 @@ export const SkillRule = z.object({
 });
 export type SkillRule = z.infer<typeof SkillRule>;
 
+/** What a skill's result must look like, checked by code (skills/rules.ts checkExpect): which files are this skill's
+ *  kind (covers: ext, and a name or content pattern), the file name a placed file must end up with (name), and that
+ *  files of other kinds stay where they are (untouched). */
+export const SkillExpect = z.object({
+  covers: z.object({ ext: strOrList.optional(), name: strOrList.optional(), content: strOrList.optional() }),
+  name: strOrList.optional(),
+  untouched: z.boolean().default(true),
+});
+export type SkillExpect = z.infer<typeof SkillExpect>;
+
 export const SkillAnswer = z.object({
   title: z.string(),
   applies_when: z.string(),
   rules: z.array(SkillRule).min(1),
   variants: z.array(z.object({ from: z.string(), content: z.string().optional(), to: z.string() })),
+  expect: SkillExpect.optional(),
 });
 export type SkillAnswer = z.infer<typeof SkillAnswer>;
+
+/** A revised skill (skills/library.ts revise): the new version, what changed in a few words (shown with the next
+ *  result), and an earlier confirmed example the correction contradicts, if the model sees one. */
+export const SkillRevision = SkillAnswer.extend({
+  change: z.string(),
+  conflicts_with: z.string().nullable().default(null),
+});
+export type SkillRevision = z.infer<typeof SkillRevision>;
