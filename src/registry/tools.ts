@@ -13,9 +13,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Capability, ExecResult } from "./capability.js";
-import { IS_MAC, ask, helperBin, helperProblem, prepareHelper, run } from "./mac.js";
+import { ask, helperBin, helperProblem, run } from "./mac.js";
 import { after, folderOk, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
-import { ABSENT, NOT_UTF8_EN, TRASH, isText, sha, type Workspace } from "./workspace.js";
+import { ABSENT, NOT_UTF8_EN, TEMP_PREFIX, TRASH, isText, sha, type Workspace } from "./workspace.js";
 import { readZip, writeZip } from "./zip.js";
 
 const pathsOf = (list: string) => list.split("\n").map(norm).filter(Boolean);
@@ -30,19 +30,34 @@ function newFile(ws: Workspace, dst: string, ext?: string): string | null {
 }
 const isLink = (full: string) => { try { return fs.lstatSync(full).isSymbolicLink(); } catch { return false; } };
 
-/** Put a tool's output at `dst`: written to a temporary file, checked there (`check` gets its path), then linked into
- *  place. Refuses, leaving nothing, when the check fails or `dst` appeared meanwhile (a link never replaces a file). */
+/** How an output is put in place: a hard link, which is atomic and never replaces a file. Tests replace it to see a
+ *  volume without hard links. */
+export const PLACE = { link: (from: string, to: string) => fs.linkSync(from, to) };
+/** Volumes without hard links (exFAT, FAT, some network shares) say so with these: the output is copied instead, with
+ *  COPYFILE_EXCL, which still never replaces a file. */
+const NO_LINKS = new Set(["ENOTSUP", "EPERM", "EXDEV", "EOPNOTSUPP"]);
+
+/** Put a tool's output at `dst`: written to a temporary file, checked there (`check` gets its path), then linked (or,
+ *  without hard links, copied) into place. Refuses, leaving nothing, when the check fails, `dst` appeared meanwhile, or
+ *  the disk will not take it: never throws. */
 export function wrote(ws: Workspace, dst: string, data: Buffer | string, check: (file: string) => string | null, output: Record<string, unknown> = {}): ExecResult {
-  const dir = ws.abs(TRASH);
-  fs.mkdirSync(dir, { recursive: true });
-  const tmp = path.join(dir, `.tmp-${randomUUID()}${path.extname(dst)}`);
+  let tmp: string | null = null;
   try {
+    const dir = ws.abs(TRASH);
+    fs.mkdirSync(dir, { recursive: true });
+    tmp = path.join(dir, `${TEMP_PREFIX}${randomUUID()}${path.extname(dst)}`);
     fs.writeFileSync(tmp, data, { flag: "wx" });
     const err = check(tmp);
     if (err) return { ...failed(err), versions_after: { [dst]: ABSENT } };
-    try { fs.linkSync(tmp, ws.abs(dst)); } catch (e) { return failed(`cannot create ${dst}: ${(e as NodeJS.ErrnoException).code ?? String(e)}`); }
+    try { PLACE.link(tmp, ws.abs(dst)); } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? "";
+      if (!NO_LINKS.has(code)) return failed(`cannot create ${dst}: ${code || String(e)}`);
+      fs.copyFileSync(tmp, ws.abs(dst), fs.constants.COPYFILE_EXCL);
+    }
+  } catch (e) {
+    return failed(`cannot create ${dst}: ${(e as NodeJS.ErrnoException).code ?? String(e).slice(0, 200)}`);
   } finally {
-    fs.rmSync(tmp, { force: true });
+    if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* swept at the next start */ }
   }
   maybeCrash();
   return after(ws, [dst], { file: dst, ...output });
@@ -237,9 +252,8 @@ export const fsOcrImage = make({
 });
 
 /** What a registry offers now. The text rewrite and zip work anywhere. PDF and OCR need the macOS helper and are
- *  offered only once it is built and answers, so a goal or plan never counts on a tool that cannot run; the first call
- *  on a Mac starts the build in the background (await prepareHelper() to have them from the start). */
+ *  offered only once it answers, so a goal or plan never counts on a tool that cannot run (a process that wants them
+ *  calls mac.prepareHelper() first; the eval runner does). */
 export function toolCapabilities(): Capability[] {
-  if (IS_MAC && !helperBin()) void prepareHelper();
   return [fsTransformText, fsZipFiles, ...(helperBin() ? [fsConvertToPdf, fsOcrImage] : [])];
 }

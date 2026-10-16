@@ -8,6 +8,8 @@ import * as path from "node:path";
 
 export const ABSENT = "absent";
 export const TRASH = ".deskmind-trash";
+/** A tool's output while it is checked (tools.ts wrote), in TRASH; one left by a crash is swept at the next start. */
+export const TEMP_PREFIX = ".tmp-";
 
 export const sha = (b: string | Buffer) => "sha256:" + createHash("sha256").update(b).digest("hex").slice(0, 16);
 
@@ -34,6 +36,14 @@ export class Workspace {
 
   constructor(root: string) {
     this.root = path.resolve(root);
+  }
+
+  /** Remove tools' temporary outputs a crashed process left in TRASH (never anything else there). */
+  sweepTemp() {
+    const dir = path.join(this.root, TRASH);
+    let names: string[] = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    for (const n of names) if (n.startsWith(TEMP_PREFIX)) try { fs.rmSync(path.join(dir, n), { force: true }); } catch { /* next time */ }
   }
 
   /** Forget the cached snapshot (after our own effect or a known external change). */

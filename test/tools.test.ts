@@ -5,15 +5,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
 import { beforeAll, describe, expect, it } from "vitest";
-import { Gateway, type Scripted } from "../src/gateway/index.js";
+import { Gateway, TRUNCATED, type Scripted } from "../src/gateway/index.js";
 import { Orchestrator, describe as describeAction, type CardUser } from "../src/orchestrator/index.js";
 import { TransformAnswer } from "../src/protocol/roles.js";
 import { Registry, type Capability, type ExecResult } from "../src/registry/capability.js";
 import { FS_CAPABILITIES, fileRegistry, fsReadText } from "../src/registry/fs.js";
-import { HELPER, IS_MAC, prepareHelper, resetHelper, run } from "../src/registry/mac.js";
+import { HELPER, IS_MAC, helperProblem, prepareHelper, resetHelper, run } from "../src/registry/mac.js";
 import { matches } from "../src/registry/reconcile.js";
 import { make } from "../src/registry/spec.js";
-import { ZIP_LIMITS, fsConvertToPdf, fsOcrImage, fsTransformText, fsZipFiles, toolCapabilities, wrote } from "../src/registry/tools.js";
+import { PLACE, ZIP_LIMITS, fsConvertToPdf, fsOcrImage, fsTransformText, fsZipFiles, toolCapabilities, wrote } from "../src/registry/tools.js";
 import { TRASH, Workspace, build } from "../src/registry/workspace.js";
 import { crc32 } from "../src/registry/zip.js";
 
@@ -117,7 +117,7 @@ describe("tool capabilities", () => {
     expect(s.status).toBe("succeeded");
     w.invalidate();
     expect(w.read("summary_en.csv")).toBe("Content");
-    expect(transformAsked).toMatch(/原文开始（数据）[\s\S]*内容[\s\S]*原文结束/);   // the source is fenced off as data
+    expect(transformAsked).toContain(`原文（JSON 字符串）：${JSON.stringify("内容")}`);   // the source is one JSON string: data
     expect(s.counters["calls:transform"]).toBe(1);
     const intent = o.log.events.find((e: any) => e.kind === "execution.intent") as any;
     expect(intent.command.args.text).toBe("Content");                        // a replay after a crash writes the same thing
@@ -145,22 +145,57 @@ describe("tool capabilities", () => {
     expect(intentPrompt.length).toBeLessThan(12_000);
   });
 
-  it("the rewrite is refused up front when the transform model cannot write that much in one answer (review 5)", async () => {
+  it("a document the rewriting model cannot read is refused up front; a long one it can read is not (re-review 1)", async () => {
+    const plan = (path: string) => ({ goal: GOAL(path === "doc.txt" ? "doc_sum.txt" : "big_sum.txt"), plan: { nodes: [{ id: "n1", capability: "fs.transform_text", depends_on: [], purpose: "总结", requirement_ids: ["r1"] }], outcome: "plan" },
+      bind: { bindings: { source: { kind: "resource_ref", path }, instruction: lit("总结成三条要点"), destination: lit(path === "doc.txt" ? "doc_sum.txt" : "big_sum.txt") }, unresolved: [] },
+      intent: { verdict: "matches", reason: "ok" }, choice: { choice: "act" } });
+    // too long to read: refused before any call
     const w = ws({ "doc.txt": "长".repeat(200) });
-    const gw = new Gateway(table({ maxOutputTokens: 50 }));
-    expect(gw.outputBudget("transform")).toBe(50);
+    const gw = new Gateway(table({ contextTokens: 50 }));
     let asked = 0;
-    gw.script = Array(12).fill(((role, sys, user) => {
-      if (role === "transform") { asked++; return { text: "x" }; }
-      return byRole({ goal: GOAL("doc_en.txt"), plan: { nodes: [{ id: "n1", capability: "fs.transform_text", depends_on: [], purpose: "翻译", requirement_ids: ["r1"] }], outcome: "plan" },
-        bind: { bindings: { source: { kind: "resource_ref", path: "doc.txt" }, instruction: lit("翻译成英文"), destination: lit("doc_en.txt") }, unresolved: [] },
-        intent: { verdict: "matches", reason: "ok" }, choice: { choice: "act" } })(role, sys, user);
-    }) as Scripted);
+    gw.script = Array(12).fill(((role, sys, user) => role === "transform" ? (asked++, { text: "x" }) : byRole(plan("doc.txt"))(role, sys, user)) as Scripted);
     const o = new Orchestrator(logPath(), w, gw, nobody, fileRegistry());
-    o.start("把 doc.txt 翻译成英文另存");
+    o.start("把 doc.txt 总结后另存");
     await o.run();
     expect(asked).toBe(0);
-    expect((o.log.events.find((e: any) => e.kind === "node.failed") as any).why).toMatch(/writes at most about 50/);
+    expect((o.log.events.find((e: any) => e.kind === "node.failed") as any).why).toMatch(/reads at most about 50 tokens/);
+    // a 6,000-character document summarised in three lines: nothing guesses the answer's length from the source
+    const w2 = ws({ "big.txt": "第一段内容。".repeat(1000) });
+    const gw2 = new Gateway(table());
+    gw2.script = Array(12).fill(((role, sys, user) => role === "transform" ? { text: "1. 一\n2. 二\n3. 三\n" } : byRole(plan("big.txt"))(role, sys, user)) as Scripted);
+    const o2 = new Orchestrator(logPath(), w2, gw2, nobody, fileRegistry());
+    o2.start("把 big.txt 总结后另存");
+    expect((await o2.run()).status).toBe("succeeded");
+    // the configured models: what they read, and the rewrite's own, longer time limit
+    const claude = new Gateway("dev-claude"), luna = new Gateway("B0-luna");
+    expect(claude.contextBudget("transform")).toBe(200_000);
+    expect(luna.contextBudget("transform")).toBe(128_000);
+    expect(luna.timeoutFor("transform")).toBe(600_000);
+    expect(luna.timeoutFor("goal")).toBe(120_000);
+  });
+
+  it("an answer the model stopped at its output limit is invalid (truncated), never parsed (re-review 1)", async () => {
+    const saved = { fetch: globalThis.fetch, key: process.env.OPENROUTER_API_KEY };
+    try {
+      process.env.OPENROUTER_API_KEY = "test-only";
+      let sent: any = null;
+      globalThis.fetch = (async (_url: string, init: any) => {
+        sent = JSON.parse(init.body);
+        return new Response(JSON.stringify({ choices: [{ finish_reason: "length", message: { content: '{"text": "Para' } }], usage: { prompt_tokens: 10, completion_tokens: 50 } }), { status: 200 });
+      }) as any;
+      const t = table();
+      t.transform = { backend: "openrouter", model: "openai/gpt-6-luna", maxOutputTokens: 50 };
+      const rep = await new Gateway(t).ask("transform", "s", "u", TransformAnswer);
+      expect(rep.outcome).toBe("invalid");
+      expect(rep.error).toBe(TRUNCATED);
+      expect(sent.max_tokens).toBe(50);
+      t.transform = { backend: "local_chat", model: "local:http://127.0.0.1:1/x" };
+      const local = await new Gateway(t).ask("transform", "s", "u", TransformAnswer);
+      expect(local.error).toBe(TRUNCATED);
+    } finally {
+      globalThis.fetch = saved.fetch;
+      if (saved.key === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = saved.key;
+    }
   });
 
   it("a source changed by an earlier step is rewritten again, so the new line is in the translation (review 2)", async () => {
@@ -168,7 +203,7 @@ describe("tool capabilities", () => {
     const gw = new Gateway(table());
     let rewrites = 0;
     gw.script = Array(30).fill(((role, sys, user) => {
-      if (role === "transform") { rewrites++; const src = user.split("原文开始（数据） ============\n")[1]!.split("\n============ 原文结束")[0]!; return { text: "EN:" + src }; }
+      if (role === "transform") { rewrites++; const src = JSON.parse(user.split("原文（JSON 字符串）：")[1]!); return { text: "EN:" + src }; }
       if (role === "bind") return user.includes("fs.append_line")
         ? { bindings: { target: { kind: "resource_ref", path: "a.txt" }, line: { kind: "source_span", quote: "买牛奶", occurrence: 1 } }, unresolved: [] }
         : { bindings: { source: { kind: "resource_ref", path: "a.txt" }, instruction: lit("翻译成英文"), destination: lit("a_en.txt") }, unresolved: [] };
@@ -196,6 +231,36 @@ describe("tool capabilities", () => {
     expect(bad.status).toBe("failed");
     expect(w.exists("bad.zip")).toBe(false);
     expect(fs.readdirSync(w.abs(TRASH))).toEqual([]);
+  });
+
+  it("on a volume without hard links the output is copied in place; it never replaces a file (re-review follow-up)", () => {
+    const w = ws({ "taken.zip": "mine" });
+    const saved = PLACE.link;
+    try {
+      PLACE.link = () => { throw Object.assign(new Error("not supported"), { code: "ENOTSUP" }); };
+      expect(wrote(w, "out.zip", Buffer.from("data"), () => null).status).toBe("ok");
+      w.invalidate();
+      expect(w.read("out.zip")).toBe("data");
+      expect(wrote(w, "taken.zip", Buffer.from("data"), () => null).status).toBe("failed");
+      w.invalidate();
+      expect(w.read("taken.zip")).toBe("mine");
+    } finally { PLACE.link = saved; }
+  });
+
+  it("wrote() fails instead of throwing when it cannot even make its temporary file (re-review follow-up)", () => {
+    const w = ws({ ".deskmind-trash": "a file where the folder should be" });
+    const r = wrote(w, "out.zip", Buffer.from("data"), () => null);
+    expect(r.status).toBe("failed");
+    expect(r.why).toMatch(/cannot create out.zip/);
+  });
+
+  it("a temporary output left by a crash is swept when a run starts; nothing else in the trash is (re-review follow-up)", () => {
+    const w = ws({ "a.txt": "x" });
+    fs.mkdirSync(w.abs(TRASH));
+    fs.writeFileSync(w.abs(`${TRASH}/.tmp-left-by-a-crash.zip`), "half");
+    fs.writeFileSync(w.abs(`${TRASH}/a.txt`), "a trashed file");
+    new Orchestrator(logPath(), w, new Gateway(table()), nobody, fileRegistry());
+    expect(fs.readdirSync(w.abs(TRASH))).toEqual(["a.txt"]);
   });
 
   it("a destination that is a symlink is refused, and a race onto it fails the step instead of throwing (review 6)", () => {
@@ -336,6 +401,36 @@ describe("tool capabilities", () => {
     w.invalidate();
     expect(w.exists("out.txt")).toBe(false);
   }, 60_000);
+
+  mac("prepareHelper never rejects and never leaves the build hanging; a registry never starts a build (re-review 2)", async () => {
+    const saved = { ...HELPER };
+    try {
+      // the cache path is a file: mkdir fails inside the build, which used to reject unhandled and kill the process
+      const blocker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "harness-cache-")), "not-a-folder");
+      fs.writeFileSync(blocker, "x");
+      Object.assign(HELPER, { cache: blocker });
+      resetHelper();
+      await expect(prepareHelper()).resolves.toBeUndefined();
+      expect(helperProblem()).toMatch(/cannot build/);
+      // a fresh cache: asking for the registry builds nothing
+      Object.assign(HELPER, { cache: fs.mkdtempSync(path.join(os.tmpdir(), "harness-cache-")) });
+      resetHelper();
+      expect(toolCapabilities().map((c) => c.id)).toEqual(["fs.transform_text", "fs.zip_files"]);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(fs.readdirSync(HELPER.cache)).toEqual([]);
+      // a build a dead process left half-done is swept by the next prepare
+      const stale = path.join(HELPER.cache, "mactools-0123456789ab.999.1.tmp");
+      fs.writeFileSync(stale, "half");
+      fs.utimesSync(stale, new Date(Date.now() - 3600_000), new Date(Date.now() - 3600_000));
+      await prepareHelper();
+      expect(fs.existsSync(stale)).toBe(false);
+      expect(helperProblem()).toBeNull();
+    } finally {
+      Object.assign(HELPER, saved);
+      resetHelper();
+      await prepareHelper();
+    }
+  }, 300_000);
 
   mac("without a usable helper, PDF and OCR are not offered, nothing is compiled, and preconditions explain (review 5)", async () => {
     const saved = { ...HELPER };

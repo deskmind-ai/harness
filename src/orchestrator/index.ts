@@ -162,6 +162,7 @@ export class Orchestrator {
     this.log = new Log(logPath);
     this.budget = { ...BUDGET, ...(opts.budget ?? {}) };
     this.policy = { ...POLICY, ...(opts.policy ?? {}) };
+    ws.sweepTemp();                                   // a tool's half-made output from a crash is never an effect
     for (const ev of this.log.events) this.st.apply(ev);
     const inFlight = [...this.st.ops].filter(([, v]) => v.state === "in_flight").map(([k]) => k);
     if (inFlight.length) this.emit("run.recovered", { unknown: inFlight });
@@ -471,12 +472,12 @@ export class Orchestrator {
       const pre = cap.preconditions(this.ws, res.args);
       if (pre) { this.emit("node.failed", { node_id: node.id, why: pre }); return false; }
       const d = cap.derive(this.ws, res.args);
-      // what the transform role's model can write back in one answer: a longer source would come back cut short
-      const budget = this.gw.outputBudget("transform");
-      if ([...d.source].length > budget) { this.emit("node.failed", { node_id: node.id, why: `the source is ${[...d.source].length} characters; the rewriting model writes at most about ${Math.floor(budget)} in one answer` }); return false; }
+      // a document the transform role's model cannot even read is refused up front; an answer cut short by the model's
+      // output limit comes back as invalid (truncated) and fails the step like any failed model call
+      const ctx = this.gw.contextBudget("transform");
+      if ([...d.source].length > ctx) { this.emit("node.failed", { node_id: node.id, why: `the source is ${[...d.source].length} characters; the rewriting model reads at most about ${ctx} tokens` }); return false; }
       const rep = await this.askModel("transform", P.transformPrompt(st.raw, d.instruction, d.source), R.TransformAnswer);
       if (rep.outcome !== "answered") { this.modelFailed(rep); return false; }
-      if ([...rep.data!.text].length > budget) { this.emit("node.failed", { node_id: node.id, why: "the rewrite is longer than the model can be trusted to have written whole" }); return false; }
       Object.assign(res.args, d.also ?? {}, { [d.field]: rep.data!.text });
     }
     this.emit("node.bound", { node_id: node.id, bindings: b.bindings, args: res.args });

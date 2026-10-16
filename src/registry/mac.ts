@@ -4,9 +4,10 @@
  *
  * The helper is compiled with swiftc into a cache folder named after its source digest (an edited source is rebuilt).
  * Compiling needs the Xcode command line tools; without them /usr/bin/swiftc opens an install dialog, so nothing is
- * compiled unless `xcode-select -p` already points at a developer folder. The build runs in the background
- * (prepareHelper, started by the first registry that asks), never inside a step; until it is ready the capabilities
- * that need it are not offered at all (tools.ts toolCapabilities), so no model plans with a tool that cannot run.
+ * compiled unless `xcode-select -p` already points at a developer folder. The build runs in the background, only when
+ * a process asks for it (prepareHelper: the eval runner and the app at start), never inside a step; until it is ready
+ * the capabilities that need it are not offered at all (tools.ts toolCapabilities), so no model plans with a tool that
+ * cannot run. A build from an earlier run stays in the cache, so later processes have it at once.
  */
 import { execFile, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -65,32 +66,54 @@ export function helperProblem(): string | null {
   return "the macOS helper is not built yet";
 }
 
-/** Build the helper in the background, once; resolves when it is ready or known to be unavailable. */
+/** Build the helper, once per process, without blocking the caller; resolves (never rejects) when it is ready or known
+ *  to be unavailable. Only an explicit call builds: a registry never starts a build as a side effect. */
 export function prepareHelper(): Promise<void> {
   if (helperBin()) return Promise.resolve();
   if (state && "building" in state) return state.building;
   if (state && "unavailable" in state) return Promise.resolve();
   const fail = (why: string) => { state = { unavailable: why }; };
-  if (!IS_MAC) { fail("needs macOS"); return Promise.resolve(); }
-  const bin = binPath();
-  if (!bin) { fail(`the helper's source is missing (${HELPER.source})`); return Promise.resolve(); }
-  // Only with the command line tools already installed: otherwise swiftc would ask the user to install them.
-  const dev = run(HELPER.xcodeSelect, ["-p"], { timeoutMs: 10_000 });
-  const devDir = dev.stdout.toString().trim();
-  if (!dev.ok || !devDir || !fs.existsSync(devDir)) { fail("needs the Xcode command line tools (xcode-select --install)"); return Promise.resolve(); }
-  const building = new Promise<void>((resolve) => {
+  try {
+    if (!IS_MAC) { fail("needs macOS"); return Promise.resolve(); }
+    const bin = binPath();
+    if (!bin) { fail(`the helper's source is missing (${HELPER.source})`); return Promise.resolve(); }
+    // Only with the command line tools already installed: otherwise swiftc would ask the user to install them.
+    const dev = run(HELPER.xcodeSelect, ["-p"], { timeoutMs: 10_000 });
+    const devDir = dev.stdout.toString().trim();
+    if (!dev.ok || !devDir || !fs.existsSync(devDir)) { fail("needs the Xcode command line tools (xcode-select --install)"); return Promise.resolve(); }
     fs.mkdirSync(HELPER.cache, { recursive: true });
+    sweepStaleBuilds();
     const tmp = `${bin}.${process.pid}.${Date.now()}.tmp`;
-    execFile("/usr/bin/xcrun", ["swiftc", "-O", "-o", tmp, HELPER.source], { timeout: 300_000 }, (err, _out, stderr) => {
-      if (!err && fs.existsSync(tmp)) fs.renameSync(tmp, bin);
-      fs.rmSync(tmp, { force: true });
-      if (fs.existsSync(bin) && works(bin)) state = { ready: bin };
-      else fail("cannot build the macOS helper: " + String(stderr || err).slice(0, 300));
-      resolve();
+    const building = new Promise<void>((resolve) => {
+      execFile("/usr/bin/xcrun", ["swiftc", "-O", "-o", tmp, HELPER.source], { timeout: 300_000 }, (err, _out, stderr) => {
+        try {
+          if (!err && fs.existsSync(tmp)) fs.renameSync(tmp, bin);
+          if (fs.existsSync(bin) && works(bin)) state = { ready: bin };
+          else fail("cannot build the macOS helper: " + String(stderr || err).slice(0, 300));
+        } catch (e) {
+          fail("cannot build the macOS helper: " + String(e).slice(0, 300));
+        } finally {
+          try { fs.rmSync(tmp, { force: true }); } catch { /* nothing left to clean */ }
+          resolve();
+        }
+      });
     });
-  });
-  state = { building };
-  return building;
+    state = { building };
+    return building;
+  } catch (e) {
+    fail("cannot build the macOS helper: " + String(e).slice(0, 300));
+    return Promise.resolve();
+  }
+}
+
+/** Builds left half-done by a process that died (older than any build still running could be). */
+function sweepStaleBuilds() {
+  const cutoff = Date.now() - 10 * 60_000;
+  for (const f of fs.readdirSync(HELPER.cache)) {
+    if (!f.endsWith(".tmp")) continue;
+    const full = path.join(HELPER.cache, f);
+    try { if (fs.statSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true }); } catch { /* raced with its owner */ }
+  }
 }
 
 /** Forget what is known about the helper (tests). */
