@@ -49,7 +49,7 @@ export interface Pending {
   version: { rules: SkillRule[]; expect?: SkillExpect; also: SkillExpect[]; variants: { from: string; content?: string; to: string }[]; change: string; title: string; applies_when: string };
   counter: Example;
   retire: string[];                              // what choosing the new way retires (the examples the card showed, and broken variants)
-  misses: number;                                // times it came up unanswered (the question itself, then later uses)
+  misses: number;                                // times it came up unanswered (the question itself, then later uses); at 2 it is dropped
   t: string;
 }
 
@@ -259,31 +259,32 @@ export class Library implements SkillLibrary {
     return !!d && !d.wrong.length && d.checks;
   }
 
-  /** Whether an example's right answer itself breaks the old version's checks (then the checks were wrong, not the
-   *  answer). A file counts as taken when the answer moved it, or when the old rules take it and leave it where the
-   *  answer has it (already in place); only the files the old version is judged on count. */
-  static answerBreaks(champion: Rules, ex: Example): boolean {
+  /** Whether an example's right answer itself breaks one of the old version's checks (then that check was wrong, not
+   *  the answer); with no check named, whether it breaks any. A file counts as taken when the answer moved it, or when
+   *  the old rules take it and leave it where the answer has it (already in place); only the files the old version is
+   *  judged on count. */
+  static answerBreaks(champion: Rules, ex: Example, check?: SkillExpect): boolean {
     const r = tryRun(champion, ex);
     if (!r) return true;
     const judged = Library.relevant(champion, ex);
     const files = ex.files.filter((f) => judged.has(f));
     const where = Object.fromEntries(files.map((f) => [f, ex.want[f] ?? f]));
     const taken = files.filter((f) => where[f] !== f || (r.matched.includes(f) && (r.where[f] ?? f) === where[f]));
-    try { return checksOf(champion).some((c) => failed(checkExpect(c, files, ex.contents ?? {}, where, [], taken))); }
+    try { return (check ? [check] : checksOf(champion)).some((c) => failed(checkExpect(c, files, ex.contents ?? {}, where, [], taken))); }
     catch { return true; }
   }
 
-  /** Whether the old version's checks bind a new one written for this counterexample: unless its right answer breaks
-   *  them. */
-  static bindsOld(champion: Rules, counter: Example): boolean {
-    return checksOf(champion).length > 0 && !Library.answerBreaks(champion, counter);
+  /** The old version's checks that bind a new one written for this counterexample: each one its right answer does not
+   *  break. A correction that breaks one check (a naming rule the user overrode) leaves the others standing. */
+  static bindingChecks(champion: Rules, counter: Example): SkillExpect[] {
+    return checksOf(champion).filter((c) => !Library.answerBreaks(champion, counter, c));
   }
 
-  /** How a new version is judged against the old one on a counterexample: right on an example under its own checks and,
-   *  while the old checks bind, under those too (so it cannot pass by weakening its own). */
+  /** How a new version is judged against the old one on a counterexample: right on an example under its own checks and
+   *  under every old check that still binds (so it cannot pass by weakening its own). */
   static judge(champion: Rules, counter: Example): (s: Rules, ex: Example) => boolean {
-    const bindOld = Library.bindsOld(champion, counter);
-    return (s, ex) => Library.replay(s, ex, [champion]) && (!bindOld || Library.replay({ rules: s.rules, expect: champion.expect, also: champion.also }, ex, [s]));
+    const old = Library.bindingChecks(champion, counter);
+    return (s, ex) => Library.replay(s, ex, [champion]) && (!old.length || Library.replay({ rules: s.rules, also: old }, ex, [s]));
   }
 
   static selfCheck(sk: { rules: SkillRule[]; variants?: { from: string; content?: string; to: string }[]; expect?: SkillExpect }, files: string[], contents: Record<string, string>, moves: Record<string, string>): Wrong[] {
@@ -420,22 +421,25 @@ export class Library implements SkillLibrary {
    *  try breaks something the user confirmed by placing it differently, the user is asked which way holds, with every
    *  example that would be retired on the card; a confirmed example broken any other way (left out, not placed) is a
    *  plain loss. A failure counts toward disabling only when a version was written and lost the replay. While a
-   *  question is unanswered no new version is written and nothing else is asked; a second use in that state stops the
-   *  skill. */
+   *  question is unanswered, the next use drops it (silence keeps the old way) and is revised as usual. */
   async revise(gw: Gateway, sk: StoredSkill, counter: Example, user?: CardUser, runId = ""): Promise<Outcome> {
     const champion: Rules = { rules: sk.rules!, expect: sk.expect, also: sk.also };
     const examples = sk.examples ?? [];
     const keepCounter = () => { if (binding(counter) || counter.confirmed) sk.examples = [...(sk.examples ?? []), counter]; };
     if (sk.pending) {
       sk.pending.misses += 1;
-      keepCounter();
-      if (sk.pending.misses >= 2) sk.status = "disabled";
-      sk.revisions = [...(sk.revisions ?? []), { ok: false, version: sk.version ?? 1, why: "a question about a conflict is unanswered", counter: counter.id, counted: false, t: now() }];
-      this.save();
-      return "pending";
+      if (sk.pending.misses < 2) {
+        keepCounter();
+        sk.revisions = [...(sk.revisions ?? []), { ok: false, version: sk.version ?? 1, why: "a question about a conflict is unanswered", counter: counter.id, counted: false, t: now() }];
+        this.save();
+        return "pending";
+      }
+      // unanswered the second time: silence keeps what the user confirmed; the question goes, revision goes on as usual
+      sk.revisions = [...(sk.revisions ?? []), { ok: false, version: sk.version ?? 1, why: "conflict unanswered twice: the old way stays", counter: sk.pending.counter.id, counted: false, asked: true, t: now() }];
+      sk.pending = null;
     }
     const right = Library.judge(champion, counter);
-    const bindOld = Library.bindsOld(champion, counter);
+    const old = Library.bindingChecks(champion, counter);
     const log = (ok: boolean, why: string, more: Record<string, unknown> = {}) =>
       (sk.revisions = [...(sk.revisions ?? []), { ok, version: sk.version ?? 1, why, counter: counter.id, t: now(), ...more }]);
     const keep = (why: string, counted: boolean): Outcome => {
@@ -467,7 +471,7 @@ export class Library implements SkillLibrary {
     const replace = (t: Tried, retired: Example[], asked = false): Outcome => {
       const at = now();
       const dropped = t.brokenImagined.filter((ex) => !retired.includes(ex));
-      Object.assign(sk, { rules: t.ch.rules, expect: t.ch.expect, also: bindOld ? checksOf(champion) : [], variants: t.data.variants, title: t.data.title || sk.title, applies_when: t.data.applies_when || sk.applies_when });
+      Object.assign(sk, { rules: t.ch.rules, expect: t.ch.expect, also: old, variants: t.data.variants, title: t.data.title || sk.title, applies_when: t.data.applies_when || sk.applies_when });
       sk.version = (sk.version ?? 1) + 1;
       sk.examples = [...examples.filter((ex) => !retired.includes(ex) && !dropped.includes(ex)), counter];
       for (const v of t.data.variants.filter((v) => v.from && v.to)) {
@@ -506,7 +510,7 @@ export class Library implements SkillLibrary {
     const a: Answer | null = user.ask(card);
     if (!a || !("option" in a)) {
       sk.pending = { card, counter, retire: [...best.brokenConfirmed, ...best.brokenImagined].map((e) => e.id), misses: 1, t: now(),
-        version: { rules: best.ch.rules, expect: best.ch.expect, also: bindOld ? checksOf(champion) : [], variants: best.data.variants, change: best.data.change, title: best.data.title, applies_when: best.data.applies_when } };
+        version: { rules: best.ch.rules, expect: best.ch.expect, also: old, variants: best.data.variants, change: best.data.change, title: best.data.title, applies_when: best.data.applies_when } };
       log(false, "conflict: no answer yet", { counted: false, asked: true });
       this.save();
       return "no_answer";

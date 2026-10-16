@@ -348,6 +348,25 @@ describe("review fixes around a use", () => {
 });
 
 describe("re-review fixes", () => {
+  it("old checks bind one by one: a correction that breaks the naming check leaves the other checks binding (round 3, F2)", async () => {
+    const lib = library();
+    const COVERS: SkillExpect = { covers: { ext: ["pdf"], name: ["发票"] }, untouched: true };
+    const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
+    sk.also = [COVERS];
+    // the user keeps 013's electronic invoices under their own names: INV_EXPECT's name check is wrong for them, COVERS is not
+    const KEEP_NAMES = { files: T013.files, want: { "电子发票-山姆-2026.08.13-99.00元.pdf": "财务/发票/2026-08/电子发票-山姆-2026.08.13-99.00元.pdf", "电子发票-携程-2026.03.12-1024.00元.pdf": "财务/发票/2026-03/电子发票-携程-2026.03.12-1024.00元.pdf" } };
+    const champion = { rules: INV_V1, expect: INV_EXPECT, also: [COVERS] };
+    expect(Library.bindingChecks(champion, ex("C", KEEP_NAMES))).toEqual([COVERS]);
+    // a new version that stops taking invoices it does not recognise passes its own empty check, not the old COVERS
+    const lax = { rules: [INV_TAUGHT], expect: { covers: { ext: ["xyz"] }, untouched: false } as SkillExpect };
+    expect(Library.judge(champion, ex("C", KEEP_NAMES))(lax, ex("C", KEEP_NAMES))).toBe(false);
+    // and a version that keeps the names is installed with COVERS kept in also, not with also: []
+    const keepNames: SkillRule[] = [INV_TAUGHT, { name: "inv-e", match: ["电子发票-(?P<shop>[^-]+)-(?P<y>\\d{4})\\.(?P<m>\\d{2})"], ext: ["pdf"], to: "财务/发票/{y}-{m}" }];
+    const weak: SkillExpect = { covers: { ext: ["xyz"] }, untouched: false };
+    expect((await lib.learn(gateway(revision(keepNames, weak, "电子发票保留原名")), "S001", { files: KEEP_NAMES.files, contents: contentsOf(KEEP_NAMES.files), final: KEEP_NAMES.want, signals: ["declined"], corrected: true, confirmed: true })).revision).toBe("replaced");
+    expect(sk.also).toEqual([COVERS]);
+  });
+
   it("variants the first try breaks get one more try too; only what the better try still breaks is dropped (R1)", async () => {
     const lib = library();
     const voice: SkillRule[] = [{ ...REC_V1[0]!, match: [...(REC_V1[0]!.match as string[]), "^Voice Recording (?P<y>\\d{4})-(?P<m>\\d{2})-(?P<d>\\d{2})"] }];
@@ -396,7 +415,7 @@ describe("re-review fixes", () => {
   it("a file already in its place is taken, so the old checks keep binding on a real use (R3)", () => {
     const counter = ex("C", { files: ["录音/2025-10/New Recording 2025-10-13.m4a", "录音 _ ２０２５０７０９.m4a"], want: { "录音 _ ２０２５０７０９.m4a": "录音/2025-07/录音 _ ２０２５０７０９.m4a" } });
     expect(Library.answerBreaks({ rules: REC_V1, expect: REC_EXPECT }, counter)).toBe(false);
-    expect(Library.bindsOld({ rules: REC_V1, expect: REC_EXPECT }, counter)).toBe(true);
+    expect(Library.bindingChecks({ rules: REC_V1, expect: REC_EXPECT }, counter)).toEqual([REC_EXPECT]);
   });
 
   it("a move the run made for another part of the task is not the skill's: a right use stays an example (R4)", async () => {
@@ -420,27 +439,35 @@ describe("re-review fixes", () => {
     expect(useOutcome("succeeded", [{ kind: "result.response", picked: "undo" }], ["undone"])).toEqual({ right: false, corrected: false });
   });
 
-  it("an unanswered conflict is asked once; the next use writes nothing and asks nothing, and stops the skill (R6)", async () => {
+  it("an unanswered conflict is kept with its question; answered later, the version written then replaces the old one (R6)", async () => {
     const lib = library();
     const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
     const BY_YEAR: SkillRule[] = [{ ...REC_V2[0]!, to: "录音/{y|04}" }];
     const T_YEAR = { files: ["New Recording 2026-02-14.m4a", ...OTHER], want: { "New Recording 2026-02-14.m4a": "录音/2026/New Recording 2026-02-14.m4a" } };
-    const use = { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined" as const], corrected: true, confirmed: true };
-    const u = user(null);
     const twice = revision(BY_YEAR, REC_EXPECT, "按年归档");
     const g1 = gateway(twice, twice);
-    expect((await lib.learn(g1, "S001", use, u)).revision).toBe("no_answer");
+    expect((await lib.learn(g1, "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true, confirmed: true }, user(null))).revision).toBe("no_answer");
     expect(g1.calls).toBe(2);
     expect(lib.pendingQuestion("S001")!.text).toContain("以后按哪个");
-    const g2 = gateway(twice, twice);
-    expect((await lib.learn(g2, "S001", use, u)).revision).toBe("pending");
-    expect(g2.calls).toBe(0);
-    expect(u.cards).toHaveLength(1);
-    expect(sk.status).toBe("disabled");
-    // answered later: the version written then replaces the old one, and the skill is usable again
     expect(lib.answerPending("S001", { option: 1 })).toBe("replaced");
     expect(sk).toMatchObject({ status: "probation", version: 2, pending: null });
     expect(sk.rules).toEqual(BY_YEAR);
+  });
+
+  it("unanswered a second time, the question is dropped and the old way stays; the skill is not stopped and revises as usual (round 3)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
+    const BY_YEAR: SkillRule[] = [{ ...REC_V2[0]!, to: "录音/{y|04}" }];
+    const T_YEAR = { files: ["New Recording 2026-02-14.m4a", ...OTHER], want: { "New Recording 2026-02-14.m4a": "录音/2026/New Recording 2026-02-14.m4a" } };
+    const twice = revision(BY_YEAR, REC_EXPECT, "按年归档");
+    expect((await lib.learn(gateway(twice, twice), "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true, confirmed: true }, user(null))).revision).toBe("no_answer");
+    // an unrelated counterexample next (009): the question goes, and 009 is revised normally
+    const r = await lib.learn(gateway(revision(REC_V2, REC_EXPECT, "现在也认得全角数字")), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], confirmed: true }, user(null));
+    expect(r.revision).toBe("replaced");
+    expect(sk).toMatchObject({ status: "probation", pending: null, version: 2 });
+    expect(sk.rules).toEqual(REC_V2);                                   // the year layout never went in
+    expect(sk.revisions!.map((x) => x.why ?? "ok")).toContain("conflict unanswered twice: the old way stays");
+    expect(lib.answerPending("S001", { option: 1 })).toBe("no_answer");
   });
 
   it("a correction binds what the user had a word on; the planner's unseen replacement is confirmed only by a later approval or a shown result (refinement)", () => {
