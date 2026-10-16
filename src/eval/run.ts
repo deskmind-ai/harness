@@ -17,6 +17,7 @@ import { readRows } from "./rows.js";
 import { Orchestrator, POLICY, cardUser, type Answer, type Card, type CardUser, type Hooks, type Policy } from "../orchestrator/index.js";
 import { Crash, Registry } from "../registry/capability.js";
 import { RENAMES, fileRegistry } from "../registry/fs.js";
+import { helperProblem, prepareHelper } from "../registry/mac.js";
 import { guiRegistry } from "../gui/sim.js";
 import { Workspace, build } from "../registry/workspace.js";
 import { EditorSim } from "../gui/sim.js";
@@ -329,6 +330,10 @@ async function main() {
   const only = a.only ? new Set(a.only.split(",")) : null;
   let tasks: Task[] = JSON.parse(fs.readFileSync(a.tasks, "utf-8"));
   setSimCache(path.join(path.dirname(path.resolve(a.tasks)), "sim-cache.json"));
+  // The macOS helper is built (or found) before the first task, so every task sees the same capabilities: PDF and OCR
+  // are offered only once it answers (registry/tools.ts).
+  await prepareHelper();
+  console.log(`macOS helper: ${helperProblem() ?? "ready (fs.convert_to_pdf, fs.ocr_image offered)"}`);
   tasks = tasks.filter((t) => groups.has(t.group) && t.split === a.split && (!only || only.has(t.id)));
   if (a.limit) tasks = tasks.slice(0, Number(a.limit));
   const policy = parsePolicy(a.policy!);
