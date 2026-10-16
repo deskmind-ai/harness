@@ -7,7 +7,7 @@ import { Orchestrator, type Answer, type Card, type CardUser } from "../src/orch
 import type { SkillExpect, SkillRule } from "../src/protocol/roles.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
-import { Library, movesBetween, useApproved, useOutcome, useSignals, type Example, type StoredSkill } from "../src/skills/library.js";
+import { Library, movesBetween, useConfirmation, useOutcome, useSignals, type Example, type StoredSkill } from "../src/skills/library.js";
 import { checkExpect } from "../src/skills/rules.js";
 
 const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
@@ -151,7 +151,7 @@ describe("revision: champion and challenger (design table: 009, 010, 013)", () =
   it("013: a version wrong on the counterexample is not taken; two such in a row disable the skill", async () => {
     const lib = library();
     const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
-    const one = await lib.learn(gateway(revision(INV_V1, INV_EXPECT, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: ["declined"], corrected: true });
+    const one = await lib.learn(gateway(revision(INV_V1, INV_EXPECT, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: ["declined"], corrected: true, confirmed: true });
     expect(one.revision).toBe("kept");
     expect(sk).toMatchObject({ version: 1, status: "probation", failed_revisions: 1 });
     expect(sk.examples!.at(-1)).toMatchObject({ source: "correction", confirmed: true });
@@ -163,7 +163,7 @@ describe("revision: champion and challenger (design table: 009, 010, 013)", () =
     const lib = library();
     const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
     const timeout = () => ({ outcome: "timeout", error: "slow" });
-    for (let i = 0; i < 2; i++) expect((await lib.learn(gateway(timeout), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: [], approved: true })).revision).toBe("kept");
+    for (let i = 0; i < 2; i++) expect((await lib.learn(gateway(timeout), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: [], confirmed: true })).revision).toBe("kept");
     expect(sk.status).toBe("probation");
     expect(sk.failed_revisions ?? 0).toBe(0);
     expect(sk.revisions!.map((x) => x.counted)).toEqual([false, false]);
@@ -172,7 +172,7 @@ describe("revision: champion and challenger (design table: 009, 010, 013)", () =
   it("an invalid pattern in the new version's checks keeps the old version instead of crashing (review 4)", async () => {
     const lib = library();
     const sk = stored(lib, "invoices", INV_V1, INV_EXPECT, T012);
-    const r = await lib.learn(gateway(revision(INV_V2, { ...INV_EXPECT, name: ["(unclosed"] }, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: [], approved: true });
+    const r = await lib.learn(gateway(revision(INV_V2, { ...INV_EXPECT, name: ["(unclosed"] }, "x")), "S001", { files: T013.files, contents: contentsOf(T013.files), final: T013.want, signals: [], confirmed: true });
     expect(r.revision).toBe("kept");
     expect(sk.revisions!.at(-1)).toMatchObject({ ok: false, why: "invalid expect", counted: true });
     expect(sk.rules).toEqual(INV_V1);
@@ -196,7 +196,7 @@ describe("revision: champion and challenger (design table: 009, 010, 013)", () =
     const only010: SkillRule[] = [{ name: "rec", match: ["new recording\\s*(?P<y>\\d{4})\\s*-\\s*(?P<m>\\d{2})\\s*-\\s*(?P<d>\\d{2})", "录音_(?P<y>[0-9０-９]{4})(?P<m>[0-9０-９]{2})"], ext: ["m4a"], to: "录音/{y|04}-{m|02}" }];
     expect(Library.replay({ rules: only010, expect: REC_EXPECT }, ex("x", T010))).toBe(true);
     expect(Library.replay({ rules: only010, expect: REC_EXPECT }, ex("x", T009))).toBe(false);
-    const r = await lib.learn(gateway(revision(only010, REC_EXPECT, "x"), revision(only010, REC_EXPECT, "x")), "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [], approved: true });
+    const r = await lib.learn(gateway(revision(only010, REC_EXPECT, "x"), revision(only010, REC_EXPECT, "x")), "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [], confirmed: true });
     expect(r.revision).toBe("kept");
     expect(sk.version).toBe(1);
   });
@@ -256,8 +256,10 @@ describe("revision: asking only on a conflict with what the user confirmed", () 
     const oldUse = ex("E3", { files: ["New Recording 2025-03-01.m4a"], want: { "New Recording 2025-03-01.m4a": "录音/2025-03/New Recording 2025-03-01.m4a" } });
     const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008, [oldVariant, oldUse]);
     const twice = revision(BY_YEAR, REC_EXPECT, "按年归档", "E1");
-    const r = await lib.learn(gateway(twice, twice), "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true }, user(1));
+    const u = user(1);
+    const r = await lib.learn(gateway(twice, twice), "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true, confirmed: true }, u);
     expect(r.revision).toBe("replaced");
+    expect(u.cards[0]!.text).toMatch(/^整理这类文件，以前是「.+」、「New Recording 2025-03-01\.m4a → 录音\/2025-03\/.+」，这次是/);   // the card shows every example it retires
     expect(sk.examples!.map((e) => e.id)).toEqual(["E4"]);
     expect(sk.revisions!.at(-1)).toMatchObject({ ok: true, asked: true, retired: ["E1", "E3", "E2"] });
   });
@@ -269,7 +271,8 @@ describe("revision: asking only on a conflict with what the user confirmed", () 
     const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008, [memo]);
     const withMemo: SkillRule[] = [{ ...REC_V1[0]!, match: [...(REC_V1[0]!.match as string[]), "^Voice Memo (?P<y>\\d{4})-(?P<m>\\d{2})-(?P<d>\\d{2})"] }];
     const memoExpect: SkillExpect = { ...REC_EXPECT, covers: { ext: ["m4a"], name: ["录音", "recording", "memo"] } };
-    const T_MEMO = { files: ["Voice Memo 2025-01-01.m4a", ...OTHER], want: { "Voice Memo 2025-01-01.m4a": "录音/2025-01/Voice Memo 2025-01-01.m4a" } };
+    // filed next to a recording the skill itself puts in 录音/2025-01, so it is the skill's business
+    const T_MEMO = { files: ["Voice Memo 2025-01-01.m4a", "New Recording 2025-01-05.m4a", ...OTHER], want: { "Voice Memo 2025-01-01.m4a": "录音/2025-01/Voice Memo 2025-01-01.m4a", "New Recording 2025-01-05.m4a": "录音/2025-01/New Recording 2025-01-05.m4a" } };
     const u = user(0);
     const r = await lib.learn(gateway(revision(withMemo, memoExpect, "现在也整理语音备忘录")), "S001", { files: T_MEMO.files, contents: contentsOf(T_MEMO.files), final: T_MEMO.want, signals: ["declined"], corrected: true }, u);
     expect(r.revision).toBe("replaced");
@@ -295,7 +298,7 @@ describe("review fixes around a use", () => {
     const teach = { files: ["录音_1.m4a"], want: { "录音_1.m4a": "录音/录音_1.m4a" } };
     const sk = stored(lib, "recordings", loose, { covers: { ext: ["m4a"] }, untouched: true }, teach);
     const files = ["录音_2.m4a", "录音笔说明书.pdf"];
-    const r = await lib.learn(gateway(revision(tight, { covers: { ext: ["m4a"] }, untouched: true }, "不再动说明书")), "S001", { files, contents: contentsOf(files), final: { "录音_2.m4a": "录音/录音_2.m4a" }, signals: [], approved: true });
+    const r = await lib.learn(gateway(revision(tight, { covers: { ext: ["m4a"] }, untouched: true }, "不再动说明书")), "S001", { files, contents: contentsOf(files), final: { "录音_2.m4a": "录音/录音_2.m4a" }, signals: [], confirmed: true });
     expect(r).toMatchObject({ signals: ["touched"], revision: "replaced" });
     expect(sk.rules).toEqual(tight);
   });
@@ -315,7 +318,7 @@ describe("review fixes around a use", () => {
     const lib = library();
     const sk = stored(lib, "recordings", REC_V2, REC_EXPECT, T008);
     await lib.learn(gateway(), "S001", { files: T010.files, contents: contentsOf(T010.files), final: T010.want, signals: [] });
-    await lib.learn(gateway(), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], approved: true });
+    await lib.learn(gateway(), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], confirmed: true });
     expect(sk.examples!.slice(1).map((e) => e.confirmed)).toEqual([false, true]);
   });
 
@@ -331,17 +334,130 @@ describe("review fixes around a use", () => {
     expect(useSignals([plan, { kind: "interaction.reply", body: { kind: "clarify", purpose: "plan", picked: "reading" } }])).toEqual(["declined"]);
     expect(useSignals([plan, { kind: "interaction.reply", body: { kind: "clarify", picked: "other", card: "plan" } }])).toEqual(["declined"]);
     expect(useSignals([plan, { kind: "interaction.reply", body: { kind: "authorize", purpose: "plan", approved: true } }])).toEqual([]);
-    expect(useApproved([plan, { kind: "interaction.reply", body: { kind: "authorize", purpose: "plan", approved: true } }])).toBe(true);
-    expect(useApproved([plan])).toBe(false);
   });
 
   it("undo and another reading, redone right, is a correction that ended right (review 9)", () => {
-    expect(useOutcome("succeeded", "undo_and_reading", ["undone"])).toEqual({ right: true, corrected: true });
-    expect(useOutcome("cancelled", "undo", ["undone"])).toEqual({ right: false, corrected: false });
-    expect(useOutcome("succeeded", null, [])).toEqual({ right: true, corrected: false });
+    expect(useOutcome("succeeded", [{ kind: "result.response", picked: "undo_and_reading" }, { kind: "run.redo" }], ["undone"])).toEqual({ right: true, corrected: true });
+    expect(useOutcome("cancelled", [{ kind: "result.response", picked: "undo" }], ["undone"])).toEqual({ right: false, corrected: false });
+    expect(useOutcome("succeeded", [], [])).toEqual({ right: true, corrected: false });
   });
 
   it("moves pair files by name before content, never crosswise (review 13)", () => {
     expect(movesBetween({ "a.txt": "x", "b.txt": "x" }, { "B/b.txt": "x", "A/a.txt": "x" })).toEqual({ "a.txt": "A/a.txt", "b.txt": "B/b.txt" });
+  });
+});
+
+describe("re-review fixes", () => {
+  it("variants the first try breaks get one more try too; only what the better try still breaks is dropped (R1)", async () => {
+    const lib = library();
+    const voice: SkillRule[] = [{ ...REC_V1[0]!, match: [...(REC_V1[0]!.match as string[]), "^Voice Recording (?P<y>\\d{4})-(?P<m>\\d{2})-(?P<d>\\d{2})"] }];
+    const variant: Example = { id: "E2", source: "variant", files: ["Voice Recording 2024-02-03.m4a"], contents: contentsOf(["Voice Recording 2024-02-03.m4a"]), want: { "Voice Recording 2024-02-03.m4a": "录音/2024-02/Voice Recording 2024-02-03.m4a" }, confirmed: false, t };
+    const sk = stored(lib, "recordings", voice, REC_EXPECT, T008, [variant]);
+    const v2voice: SkillRule[] = [{ ...REC_V2[0]!, match: [...(REC_V2[0]!.match as string[]), "voice recording\\s*(?P<y>\\d{4})\\s*-\\s*(?P<m>\\d{2})\\s*-\\s*(?P<d>\\d{2})"] }];
+    const r = await lib.learn(gateway(revision(REC_V2, REC_EXPECT, "x"), revision(v2voice, REC_EXPECT, "现在也认得全角数字")), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], confirmed: true });
+    expect(r.revision).toBe("replaced");
+    expect(sk.rules).toEqual(v2voice);
+    expect(sk.examples!.map((e) => e.id)).toContain("E2");
+    // when the second try breaks it as well, it is dropped, and the drop is on record
+    const lib2 = library();
+    const sk2 = stored(lib2, "recordings", voice, REC_EXPECT, T008, [variant]);
+    expect((await lib2.learn(gateway(revision(REC_V2, REC_EXPECT, "x"), revision(REC_V2, REC_EXPECT, "x")), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], confirmed: true })).revision).toBe("replaced");
+    expect(sk2.examples!.map((e) => e.id)).not.toContain("E2");
+    expect(sk2.revisions!.at(-1)).toMatchObject({ dropped: ["E2"] });
+  });
+
+  it("a confirmed example the new version leaves out is a loss, not a conflict: nothing asked, nothing retired (R2)", async () => {
+    const lib = library();
+    const english = { files: ["New Recording 2026-01-27.m4a", ...OTHER], want: { "New Recording 2026-01-27.m4a": "录音/2026-01/New Recording 2026-01-27.m4a" } };
+    const chinese = ex("E2", { files: ["录音_20260515.m4a", ...OTHER], want: { "录音_20260515.m4a": "录音/2026-05/录音_20260515.m4a" } });
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, english, [chinese]);
+    const englishByYear: SkillRule[] = [{ name: "rec", match: ["new recording\\s*(?P<y>\\d{4})\\s*-\\s*(?P<m>\\d{2})"], ext: ["m4a"], to: "录音/{y}" }];   // no 录音_ rule at all
+    const T_YEAR = { files: ["New Recording 2026-02-14.m4a", ...OTHER], want: { "New Recording 2026-02-14.m4a": "录音/2026/New Recording 2026-02-14.m4a" } };
+    const u = user(1);
+    const twice = revision(englishByYear, REC_EXPECT, "按年归档", "E1");
+    const r = await lib.learn(gateway(twice, twice), "S001", { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined"], corrected: true, confirmed: true }, u);
+    expect(r.revision).toBe("kept");
+    expect(u.cards).toEqual([]);
+    expect(sk.rules).toEqual(REC_V1);
+    expect(sk.examples!.map((e) => e.id)).toEqual(["E1", "E2", "E3"]);
+  });
+
+  it("while the old checks bind, they are kept with the new version's (R3)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
+    const empty: SkillExpect = { covers: { ext: ["xyz"] }, untouched: false };
+    expect((await lib.learn(gateway(revision(REC_V2, empty, "x")), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: [], confirmed: true })).revision).toBe("replaced");
+    expect(sk.expect).toEqual(empty);
+    expect(sk.also).toEqual([REC_EXPECT]);
+    // and the old checks still guard the next use: a recording no rule knows goes back to the planner
+    expect(lib.plan(sk, ["Voice Memo 录音 2025.m4a"], {}).report!.uncovered).toEqual(["Voice Memo 录音 2025.m4a"]);
+  });
+
+  it("a file already in its place is taken, so the old checks keep binding on a real use (R3)", () => {
+    const counter = ex("C", { files: ["录音/2025-10/New Recording 2025-10-13.m4a", "录音 _ ２０２５０７０９.m4a"], want: { "录音 _ ２０２５０７０９.m4a": "录音/2025-07/录音 _ ２０２５０７０９.m4a" } });
+    expect(Library.answerBreaks({ rules: REC_V1, expect: REC_EXPECT }, counter)).toBe(false);
+    expect(Library.bindsOld({ rules: REC_V1, expect: REC_EXPECT }, counter)).toBe(true);
+  });
+
+  it("a move the run made for another part of the task is not the skill's: a right use stays an example (R4)", async () => {
+    const lib = library();
+    stored(lib, "recordings", REC_V2, REC_EXPECT, T008);
+    const gw = gateway();
+    const r = await lib.learn(gw, "S001", { files: T010.files, contents: contentsOf(T010.files), final: { ...T010.want, "todo.md": "文档/todo.md" }, signals: [], confirmed: true });
+    expect(r).toEqual({ signals: [], example: "E2" });
+    expect(gw.calls).toBe(0);
+    expect(Library.answerBreaks({ rules: REC_V2, expect: REC_EXPECT }, ex("C", { files: T010.files, want: { ...T010.want, "todo.md": "文档/todo.md" } }))).toBe(false);
+  });
+
+  it("a file the right answer moved into one of the skill's own folders is still judged as the skill's (R4, guard: the narrowing goes no further)", () => {
+    // 录音备份.m4a has a name no rule or check knows, but the user filed it into 录音/2025-07, where the skill puts recordings
+    const E = ex("E", { files: ["录音 _ ２０２５０７０９.m4a", "备份0709.m4a"], want: { "录音 _ ２０２５０７０９.m4a": "录音/2025-07/录音 _ ２０２５０７０９.m4a", "备份0709.m4a": "录音/2025-07/备份0709.m4a" } });
+    expect(Library.replay({ rules: REC_V2, expect: REC_EXPECT }, E)).toBe(false);
+  });
+
+  it("an undo the system refused leaves a rejected result: not right, not a correction (R5)", () => {
+    expect(useOutcome("succeeded", [{ kind: "result.response", picked: "undo_and_reading" }, { kind: "execution.undo_refused" }], ["undone"])).toEqual({ right: false, corrected: false });
+    expect(useOutcome("succeeded", [{ kind: "result.response", picked: "undo" }], ["undone"])).toEqual({ right: false, corrected: false });
+  });
+
+  it("an unanswered conflict is asked once; the next use writes nothing and asks nothing, and stops the skill (R6)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
+    const BY_YEAR: SkillRule[] = [{ ...REC_V2[0]!, to: "录音/{y|04}" }];
+    const T_YEAR = { files: ["New Recording 2026-02-14.m4a", ...OTHER], want: { "New Recording 2026-02-14.m4a": "录音/2026/New Recording 2026-02-14.m4a" } };
+    const use = { files: T_YEAR.files, contents: contentsOf(T_YEAR.files), final: T_YEAR.want, signals: ["declined" as const], corrected: true, confirmed: true };
+    const u = user(null);
+    const twice = revision(BY_YEAR, REC_EXPECT, "按年归档");
+    const g1 = gateway(twice, twice);
+    expect((await lib.learn(g1, "S001", use, u)).revision).toBe("no_answer");
+    expect(g1.calls).toBe(2);
+    expect(lib.pendingQuestion("S001")!.text).toContain("以后按哪个");
+    const g2 = gateway(twice, twice);
+    expect((await lib.learn(g2, "S001", use, u)).revision).toBe("pending");
+    expect(g2.calls).toBe(0);
+    expect(u.cards).toHaveLength(1);
+    expect(sk.status).toBe("disabled");
+    // answered later: the version written then replaces the old one, and the skill is usable again
+    expect(lib.answerPending("S001", { option: 1 })).toBe("replaced");
+    expect(sk).toMatchObject({ status: "probation", version: 2, pending: null });
+    expect(sk.rules).toEqual(BY_YEAR);
+  });
+
+  it("a correction binds what the user had a word on; the planner's unseen replacement is confirmed only by a later approval or a shown result (refinement)", () => {
+    const plan = { kind: "plan.accepted", plan: { source: "skill", skill: "S001", nodes: [{ id: "mv0", args: { source: "a.m4a", destination: "录音/a.m4a" } }] } };
+    const declined = { kind: "node.failed", node_id: "mv0", why: "declined by the user" };
+    expect(useConfirmation([plan, declined], false)).toEqual({ confirmed: false, declined: ["a.m4a"] });
+    expect(useConfirmation([plan, declined, { kind: "interaction.reply", body: { kind: "authorize", purpose: "plan", approved: true } }], false).confirmed).toBe(true);
+    expect(useConfirmation([plan, declined], true).confirmed).toBe(true);
+    expect(useConfirmation([plan, declined, { kind: "result.response", picked: "undo" }], true).confirmed).toBe(false);
+    // an approval before the correction does not cover what came after it
+    expect(useConfirmation([plan, { kind: "interaction.reply", body: { kind: "authorize", purpose: "plan", approved: true } }, declined], false).confirmed).toBe(false);
+  });
+
+  it("only the declined files of an unconfirmed correction bind a new version (refinement)", async () => {
+    const lib = library();
+    const sk = stored(lib, "recordings", REC_V1, REC_EXPECT, T008);
+    await lib.learn(gateway(revision(REC_V1, REC_EXPECT, "x")), "S001", { files: T009.files, contents: contentsOf(T009.files), final: T009.want, signals: ["declined"], corrected: true, declined: ["FINAL_录音_20251025.m4a"] });
+    expect(sk.examples!.at(-1)).toMatchObject({ confirmed: false, confirmed_files: ["FINAL_录音_20251025.m4a"] });
   });
 });

@@ -19,12 +19,14 @@ import { SYSTEM } from "../orchestrator/prompts.js";
 import { SkillAnswer, SkillRevision, type SkillExpect, type SkillRule } from "../protocol/roles.js";
 import type { PlanNode } from "../protocol/schemas.js";
 import type { Workspace } from "../registry/workspace.js";
-import { DSL_HELP, SkillError, checkExpect, coversSomething, failed, runSkill, type ExpectReport } from "./rules.js";
+import { DSL_HELP, SkillError, checkExpect, coversSomething, failed, ofKind, runSkill, type ExpectReport } from "./rules.js";
 
 export type SkillStatus = "draft" | "validated" | "probation" | "active" | "disabled" | "rejected";
 
-/** One case a skill is held to: these files, and where each should end up (a file not in want stays). confirmed: the
- *  user's own runs and answers, as opposed to the teacher's imagined variants. */
+/** One case a skill is held to: the files of a folder, and where each should end up (a file not in want stays).
+ *  confirmed: the user approved this result, or saw it on a result card and did not undo it, as opposed to the
+ *  teacher's imagined variants and results nobody looked at. confirmed_files: when only part of it is the user's own
+ *  word (the steps they declined, when what replaced them was never shown), the files that part is about. */
 export interface Example {
   id: string;
   source: "teach" | "variant" | "use" | "correction";
@@ -32,12 +34,24 @@ export interface Example {
   contents?: Record<string, string>;
   want: Record<string, string>;
   confirmed: boolean;
+  confirmed_files?: string[];
   t: string;
 }
 
 /** What went wrong in a use, read from structure only: the skill's own checks, the run's guards and goal check, and
  *  what the user did with the plan or the result. Never from the user's words. */
 export type Signal = "uncovered" | "misnamed" | "touched" | "guard" | "goal" | "declined" | "undone";
+
+/** A version that lost only because the user has to choose between it and what they confirmed before: kept with the
+ *  question until it is answered (answerPending). */
+export interface Pending {
+  card: Card;
+  version: { rules: SkillRule[]; expect?: SkillExpect; also: SkillExpect[]; variants: { from: string; content?: string; to: string }[]; change: string; title: string; applies_when: string };
+  counter: Example;
+  retire: string[];                              // what choosing the new way retires (the examples the card showed, and broken variants)
+  misses: number;                                // times it came up unanswered (the question itself, then later uses)
+  t: string;
+}
 
 export interface StoredSkill {
   id: string;
@@ -50,24 +64,34 @@ export interface StoredSkill {
   rules?: SkillRule[];
   variants?: { from: string; content?: string; to: string }[];
   expect?: SkillExpect;
+  also?: SkillExpect[];                          // earlier versions' checks a revision kept: every one must hold too
   examples?: Example[];
   admission: Record<string, unknown>;
   uses?: { ok: boolean; teacher_calls: number; t: string; signals?: Signal[] }[];
-  revisions?: { ok: boolean; version: number; change?: string; why?: string; counter: string; counted?: boolean; asked?: boolean; retired?: string[]; t: string }[];
+  revisions?: { ok: boolean; version: number; change?: string; why?: string; counter: string; counted?: boolean; asked?: boolean; retired?: string[]; dropped?: string[]; t: string }[];
   failed_revisions?: number;                     // in a row, of versions written and lost on the replay; two disable the skill
   notice?: string | null;                        // what the last revision changed, said once with the next result
+  pending?: Pending | null;
   draft?: unknown;
 }
 
 type Wrong = [string, string, string];
 type Run = { where: Record<string, string>; unsure: string[]; matched: string[] };
 type Planned = { files: string[]; contents: Record<string, string>; raw: Run; where: Record<string, string>; unsure: string[]; report: ExpectReport | null };
-type Rules = { rules: SkillRule[]; expect?: SkillExpect };
-type Outcome = "replaced" | "kept" | "asked_kept" | "no_answer";
+type Rules = { rules: SkillRule[]; expect?: SkillExpect; also?: SkillExpect[] };
+type Outcome = "replaced" | "kept" | "asked_kept" | "no_answer" | "pending";
+type Events = { kind: string; [k: string]: any }[];
 
 const now = () => new Date().toISOString();
 const nextId = (examples: Example[] | undefined) => `E${Math.max(0, ...(examples ?? []).map((e) => Number(e.id.slice(1)) || 0)) + 1}`;
 const base = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+const dir = (p: string) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");
+const checksOf = (s: { expect?: SkillExpect; also?: SkillExpect[] }): SkillExpect[] => [...(s.expect ? [s.expect] : []), ...(s.also ?? [])];
+const merge = (rs: ExpectReport[]): ExpectReport => ({ uncovered: [...new Set(rs.flatMap((r) => r.uncovered))], misnamed: [...new Set(rs.flatMap((r) => r.misnamed))], touched: [...new Set(rs.flatMap((r) => r.touched))] });
+const tryRun = (s: Rules, ex: Example): Run | null => { try { return runSkill({ rules: s.rules }, ex.files, ex.contents ?? {}); } catch { return null; } };
+const isKind = (c: SkillExpect, f: string, text: string) => { try { return ofKind(c.covers, base(f), text); } catch { return false; } };
+/** The part of an example that binds a new version: all of it when confirmed, else the files the user had a word on. */
+const binding = (ex: Example): Example | null => ex.confirmed ? ex : ex.confirmed_files?.length ? { ...ex, files: ex.files.filter((f) => ex.confirmed_files!.includes(f)) } : null;
 
 /** The moves between two trees (path → content): a file gone from `start` whose content shows up at a new path. Same
  *  name first, so two files with the same content are not paired crosswise. */
@@ -83,11 +107,17 @@ export function movesBetween(start: Record<string, string | null>, end: Record<s
   return moves;
 }
 
+const skillPlan = (events: Events) => events.findIndex((e) => e.kind === "plan.accepted" && e.plan?.source === "skill");
+const declinedOn = (e: Events[number], ids: Set<string>) => e.kind === "node.failed" && ids.has(e.node_id) && e.why === "declined by the user";
+const redirected = (e: Events[number]) => e.kind === "interaction.reply" && ((e.body?.purpose === "plan" && e.body.approved === false)
+  || (e.body?.kind === "clarify" && (e.body.purpose === "plan" || e.body.card === "plan" || e.body.card === "action")));
+const undone = (e: Events[number]) => e.kind === "result.response" && (e.picked === "undo" || e.picked === "undo_and_reading");
+
 /** The misuse signals of a run that used a skill, from its log: a guard or check stopping one of the skill's steps,
  *  the user declining a step of it, picking another reading or answering in their own words on its cards, the goal
  *  check failing after it, and the user undoing the result. */
-export function useSignals(events: { kind: string; [k: string]: any }[]): Signal[] {
-  const at = events.findIndex((e) => e.kind === "plan.accepted" && e.plan?.source === "skill");
+export function useSignals(events: Events): Signal[] {
+  const at = skillPlan(events);
   if (at < 0) return [];
   const ids = new Set<string>(events[at]!.plan.nodes.map((n: PlanNode) => n.id));
   const out = new Set<Signal>();
@@ -95,26 +125,40 @@ export function useSignals(events: { kind: string; [k: string]: any }[]): Signal
   for (const e of events.slice(at + 1)) {
     if (e.kind === "plan.accepted") own = false;
     if (own && e.kind === "node.failed" && ids.has(e.node_id)) out.add(e.why === "declined by the user" ? "declined" : "guard");
-    if (own && e.kind === "interaction.reply" && e.body?.purpose === "plan" && e.body.approved === false) out.add("declined");
-    if (own && e.kind === "interaction.reply" && e.body?.kind === "clarify" && (e.body.purpose === "plan" || e.body.card === "plan" || e.body.card === "action")) out.add("declined");
+    if (own && redirected(e)) out.add("declined");
     if (e.kind === "verification" && e.subject === "goal" && e.passed === false) out.add("goal");
-    if (e.kind === "result.response" && (e.picked === "undo" || e.picked === "undo_and_reading")) out.add("undone");
+    if (undone(e)) out.add("undone");
   }
   return [...out];
 }
 
-/** Whether the user approved what the skill's run did: its plan card, or the result card. */
-export function useApproved(events: { kind: string; [k: string]: any }[]): boolean {
-  const at = events.findIndex((e) => e.kind === "plan.accepted" && e.plan?.source === "skill");
-  return at >= 0 && events.slice(at + 1).some((e) => (e.kind === "interaction.reply" && e.body?.kind === "authorize" && (e.body.purpose === "plan" || e.body.purpose === "result") && e.body.approved === true)
+/** How much of a skill's run the user stands behind. confirmed: after the last time they corrected it (declined or
+ *  redirected a step, undid for another reading), they approved a plan or result card, or a result card was shown and
+ *  not undone. declined: the files of the skill's steps they declined, their own word even when what replaced the
+ *  steps was never shown to them. */
+export function useConfirmation(events: Events, resultCardShown: boolean): { confirmed: boolean; declined: string[] } {
+  const at = skillPlan(events);
+  if (at < 0) return { confirmed: false, declined: [] };
+  const nodes: PlanNode[] = events[at]!.plan.nodes, ids = new Set(nodes.map((n) => n.id));
+  const after = events.slice(at + 1);
+  let last = -1;
+  after.forEach((e, i) => { if (declinedOn(e, ids) || redirected(e) || (e.kind === "result.response" && e.picked === "undo_and_reading")) last = i; });
+  const since = after.slice(last + 1);
+  const approved = since.some((e) => (e.kind === "interaction.reply" && e.body?.kind === "authorize" && (e.body.purpose === "plan" || e.body.purpose === "result") && e.body.approved === true)
     || (e.kind === "result.response" && e.picked === "approve"));
+  const declined = after.filter((e) => declinedOn(e, ids)).map((e) => String(nodes.find((n) => n.id === e.node_id)?.args?.source ?? "")).filter(Boolean);
+  return { confirmed: approved || (resultCardShown && !since.some(undone)), declined };
 }
 
-/** What a finished run that used a skill gives to learn from: its moves are right when it ended succeeded (an undo
- *  leaves it cancelled; undo and another reading, redone, ends succeeded), and the user corrected it when they declined
- *  or redirected the skill's plan, or undid the result for another reading. */
-export function useOutcome(status: string, resultResponse: string | null, signals: Signal[]): { right: boolean; corrected: boolean } {
-  return { right: status === "succeeded", corrected: signals.includes("declined") || resultResponse === "undo_and_reading" };
+/** What a finished run that used a skill gives to learn from: its moves are right when it ended succeeded and the last
+ *  undo the user asked for (if any) was followed by a redo (an undo the system refused leaves the run succeeded with
+ *  a result the user rejected), and the user corrected it when they declined or redirected the skill's plan, or undid
+ *  the result for another reading that was redone. */
+export function useOutcome(status: string, events: Events, signals: Signal[]): { right: boolean; corrected: boolean } {
+  let lastUndo = -1;
+  events.forEach((e, i) => { if (undone(e)) lastUndo = i; });
+  const redone = lastUndo >= 0 && events.slice(lastUndo + 1).some((e) => e.kind === "run.redo");
+  return { right: status === "succeeded" && (lastUndo < 0 || redone), corrected: signals.includes("declined") || (redone && events[lastUndo]!.picked === "undo_and_reading") };
 }
 
 export class Library implements SkillLibrary {
@@ -142,7 +186,8 @@ export class Library implements SkillLibrary {
    *  one of the skill's kind no rule took (uncovered), one taken under the wrong name, one of another kind moved. */
   plan(sk: StoredSkill, files: string[], contents: Record<string, string>): Planned {
     const raw = runSkill({ rules: sk.rules! }, files, contents);
-    const report = sk.expect ? checkExpect(sk.expect, files, contents, raw.where, raw.unsure, raw.matched) : null;
+    const checks = checksOf(sk);
+    const report = checks.length ? merge(checks.map((c) => checkExpect(c, files, contents, raw.where, raw.unsure, raw.matched))) : null;
     const back = report ? [...report.uncovered, ...report.misnamed, ...report.touched] : [];
     const where = { ...raw.where };
     for (const f of back) delete where[f];
@@ -180,30 +225,65 @@ export class Library implements SkillLibrary {
     return { nodes, unsure, notice: sk.notice ?? null };
   }
 
-  /** The rules and checks on one example: right when every file ends where the example says and the checks pass. A
-   *  pattern that does not compile (in the rules or the checks) is a wrong answer, never an exception. */
-  static replay(sk: Rules, ex: Example): boolean {
-    try {
-      const r = runSkill({ rules: sk.rules }, ex.files, ex.contents ?? {});
-      if (ex.files.some((f) => (r.where[f] ?? f) !== (ex.want[f] ?? f))) return false;
-      return !sk.expect || !failed(checkExpect(sk.expect, ex.files, ex.contents ?? {}, r.where, r.unsure, r.matched));
-    } catch { return false; }
+  /** Which files of an example a version is judged on: the ones a rule of this version or of the other one takes, the
+   *  ones of the kind either version's checks cover, and the ones the right answer moved into a folder the version
+   *  itself places files of this example into. Every other file only has to stay where it was: a move the run made
+   *  for some other part of the task is not the skill's to learn. */
+  static relevant(s: Rules, ex: Example, peers: Rules[] = []): Set<string> {
+    const out = new Set<string>();
+    const contents = ex.contents ?? {};
+    for (const v of [s, ...peers]) {
+      const r = tryRun(v, ex);
+      for (const f of r?.matched ?? []) out.add(f);
+      for (const c of checksOf(v)) for (const f of ex.files) if (isKind(c, f, contents[f] ?? "")) out.add(f);
+      const folders = new Set((r?.matched ?? []).map((f) => r!.where[f]).filter((w): w is string => !!w).map(dir).filter(Boolean));
+      for (const f of ex.files) if (ex.want[f] && ex.want[f] !== f && folders.has(dir(ex.want[f]!))) out.add(f);
+    }
+    return out;
   }
 
-  /** Whether an example's right answer itself breaks these checks (then the checks were wrong, not the answer): a file
-   *  they count as this kind left where it was counts as not taken. */
-  static answerBreaks(expect: SkillExpect, ex: Example): boolean {
-    const moved = ex.files.filter((f) => (ex.want[f] ?? f) !== f);
-    try { return failed(checkExpect(expect, ex.files, ex.contents ?? {}, Object.fromEntries(ex.files.map((f) => [f, ex.want[f] ?? f])), [], moved)); }
+  /** The rules and checks on one example: the files it is judged on (relevant) end where it says, the rest stay put,
+   *  and every check passes. A pattern that does not compile is a wrong answer, never an exception. */
+  static diff(s: Rules, ex: Example, peers: Rules[] = []): { wrong: string[]; checks: boolean } | null {
+    try {
+      const r = runSkill({ rules: s.rules }, ex.files, ex.contents ?? {});
+      const judged = Library.relevant(s, ex, peers);
+      const wrong = ex.files.filter((f) => (r.where[f] ?? f) !== (judged.has(f) ? ex.want[f] ?? f : f));
+      const checks = checksOf(s).every((c) => !failed(checkExpect(c, ex.files.filter((f) => judged.has(f) || (r.where[f] ?? f) !== f), ex.contents ?? {}, r.where, r.unsure, r.matched)));
+      return { wrong, checks };
+    } catch { return null; }
+  }
+
+  static replay(s: Rules, ex: Example, peers: Rules[] = []): boolean {
+    const d = Library.diff(s, ex, peers);
+    return !!d && !d.wrong.length && d.checks;
+  }
+
+  /** Whether an example's right answer itself breaks the old version's checks (then the checks were wrong, not the
+   *  answer). A file counts as taken when the answer moved it, or when the old rules take it and leave it where the
+   *  answer has it (already in place); only the files the old version is judged on count. */
+  static answerBreaks(champion: Rules, ex: Example): boolean {
+    const r = tryRun(champion, ex);
+    if (!r) return true;
+    const judged = Library.relevant(champion, ex);
+    const files = ex.files.filter((f) => judged.has(f));
+    const where = Object.fromEntries(files.map((f) => [f, ex.want[f] ?? f]));
+    const taken = files.filter((f) => where[f] !== f || (r.matched.includes(f) && (r.where[f] ?? f) === where[f]));
+    try { return checksOf(champion).some((c) => failed(checkExpect(c, files, ex.contents ?? {}, where, [], taken))); }
     catch { return true; }
   }
 
+  /** Whether the old version's checks bind a new one written for this counterexample: unless its right answer breaks
+   *  them. */
+  static bindsOld(champion: Rules, counter: Example): boolean {
+    return checksOf(champion).length > 0 && !Library.answerBreaks(champion, counter);
+  }
+
   /** How a new version is judged against the old one on a counterexample: right on an example under its own checks and,
-   *  unless the counterexample's right answer breaks them, under the old version's checks too (so it cannot pass by
-   *  weakening its own). */
+   *  while the old checks bind, under those too (so it cannot pass by weakening its own). */
   static judge(champion: Rules, counter: Example): (s: Rules, ex: Example) => boolean {
-    const bindOld = !!champion.expect && !Library.answerBreaks(champion.expect, counter);
-    return (s, ex) => Library.replay(s, ex) && (!bindOld || Library.replay({ rules: s.rules, expect: champion.expect }, ex));
+    const bindOld = Library.bindsOld(champion, counter);
+    return (s, ex) => Library.replay(s, ex, [champion]) && (!bindOld || Library.replay({ rules: s.rules, expect: champion.expect, also: champion.also }, ex, [s]));
   }
 
   static selfCheck(sk: { rules: SkillRule[]; variants?: { from: string; content?: string; to: string }[]; expect?: SkillExpect }, files: string[], contents: Record<string, string>, moves: Record<string, string>): Wrong[] {
@@ -290,13 +370,11 @@ export class Library implements SkillLibrary {
   }
 
   /** After a run that used the skill: the use is recorded (with the skill's own check signals added), and learnt from.
-   *  files/contents: the folder before the run; final: the moves of a run that ended right (succeeded), else null;
-   *  signals: useSignals of its log; approved: the user approved its plan or result (useApproved); corrected: the
-   *  user corrected it (declined, another reading, their own words); noticeShown: the result card said what the last
-   *  revision changed. A use the skill got right becomes an example; one it got wrong that ended right is a
-   *  counterexample, and the skill is revised on it. The example is confirmed (binding on every later version) only
-   *  when the user approved or corrected the run. */
-  async learn(gw: Gateway, skillId: string, o: { files: string[]; contents: Record<string, string>; final: Record<string, string> | null; signals: Signal[]; ok?: boolean; teacherCalls?: number; approved?: boolean; corrected?: boolean; noticeShown?: boolean }, user?: CardUser, runId = ""): Promise<{ signals: Signal[]; example?: string; revision?: Outcome }> {
+   *  files/contents: the folder before the run; final: the moves of a run that ended right (useOutcome), else null;
+   *  signals: useSignals of its log; confirmed / declined: useConfirmation; corrected: the user corrected it;
+   *  noticeShown: the result card said what the last revision changed. A use the skill got right becomes an example; one
+   *  it got wrong that ended right is a counterexample, and the skill is revised on it. The example keeps every file. */
+  async learn(gw: Gateway, skillId: string, o: { files: string[]; contents: Record<string, string>; final: Record<string, string> | null; signals: Signal[]; ok?: boolean; teacherCalls?: number; confirmed?: boolean; declined?: string[]; corrected?: boolean; noticeShown?: boolean }, user?: CardUser, runId = ""): Promise<{ signals: Signal[]; example?: string; revision?: Outcome }> {
     const sk = this.skills.find((s) => s.id === skillId);
     if (!sk?.rules) return { signals: o.signals };
     if (o.noticeShown) sk.notice = null;         // said once, with the result it was shown on
@@ -306,12 +384,10 @@ export class Library implements SkillLibrary {
     const signals = [...new Set([...o.signals, ...own])];
     this.recordUse(skillId, o.ok ?? o.final !== null, o.teacherCalls ?? 0, signals);
     if (!o.final) { this.save(); return { signals }; }
-    // the example keeps every file of the folder: one the skill moved by mistake, and one of a kind its checks did not
-    // know yet but the user's run filed, are what a revision has to learn from
-    const scope = o.files;
-    const ex: Example = { id: nextId(sk.examples), source: o.corrected ? "correction" : "use", files: scope,
-      contents: Object.fromEntries(scope.map((f) => [f, o.contents[f] ?? ""])), want: Object.fromEntries(scope.filter((f) => o.final![f]).map((f) => [f, o.final![f]!])),
-      confirmed: !!(o.approved || o.corrected), t: now() };
+    const declined = (o.declined ?? []).filter((f) => o.files.includes(f));
+    const ex: Example = { id: nextId(sk.examples), source: o.corrected ? "correction" : "use", files: o.files,
+      contents: Object.fromEntries(o.files.map((f) => [f, o.contents[f] ?? ""])), want: { ...o.final }, confirmed: !!o.confirmed,
+      ...(!o.confirmed && declined.length ? { confirmed_files: declined } : {}), t: now() };
     // right on what the run ended with (whatever the signals were about): one more example, nothing to revise
     if (Library.replay(sk as Rules, ex)) {
       sk.examples = [...(sk.examples ?? []), ex];
@@ -337,20 +413,33 @@ export class Library implements SkillLibrary {
   }
 
   /** Champion and challenger: the skill role writes a revised version from the counterexample; code replays both on
-   *  every example. The new version replaces the old only if it gets the counterexample right and every confirmed
-   *  example right; imagined variants it breaks are dropped (they never outrank what the user confirmed). The old
-   *  version's checks bind the new one too, unless this right answer breaks them. If the new version breaks a
-   *  confirmed example, the skill role gets one more try at a version that keeps both; only if that also fails is the
-   *  user asked which way holds from now on. A failure counts toward disabling only when a version was written and
-   *  lost the replay. */
+   *  every example. The new version replaces the old only if it gets the counterexample right and everything the user
+   *  confirmed (binding) right, under its own checks and, while they bind, the old ones (which it then keeps, in
+   *  `also`). If it breaks anything, confirmed or imagined, the skill role gets one more try at a version that keeps it;
+   *  imagined variants the better try still breaks are dropped (they never outrank what the user confirmed). If every
+   *  try breaks something the user confirmed by placing it differently, the user is asked which way holds, with every
+   *  example that would be retired on the card; a confirmed example broken any other way (left out, not placed) is a
+   *  plain loss. A failure counts toward disabling only when a version was written and lost the replay. While a
+   *  question is unanswered no new version is written and nothing else is asked; a second use in that state stops the
+   *  skill. */
   async revise(gw: Gateway, sk: StoredSkill, counter: Example, user?: CardUser, runId = ""): Promise<Outcome> {
-    const champion: Rules = { rules: sk.rules!, expect: sk.expect };
+    const champion: Rules = { rules: sk.rules!, expect: sk.expect, also: sk.also };
     const examples = sk.examples ?? [];
+    const keepCounter = () => { if (binding(counter) || counter.confirmed) sk.examples = [...(sk.examples ?? []), counter]; };
+    if (sk.pending) {
+      sk.pending.misses += 1;
+      keepCounter();
+      if (sk.pending.misses >= 2) sk.status = "disabled";
+      sk.revisions = [...(sk.revisions ?? []), { ok: false, version: sk.version ?? 1, why: "a question about a conflict is unanswered", counter: counter.id, counted: false, t: now() }];
+      this.save();
+      return "pending";
+    }
     const right = Library.judge(champion, counter);
+    const bindOld = Library.bindsOld(champion, counter);
     const log = (ok: boolean, why: string, more: Record<string, unknown> = {}) =>
       (sk.revisions = [...(sk.revisions ?? []), { ok, version: sk.version ?? 1, why, counter: counter.id, t: now(), ...more }]);
     const keep = (why: string, counted: boolean): Outcome => {
-      if (counter.confirmed || counted) sk.examples = [...examples, counter];   // a later version has to get it right
+      if (counted) sk.examples = [...examples, counter]; else keepCounter();   // a later version has to get it right
       log(false, why, { counted });
       if (counted) {
         sk.failed_revisions = (sk.failed_revisions ?? 0) + 1;
@@ -370,40 +459,89 @@ export class Library implements SkillLibrary {
         try { checkExpect(ch.expect, counter.files, counter.contents ?? {}, {}, [], counter.files); }
         catch { return "invalid expect"; }
       }
-      return { ch, data: rep.data!, counterOk: right(ch, counter), brokenConfirmed: examples.filter((ex) => ex.confirmed && !right(ch, ex)), brokenImagined: examples.filter((ex) => !ex.confirmed && !right(ch, ex)) };
+      return { ch, data: rep.data!, counterOk: right(ch, counter),
+        brokenConfirmed: examples.filter((ex) => { const b = binding(ex); return !!b && !right(ch, b); }),
+        brokenImagined: examples.filter((ex) => !binding(ex) && !right(ch, ex)) };
     };
+    const ok = (t: Tried | string): t is Tried => typeof t !== "string" && t.counterOk;
     const replace = (t: Tried, retired: Example[], asked = false): Outcome => {
       const at = now();
-      Object.assign(sk, { rules: t.ch.rules, expect: t.ch.expect, variants: t.data.variants, title: t.data.title || sk.title, applies_when: t.data.applies_when || sk.applies_when });
+      const dropped = t.brokenImagined.filter((ex) => !retired.includes(ex));
+      Object.assign(sk, { rules: t.ch.rules, expect: t.ch.expect, also: bindOld ? checksOf(champion) : [], variants: t.data.variants, title: t.data.title || sk.title, applies_when: t.data.applies_when || sk.applies_when });
       sk.version = (sk.version ?? 1) + 1;
-      sk.examples = [...examples.filter((ex) => !retired.includes(ex)), counter];
+      sk.examples = [...examples.filter((ex) => !retired.includes(ex) && !dropped.includes(ex)), counter];
       for (const v of t.data.variants.filter((v) => v.from && v.to)) {
         const vx: Example = { id: nextId(sk.examples), source: "variant", files: [v.from], contents: { [v.from]: v.content ?? "" }, want: { [v.from]: v.to }, confirmed: false, t: at };
         if (right(t.ch, vx)) sk.examples.push(vx);
       }
       sk.failed_revisions = 0;
       sk.notice = t.data.change;
-      sk.revisions = [...(sk.revisions ?? []), { ok: true, version: sk.version, change: t.data.change, counter: counter.id, t: at, ...(asked ? { asked } : {}), ...(retired.length ? { retired: retired.map((e) => e.id) } : {}) }];
+      sk.pending = null;
+      sk.revisions = [...(sk.revisions ?? []), { ok: true, version: sk.version, change: t.data.change, counter: counter.id, t: at, ...(asked ? { asked } : {}),
+        ...(retired.length ? { retired: retired.map((e) => e.id) } : {}), ...(dropped.length ? { dropped: dropped.map((e) => e.id) } : {}) }];
       this.save();
       return "replaced";
     };
     const first = await attempt([]);
     if (typeof first === "string") return keep(first, first.startsWith("invalid"));
     if (!first.counterOk) return keep("the new version is wrong on the counterexample too", true);
-    if (!first.brokenConfirmed.length) return replace(first, first.brokenImagined);
-    // it breaks something the user confirmed: one more try at a version that keeps both, before calling it a conflict
-    const second = await attempt(first.brokenConfirmed);
-    if (typeof second !== "string" && second.counterOk && !second.brokenConfirmed.length) return replace(second, second.brokenImagined);
-    const best = typeof second !== "string" && second.counterOk && second.brokenConfirmed.length < first.brokenConfirmed.length ? second : first;
+    if (!first.brokenConfirmed.length && !first.brokenImagined.length) return replace(first, []);
+    // it breaks something: one more try at a version that keeps it, before dropping variants or calling it a conflict
+    const second = await attempt([...first.brokenConfirmed, ...first.brokenImagined]);
+    const clean = [second, first].filter((t): t is Tried => ok(t) && !t.brokenConfirmed.length).sort((a, b) => a.brokenImagined.length - b.brokenImagined.length);
+    if (clean.length) return replace(clean[0]!, []);
+    const best = ok(second) && second.brokenConfirmed.length <= first.brokenConfirmed.length ? second : first;
+    // a conflict is the user's old way placed differently; an example the new version leaves out is just a loss
+    const differently = (ex: Example) => {
+      const b = binding(ex)!, r = tryRun(best.ch, b), d = Library.diff(best.ch, b, [champion]);
+      return !!r && !!d && d.wrong.length > 0 && d.wrong.every((f) => (r.where[f] ?? f) !== f && (b.want[f] ?? f) !== f && !r.unsure.includes(f));
+    };
+    const lost = best.brokenConfirmed.filter((ex) => !differently(ex));
+    if (lost.length) return keep(`the new version breaks ${lost.map((e) => e.id).join(", ")}, which the user confirmed`, true);
     if (!user) return keep(`conflicts with ${best.brokenConfirmed.map((e) => e.id).join(", ")}; nobody to ask`, false);
-    const old = best.brokenConfirmed.find((ex) => ex.id === best.data.conflicts_with) ?? best.brokenConfirmed.find((ex) => Library.replay(champion, ex)) ?? best.brokenConfirmed[0]!;
     const sample = (ex: Example) => { const f = ex.files.find((x) => ex.want[x] && ex.want[x] !== x) ?? ex.files[0]!; return `${f} → ${ex.want[f] ?? f}`; };
-    const card: Card = { kind: "ambiguity", text: `整理这类文件，以前是「${sample(old)}」，这次是「${sample(counter)}」，以后按哪个？`, free_text: false, blocking: true,
-      options: [{ kind: "reading", text: `以前的：${sample(old)}` }, { kind: "reading", text: `这次的：${sample(counter)}` }] };
+    const olds = best.brokenConfirmed.map((ex) => `「${sample(binding(ex)!)}」`).join("、");
+    const card: Card = { kind: "ambiguity", text: `整理这类文件，以前是${olds}，这次是「${sample(counter)}」，以后按哪个？`, free_text: false, blocking: true,
+      options: [{ kind: "reading", text: `以前的：${olds}` }, { kind: "reading", text: `这次的：「${sample(counter)}」` }] };
     const a: Answer | null = user.ask(card);
-    if (!a || !("option" in a)) { log(false, "conflict: no answer", { counted: false, asked: true }); this.save(); return "no_answer"; }
+    if (!a || !("option" in a)) {
+      sk.pending = { card, counter, retire: [...best.brokenConfirmed, ...best.brokenImagined].map((e) => e.id), misses: 1, t: now(),
+        version: { rules: best.ch.rules, expect: best.ch.expect, also: bindOld ? checksOf(champion) : [], variants: best.data.variants, change: best.data.change, title: best.data.title, applies_when: best.data.applies_when } };
+      log(false, "conflict: no answer yet", { counted: false, asked: true });
+      this.save();
+      return "no_answer";
+    }
     if (a.option === 0) { log(false, "conflict: the user keeps the old way", { counted: false, asked: true }); this.save(); return "asked_kept"; }
-    // the new way holds: everything of the old way that version breaks is retired, imagined variants included
+    // the new way holds: the examples the card showed are retired, and the variants of the old way with them
     return replace(best, [...best.brokenConfirmed, ...best.brokenImagined], true);
+  }
+
+  /** The question a skill is waiting on, if any (shown again by the app whenever it can). */
+  pendingQuestion(skillId: string): Card | null {
+    return this.skills.find((s) => s.id === skillId)?.pending?.card ?? null;
+  }
+
+  /** The user's answer to a pending conflict question: the new way replaces the old as written then, retiring what the
+   *  card showed; the old way drops the question. No model is asked again. */
+  answerPending(skillId: string, answer: Answer): Outcome {
+    const sk = this.skills.find((s) => s.id === skillId);
+    const pd = sk?.pending;
+    if (!sk || !pd || !("option" in answer)) return "no_answer";
+    const at = now();
+    sk.pending = null;
+    if (answer.option === 0) {
+      sk.revisions = [...(sk.revisions ?? []), { ok: false, version: sk.version ?? 1, why: "conflict: the user keeps the old way", counter: pd.counter.id, counted: false, asked: true, t: at }];
+      this.save();
+      return "asked_kept";
+    }
+    Object.assign(sk, { rules: pd.version.rules, expect: pd.version.expect, also: pd.version.also, variants: pd.version.variants, title: pd.version.title || sk.title, applies_when: pd.version.applies_when || sk.applies_when });
+    sk.version = (sk.version ?? 1) + 1;
+    sk.examples = [...(sk.examples ?? []).filter((ex) => !pd.retire.includes(ex.id)), pd.counter];
+    sk.failed_revisions = 0;
+    sk.notice = pd.version.change;
+    if (sk.status === "disabled") sk.status = "probation";
+    sk.revisions = [...(sk.revisions ?? []), { ok: true, version: sk.version, change: pd.version.change, counter: pd.counter.id, asked: true, retired: pd.retire, t: at }];
+    this.save();
+    return "replaced";
   }
 }

@@ -19,7 +19,7 @@ import { RENAMES, fileRegistry } from "../registry/fs.js";
 import { guiRegistry } from "../gui/sim.js";
 import { Workspace, build } from "../registry/workspace.js";
 import { EditorSim } from "../gui/sim.js";
-import { Library, movesBetween, useApproved, useOutcome, useSignals } from "../skills/library.js";
+import { Library, movesBetween, useConfirmation, useOutcome, useSignals } from "../skills/library.js";
 import { spawnSync } from "node:child_process";
 import { score, talkOf, type Task } from "./score.js";
 
@@ -227,15 +227,16 @@ async function runTask(task: Task, gw: Gateway, outDir: string, verbose: boolean
   }
   let learned: unknown = null;
   if (library && summ.skill) {
-    // the use, and what it teaches the skill: a run that ended succeeded gives the right moves (an undo leaves it
-    // cancelled; undo and another reading, redone, is the user's correction)
+    // the use, and what it teaches the skill: the right moves of a run that ended right (useOutcome), and how much of
+    // it the user stood behind (useConfirmation; the simulated user approves most plans, so most uses are confirmed)
     const events = orch.log.events as any;
     const signals = useSignals(events);
     const files = Object.entries(start).filter(([, v]) => v !== null).map(([p]) => p);
-    const { right, corrected } = useOutcome(summ.status, resultResponse, signals);
+    const { right, corrected } = useOutcome(summ.status, events, signals);
+    const { confirmed, declined } = useConfirmation(events, resultResponse !== null || !!summ.result_card);
     learned = await library.learn(gw, summ.skill, { files, contents: Object.fromEntries(files.map((f) => [f, start[f]!])),
       final: right ? movesBetween(start, ws.tree()) : null, signals, ok: summ.status === "succeeded",
-      teacherCalls: (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0), approved: useApproved(events),
+      teacherCalls: (summ.counters["calls:plan"] ?? 0) + (summ.counters["calls:bind"] ?? 0), confirmed, declined,
       corrected, noticeShown }, user, summ.run_id);
   }
   const sc = score(task, start, ws.tree(), summ, gui?.log ?? [], talkOf(orch.log.events as any, user));
