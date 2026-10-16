@@ -47,6 +47,8 @@ export interface NodeState {
 
 export interface OpState { intent: ExecutionCommand; state: "in_flight" | "ok" | "unknown" | "not_executed" | string; receipt?: ExecutionResult }
 
+export interface Settled { point: string; readings: string[]; text: string; option: number | null; question: string; card?: "plan"; digest?: string }
+
 export class State {
   runId = "";
   status: RunStatus = "received";
@@ -73,7 +75,17 @@ export class State {
   planConfirmed = false;                         // the user approved the current plan (plan.confirmed)
   /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
    *  readings, or null for free text). They bind every later goal. */
-  settled: { point: string; readings: string[]; text: string; option: number | null }[] = [];
+  /** The user's answers about each ambiguous point, oldest first. question: what they answered. card "plan": words
+   *  typed on a plan card while the point was open (digest: that card), filed against every open point; the judge
+   *  says which point, if any, they are about. */
+  settled: Settled[] = [];
+  /** Points where the user clicked 「由你决定」. */
+  delegatedPoints: { point: string; readings: string[] }[] = [];
+  /** Plan cards the user answered in their own words (digests). */
+  textAnsweredPlans = new Set<string>();
+  /** Readings the judge found the user's answer did not mean (it meant something else): the goal is derived again
+   *  without them. */
+  notMeant: { point: string; readings: string[]; text: string }[] = [];
   delegatedByAnswer = false;                     // the user picked 「由你决定」 on some question
   askDecision: "act" | "confirm" | null = null;   // the judgement for the current plan (ask.decided)
   preferences: string[] = [];                    // what the user said about being asked (preference events)
@@ -163,8 +175,11 @@ export class State {
       case "preference":
         this.preferences.push(e.text);
         break;
+      case "ambiguity.not_meant":
+        this.notMeant.push({ point: e.point, readings: e.readings, text: e.text });
+        break;
       case "ambiguity.settled":                  // the judge read a free-text answer as picking one of the readings
-        this.settled.push({ point: e.point, readings: e.readings, text: e.text, option: e.option });
+        this.settled.push({ point: e.point, readings: e.readings, text: e.text, option: e.option, question: e.question ?? "" });
         break;
       case "plan.confirmed":
         this.planConfirmed = true;
@@ -181,8 +196,12 @@ export class State {
         if (b.kind === "clarify") {
           // the answer may change what the goal means: goal and plan are re-derived (also when the log is replayed)
           this.answers.push({ question: b.question, text: b.text }); this.revs.evidence_epoch += 1;
-          if (b.delegated) this.delegatedByAnswer = true;
-          else if (b.point) this.settled.push({ point: b.point, readings: b.readings ?? [], text: b.text, option: typeof b.option === "number" ? b.option : null });
+          if (b.delegated) {
+            this.delegatedByAnswer = true;
+            if (b.point) this.delegatedPoints.push({ point: b.point, readings: b.readings ?? [] });
+          } else if (b.point) this.settled.push({ point: b.point, readings: b.readings ?? [], text: b.text, option: typeof b.option === "number" ? b.option : null, question: b.question ?? "" });
+          for (const x of (b.about ?? []) as { point: string; readings: string[] }[]) this.settled.push({ ...x, text: b.text, option: null, question: b.question ?? "", card: "plan", digest: b.digest });
+          if (b.card === "plan") { this.count("ask:plan_text"); if (b.digest) this.textAnsweredPlans.add(b.digest); }
           this.goal = null; this.plan = null; this.nodes = new Map(); this.planConfirmed = false;
         }
         else if (b.kind === "authorize") {

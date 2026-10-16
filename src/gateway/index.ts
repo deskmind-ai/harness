@@ -99,6 +99,8 @@ export interface Reply<T = unknown> {
 
 export interface CallRecord {
   kind: "model.call";
+  /** This call asked again after the previous one ended so (Gateway.ask). */
+  retry_of?: Outcome;
   run_id: string;
   role: Role;
   backend: Backend;
@@ -177,7 +179,22 @@ export class Gateway {
     return timeoutMs ?? this.opts.timeoutMs ?? BACKEND_DEFAULTS[backend].timeoutMs;
   }
 
+  /** One call, asked again once when it timed out on the CLI or came back unreadable: a hung `claude -p` and a reply
+   *  with broken JSON are one-off (10-16: a goal call hung 181 s; a goal reply had a missing comma), and both used to
+   *  end the run. Only the cloud backends (claude_cli, openrouter): a hosted model's reply varies between calls even at
+   *  temperature 0 (batching, routing across servers), and their transport fails now and then; the local server is one
+   *  process decoding greedily, so the same prompt gives the same bad JSON again. A cut-off answer would be cut again.
+   *  Both attempts are logged; the second says it is a retry. A retry is not counted against the run's model-call
+   *  budget (the orchestrator sees one reply). */
   async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = ""): Promise<Reply<z.infer<S>>> {
+    const first = await this.askOnce(role, system, user, schema, runId, null);
+    const { backend } = this.table[role];
+    const again = (first.outcome === "timeout" && backend === "claude_cli")
+      || (first.outcome === "invalid" && first.error !== TRUNCATED && (backend === "claude_cli" || backend === "openrouter"));
+    return again ? this.askOnce(role, system, user, schema, runId, first.outcome) : first;
+  }
+
+  private async askOnce<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId: string, retryOf: Outcome | null): Promise<Reply<z.infer<S>>> {
     const { backend, model } = this.table[role];
     const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" });
     const sys = `${system}\n\n只输出一个 JSON 对象，不要别的文字。字段名必须和这个 JSON Schema 完全一致（例如判别字段叫 kind 就写 kind）：\n${JSON.stringify(jsonSchema)}`;
@@ -224,6 +241,7 @@ export class Gateway {
       kind: "model.call", run_id: runId, role, backend, model, outcome: rep.outcome, tokens_in: rep.tokensIn,
       tokens_out: rep.tokensOut, cost_usd: Number(rep.costUsd.toFixed(6)), latency_ms: Math.round(rep.latencyMs),
       error: rep.error.slice(0, 300), system_chars: sys.length, user_chars: user.length, answer: rep.data,
+      ...(retryOf ? { retry_of: retryOf } : {}),
     });
     return rep;
   }

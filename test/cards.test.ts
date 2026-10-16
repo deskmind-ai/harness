@@ -113,9 +113,10 @@ describe("interaction cards", () => {
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
   });
 
-  it("plan card: the user's own words are an answer; the goal is derived again with them", async () => {
+  it("plan card: the user's own words that change something are an answer; the goal is derived again with them", async () => {
     const u = picker({ text: "只在末尾加一行就好" });
-    const w = byRole({ goal: { ...GOALW, assumptions: [AMBW] }, choice: { choice: "r0" }, plan: PLANW, bind: BINDW, intent: MATCH });
+    const answers = { goal: { ...GOALW, assumptions: [AMBW] }, plan: PLANW, bind: BINDW, intent: MATCH } as Record<string, unknown>;
+    const w: Scripted = (role, _s, user) => role !== "choice" ? answers[role] ?? { outcome: "error", error: "none" } : { choice: user.includes("打了一段字") ? "change" : "r0" };
     const { o } = setup(LOG, Array(8).fill(w), u, "把 日志.log 的内容改成「X」");
     const s = await o.run();
     expect(s.answers).toContain("只在末尾加一行就好");

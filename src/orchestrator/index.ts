@@ -22,7 +22,7 @@ import { describeCapability, type Capability, type Registry } from "../registry/
 import { matches as versionsMatch, reconcile as reconcileVersions } from "../registry/reconcile.js";
 import { ABSENT, Workspace, sha } from "../registry/workspace.js";
 import { Crash } from "../registry/capability.js";
-import { Log, State, type NodeState } from "./log.js";
+import { Log, State, type NodeState, type Settled } from "./log.js";
 import * as P from "./prompts.js";
 
 /** A user's answer: a picked option (index into the options shown) or free text. */
@@ -36,6 +36,7 @@ export interface CardOption {
   node_id?: string;                                   // skip_step: which step
   point?: string; readings?: string[]; reading_index?: number;   // reading / undo_and_reading: which reading of which point
 }
+type Verdict = { kind: "reading"; k: number } | { kind: "cant_tell" | "proceed" | "unclear" | "other" | "refuse" | "not_about" };
 export type CardKind = "missing" | "ambiguity" | "plan" | "action" | "result_check" | "cannot" | "result";
 /** Every interaction with the user is a card: the situation, options that cover what can happen next, and free text
  *  (「其他」). Blocking cards stop the run until answered; the result card is shown with the result. */
@@ -62,7 +63,7 @@ export function cardUser(u: User): CardUser {
       if (card.kind === "cannot" || card.kind === "result") return null;
       if (idx("approve") >= 0) {
         if (l.authorize(card.text)) return { option: idx("approve") };
-        const no = card.kind === "plan" ? idx("cancel") : card.kind === "action" ? card.options.findIndex((o) => o.kind === "skip_step") : idx("undo");
+        const no = card.kind === "plan" ? idx("cancel") : card.kind === "action" ? card.options.findIndex((o) => o.kind === "skip_step") : idx("undo") >= 0 ? idx("undo") : idx("cancel");
         return no >= 0 ? { option: no } : null;
       }
       const shown = card.options.map((o, i) => [o, i] as const).filter(([o]) => ["value", "proposal", "reading", "delegate"].includes(o.kind));
@@ -229,7 +230,7 @@ export class Orchestrator {
       const bound = nodes.filter((n) => n.status === "ready");
       if (bound.length) {
         // before the first write: show the plan first, or act and report (docs/ask-policy.md)
-        if (this.cap(bound[0]!.node.capability).effect !== "observe" && !st.planConfirmed && (await this.planNeedsConfirmation())) { this.confirmPlan(); continue; }
+        if (this.cap(bound[0]!.node.capability).effect !== "observe" && !st.planConfirmed && (await this.planNeedsConfirmation())) { await this.confirmPlan(); continue; }
         this.doExecute(bound[0]!); continue;
       }
       if (ready.length) {
@@ -272,7 +273,7 @@ export class Orchestrator {
   private async doGoal() {
     const st = this.st;
     const caps = this.registry.list().map((c) => ({ id: c.id, description: c.description }));
-    const rep = await this.askModel("goal", P.goalPrompt(st.raw, st.answersText(), this.ws.listing(), caps, st.scope, this.decided()), R.GoalAnswer);
+    const rep = await this.askModel("goal", P.goalPrompt(st.raw, st.answersText(), this.ws.listing(), caps, st.scope, this.decided(), st.notMeant), R.GoalAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const g = rep.data!;
     if (g.feasible === "needs_capability_we_lack") return this.cannot(g.infeasible_reason ?? "需要没有注册的能力");
@@ -301,9 +302,11 @@ export class Orchestrator {
     // Ambiguity (docs/ask-policy.md).
     const delegated = g.user_delegated || st.delegatedByAnswer;     // the 「由你决定」 option is structural, not a reading of words
     const assumptions: Goal["assumptions"] = [];
-    const fromAnswer = new Set<number>();
+    // where each reading's evidence comes from: lines the goal model cited, or the user's answer to our question; and
+    // words the user later typed on a plan card, which may or may not be about it
+    const src: { answer: Settled | null; card: Settled | null }[] = [];
     for (const a of g.assumptions) {
-      const s = this.settledFor(a);
+      const { answer: s, card } = this.repliesFor(a);
       if (s && s.option !== null && s.option < s.readings.length) {
         // the user picked a reading: the goal must follow it, whatever the model now prefers
         const chosen = s.readings[s.option]!;
@@ -312,15 +315,14 @@ export class Orchestrator {
           if (st.get("goal_retry") < 1) { this.emit("goal.retry", {}); return; }        // goal stays empty: derived again
           return this.finish("failed", "goal: kept ignoring the user's choice");
         }
-        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: true });
-      } else if (s) {
+        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: true, unpicked: false });
+        src.push({ answer: s, card: null });
+      } else {
         // a free-text answer is evidence, but only the judge below can say whether it picks this reading
         // (「按我原来说的做」 picks nothing)
-        fromAnswer.add(assumptions.length);
-        assumptions.push({ ...a, evidence: [s.text], backed: true, settled: false });
-      } else {
-        const evidence = a.evidence.filter((x) => this.isEvidence(x));
-        assumptions.push({ ...a, evidence, backed: evidence.length > 0, settled: false });
+        const evidence = s ? [s.text] : a.evidence.filter((x) => this.isEvidence(x));
+        assumptions.push({ ...a, evidence, backed: evidence.length > 0 || !!card, settled: false, unpicked: false });
+        src.push({ answer: s, card });
       }
     }
     // a goal that silently drops an ambiguity the user settled has nothing to check it against: treated like ignoring it
@@ -333,22 +335,46 @@ export class Orchestrator {
     // an independent judge decides whether the cited evidence actually tells the readings apart
     for (const [i, a] of assumptions.entries()) {
       if (a.settled || !a.backed || !a.alternatives.length || delegated) continue;
-      const opts = [a.reading, ...a.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
-      const ids = opts.map((o) => o.id) as [string, ...string[]];
-      // evidence counts only when it shows the very feature the user named; a common-sense guess about which one the
-      // user more likely means is not evidence (owner 10-12, harness#5)
-      const rep = await this.askModel("choice", P.choicePrompt(P.evidenceQuestion(a.point, this.policy.evidence), { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
-      if (rep.outcome !== "answered") return this.modelFailed(rep);
-      const k = Number(rep.data!.choice.slice(1));
-      if (k === 0) { if (fromAnswer.has(i)) a.settled = true; }
-      else if (fromAnswer.has(i) && k <= a.alternatives.length) {
+      const { answer, card } = src[i]!;
+      let v = await this.judgeEvidence(a, answer, card), words = card ?? answer;
+      // words on a plan card about something else: the reading stands on what it stood on before
+      if (v?.kind === "not_about") {
+        // the goal may have cited the card's words as evidence: they are not about this point, so they do not count
+        words = answer; a.evidence = a.evidence.filter((x) => loose(x) !== loose(card!.text));
+        v = a.evidence.length ? await this.judgeEvidence(a, answer, null) : { kind: "cant_tell" };
+      }
+      if (!v) return;                                                  // the judge's call failed; the run has stopped
+      const where = a.point || a.reading, readings = [a.reading, ...a.alternatives];
+      if (v.kind === "reading" && v.k === 0) { if (words) a.settled = true; }
+      else if (v.kind === "reading" && words) {
         // the user's own words pick another reading: record it as their choice and derive the goal again
-        this.emit("ambiguity.settled", { point: a.point, readings: [a.reading, ...a.alternatives], option: k, text: assumptions[i]!.evidence[0] ?? "" });
+        this.emit("ambiguity.settled", { point: a.point, readings, option: v.k, text: words.text, question: words.question });
         if (st.get("goal_retry") < 1) { this.emit("goal.retry", {}); return; }
         return this.finish("failed", "goal: kept ignoring the user's choice");
+      } else if (v.kind === "proceed") {
+        // the answer leaves it to us: asking the same again is refused (clarify), and stopping left the run with
+        // nothing to do. Go on with the leading reading and say so with the result, where the user can undo it or
+        // pick another (owner 10-09: report in the result, with undo, is fine). A plan with a step that cannot be
+        // taken back is still shown first (planNeedsConfirmation; in the GUI, confirmGui).
+        a.unpicked = true;
+        this.emit("note", { text: `问过用户「${where}」，回答里没有选哪一种；先按「${a.reading}」做，结果里说明，可以撤回或改成另一种` });
+      } else if (v.kind === "unclear") {
+        // ask once more, in other words (a second identical question is refused, and the run stops there)
+        this.emit("note", { text: `看不出用户对「${where}」的回答是什么意思；换个说法再问一次` });
+        return this.clarify(`「${where}」我还是拿不准该按哪一种做，请选一种，或者直接说你要的样子：`, "goal: ambiguous, the answer could not be made out", readings, { checkOptions: false, point: where });
+      } else if (v.kind === "other") {
+        // the answer means a reading the goal did not list: derive the goal again without these readings, once
+        this.emit("note", { text: `用户对「${where}」的回答说的是另一种意思：${words!.text.slice(0, 60)}` });
+        this.emit("ambiguity.not_meant", { point: where, readings, text: words!.text });
+        if (st.get("goal_retry") < 1) { this.emit("goal.retry", {}); return; }
+        return this.finish("waiting_user", "the answer meant a reading the goal could not take up");
+      } else if (v.kind === "refuse") {
+        // the answer turns the readings down or says not to do it: nothing is done; it is the user's to say more
+        this.emit("note", { text: `问过用户「${where}」，回答否定了这几种理解或不让做；不动手` });
+        return this.finish("waiting_user", "the answer rejected the readings or asked not to change anything");
       } else {
         a.backed = false;
-        this.emit("note", { text: `核对证据时没有支持「${a.reading}」（选了 ${opts.find((o) => o.id === rep.data!.choice)?.text}）` });
+        this.emit("note", { text: `核对证据时没有支持「${a.reading}」（${v.kind === "reading" ? "证据指向「" + readings[v.k] + "」" : "证据区分不了"}）` });
       }
     }
     // a user who handed the choice to us is not asked to choose again; the plan is shown to them instead (step 3)
@@ -677,7 +703,7 @@ export class Orchestrator {
     ];
     const ctx = {
       用户原文: st.raw, 用户后来补充: st.answersText(),
-      我的理解: open.map((a) => ({ 哪一处: a.point, 我选的: a.reading, 其他说得通的: a.alternatives, 依据: a.evidence })),
+      我的理解: open.map((a) => ({ 哪一处: a.point, 我选的: a.reading, 其他说得通的: a.alternatives, 依据: a.evidence, ...(a.unpicked ? { 问过用户没有: "问过一次，用户的回答没有选哪一种" } : {}) })),
       计划要做的改动: steps, 已知会改到的文件和文件夹数: paths.size, 还没定下具体文件的步骤数: writes.filter((n) => !st.nodes.get(n.id)?.args).length,
       能不能撤回: "每一步都能撤回",
       ...(this.opts.history?.length ? { 这位用户以前的反应: this.opts.history.slice(-10) } : {}),
@@ -688,7 +714,7 @@ export class Orchestrator {
     return rep.data!.choice === "confirm";
   }
 
-  private confirmPlan() {
+  private async confirmPlan() {
     const st = this.st, g = st.goal!, plan = st.plan!;
     const writes = plan.nodes.filter((n) => this.registry.get(n.capability)?.effect !== "observe");
     // each step as concretely as it is known: the bound action (files and text), else the purpose
@@ -702,6 +728,8 @@ export class Orchestrator {
     const text = `${why}${reading}我打算这样做：\n${steps.join("\n")}\n可以吗？`;
     const digest = sha("plan:" + canon({ nodes: writes.map((n) => [n.capability, n.purpose, st.nodes.get(n.id)?.args ?? null]), readings: open.map((a) => a.reading) }));
     if (st.declined.has(digest)) return this.finish("waiting_user", "the user declined the plan; their choice is needed");
+    if (!st.approvals.has(digest) && st.textAnsweredPlans.has(digest)) return this.finish("waiting_user", "the same plan card would show again after the user's words");
+    if (!st.approvals.has(digest) && st.get("ask:plan_text") >= this.budget.asks) return this.finish("waiting_user", "asked the user too often without progress");
     if (!st.approvals.has(digest)) {
       // the card covers what can happen next: go ahead; another reading (each one the goal listed); drop a step that
       // cannot be taken back; the user's own words; stop. Another guess of ours is never offered.
@@ -724,7 +752,7 @@ export class Orchestrator {
       } else if (pick?.kind === "cancel") {
         this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: false, picked: "cancel" } });
         return this.finish("cancelled", "the user stopped the task");
-      } else return this.answerAsText(text, got.text, "plan");
+      } else return await this.cardWords(text, got.text, digest);
     }
     this.emit("plan.confirmed", {});
   }
@@ -755,9 +783,12 @@ export class Orchestrator {
   }
 
   /** The user's own words on a card: recorded as an answer; the goal is derived again with it. */
-  private answerAsText(question: string, text: string, card: CardKind) {
+  private answerAsText(question: string, text: string, card: CardKind, digest?: string) {
     if (!text.trim()) return this.finish("waiting_user", "empty answer");
-    this.emit("interaction.reply", { body: { kind: "clarify", question, text, options: [], option: null, delegated: false, picked: "other", card } });
+    // words on a plan card shown while readings are open are filed with every open reading, with the card they answer;
+    // the judge says for each whether they are about it (an action card's words are about that one action)
+    const about = card === "plan" ? (this.st.goal?.assumptions ?? []).filter((a) => !a.settled && a.alternatives.length).map((a) => ({ point: a.point || a.reading, readings: [a.reading, ...a.alternatives] })) : [];
+    this.emit("interaction.reply", { body: { kind: "clarify", question, text, options: [], option: null, delegated: false, picked: "other", card, ...(digest ? { digest } : {}), ...(about.length ? { about } : {}) } });
   }
 
   /** Drop one step the user does not want and plan the rest again. */
@@ -799,6 +830,8 @@ export class Orchestrator {
   undoRun(): { undone: number; total: number; refused: string | null } {
     const st = this.st;
     const done = [...st.ops].filter(([, v]) => v.state === "ok" && (v.intent.writes ?? []).length > 0).reverse();
+    // a step with no undo, which records no writes (a GUI action), would otherwise be skipped and the rest reported done
+    if (!this.canUndo()) return { undone: 0, total: done.length, refused: "有的动作没有撤回的办法（例如在界面上的操作）" };
     const ours = new Set(done.flatMap(([, op]) => op.intent.writes));
     // what each step left (its receipt, or the versions found when it was reconciled after a crash) and what undo
     // needs from before it (receipt, or the intent's record)
@@ -857,11 +890,13 @@ export class Orchestrator {
     const open = g.assumptions.filter((a) => !a.settled);
     // a skill revised since its last use says what changed, once, with the result; the user can undo it
     const updated = st.skillNotice ? `按教材整理（已更新：${st.skillNotice}）` : "";
-    if (!open.length) return updated ? { kind: "result", text: updated, options: [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }], free_text: false, blocking: false } : null;
-    const options: CardOption[] = [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }];
-    for (const a of open) a.alternatives.forEach((alt, k) => options.push({ kind: "undo_and_reading", text: `撤回，改成：${alt}`, point: a.point || a.reading, readings: [a.reading, ...a.alternatives], reading_index: k + 1 }));
+    // undo is offered only when every step this run took has one (a GUI action has none)
+    const undo: CardOption[] = this.canUndo() ? [{ kind: "undo", text: "撤回" }] : [];
+    if (!open.length) return updated ? { kind: "result", text: updated, options: [{ kind: "approve", text: "好的" }, ...undo], free_text: false, blocking: false } : null;
+    const options: CardOption[] = [{ kind: "approve", text: "好的" }, ...undo];
+    if (undo.length) for (const a of open) a.alternatives.forEach((alt, k) => options.push({ kind: "undo_and_reading", text: `撤回，改成：${alt}`, point: a.point || a.reading, readings: [a.reading, ...a.alternatives], reading_index: k + 1 }));
     options.push({ kind: "never_ask_this", text: "这种以后不用告诉我" });
-    return { kind: "result", text: (updated ? updated + "。" : "") + "我是这样理解的：" + open.map((a) => a.reading).join("；"), options, free_text: false, blocking: false };
+    return { kind: "result", text: (updated ? updated + "。" : "") + "我是这样理解的：" + open.map((a) => a.reading + (a.unpicked ? "（问过你，回答里没有选哪一种）" : "")).join("；"), options, free_text: false, blocking: false };
   }
 
   /** The user's response to the result card. undo_and_reading, and saying a can't-do differently, leave the run ready
@@ -899,8 +934,39 @@ export class Orchestrator {
   }
 
   /** The user's earlier answer about the same ambiguity: same point, or one of the readings offered then. */
-  private settledFor(a: { point: string; reading: string; alternatives: string[] }) {
-    return [...this.st.settled].reverse().find((s) => this.sameAmbiguity(a, s));      // the latest answer wins
+  /** The latest answer the user gave about this point on a question card, and words typed on a plan card after it. */
+  private repliesFor(a: { point: string; reading: string; alternatives: string[] }): { answer: Settled | null; card: Settled | null } {
+    const mine = this.st.settled.filter((s) => this.sameAmbiguity(a, s));
+    const k = mine.map((s) => !s.card).lastIndexOf(true);
+    return { answer: k >= 0 ? mine[k]! : null, card: mine.slice(k + 1).at(-1) ?? null };
+  }
+
+  /** The evidence judge for one reading. Evidence is the lines the goal cited, or the user's answer (with the question
+   *  it answered); words typed on a plan card come with that card, and may not be about this point at all. */
+  private async judgeEvidence(a: Goal["assumptions"][number], answer: Settled | null, card: Settled | null): Promise<Verdict | null> {
+    const st = this.st, words = !!(answer || card);
+    const last = words ? [...P.ANSWER_OPTIONS] : ["说不清：这些证据区分不了"];
+    const opts = [a.reading, ...a.alternatives, ...last, ...(card ? [P.NOT_ABOUT] : [])].map((text, i) => ({ id: `r${i}`, text }));
+    const ids = opts.map((o) => o.id) as [string, ...string[]];
+    // evidence counts only when it shows the very feature the user named; a common-sense guess about which one the
+    // user more likely means is not evidence (owner 10-12, harness#5). The files next to the cited ones are shown, so
+    // a reading the names in view settle (「说明书.pdf 不是录音」) can be seen.
+    const evidence = answer ? [] : a.evidence.filter((x) => !card || x !== card.text);
+    const nearby = this.nearby(evidence);
+    const ctx = {
+      用户原文: st.raw,
+      ...(evidence.length ? { 证据: evidence } : {}),
+      ...(answer ? { 我们问用户的问题: answer.question, 用户的回答: answer.text } : {}),
+      ...(card ? { 之后在卡片上说的话: { 卡片: card.question, 用户打的字: card.text } } : {}),
+      ...(nearby.length ? { 相关目录里的文件: nearby } : {}),
+    };
+    const question = P.evidenceQuestion(a.point, this.policy.evidence) + (words ? P.EVIDENCE_FROM_ANSWER : "") + (card ? P.EVIDENCE_FROM_CARD : "");
+    const rep = await this.askModel("choice", P.choicePrompt(question, ctx, opts), R.choiceAnswer(ids));
+    if (rep.outcome !== "answered") { this.modelFailed(rep); return null; }
+    const k = Number(rep.data!.choice.slice(1)), n = a.alternatives.length;
+    if (k <= n) return { kind: "reading", k };
+    if (!words) return { kind: "cant_tell" };
+    return { kind: (["proceed", "unclear", "other", "refuse", "not_about"] as const)[k - n - 1]! };
   }
 
   private sameAmbiguity(a: { point: string; reading: string; alternatives: string[] }, s: { point: string; readings: string[] }) {
@@ -1022,14 +1088,20 @@ export class Orchestrator {
         // only the user can judge this one: ask once, remember the answer (never the verify model)
         const digest = sha("confirm:" + r.statement);
         if (!st.approvals.has(digest) && !st.declined.has(digest)) {
+          // undo is offered only when it can be done (GUI actions cannot be taken back)
           const card: Card = { kind: "result_check", text: r.statement, free_text: true, blocking: true, options: [
-            { kind: "approve", text: "对" }, { kind: "undo", text: "不对，撤回刚才做的" }] };
+            { kind: "approve", text: "对" }, this.canUndo() ? { kind: "undo", text: "不对，撤回刚才做的" } : { kind: "cancel", text: "不对（刚才的操作撤不回）" }] };
           const got = this.ask(card, { kind: "authorize", purpose: "result", text: r.statement, digest });
           if (got === null) { this.finish("waiting_user", "no answer from the user"); return true; }
           if (got.option?.kind === "undo") {
             this.emit("interaction.reply", { body: { kind: "authorize", purpose: "result", text: r.statement, digest, approved: false, picked: "undo" } });
             if (this.afterUndo(this.undoRun(), "确认前")) this.finish("cancelled", "the user rejected the result; changes undone");
             else if (!TERMINAL.has(this.st.status)) this.finish("waiting_user", "the user rejected the result and it could not be undone");
+            return true;
+          }
+          if (got.option?.kind === "cancel") {
+            this.emit("interaction.reply", { body: { kind: "authorize", purpose: "result", text: r.statement, digest, approved: false, picked: "cancel" } });
+            this.finish("waiting_user", "the user rejected the result and it cannot be undone");
             return true;
           }
           if (!got.option) { this.answerAsText(r.statement, got.text, "result"); return false; }
@@ -1066,6 +1138,7 @@ export class Orchestrator {
       if (await this.rootCheck(true)) return;
     }
     if (st.get("actions") >= this.budget.actions) return this.finish("failed", "budget: actions");
+    if (this.guiNeedsConfirmation()) return await this.confirmGui();
     this.hook("before_gui_step");
     const obs = gui.observe();
     this.emit("observation", { versions: st.lastVersions, gui_epoch: obs.observation_epoch });
@@ -1159,6 +1232,90 @@ export class Orchestrator {
     return out;
   }
 
+
+  /** Every step this run took that changed something has an undo (an unregistered capability, such as a GUI action,
+   *  has none). */
+  private canUndo(): boolean {
+    return [...this.st.ops.values()].filter((op) => op.state === "ok").every((op) => {
+      const cap = this.registry.get(op.intent.capability);
+      return !!cap && (cap.effect === "observe" || !!cap.undo);
+    });
+  }
+
+  /** The run acts through a GUI whose actions cannot be taken back. */
+  private guiCannotUndo(): boolean {
+    return !!this.opts.gui && this.registry.list().some((c) => c.channel === "gui" && !c.reversible);
+  }
+
+  /** Before the first GUI action, which cannot be taken back: the user confirms once when the run decides something
+   *  for them, as planNeedsConfirmation does for a plan with a step without undo. That is when the choice was handed to
+   *  us (in words or by a 「由你决定」 click: a click on one question says nothing about what else the run decides, and
+   *  one more confirmation is unnecessary, not wrong), or when it acts on a reading the user has not settled. */
+  private guiNeedsConfirmation(): boolean {
+    const st = this.st, g = st.goal!;
+    if (!this.guiCannotUndo() || st.get("actions") > 0) return false;
+    const decides = g.user_delegated || this.guiOpen().length > 0;
+    return decides && !st.approvals.has(this.guiDigest());
+  }
+
+  private guiDigest(): string {
+    const g = this.st.goal!;
+    return sha("gui-plan:" + canon({ requirements: g.requirements.map((r) => r.statement), readings: this.guiOpen().map((a) => a.reading) }));
+  }
+
+  /** Readings the run decides on: not settled, and not a point where the user clicked 「由你决定」. */
+  private guiOpen() {
+    return this.st.goal!.assumptions.filter((a) => !a.settled && !this.st.delegatedPoints.some((d) => this.sameAmbiguity(a, d)));
+  }
+
+  private async confirmGui() {
+    const st = this.st, g = st.goal!, digest = this.guiDigest();
+    if (st.declined.has(digest)) return this.finish("waiting_user", "the user declined the plan; their choice is needed");
+    if (st.textAnsweredPlans.has(digest)) return this.finish("waiting_user", "the same plan card would show again after the user's words");
+    if (st.get("ask:plan_text") >= this.budget.asks) return this.finish("waiting_user", "asked the user too often without progress");
+    const open = this.guiOpen();
+    const what = open.length ? open.map((a) => a.reading).join("；") : g.requirements.map((r) => r.statement).join("；");
+    const text = `我打算按「${what}」在界面上做，做了撤不回，可以吗？`;
+    const options: CardOption[] = [{ kind: "approve", text: "可以，就这样做" }];
+    for (const a of open) a.alternatives.forEach((alt, k) => options.push({ kind: "reading", text: `不对，「${a.point || a.reading}」指的是：${alt}`, point: a.point || a.reading, readings: [a.reading, ...a.alternatives], reading_index: k + 1 }));
+    options.push({ kind: "cancel", text: "先别做了" });
+    const card: Card = { kind: "plan", text, options, free_text: true, blocking: true };
+    const got = this.ask(card, { kind: "authorize", purpose: "plan", text, digest });
+    if (got === null) return this.finish("waiting_user", "no answer from the user");
+    const pick = got.option;
+    if (pick?.kind === "approve") return void this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: true, picked: "approve" } });
+    if (pick?.kind === "reading") return this.settleReading(text, pick, "plan");
+    if (pick?.kind === "cancel") {
+      this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text, digest, approved: false, picked: "cancel" } });
+      return this.finish("cancelled", "the user stopped the task");
+    }
+    return await this.cardWords(text, got.text, digest);
+  }
+
+  /** Words typed on a plan card (or the GUI's confirmation), judged when they arrive by what they do to this card:
+   *  go ahead with it (approved, nothing re-derived), change something (an answer like any other: goal and readings
+   *  are derived again with it), or stop (declined, nothing written). */
+  private async cardWords(question: string, text: string, digest: string) {
+    if (!text.trim()) return this.finish("waiting_user", "empty answer");
+    const rep = await this.askModel("choice", P.choicePrompt(P.CARD_WORDS_QUESTION, { 卡片: question, 用户打的字: text }, [...P.CARD_WORDS_OPTIONS]), R.choiceAnswer(["approve", "change", "refuse"]));
+    if (rep.outcome !== "answered") return this.modelFailed(rep);
+    const c = rep.data!.choice;
+    if (c === "change") return this.answerAsText(question, text, "plan", digest);
+    this.emit("interaction.reply", { body: { kind: "authorize", purpose: "plan", text: question, digest, approved: c === "approve", picked: "words", words: text } });
+    if (c === "refuse") return this.finish("waiting_user", "the user's words on the plan card declined it; nothing written");
+  }
+
+  /** Listing entries in the folders of the cited items (a cited path, or an entry named in a cited line), capped: data
+   *  for the evidence judge, beside what the goal model cited. */
+  private nearby(evidence: string[], cap = 60): string[] {
+    const entries = this.ws.listing().entries;
+    const folder = (p: string) => p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+    const base = (p: string) => p.slice(p.lastIndexOf("/") + 1);
+    // a cited path, or a file named in a cited line (a folder's name inside a path is not a citation of the folder)
+    const cited = entries.filter((e) => evidence.some((x) => x === e.path || (e.kind === "file" && base(e.path).length > 1 && x.includes(base(e.path)))));
+    const folders = new Set(cited.map((e) => folder(e.path)));
+    return entries.filter((e) => folders.has(folder(e.path))).map((e) => e.kind === "folder" ? e.path + "/" : e.path).slice(0, cap);
+  }
 
   // --- interaction --------------------------------------------------------------------------------------------------------
   static readonly DELEGATE = "由你决定";
