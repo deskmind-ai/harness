@@ -4,8 +4,8 @@
  * although the means were on the Mac (evalset v2's lack tasks, 10-16): each closes one such gap.
  *
  * Every one only creates its output file, so undo deletes it. The output is made and checked in a temporary file
- * first (under the workspace's trash folder: same volume, never listed), then linked into place, which is atomic and
- * never replaces anything. A crash therefore leaves either no output or a complete, checked one, and a tool that ran
+ * first (in the workspace's own hidden temporary folder: same volume, never listed), then linked into place, which is
+ * atomic and never replaces anything. A crash therefore leaves either no output or a complete, checked one, and a tool that ran
  * but made the wrong thing leaves nothing behind: the step fails with the reason.
  */
 import * as fs from "node:fs";
@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import type { Capability, ExecResult } from "./capability.js";
 import { ask, helperBin, helperProblem, run } from "./mac.js";
 import { after, folderOk, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
-import { ABSENT, NOT_UTF8_EN, TEMP_PREFIX, TRASH, isText, sha, type Workspace } from "./workspace.js";
+import { ABSENT, NOT_UTF8_EN, TMP, isText, sha, type Workspace } from "./workspace.js";
 import { readZip, writeZip } from "./zip.js";
 
 const pathsOf = (list: string) => list.split("\n").map(norm).filter(Boolean);
@@ -33,31 +33,34 @@ const isLink = (full: string) => { try { return fs.lstatSync(full).isSymbolicLin
 /** How an output is put in place: a hard link, which is atomic and never replaces a file. Tests replace it to see a
  *  volume without hard links. */
 export const PLACE = { link: (from: string, to: string) => fs.linkSync(from, to) };
-/** Volumes without hard links (exFAT, FAT, some network shares) say so with these: the output is copied instead, with
- *  COPYFILE_EXCL, which still never replaces a file. */
+/** Volumes without hard links (exFAT, FAT, some network shares) say so with these. The checked temporary file is then
+ *  renamed into place instead (atomic, same volume), after looking once more that the destination is still free:
+ *  rename would replace a file, a link never does. */
 const NO_LINKS = new Set(["ENOTSUP", "EPERM", "EXDEV", "EOPNOTSUPP"]);
 
-/** Put a tool's output at `dst`: written to a temporary file, checked there (`check` gets its path), then linked (or,
- *  without hard links, copied) into place. Refuses, leaving nothing, when the check fails, `dst` appeared meanwhile, or
- *  the disk will not take it: never throws. */
+/** Put a tool's output at `dst`: written to a temporary file in TMP, checked there (`check` gets its path), then
+ *  linked (or, without hard links, renamed) into place. Refuses, leaving nothing, when the check fails, `dst` appeared
+ *  meanwhile, or the disk will not take it: never throws. */
 export function wrote(ws: Workspace, dst: string, data: Buffer | string, check: (file: string) => string | null, output: Record<string, unknown> = {}): ExecResult {
   let tmp: string | null = null;
   try {
-    const dir = ws.abs(TRASH);
+    const dir = ws.abs(TMP);
     fs.mkdirSync(dir, { recursive: true });
-    tmp = path.join(dir, `${TEMP_PREFIX}${randomUUID()}${path.extname(dst)}`);
+    tmp = path.join(dir, `${randomUUID()}${path.extname(dst)}`);
     fs.writeFileSync(tmp, data, { flag: "wx" });
     const err = check(tmp);
     if (err) return { ...failed(err), versions_after: { [dst]: ABSENT } };
     try { PLACE.link(tmp, ws.abs(dst)); } catch (e) {
       const code = (e as NodeJS.ErrnoException).code ?? "";
       if (!NO_LINKS.has(code)) return failed(`cannot create ${dst}: ${code || String(e)}`);
-      fs.copyFileSync(tmp, ws.abs(dst), fs.constants.COPYFILE_EXCL);
+      if (fs.existsSync(ws.abs(dst)) || isLink(ws.abs(dst))) return failed(`cannot create ${dst}: EEXIST`);
+      fs.renameSync(tmp, ws.abs(dst));
+      tmp = null;
     }
   } catch (e) {
     return failed(`cannot create ${dst}: ${(e as NodeJS.ErrnoException).code ?? String(e).slice(0, 200)}`);
   } finally {
-    if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* swept at the next start */ }
+    if (tmp) try { fs.rmSync(tmp, { force: true }); } catch { /* swept at a later start */ }
   }
   maybeCrash();
   return after(ws, [dst], { file: dst, ...output });

@@ -8,8 +8,12 @@ import * as path from "node:path";
 
 export const ABSENT = "absent";
 export const TRASH = ".deskmind-trash";
-/** A tool's output while it is checked (tools.ts wrote), in TRASH; one left by a crash is swept at the next start. */
-export const TEMP_PREFIX = ".tmp-";
+/** Tools' outputs while they are checked (tools.ts wrote): their own hidden folder at the root, on the same volume as
+ *  the task's files and never listed. Nothing a user owns is ever put there (a trashed file goes to TRASH, under its
+ *  own name, whatever that name is), so sweeping it can never delete the user's data. */
+export const TMP = ".deskmind-tmp";
+/** A temporary output older than this is left by a process that died, not one still being checked. */
+const STALE_TEMP_MS = 10 * 60_000;
 
 export const sha = (b: string | Buffer) => "sha256:" + createHash("sha256").update(b).digest("hex").slice(0, 16);
 
@@ -38,12 +42,17 @@ export class Workspace {
     this.root = path.resolve(root);
   }
 
-  /** Remove tools' temporary outputs a crashed process left in TRASH (never anything else there). */
+  /** Remove tools' temporary outputs a crashed process left in TMP: only there, and only old ones, so another run
+   *  checking its output right now keeps it. */
   sweepTemp() {
-    const dir = path.join(this.root, TRASH);
+    const dir = path.join(this.root, TMP);
     let names: string[] = [];
     try { names = fs.readdirSync(dir); } catch { return; }
-    for (const n of names) if (n.startsWith(TEMP_PREFIX)) try { fs.rmSync(path.join(dir, n), { force: true }); } catch { /* next time */ }
+    const cutoff = Date.now() - STALE_TEMP_MS;
+    for (const n of names) {
+      const full = path.join(dir, n);
+      try { if (fs.lstatSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true }); } catch { /* raced, or next time */ }
+    }
   }
 
   /** Forget the cached snapshot (after our own effect or a known external change). */
@@ -56,7 +65,7 @@ export class Workspace {
     const parts: string[] = [];
     const walk = (dir: string) => {
       for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (d.name === TRASH || d.name === ".keep") continue;
+        if (d.name === TRASH || d.name === TMP || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
         const st = fs.lstatSync(full);              // a link (even a dangling one) is not followed
         parts.push(`${full}:${st.mtimeMs}:${st.size}`);
@@ -80,7 +89,7 @@ export class Workspace {
     const out: Record<string, string> = {};
     const walk = (dir: string, rel: string) => {
       const names = fs.readdirSync(dir, { withFileTypes: true });
-      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH).map((d) => d.name).sort();
+      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP).map((d) => d.name).sort();
       const files = names.filter((d) => d.isFile() && d.name !== ".keep").map((d) => d.name).sort();
       for (const d of dirs) out[rel ? `${rel}/${d}` : d] = "dir";
       for (const f of files) out[rel ? `${rel}/${f}` : f] = sha(fs.readFileSync(path.join(dir, f)));

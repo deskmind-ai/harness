@@ -5,16 +5,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { deflateSync } from "node:zlib";
 import { beforeAll, describe, expect, it } from "vitest";
-import { Gateway, TRUNCATED, type Scripted } from "../src/gateway/index.js";
+import { CONFIGS, Gateway, TRUNCATED, withOverrides, type Scripted } from "../src/gateway/index.js";
 import { Orchestrator, describe as describeAction, type CardUser } from "../src/orchestrator/index.js";
 import { TransformAnswer } from "../src/protocol/roles.js";
 import { Registry, type Capability, type ExecResult } from "../src/registry/capability.js";
-import { FS_CAPABILITIES, fileRegistry, fsReadText } from "../src/registry/fs.js";
+import { FS_CAPABILITIES, fileRegistry, fsReadText, fsTrash } from "../src/registry/fs.js";
 import { HELPER, IS_MAC, helperProblem, prepareHelper, resetHelper, run } from "../src/registry/mac.js";
 import { matches } from "../src/registry/reconcile.js";
 import { make } from "../src/registry/spec.js";
 import { PLACE, ZIP_LIMITS, fsConvertToPdf, fsOcrImage, fsTransformText, fsZipFiles, toolCapabilities, wrote } from "../src/registry/tools.js";
-import { TRASH, Workspace, build } from "../src/registry/workspace.js";
+import { TMP, TRASH, Workspace, build } from "../src/registry/workspace.js";
 import { crc32 } from "../src/registry/zip.js";
 
 const ROLES = ["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"];
@@ -87,7 +87,7 @@ describe("tool capabilities", () => {
     expect(fsTransformText.undo!(w, full, r)).toBeNull();
     w.invalidate();
     expect(w.exists("summary_en.csv")).toBe(false);
-    expect(fs.readdirSync(w.abs(TRASH))).toEqual([]);                        // no temporary file left behind
+    expect(fs.readdirSync(w.abs(TMP))).toEqual([]);                          // no temporary file left behind
   });
 
   it("transform_text refuses a missing or non-UTF-8 source, an existing target, and a source changed since the rewrite", () => {
@@ -223,17 +223,18 @@ describe("tool capabilities", () => {
   it("an output is checked before it appears: the destination does not exist while the tool checks it (review 3)", () => {
     const w = ws({});
     let seen: boolean | null = null;
-    const r = wrote(w, "out.zip", Buffer.from("data"), (file) => { seen = fs.existsSync(w.abs("out.zip")); return file.includes(TRASH) ? null : "not a temporary file"; });
+    const r = wrote(w, "out.zip", Buffer.from("data"), (file) => { seen = fs.existsSync(w.abs("out.zip")); return file.includes(TMP) ? null : "not a temporary file"; });
     expect(seen).toBe(false);
     expect(r.status).toBe("ok");
     const bad = wrote(w, "bad.zip", Buffer.from("data"), () => "wrong");
     w.invalidate();
     expect(bad.status).toBe("failed");
     expect(w.exists("bad.zip")).toBe(false);
-    expect(fs.readdirSync(w.abs(TRASH))).toEqual([]);
+    expect(fs.readdirSync(w.abs(TMP))).toEqual([]);
+    expect(w.listing().entries.map((e) => e.path)).toEqual(["out.zip"]);     // the temporary folder is never listed
   });
 
-  it("on a volume without hard links the output is copied in place; it never replaces a file (re-review follow-up)", () => {
+  it("on a volume without hard links the output is renamed into place; it never replaces a file (round 3)", () => {
     const w = ws({ "taken.zip": "mine" });
     const saved = PLACE.link;
     try {
@@ -241,26 +242,54 @@ describe("tool capabilities", () => {
       expect(wrote(w, "out.zip", Buffer.from("data"), () => null).status).toBe("ok");
       w.invalidate();
       expect(w.read("out.zip")).toBe("data");
+      expect(fs.readdirSync(w.abs(TMP))).toEqual([]);                        // renamed, not copied and left behind
       expect(wrote(w, "taken.zip", Buffer.from("data"), () => null).status).toBe("failed");
       w.invalidate();
       expect(w.read("taken.zip")).toBe("mine");
+      // the destination appears between the link attempt and the rename: still refused
+      PLACE.link = (_from, to) => { fs.writeFileSync(to, "someone else's"); throw Object.assign(new Error("no links"), { code: "EXDEV" }); };
+      expect(wrote(w, "late.zip", Buffer.from("data"), () => null).why).toMatch(/EEXIST/);
+      w.invalidate();
+      expect(w.read("late.zip")).toBe("someone else's");
     } finally { PLACE.link = saved; }
   });
 
   it("wrote() fails instead of throwing when it cannot even make its temporary file (re-review follow-up)", () => {
-    const w = ws({ ".deskmind-trash": "a file where the folder should be" });
+    const w = ws({ ".deskmind-tmp": "a file where the folder should be" });
     const r = wrote(w, "out.zip", Buffer.from("data"), () => null);
     expect(r.status).toBe("failed");
     expect(r.why).toMatch(/cannot create out.zip/);
   });
 
-  it("a temporary output left by a crash is swept when a run starts; nothing else in the trash is (re-review follow-up)", () => {
-    const w = ws({ "a.txt": "x" });
-    fs.mkdirSync(w.abs(TRASH));
-    fs.writeFileSync(w.abs(`${TRASH}/.tmp-left-by-a-crash.zip`), "half");
-    fs.writeFileSync(w.abs(`${TRASH}/a.txt`), "a trashed file");
+  it("a run's start sweeps only old temporary outputs, never a trashed file, whatever its name (round 3 blocker)", async () => {
+    const w = ws({ ".tmp-notes.txt": "the user's notes" });
+    expect(act(w, fsTrash, { target: ".tmp-notes.txt" }).ok).toBe(true);    // in the trash, under its own name
+    fs.mkdirSync(w.abs(TMP));
+    fs.writeFileSync(w.abs(`${TMP}/left-by-a-crash.zip`), "half");
+    fs.utimesSync(w.abs(`${TMP}/left-by-a-crash.zip`), new Date(Date.now() - 3600_000), new Date(Date.now() - 3600_000));
+    fs.writeFileSync(w.abs(`${TMP}/another-run-checking-it-now.zip`), "fresh");
     new Orchestrator(logPath(), w, new Gateway(table()), nobody, fileRegistry());
-    expect(fs.readdirSync(w.abs(TRASH))).toEqual(["a.txt"]);
+    expect(fs.readdirSync(w.abs(TRASH)).some((n) => fs.readFileSync(w.abs(`${TRASH}/${n}`), "utf-8") === "the user's notes")).toBe(true);
+    expect(fs.readdirSync(w.abs(TMP))).toEqual(["another-run-checking-it-now.zip"]);
+  });
+
+  it("a role's own time limit survives --role; a local model may write a whole rewrite (round 3)", async () => {
+    const t = withOverrides(CONFIGS["B0-luna"]!, ["transform=local_chat:http://127.0.0.1:1|qwen", "goal=local_chat:http://127.0.0.1:1|qwen"]);
+    const g = new Gateway(t);
+    expect(g.timeoutFor("transform")).toBe(600_000);
+    const saved = globalThis.fetch;
+    const sent: Record<string, number> = {};
+    try {
+      globalThis.fetch = (async (_url: string, init: any) => {
+        const b = JSON.parse(init.body);
+        sent[b.messages[1].content] = b.max_tokens;
+        return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: '{"text":"ok"}' } }] }), { status: 200 });
+      }) as any;
+      await g.ask("transform", "s", "rewrite", TransformAnswer);
+      await g.ask("goal", "s", "decide", TransformAnswer);
+    } finally { globalThis.fetch = saved; }
+    expect(sent.rewrite).toBe(16_000);
+    expect(sent.decide).toBe(2_000);
   });
 
   it("a destination that is a symlink is refused, and a race onto it fails the step instead of throwing (review 6)", () => {
@@ -412,6 +441,13 @@ describe("tool capabilities", () => {
       resetHelper();
       await expect(prepareHelper()).resolves.toBeUndefined();
       expect(helperProblem()).toMatch(/cannot build/);
+      // a source path that cannot be read (a folder): helperBin used to throw before the try
+      const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-src-"));
+      Object.assign(HELPER, saved, { source: folder });
+      resetHelper();
+      await expect(prepareHelper()).resolves.toBeUndefined();
+      expect(helperProblem()).toMatch(/cannot build/);
+      Object.assign(HELPER, saved);
       // a fresh cache: asking for the registry builds nothing
       Object.assign(HELPER, { cache: fs.mkdtempSync(path.join(os.tmpdir(), "harness-cache-")) });
       resetHelper();

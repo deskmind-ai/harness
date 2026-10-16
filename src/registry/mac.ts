@@ -69,11 +69,11 @@ export function helperProblem(): string | null {
 /** Build the helper, once per process, without blocking the caller; resolves (never rejects) when it is ready or known
  *  to be unavailable. Only an explicit call builds: a registry never starts a build as a side effect. */
 export function prepareHelper(): Promise<void> {
-  if (helperBin()) return Promise.resolve();
-  if (state && "building" in state) return state.building;
-  if (state && "unavailable" in state) return Promise.resolve();
   const fail = (why: string) => { state = { unavailable: why }; };
   try {
+    if (helperBin()) return Promise.resolve();
+    if (state && "building" in state) return state.building;
+    if (state && "unavailable" in state) return Promise.resolve();
     if (!IS_MAC) { fail("needs macOS"); return Promise.resolve(); }
     const bin = binPath();
     if (!bin) { fail(`the helper's source is missing (${HELPER.source})`); return Promise.resolve(); }

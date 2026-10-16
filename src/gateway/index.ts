@@ -40,8 +40,9 @@ const BACKEND_DEFAULTS: Record<Backend, { contextTokens: number; timeoutMs: numb
 
 /** Rewriting a whole document (fs.transform_text) writes far more than a decision does: it gets more time. */
 const TRANSFORM_TIMEOUT_MS = 600_000;
-/** What a local chat server is asked to write at most when the table does not say (its answers are decisions). */
-const LOCAL_MAX_TOKENS = 2_000;
+/** What a local chat server is asked to write at most when the table does not say: a decision is short; a rewritten
+ *  document (transform) can be as long as the 32k context leaves room for after reading its source. */
+const LOCAL_MAX_TOKENS = 2_000, LOCAL_TRANSFORM_MAX_TOKENS = 16_000;
 /** A reply the model stopped because it hit its output limit: never parsed, whatever JSON it happens to hold. */
 export const TRUNCATED = "truncated: the answer hit the model's output limit";
 
@@ -62,7 +63,9 @@ export function withOverrides(base: RoleTable, overrides: string[]): RoleTable {
     if (!m) throw new Error(`bad --role ${o}; expected role=backend:model`);
     const [, role, backend, model] = m;
     if (!(role! in t)) throw new Error(`unknown role ${role}`);
-    t[role as Role] = { backend: backend as Backend, model: model! };
+    // a different model for the role; what the role itself needs (the rewrite's longer time limit) stays
+    const { timeoutMs } = base[role as Role];
+    t[role as Role] = { backend: backend as Backend, model: model!, ...(timeoutMs ? { timeoutMs } : {}) };
   }
   return t;
 }
@@ -186,7 +189,7 @@ export class Gateway {
       const t0 = performance.now();
       const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens;
       let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens)
-        : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? LOCAL_MAX_TOKENS)
+        : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? (role === "transform" ? LOCAL_TRANSFORM_MAX_TOKENS : LOCAL_MAX_TOKENS))
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user, timeoutMs)
         : this.scripted(role, sys, user);
