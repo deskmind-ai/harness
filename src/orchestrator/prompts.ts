@@ -132,6 +132,18 @@ export function intentPrompt(raw: string, answers: string[], actions: string[], 
 
 export interface Option { id: string; text: string }
 
+/** The judge's question: do the cited entries tell the readings apart? Evidence has to show the feature the user named
+ *  (a version or date for 「旧的那份」, a line of a file that mentions it, an earlier answer). Which one the user more
+ *  likely means, guessed from common sense, is not evidence: that is the ambiguity itself (owner 10-12, harness#5). */
+export function evidenceQuestion(point: string): string {
+  return [
+    `用户原话里的「${point}」指的是哪一种？只根据下面的证据判断。`,
+    "证据里看得到用户话里说的那个东西或特征，就算支持对应的理解：例如用户说「岗位」，文件名里带着各自的岗位；用户说「旧的那份」，文件名里有版本号或日期。看懂这些可以用常识（编号、版本号、副本标记、文件里写明的日期或收件人是什么意思）。",
+    "不算证据的情况：证据里根本没有用户说的那个特征，只是几个候选并列，要靠推测「要做的这件事更像属于哪一类」「用户更可能想要哪个」才能挑出一个。",
+    "证据区分不了就选「说不清」。",
+  ].join("");
+}
+
 export function choicePrompt(question: string, context: unknown, options: Option[]): string {
   return ["任务：从下面的选项里选一个。只能选给出的 id。", "", "材料：", J(context), "", `问题：${question}`, "选项：", ...options.map((o) => `- ${o.id}: ${o.text}`)].join("\n");
 }

@@ -314,7 +314,9 @@ export class Orchestrator {
       if (a.settled || !a.backed || !a.alternatives.length || delegated) continue;
       const opts = [a.reading, ...a.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
       const ids = opts.map((o) => o.id) as [string, ...string[]];
-      const rep = await this.askModel("choice", P.choicePrompt(`用户原话里的「${a.point}」指的是哪一种？只根据下面的证据判断；证据区分不了就选「说不清」。`, { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
+      // evidence counts only when it shows the very feature the user named; a common-sense guess about which one the
+      // user more likely means is not evidence (owner 10-12, harness#5)
+      const rep = await this.askModel("choice", P.choicePrompt(P.evidenceQuestion(a.point), { 用户原文: st.raw, 证据: a.evidence }, opts), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") return this.modelFailed(rep);
       const k = Number(rep.data!.choice.slice(1));
       if (k === 0) { if (fromAnswer.has(i)) a.settled = true; }
