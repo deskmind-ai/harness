@@ -13,6 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import { CONFIGS, Gateway, withOverrides } from "../gateway/index.js";
+import { readRows } from "./rows.js";
 import { Orchestrator, POLICY, cardUser, type Answer, type Card, type CardUser, type Hooks, type Policy } from "../orchestrator/index.js";
 import { Crash, Registry } from "../registry/capability.js";
 import { RENAMES, fileRegistry } from "../registry/fs.js";
@@ -270,23 +271,24 @@ function mergeSummaries(prev: any, cur: any) {
 function reportV2(rows: any[]) {
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = `${r.config}|${r.category}`; by.set(k, [...(by.get(k) ?? []), r]); }
-  console.log("config | category | n | correct | capability gaps | wrong action | of which guessed | false success | errored | interruptions | unnecessary | declined plan | sim fallbacks | acted on own reading | of which not the first outcome | outcomes | s/task");
+  console.log("config | category | n | correct | lack: completed / gap / stopped / wrong / done but reported failed | wrong action | of which guessed | false success | errored | interruptions | unnecessary | declined plan | sim fallbacks | acted on own reading | of which not the first outcome | outcomes | s/task");
   const pct: Record<string, number[]> = {};
   for (const [k, rs] of [...by].sort()) {
     const n = rs.length, f = (key: string) => rs.filter((r) => r[key]).length;
     const outs = Object.entries(rs.reduce((a: Record<string, number>, r) => { if (r.correct) a[r.outcome ?? "?"] = (a[r.outcome ?? "?"] ?? 0) + 1; return a; }, {})).map(([o, c]) => `${o}:${c}`).join(" ");
-    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${f("gap")} | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${f("declined_plan")} | ${rs.reduce((a, r) => a + (r.sim?.fallbacks ?? 0), 0)} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act")).length} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act") && r.outcome && r.outcome !== r.first_outcome).length} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
+    console.log(`${k.replace("|", " | ")} | ${n} | ${f("correct")} (${Math.round((100 * f("correct")) / n)}%) | ${["completed", "gap", "stopped", "wrong", "done_but_reported_failed"].map((o) => rs.filter((r) => r.lack_outcome === o).length).join(" / ")} | ${f("wrong_effect")} | ${f("guessed")} | ${f("false_success")} | ${f("errored")} | ${rs.reduce((a, r) => a + (r.interruptions ?? 0), 0)} | ${rs.reduce((a, r) => a + (r.unnecessary ?? 0), 0)} | ${f("declined_plan")} | ${rs.reduce((a, r) => a + (r.sim?.fallbacks ?? 0), 0)} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act")).length} | ${rs.filter((r) => (r.ask_decisions ?? []).includes("act") && r.outcome && r.outcome !== r.first_outcome).length} | ${outs} | ${(rs.reduce((a, r) => a + r.seconds, 0) / n).toFixed(1)}`);
     const cfg = k.split("|")[0]!;
     (pct[cfg] ??= []).push(f("correct") / n);
   }
   for (const [cfg, ps] of Object.entries(pct)) console.log(`${cfg}: lowest category ${Math.round(100 * Math.min(...ps))}%, unweighted mean ${Math.round((100 * ps.reduce((a, b) => a + b, 0)) / ps.length)}% (a capability gap — an honest stop on a request we lack the means for — counts as not correct)`);
+  console.log("Rows are as scored when they ran: result files from before the three-tier can't-do scoring (10-16) are not rescored; rerun those tasks with a new --out and pass both files with --supersede.");
   for (const [k, rs] of [...by].sort()) for (const r of rs.filter((r) => !r.correct)) console.log(`  ${r.gap ? "◌" : "✗"} ${k} ${r.task}: ${r.status} (${(r.reason ?? "").slice(0, 70)}) ${r.why.slice(0, 160)}`);
 }
 
-function report(paths: string[]) {
-  const all = paths.flatMap((p) => fs.readFileSync(p, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)));
+function report(paths: string[], supersede = false) {
+  const all = readRows(paths, supersede);
   if (all.length && all.every((r) => r.category)) return reportV2(all);
-  const rows = paths.flatMap((p) => fs.readFileSync(p, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)));
+  const rows = all;
   const by = new Map<string, any[]>();
   for (const r of rows) { const k = `${r.config}|${r.group}`; by.set(k, [...(by.get(k) ?? []), r]); }
   console.log("config | group | n | correct | wrong effect | false success | unconfirmed write | errored | stopped | asked | calls/task | $/task | s/task");
@@ -314,11 +316,12 @@ async function main() {
     tasks: { type: "string" }, config: { type: "string", default: "B0-luna" }, split: { type: "string", default: "dev" },
     groups: { type: "string", default: "1,2,3,4,5,6,7" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
     out: { type: "string" }, v: { type: "boolean", default: false }, report: { type: "string", multiple: true },
+    supersede: { type: "boolean", default: false },      // with --report: a later file's row replaces an earlier one for the same task
     role: { type: "string", multiple: true, default: [] },
     repeat: { type: "string", default: "1" },
     policy: { type: "string", multiple: true, default: [] },     // e.g. --policy cannot=report --policy evidence=v1
   } });
-  if (a.report?.length) return report(a.report);
+  if (a.report?.length) return report(a.report, a.supersede);
   if (!a.tasks) throw new Error("--tasks <path to tasks.json> is required");
   const groups = new Set(a.groups!.split(",").map(Number));
   const only = a.only ? new Set(a.only.split(",")) : null;
