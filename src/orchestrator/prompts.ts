@@ -45,7 +45,7 @@ export function goalPrompt(raw: string, answers: string[], workspace: Listing, c
     "", "要求：", "- requirements 逐条对应原文里的一个要求或约束（含「其他文件不动」「不要覆盖」这类限制）；每条给 quotes：原文里支持它的原话片段。",
     "- 能用代码核验的用 deterministic 并填 name/args；只能看出来对不对的用 semantic；user_confirmation 只用于结果只有用户能判断的要求，不要用它表达「用编辑器做」「不要覆盖」这类过程约束——过程约束放进 constraints。",
     "- 原文缺了只有用户知道的信息（哪个文件、内容、位置），写进 missing，并给一个用户能直接回答的问题；不要用猜的值补。",
-    "- 先核对要求里提到的输入在不在：用户点名要处理的文件、图片、文件夹，目录里有没有。没有的话，不要先问格式、命名这类偏好；直接说缺什么（写进 missing，或者 feasible 写做不到并说明缺的东西）。",
+    "- 先核对要求里提到的输入在不在：用户点名要处理的文件、图片、文件夹，目录里有没有。没有的话，不要先问格式、命名这类偏好；直接说缺什么：写进 missing（kind 用 information），问题里说清楚哪个找不到。缺输入不是缺能力，feasible 不要因此写成做不到。",
     "- 「放到 / 移到 / 归档到 / 整理到」某处，默认是移动（原位置不再有），不要问「移动还是复制」。用户已经回答过的问题不要再问。",
     "- missing 的每条带 kind：information = 只有用户知道的信息（哪个文件、什么内容、放哪）；observable = 打开文件或看目录就能查到的事（例如「哪份是最新的」「文件里写的是哪个项目」），程序不会去问用户，会让计划先读；approval = 你已经知道怎么做、只是想要许可。有后果的动作（删除、覆盖）程序会在执行前自己向用户确认，所以 approval 类一般不需要写；写了也不会变成问题去问用户。",
     "- 用户如果回答「随便」「你看着办」「由你决定」，就是把选择交给你：user_delegated 填 true，按常理做决定、写进需求；程序会在动手前把整个计划给用户过目一次。",
@@ -147,6 +147,9 @@ export const EVIDENCE_WORDINGS = {
   ],
 };
 export type EvidenceWording = keyof typeof EVIDENCE_WORDINGS;
+
+/** Added to the evidence question when the evidence is the user's answer to our question about this very point. */
+export const EVIDENCE_FROM_ANSWER = "这里的证据是用户对这个问题的回答：回答把选择留给我们、让按原话做，选「说不清」那一项；回答否定了这些理解、不让改，或者说的是另一种意思，选最后一项。";
 
 export function evidenceQuestion(point: string, wording: EvidenceWording = "v2"): string {
   const ask = `用户原话里的「${point}」指的是哪一种？只根据下面的证据判断`;

@@ -333,13 +333,17 @@ export class Orchestrator {
     // an independent judge decides whether the cited evidence actually tells the readings apart
     for (const [i, a] of assumptions.entries()) {
       if (a.settled || !a.backed || !a.alternatives.length || delegated) continue;
-      const opts = [a.reading, ...a.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
+      // when the evidence is the user's answer to our question, 「picks none」 is two cases the judge tells apart: the
+      // answer leaves it to us (「按我原来说的做」), or it rejects the readings, forbids the change, or means something else
+      const last = fromAnswer.has(i) ? ["说不清：回答没有选哪一种，可以按用户原话去做", "回答否定了这些理解、不让做，或者说的是另一种意思"] : ["说不清：这些证据区分不了"];
+      const opts = [a.reading, ...a.alternatives, ...last].map((text, i) => ({ id: `r${i}`, text }));
       const ids = opts.map((o) => o.id) as [string, ...string[]];
       // evidence counts only when it shows the very feature the user named; a common-sense guess about which one the
       // user more likely means is not evidence (owner 10-12, harness#5)
       // the files next to the cited ones, so a reading the names in view settle (「说明书.pdf 不是录音」) can be seen
       const nearby = this.nearby(a.evidence);
-      const rep = await this.askModel("choice", P.choicePrompt(P.evidenceQuestion(a.point, this.policy.evidence), { 用户原文: st.raw, 证据: a.evidence, ...(nearby.length ? { 相关目录里的文件: nearby } : {}) }, opts), R.choiceAnswer(ids));
+      const question = P.evidenceQuestion(a.point, this.policy.evidence) + (fromAnswer.has(i) ? P.EVIDENCE_FROM_ANSWER : "");
+      const rep = await this.askModel("choice", P.choicePrompt(question, { 用户原文: st.raw, 证据: a.evidence, ...(nearby.length ? { 相关目录里的文件: nearby } : {}) }, opts), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") return this.modelFailed(rep);
       const k = Number(rep.data!.choice.slice(1));
       if (k === 0) { if (fromAnswer.has(i)) a.settled = true; }
@@ -347,9 +351,20 @@ export class Orchestrator {
         // asked, and the answer picks none of the readings: asking the same again is refused (clarify), and stopping
         // here left the run with nothing to do. Go on with the leading reading and say so with the result, where the
         // user can undo it or pick another (owner 10-09: report in the result, with undo, is fine). A plan with a step
-        // that cannot be taken back is still shown first (planNeedsConfirmation).
+        // that cannot be taken back is still shown first (planNeedsConfirmation). The GUI loop has no plan to show and
+        // its actions cannot be taken back: there the user is asked once more, in other words.
+        if (this.guiCannotUndo()) {
+          const where = a.point || a.reading;
+          this.emit("note", { text: `问过用户「${where}」，回答里没有选哪一种；界面上的操作撤不回，换个说法再问一次` });
+          return this.clarify(`「${where}」我还是拿不准该按哪一种做。在界面上做了就撤不回，请选一种：`, "goal: ambiguous, the answer picked none, cannot undo", [a.reading, ...a.alternatives], { checkOptions: false, point: where });
+        }
         a.unpicked = true;
         this.emit("note", { text: `问过用户「${a.point || a.reading}」，回答里没有选哪一种；先按「${a.reading}」做，结果里说明，可以撤回或改成另一种` });
+      }
+      else if (fromAnswer.has(i) && k === a.alternatives.length + 2) {
+        // the answer turns the readings down or says not to do it: nothing is done; it is the user's to say more
+        this.emit("note", { text: `问过用户「${a.point || a.reading}」，回答否定了这几种理解或不让做；不动手` });
+        return this.finish("waiting_user", "the answer rejected the readings or asked not to change anything");
       }
       else if (fromAnswer.has(i) && k <= a.alternatives.length) {
         // the user's own words pick another reading: record it as their choice and derive the goal again
@@ -677,9 +692,6 @@ export class Orchestrator {
     const open = g.assumptions.filter((a) => !a.settled);
     if (!open.length) return false;
     if (writes.some((n) => !this.registry.get(n.capability)?.reversible)) return true;
-    // the user was already asked about every open reading and picked none: everything can be undone, so act and report
-    // it with the result rather than ask a second time
-    if (open.every((a) => a.unpicked)) return false;
     // everything can be undone: whether to interrupt the user first is a judgement, made once per plan and logged
     if (st.askDecision) return st.askDecision === "confirm";
     const steps = writes.map((n) => { const a = st.nodes.get(n.id)?.args; return a ? describe(this.cap(n.capability), a) : n.purpose; });
@@ -690,7 +702,7 @@ export class Orchestrator {
     ];
     const ctx = {
       用户原文: st.raw, 用户后来补充: st.answersText(),
-      我的理解: open.map((a) => ({ 哪一处: a.point, 我选的: a.reading, 其他说得通的: a.alternatives, 依据: a.evidence })),
+      我的理解: open.map((a) => ({ 哪一处: a.point, 我选的: a.reading, 其他说得通的: a.alternatives, 依据: a.evidence, ...(a.unpicked ? { 问过用户没有: "问过一次，用户的回答没有选哪一种" } : {}) })),
       计划要做的改动: steps, 已知会改到的文件和文件夹数: paths.size, 还没定下具体文件的步骤数: writes.filter((n) => !st.nodes.get(n.id)?.args).length,
       能不能撤回: "每一步都能撤回",
       ...(this.opts.history?.length ? { 这位用户以前的反应: this.opts.history.slice(-10) } : {}),
@@ -870,9 +882,11 @@ export class Orchestrator {
     const open = g.assumptions.filter((a) => !a.settled);
     // a skill revised since its last use says what changed, once, with the result; the user can undo it
     const updated = st.skillNotice ? `按教材整理（已更新：${st.skillNotice}）` : "";
-    if (!open.length) return updated ? { kind: "result", text: updated, options: [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }], free_text: false, blocking: false } : null;
-    const options: CardOption[] = [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }];
-    for (const a of open) a.alternatives.forEach((alt, k) => options.push({ kind: "undo_and_reading", text: `撤回，改成：${alt}`, point: a.point || a.reading, readings: [a.reading, ...a.alternatives], reading_index: k + 1 }));
+    // undo is offered only when every step this run took has one (a GUI action has none)
+    const undo: CardOption[] = this.canUndo() ? [{ kind: "undo", text: "撤回" }] : [];
+    if (!open.length) return updated ? { kind: "result", text: updated, options: [{ kind: "approve", text: "好的" }, ...undo], free_text: false, blocking: false } : null;
+    const options: CardOption[] = [{ kind: "approve", text: "好的" }, ...undo];
+    if (undo.length) for (const a of open) a.alternatives.forEach((alt, k) => options.push({ kind: "undo_and_reading", text: `撤回，改成：${alt}`, point: a.point || a.reading, readings: [a.reading, ...a.alternatives], reading_index: k + 1 }));
     options.push({ kind: "never_ask_this", text: "这种以后不用告诉我" });
     return { kind: "result", text: (updated ? updated + "。" : "") + "我是这样理解的：" + open.map((a) => a.reading + (a.unpicked ? "（问过你，回答里没有选哪一种）" : "")).join("；"), options, free_text: false, blocking: false };
   }
@@ -1172,6 +1186,20 @@ export class Orchestrator {
     return out;
   }
 
+
+  /** Every step this run took that changed something has an undo (an unregistered capability, such as a GUI action,
+   *  has none). */
+  private canUndo(): boolean {
+    return [...this.st.ops.values()].filter((op) => op.state === "ok").every((op) => {
+      const cap = this.registry.get(op.intent.capability);
+      return !!cap && (cap.effect === "observe" || !!cap.undo);
+    });
+  }
+
+  /** The run acts through a GUI whose actions cannot be taken back. */
+  private guiCannotUndo(): boolean {
+    return !!this.opts.gui && this.registry.list().some((c) => c.channel === "gui" && !c.reversible);
+  }
 
   /** Listing entries in the folders of the cited items (a cited path, or an entry named in a cited line), capped: data
    *  for the evidence judge, beside what the goal model cited. */

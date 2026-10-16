@@ -12,17 +12,32 @@ const table = (backend: string, model: string, timeoutMs?: number) =>
   Object.fromEntries(ROLES.map((r) => [r, { backend, model, ...(timeoutMs ? { timeoutMs } : {}) }])) as any;
 
 describe("gateway retries", () => {
-  it("an unreadable reply is asked again once, and the second call says it is a retry", async () => {
-    const saved = globalThis.fetch, logged: CallRecord[] = [];
+  it("an unreadable reply from a cloud model is asked again once, and the second call says it is a retry", async () => {
+    const saved = { fetch: globalThis.fetch, key: process.env.OPENROUTER_API_KEY }, logged: CallRecord[] = [];
+    process.env.OPENROUTER_API_KEY = "test";
     let n = 0;
     globalThis.fetch = (async () => {
       const content = n++ === 0 ? '{"choice": "a", "reason": "x"' : '{"choice": "a"}';
       return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content } }] }), { status: 200 });
     }) as any;
     try {
-      const rep = await new Gateway(table("local_chat", "local:http://127.0.0.1:1/x"), { log: (r) => logged.push(r) }).ask("choice", "s", "u", choiceAnswer(["a", "b"]));
+      const rep = await new Gateway(table("openrouter", "openai/gpt-6-luna"), { log: (r) => logged.push(r) }).ask("choice", "s", "u", choiceAnswer(["a", "b"]));
       expect(rep.outcome).toBe("answered");
       expect(logged.map((r) => [r.outcome, r.retry_of ?? null])).toEqual([["invalid", null], ["answered", "invalid"]]);
+    } finally {
+      globalThis.fetch = saved.fetch;
+      if (saved.key === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = saved.key;
+    }
+  });
+
+  it("an unreadable reply from the local model is not asked again (temperature 0: the same reply again)", async () => {
+    const saved = globalThis.fetch;
+    let n = 0;
+    globalThis.fetch = (async () => { n++; return new Response(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content: '{"choice": "a"' } }] }), { status: 200 }); }) as any;
+    try {
+      const rep = await new Gateway(table("local_chat", "local:http://127.0.0.1:1/x")).ask("choice", "s", "u", choiceAnswer(["a", "b"]));
+      expect(rep.outcome).toBe("invalid");
+      expect(n).toBe(1);
     } finally { globalThis.fetch = saved; }
   });
 
@@ -58,5 +73,6 @@ describe("goal prompt", () => {
   it("asks the model to check that the named inputs exist before asking about preferences", () => {
     const p = goalPrompt("把 截图.png 识别成文字", [], { entries: [], truncated: false } as any, [], "");
     expect(p).toContain("先核对要求里提到的输入在不在");
+    expect(p).toContain("缺输入不是缺能力");          // missing inputs go into missing, not a capability gap
   });
 });

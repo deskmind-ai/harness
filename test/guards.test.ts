@@ -10,6 +10,7 @@ import { Gateway, type Scripted } from "../src/gateway/index.js";
 import { Orchestrator, type Answer, type User } from "../src/orchestrator/index.js";
 import { Crash } from "../src/registry/capability.js";
 import { fileRegistry } from "../src/registry/fs.js";
+import { EditorSim, guiRegistry } from "../src/gui/sim.js";
 import { Workspace, build } from "../src/registry/workspace.js";
 
 const scriptedTable = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
@@ -407,9 +408,13 @@ describe("execution guards", () => {
 
   it("a free-text answer that picks no reading: no second identical question, no dead end; the leading reading is done and reported with undo", async () => {
     const asked: string[] = [];
+    let judged = "";
     const u: User = { clarify(q) { asked.push(q); return { text: "按我原来说的做。" }; }, authorize: () => true };
-    const g = byRole({ goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, choice: { choice: "r2" }, plan: PLAN, bind: BIND, intent: MATCH });
-    const { o, ws, log } = setup(TODO, Array(8).fill(g), u);
+    const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
+    // the evidence judge: the answer picks none; the ask-first judgement: act (and it is told the user was asked)
+    const g: Scripted = (role, _s, user) => role !== "choice" ? answers[role] ?? { outcome: "error", error: "none" }
+      : user.includes("要不要先打断用户") ? (judged = user, { choice: "act" }) : { choice: "r2" };
+    const { o, ws } = setup(TODO, Array(10).fill(g), u);
     const s = await o.run();
     expect(asked.length).toBe(1);
     expect(s.status).toBe("succeeded");
@@ -417,7 +422,66 @@ describe("execution guards", () => {
     expect(s.result_card).toMatchObject({ kind: "result", blocking: false });
     expect(s.result_card!.text).toContain("问过你，回答里没有选哪一种");
     expect(s.result_card!.options.map((x) => x.kind)).toContain("undo");
-    expect(fs.readFileSync(log, "utf-8")).not.toContain('"kind":"ask.decided"');   // asked once already: not judged again
+    expect(judged).toContain("问过一次，用户的回答没有选哪一种");      // the judgement is still made, with this as material
+  });
+
+  it("an answer that turns the readings down or says not to change anything: nothing is written, no second question", async () => {
+    const asked: string[] = [];
+    let judged = "";
+    const u: User = { clarify(q) { asked.push(q); return { text: "两个都不对，先别改。" }; }, authorize: () => true };
+    const answers: Record<string, unknown> = { goal: { ...GOAL, assumptions: [{ ...AMB, evidence: [] }] }, plan: PLAN, bind: BIND, intent: MATCH };
+    const g: Scripted = (role, _s, user) => role === "choice" ? (judged = user, { choice: "r3" }) : answers[role] ?? { outcome: "error", error: "none" };
+    const { o, ws } = setup(TODO, Array(10).fill(g), u);
+    const s = await o.run();
+    expect(judged).toContain("回答否定了这些理解、不让做");
+    expect(asked.length).toBe(1);
+    expect(s.status).toBe("waiting_user");
+    expect(s.reason).not.toContain("already answered");
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+  });
+
+  describe("through the GUI (its actions cannot be undone)", () => {
+    const GUIGOAL = { requirements: [{ id: "r1", statement: "todo.txt 内容是 买牛奶", check: { kind: "deterministic", name: "text_equals", args: { path: "todo.txt", text: "买牛奶" } }, quotes: ["买牛奶"] }], constraints: [], authorized_rewrites: ["todo.txt"], missing: [], feasible: "yes" };
+    const GUIAMB = { point: "改成", reading: "整个文件只剩 买牛奶", alternatives: ["在末尾加上 买牛奶"] };
+    const pick = (user: string, re: RegExp) => user.split("\n").find((l) => l.startsWith("- ") && re.test(l))!.slice(2).split(": ")[0]!;
+    // the editor: set the text, then save
+    const editor = (judge: string): Scripted => (role, _s, user) => {
+      if (role === "goal") return { ...GUIGOAL, assumptions: [{ ...GUIAMB, evidence: judge === "r0" ? ["交房租"] : [] }] };
+      if (role !== "choice") return { outcome: "error", error: "none" };
+      if (!user.includes("下一步做什么")) return { choice: judge };
+      return { choice: user.includes('"value": "买牛奶"') ? pick(user, /点「保存」/) : pick(user, /「正文」的内容设为「买牛奶」/) };
+    };
+    function gsetup(script: Scripted, u: User) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "harness-gui-"));
+      build(root, { "todo.txt": "交房租" });
+      const gui = new EditorSim(root);
+      gui.openFile("todo.txt");
+      const gw = new Gateway(scriptedTable);
+      gw.script = Array(20).fill(script);
+      const o = new Orchestrator(path.join(fs.mkdtempSync(path.join(os.tmpdir(), "harness-log-")), "log.jsonl"), new Workspace(root), gw, u, guiRegistry(), { gui });
+      o.start("把 todo.txt 改成 买牛奶");
+      return { o, read: () => fs.readFileSync(path.join(root, "todo.txt"), "utf-8") };
+    }
+
+    it("an answer that picks no reading: asked once more in other words, nothing written", async () => {
+      const asked: string[] = [];
+      const { o, read } = gsetup(editor("r2"), { clarify(q) { asked.push(q); return { text: "你看着办吧，按我原来说的。" }; }, authorize: () => true });
+      const s = await o.run();
+      expect(asked.length).toBe(2);
+      expect(asked[1]).not.toBe(asked[0]);
+      expect(s.status).toBe("waiting_user");
+      expect(read()).toBe("交房租");
+    });
+
+    it("the result card offers no undo the run cannot do", async () => {
+      const { o, read } = gsetup(editor("r0"), { clarify: () => null, authorize: () => true });
+      const s = await o.run();
+      expect(s.status).toBe("succeeded");
+      expect(read()).toBe("买牛奶");
+      expect(s.result_card!.text).toContain(GUIAMB.reading);
+      expect(s.result_card!.options.map((x) => x.kind)).not.toContain("undo");
+      expect(s.result_card!.options.map((x) => x.kind)).not.toContain("undo_and_reading");
+    });
   });
 
   it("a free-text answer that picks no reading, with a step that cannot be undone: the plan is shown first, nothing written when declined", async () => {
