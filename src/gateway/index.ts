@@ -388,7 +388,9 @@ export class Gateway {
     const field = Object.entries(sch.properties ?? {}).find(([, v]) => Array.isArray(v.enum));
     if (!field) return { outcome: "error", error: "systemone backend needs a role whose answer is one enum field" };
     const [name, { enum: options }] = field;
-    const body = { state: user, questions: { [name]: { type: "choice", instructions: { goal: system, question: name }, criteria: options!.map((o) => ({ key: o, description: o })) } } };
+    // criteria is a map (Brain ≥ the app's 0.3 build and pi-ai's typesafe-system-one agree; the list form was refused
+    // on 10-18 with "choice criteria must be a map")
+    const body = { state: user, questions: { [name]: { type: "choice", instructions: { goal: system, question: name }, criteria: Object.fromEntries(options!.map((o) => [o, o])) } } };
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (process.env.DESKMIND_BRAIN_TOKEN) headers.Authorization = `Bearer ${process.env.DESKMIND_BRAIN_TOKEN}`;
     const t0 = performance.now();
