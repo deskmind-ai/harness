@@ -22,7 +22,25 @@ import { ROLES, type Role } from "../protocol/roles.js";
  * claude_cli   `claude -p`, local development on synthetic data only
  * scripted     tests
  */
-export type Backend = "openrouter" | "local_chat" | "systemone" | "claude_cli" | "scripted";
+export type Backend = "openrouter" | "openai" | "local_chat" | "systemone" | "claude_cli" | "scripted";
+
+/**
+ * openai: any OpenAI-compatible chat-completions service with a key, named by a provider entry: the model string is
+ * `<provider>|<model>` (e.g. `yy|gpt-6-luna`), the provider's URL and key come from the environment and are never
+ * logged. Adding a service is one line here, not a new backend.
+ */
+export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: string }> = {
+  yy: { urlEnv: "YY_URL", keyEnv: "YY_API_KEY" },
+  openrouter: { urlEnv: "OPENROUTER_URL", keyEnv: "OPENROUTER_API_KEY", url: "https://openrouter.ai/api/v1" },
+};
+export function providerOf(model: string): { url: string; key: string | undefined; model: string; name: string } | { error: string } {
+  const [name, ...rest] = model.split("|");
+  const p = PROVIDERS[name!];
+  if (!p || !rest.length) return { error: `openai backend needs <provider>|<model>; providers: ${Object.keys(PROVIDERS).join(", ")}` };
+  const url = process.env[p.urlEnv] ?? p.url;
+  if (!url) return { error: `${p.urlEnv} not set` };
+  return { url: url.replace(/\/$/, "").replace(/\/v1$/, ""), key: process.env[p.keyEnv], model: rest.join("|"), name: name! };
+}
 /** Per role, beyond backend and model: maxOutputTokens, the most it may write in one answer (sent as max_tokens);
  *  contextTokens, how much it can read; timeoutMs, how long one call may take. Unset, the backend's defaults below. */
 export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutputTokens?: number; contextTokens?: number; timeoutMs?: number }>;
@@ -32,6 +50,7 @@ export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutpu
  *  backend reads a state but writes no text; tests (scripted) are not limited. */
 const BACKEND_DEFAULTS: Record<Backend, { contextTokens: number; timeoutMs: number }> = {
   openrouter: { contextTokens: 128_000, timeoutMs: 120_000 },
+  openai: { contextTokens: 128_000, timeoutMs: 120_000 },
   local_chat: { contextTokens: 32_000, timeoutMs: 300_000 },
   systemone: { contextTokens: 8_000, timeoutMs: 120_000 },
   claude_cli: { contextTokens: 200_000, timeoutMs: 180_000 },
@@ -53,13 +72,17 @@ export const CONFIGS: Record<string, RoleTable> = {
   "B0-luna": all("openrouter", "openai/gpt-6-luna"),
   "B0-mix": { ...all("openrouter", "openai/gpt-6.1-sol"), choice: { backend: "openrouter", model: "openai/gpt-6-luna" } },
   "dev-claude": all("claude_cli", "sonnet"),
+  // YY (an OpenAI-compatible gateway, cheap): the same two models the OpenRouter configs use
+  "yy-luna": all("openai", "yy|gpt-6-luna"),
+  "yy-sol": all("openai", "yy|gpt-6.1-sol"),
+  "yy-mix": { ...all("openai", "yy|gpt-6.1-sol"), choice: { backend: "openai", model: "yy|gpt-6-luna" }, transform: { backend: "openai", model: "yy|gpt-6-luna", timeoutMs: TRANSFORM_TIMEOUT_MS } },
 };
 
 /** `--role goal=openrouter:openai/gpt-6-luna --role choice=systemone:http://127.0.0.1:18852` on top of a config. */
 export function withOverrides(base: RoleTable, overrides: string[]): RoleTable {
   const t: RoleTable = { ...base };
   for (const o of overrides) {
-    const m = /^(\w+)=(\w+):(.+)$/.exec(o);
+    const m = /^(\w+)=(\w+):(.+)$/s.exec(o);
     if (!m) throw new Error(`bad --role ${o}; expected role=backend:model`);
     const [, role, backend, model] = m;
     if (!(role! in t)) throw new Error(`unknown role ${role}`);
@@ -190,7 +213,7 @@ export class Gateway {
     const first = await this.askOnce(role, system, user, schema, runId, null);
     const { backend } = this.table[role];
     const again = (first.outcome === "timeout" && backend === "claude_cli")
-      || (first.outcome === "invalid" && first.error !== TRUNCATED && (backend === "claude_cli" || backend === "openrouter"));
+      || (first.outcome === "invalid" && first.error !== TRUNCATED && (backend === "claude_cli" || backend === "openrouter" || backend === "openai"));
     return again ? this.askOnce(role, system, user, schema, runId, first.outcome) : first;
   }
 
@@ -206,13 +229,14 @@ export class Gateway {
       const t0 = performance.now();
       const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens;
       let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens)
+        : backend === "openai" ? await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens)
         : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? (role === "transform" ? LOCAL_TRANSFORM_MAX_TOKENS : LOCAL_MAX_TOKENS))
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user, timeoutMs)
         : this.scripted(role, sys, user);
-      for (let i = 0; i < 2 && backend === "openrouter" && (partial.outcome === "error" || partial.outcome === "timeout") && !/HTTP 4/.test(partial.error ?? ""); i++) {
+      for (let i = 0; i < 2 && (backend === "openrouter" || backend === "openai") && (partial.outcome === "error" || partial.outcome === "timeout") && !/HTTP 4/.test(partial.error ?? ""); i++) {
         await new Promise((r) => setTimeout(r, 2000));                 // transient network failure: retry, then report
-        partial = await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens);
+        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens);
       }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;
       rep.latencyMs ||= performance.now() - t0;
@@ -225,8 +249,9 @@ export class Gateway {
           rep.data = undefined;
         }
       }
-      if (!rep.costUsd && PRICES[model]) {
-        const [pi, po] = PRICES[model]!;
+      const priced = PRICES[model] ?? PRICES["openai/" + model.split("|").pop()!];
+      if (!rep.costUsd && priced) {
+        const [pi, po] = priced;
         rep.costUsd = rep.tokensIn * pi + rep.tokensOut * po;
       }
     }
@@ -296,14 +321,41 @@ export class Gateway {
   }
 
   /** An OpenAI-compatible local server (mlx_lm.server): same shape as OpenRouter, no key, no cost. */
-  private async localChat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens: number): Promise<Partial<Reply>> {
-    const body = { model: localModelName(model), temperature: 0, max_tokens: maxTokens,
+  private localChat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens: number): Promise<Partial<Reply>> {
+    return this.chatCompletions(localUrl(model), undefined, localModelName(model), system, user, jsonSchema, timeoutMs, maxTokens);
+  }
+
+  /** A keyed OpenAI-compatible service (PROVIDERS): the model string names the provider. */
+  private openaiCompat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
+    const p = providerOf(model);
+    if ("error" in p) return Promise.resolve({ outcome: "error", error: p.error });
+    if (!p.key) return Promise.resolve({ outcome: "error", error: `${PROVIDERS[p.name]!.keyEnv} not set` });
+    return this.chatCompletions(p.url, p.key, p.model, system, user, jsonSchema, timeoutMs, maxTokens);
+  }
+
+  /** Models whose service rejects our (non-strict) JSON Schema: asked for a JSON object instead, the schema stays in
+   *  the system prompt and zod still validates the answer (gpt-6.1-sol behind a Responses-API proxy insists on
+   *  strict schemas with every property required, which our optional fields and records are not). */
+  private readonly jsonObjectOnly = new Set<string>();
+
+  private async chatCompletions(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
+    const k = `${url}|${model}`;
+    const r = await this.chatCompletionsOnce(url, key, model, system, user, this.jsonObjectOnly.has(k) ? null : jsonSchema, timeoutMs, maxTokens);
+    if (r.outcome === "error" && /Invalid schema/i.test(r.error ?? "") && !this.jsonObjectOnly.has(k)) {
+      this.jsonObjectOnly.add(k);
+      return this.chatCompletionsOnce(url, key, model, system, user, null, timeoutMs, maxTokens);
+    }
+    return r;
+  }
+
+  private async chatCompletionsOnce(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown | null, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
+    const body = { model, temperature: 0, ...(maxTokens ? { max_tokens: maxTokens } : {}),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
-      response_format: { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } };
+      response_format: jsonSchema ? { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } : { type: "json_object" } };
     const t0 = performance.now();
     let res: Response;
     try {
-      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+      res = await fetch(url.replace(/\/$/, "") + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       return { outcome: msg.includes("Timeout") ? "timeout" : "error", error: msg.slice(0, 300) };
@@ -313,9 +365,11 @@ export class Gateway {
     try {
       const out = JSON.parse(raw);
       const usage = out.usage ?? {};
-      const counts = { tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, latencyMs };
-      if (out.choices[0].finish_reason === "length") return { outcome: "invalid", error: TRUNCATED, ...counts };
-      return { outcome: "answered", data: extractJson(out.choices[0].message.content ?? ""), ...counts };
+      const counts = { tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, costUsd: Number(usage.cost ?? 0), latencyMs };
+      const ch = out.choices[0];
+      if (ch.message?.refusal || ch.finish_reason === "content_filter") return { ...counts, outcome: "refusal", error: String(ch.message?.refusal ?? "content_filter").slice(0, 300) };
+      if (ch.finish_reason === "length") return { outcome: "invalid", error: TRUNCATED, ...counts };
+      return { outcome: "answered", data: extractJson(ch.message.content ?? ""), ...counts };
     } catch (e) {
       return { outcome: "invalid", error: `bad reply: ${e instanceof Error ? e.message : e}: ${raw.slice(0, 300)}`, latencyMs };
     }
