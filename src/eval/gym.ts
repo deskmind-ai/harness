@@ -29,7 +29,7 @@ const ZH_REPLIES = ["收到，谢谢", "好的，我明天回复你", "没问题
 const EN_REPLIES = ["Got it, thanks", "Sounds good to me", "I will check and get back to you", "Confirmed", "Works for me"];
 const TIMES = ["09:30", "10:00", "14:00", "15:30", "16:45", "11:15"];
 const APPS = ["Mailora", "Mailwise", "Inkwell", "信鸽", "邮筒"];
-const EN_TEXTS: Record<string, string> = { inbox: "Inbox", reply: "Reply", delete: "Delete", flag: "Flag", unflag: "Unflag", send: "Send", cancel: "Cancel", confirm: "Delete message", confirmText: "Delete this message?", body: "Reply text", draft: " (draft)", meeting: "Meeting time: %s", empty: "Select a message" };
+const EN_TEXTS: Record<string, string> = { replied: "Replied", inbox: "Inbox", reply: "Reply", delete: "Delete", flag: "Flag", unflag: "Unflag", send: "Send", cancel: "Cancel", confirm: "Delete message", confirmText: "Delete this message?", body: "Reply text", draft: " (draft)", meeting: "Meeting time: %s", empty: "Select a message" };
 const GOALS: Record<string, Record<string, string[]>> = {
   reply: { zh: ["在{app}里回复{sender}关于“{subject}”的邮件：“{body}”", "用{app}给{sender}的“{subject}”那封邮件回复“{body}”"], en: ["In {app}, reply to {sender}'s email about \"{subject}\" with \"{body}\"", "Reply \"{body}\" to the \"{subject}\" email from {sender} in {app}"] },
   delete: { zh: ["在{app}里删除{sender}发来的“{subject}”邮件", "把{app}里{sender}那封“{subject}”删掉"], en: ["Delete the \"{subject}\" email from {sender} in {app}", "In {app}, delete {sender}'s message about \"{subject}\""] },

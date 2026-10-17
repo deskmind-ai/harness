@@ -18,7 +18,7 @@ import type { Action, Driver, Element, Observation, Snapshot, WindowInfo } from 
 
 export interface MailMessage { id: string; from: string; subject: string; body: string[]; time: string; date?: string }
 export interface MailState { app: string; inbox: MailMessage[]; flagged: string[]; deleted: string[]; replies: { to: string; body: string }[]; selected: string | null; composing: { to: string; body: string } | null; dialog: { kind: "delete"; id: string } | null; texts: Record<string, string> }
-export const ZH_MAIL_TEXTS: Record<string, string> = { inbox: "收件箱", reply: "回复", delete: "删除", flag: "加旗标", unflag: "取消旗标", send: "发送", cancel: "取消", confirm: "确认删除", confirmText: "确定删除这封邮件吗？", body: "回复内容", meeting: "会议时间：%s", empty: "选择一封邮件" };
+export const ZH_MAIL_TEXTS: Record<string, string> = { replied: "已回复", inbox: "收件箱", reply: "回复", delete: "删除", flag: "加旗标", unflag: "取消旗标", send: "发送", cancel: "取消", confirm: "确认删除", confirmText: "确定删除这封邮件吗？", body: "回复内容", meeting: "会议时间：%s", empty: "选择一封邮件" };
 
 interface Win { id: string; app: string; kind: "mail" | "editor" | "browser" | "settings"; title: string; focused: boolean; minimized: boolean; modal: { title: string; buttons: string[] } | null; state: any; gen: number }
 
@@ -79,10 +79,12 @@ export class SimComputer implements Driver {
     if (w.kind === "mail") {
       const s = w.state as MailState, T = s.texts;
       const rows = s.inbox.filter((m) => !s.deleted.includes(m.id));
-      for (const m of rows) el(`row:${m.id}`, "row", `${m.from} · ${m.subject}${s.flagged.includes(m.id) ? " · ⚑" : ""}`, { actions: ["click"], focused: s.selected === m.id });
+      // a replied-to message carries the reply arrow every mail app shows: what a verdict can see after Send
+      for (const m of rows) el(`row:${m.id}`, "row", `${m.from} · ${m.subject}${s.flagged.includes(m.id) ? " · ⚑" : ""}${s.replies.some((r) => r.to === m.id) ? " · ↩" : ""}`, { actions: ["click"], focused: s.selected === m.id });
       if (s.selected && !s.deleted.includes(s.selected)) {
         const m = s.inbox.find((x) => x.id === s.selected)!;
-        text = [`${m.from} — ${m.subject}`, ...m.body].join("\n");
+        const sent = s.replies.filter((r) => r.to === m.id);
+        text = [`${m.from} — ${m.subject}`, ...m.body, ...sent.map((r) => `↩ ${T.replied ?? "已回复"}：${r.body}`)].join("\n");
         el("body", "staticText", text, { actions: [] });
         el("reply", "button", T.reply!, { actions: ["click"] });
         el("delete", "button", T.delete!, { actions: ["click"] });
