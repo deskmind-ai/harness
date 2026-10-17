@@ -310,7 +310,15 @@ export class FrontierRuntime {
       模型自称: summary,
     };
     const req = { statement: "用户的要求已经做到，最终状态和要求一致；用户问的是问题则答案有依据", check: { kind: "semantic" } };
-    const rep = await this.o.gateway.ask("verify", P.SYSTEM, P.verifyPrompt(req, this.o.raw, evidence) + "\n只看证据：模型自称做完了不算证据；证据不足就 unknown。", VerifyAnswer, this.o.task);
+    // the audit's wording follows Codex's completion audit (ext/goal/templates/goals/continuation.md): completion is
+    // unproven until the current state proves every requirement; weak or indirect evidence is not achieved
+    const audit = [
+      "核对的做法：先从用户的要求里列出每一条具体要求（每个文件、每句话、每个动作、每个问题的答案），再逐条在证据里找能证明它的东西。",
+      "证据只认现在的状态（窗口的元素和文字、文件内容、执行回执）；模型自称做完了、动作「发出去了」但没读回结果、只和要求「相符」但证明不了，都不算。",
+      "一条要求的证据范围要和它一样宽：用一个窄的检查不能支持一个宽的结论。",
+      "每条都被证明才 pass；有一条证据矛盾就 fail；有一条证据不够、没有或间接，就 unknown。reason 里写明哪一条、缺什么。",
+    ].join("\n");
+    const rep = await this.o.gateway.ask("verify", P.SYSTEM, P.verifyPrompt(req, this.o.raw, evidence) + "\n" + audit, VerifyAnswer, this.o.task);
     this.count("model_calls");
     if (rep.outcome !== "answered") return { verdict: "unknown", reason: `verify ${rep.outcome}: ${rep.error}` };
     return { verdict: rep.data!.verdict, reason: rep.data!.reason };
