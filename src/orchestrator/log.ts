@@ -134,8 +134,8 @@ export class State {
         this.count("replans", e.replan ?? 0);
         break;
       case "node.bound": {
-        const nd = this.nodes.get(e.node_id)!;
-        nd.bindings = e.bindings; nd.args = e.args; nd.status = "ready"; nd.attempts += 1;
+        const nd = this.nodes.get(e.node_id);                 // a node of a plan since replaced: nothing to bind
+        if (nd) { nd.bindings = e.bindings; nd.args = e.args; nd.status = "ready"; nd.attempts += 1; }
         break;
       }
       case "node.unbound": {

@@ -238,9 +238,12 @@ export class Orchestrator {
       }
       if (ready.length) {
         const boundNow: NodeState[] = [];
+        const planRev = st.revs.plan_rev;
         for (const n of ready) {
           if (await this.doBind(n, "", true)) boundNow.push(n);
-          if ((st.status !== "running" && st.status !== "received") || st.nodes.size === 0) break;
+          // a bind can replace the plan (missing observation → read-only steps first): the rest of this batch belongs
+          // to the old plan and is not bound (10-18: a stale node's node.bound crashed State.apply)
+          if ((st.status !== "running" && st.status !== "received") || st.nodes.size === 0 || st.revs.plan_rev !== planRev) break;
         }
         if (boundNow.length && boundNow.every((n) => st.nodes.has(n.node.id))) await this.intentCheck(boundNow);
         continue;
