@@ -97,11 +97,14 @@ export interface ActResult {
   after?: Observation;               // the window after the action (re-observed)
 }
 
-/** The raw driver: sees and moves, decides nothing. */
+export interface PerformResult { status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo }
+type Maybe<T> = T | Promise<T>;
+/** The raw driver: sees and moves, decides nothing. The simulated one answers at once; a real one talks to a process. */
 export interface Driver {
-  snapshot(): Snapshot;
-  observe(windowId: string, opts?: { screenshot?: boolean }): Observation;
-  perform(action: Action): { status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo };
+  snapshot(): Maybe<Snapshot>;
+  observe(windowId: string, opts?: { screenshot?: boolean }): Maybe<Observation>;
+  perform(action: Action): Maybe<PerformResult>;
+  end?(): Maybe<void>;
 }
 
 /** What a run's receipts and verification can read back: the executor's own log of what it did. */

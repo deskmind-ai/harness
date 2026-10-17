@@ -142,12 +142,12 @@ export class FrontierRuntime {
     const tools: AgentTool<any>[] = [];
     tools.push(tool({
       name: "computer_snapshot", label: "看整台电脑", description: "整台电脑的状态：锁屏没有、最前面的应用、所有窗口（id、应用、标题、归谁 owner、浏览器标签页）。只读。",
-      parameters: Type.Object({}), execute: async () => text(J(ex.snapshot())),
+      parameters: Type.Object({}), execute: async () => text(J(await ex.snapshot())),
     }));
     tools.push(tool({
       name: "computer_observe", label: "看一个窗口", description: "一个窗口的元素（id、角色、标签、值、能做的动作）、弹窗、文字。只读。动作要用这里的元素 id 和 epoch。",
       parameters: Type.Object({ window: Type.String() }),
-      execute: async (_id, p: { window: string }) => { try { return text(J(ex.observe(p.window))); } catch (e) { return err(String(e instanceof Error ? e.message : e)); } },
+      execute: async (_id, p: { window: string }) => { try { return text(J(await ex.observe(p.window))); } catch (e) { return err(String(e instanceof Error ? e.message : e)); } },
     }));
     tools.push(tool({
       name: "computer_act", label: "动手", description: "在界面上做一个动作。带上观察时的 epoch 和你判断的后果类别 consequence（read / create / modify_user / external；执行层只会往上调）。改用户的东西、往外发会先征得用户同意。",
@@ -207,13 +207,13 @@ export class FrontierRuntime {
     const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
     let consent = this.tokens.get(pre.object);
     if (consent && rank(consent.consequence) < rank(pre.consequence)) consent = undefined;
-    let r = this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent });
+    let r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent });
     if (r.status === "needs_consent" && r.challenge) {
       const t = await this.consentFor(r.challenge);
       if (t === null) return this.end("failed", "no answer from the user");
       if (t === "cancel") return this.end("cancelled", "the user stopped the task");
       if (t === "declined") return err(`用户不同意这一步：${r.challenge.text}。换一种不需要它的做法，或者 finish 说明。`);
-      r = this.o.executor.act({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t });
+      r = await this.o.executor.act({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t });
     }
     this.count("actions"); this.count(`actions:${r.status}`);
     if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(`${p.purpose}：${describeAction(a, r.after, r.consequence)}`);
@@ -299,7 +299,7 @@ export class FrontierRuntime {
 
   /** The independent verdict: the computer and files after, every window the task touched, what it did, its claim. */
   private async verify(summary: string): Promise<{ verdict: string; reason: string }> {
-    const ev = this.o.executor.verify();
+    const ev = await this.o.executor.verify();
     const evidence: Record<string, unknown> = {
       任务结束时整台电脑: ev.snapshot,
       任务碰过的窗口现在的样子: ev.windows.map((o) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) })),
@@ -327,7 +327,7 @@ export class FrontierRuntime {
 
   async run(): Promise<RuntimeResult> {
     const ex = this.o.executor;
-    const snap = ex.begin(this.o.workspace ? Object.keys(this.o.workspace.entries()) : []);
+    const snap = await ex.begin(this.o.workspace ? Object.keys(this.o.workspace.entries()) : []);
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; return this.result(); }
     const context: AgentContext = {
@@ -340,6 +340,7 @@ export class FrontierRuntime {
     let turns = 0, calls = 0, nudge = false;
     const config: AgentLoopConfig = {
       model: this.o.model.model, apiKey: this.o.model.apiKey, convertToLlm: (m) => m as never, toolExecution: "sequential",
+      maxRetries: 4, maxRetryDelayMs: 60_000,            // 429s when several runs share a key: pi-ai backs off
       beforeToolCall: async ({ toolCall }) => {
         if (this.status) return { block: true, reason: `已经结束：${this.status}`, terminate: true };
         calls += 1; this.count("tool_calls");
@@ -370,7 +371,7 @@ export class FrontierRuntime {
       if (!this.status) { this.status = "failed"; this.reason = `loop error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200); }
     }
     if (!this.status) { this.status = "failed"; this.reason = "the model stopped without finishing"; }
-    ex.end();
+    await ex.end();
     return this.result();
   }
 

@@ -19,158 +19,143 @@ function mailSim() {
   return { sim, w };
 }
 
-function setup() {
-  const app = ConsentSigner.fresh();
+function setup(now?: () => number) {
+  const app = ConsentSigner.fresh(now);
   const { sim, w } = mailSim();
   const events: string[] = [];
-  const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, onEvent: (k) => events.push(k) });
+  const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, now, onEvent: (k) => events.push(k) });
   return { app, sim, w, ex, events };
 }
 
-const find = (ex: Executor, win: string, label: string) => { const o = ex.observe(win); const e = o.elements.find((x) => x.label.includes(label))!; return { o, e }; };
+const find = async (ex: Executor, win: string, label: string) => { const o = await ex.observe(win); const e = o.elements.find((x) => x.label.includes(label))!; return { o, e }; };
+const click = async (ex: Executor, win: string, label: string, extra: Record<string, unknown> = {}) => { const { o, e } = await find(ex, win, label); return ex.act({ action: { kind: "click", window: win, target: e.id }, epoch: o.epoch, ...extra }); };
 
 describe("executor: ownership and the consequence floor", () => {
-  it("windows on screen at begin are the user's; a window the task opens is the task's", () => {
+  it("windows on screen at begin are the user's; a window the task opens is the task's", async () => {
     const { ex, w } = setup();
-    const s = ex.begin();
+    const s = await ex.begin();
     expect(s.windows.find((x) => x.id === w.id)?.owner).toBe("user");
-    const r = ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: s.epoch });
+    const r = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: s.epoch });
     expect(r.status).toBe("ok");
     expect(r.consequence).toBe("create");
-    const s2 = ex.snapshot();
+    const s2 = await ex.snapshot();
     const mine = s2.windows.find((x) => x.app === "编辑器")!;
     expect(mine.owner).toBe("task");
     // acting in the task's own window is "create"; in the user's it is at least "modify_user"
-    const { o, e } = find(ex, mine.id, "新建文档");
+    const { o, e } = await find(ex, mine.id, "新建文档");
     expect(ex.preview({ action: { kind: "click", window: mine.id, target: e.id }, epoch: o.epoch })).toMatchObject({ consequence: "create", needs_consent: false });
-    const { o: o2, e: e2 } = find(ex, w.id, "林晓 · Q3 预算");
+    const { o: o2, e: e2 } = await find(ex, w.id, "林晓 · Q3 预算");
     expect(ex.preview({ action: { kind: "click", window: w.id, target: e2.id }, epoch: o2.epoch })).toMatchObject({ consequence: "modify_user", needs_consent: true });
   });
 
-  it("a model may raise the class, never lower it", () => {
+  it("a model may raise the class, never lower it", async () => {
     const { ex, w } = setup();
-    ex.begin();
-    const { o, e } = find(ex, w.id, "林晓 · Q3 预算");
+    await ex.begin();
+    const { o, e } = await find(ex, w.id, "林晓 · Q3 预算");
     expect(ex.preview({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch, consequence: "read" }).consequence).toBe("modify_user");
     expect(ex.preview({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch, consequence: "external" }).consequence).toBe("external");
   });
 
-  it("an element marked as sending floors at external, even in the task's own window", () => {
+  it("an element marked as sending floors at external, even in the task's own window", async () => {
     const { ex, sim, app } = setup();
-    const s = ex.begin();
-    // the task opens its own mail window (the sim lets a test add one after begin)
+    await ex.begin();
+    // the task's own mail window (the sim lets a test add one after begin)
     const mine = sim.addMail({ app: "信鸽", texts: ZH_MAIL_TEXTS, flagged: [], inbox: [{ id: "a1", from: "顾青", subject: "合同", body: ["x"], time: "10:00" }] });
     ex.ledger.created(`window:${mine.id}`);
-    expect(ex.snapshot().windows.find((x) => x.id === mine.id)?.owner).toBe("task");
-    void s;
-    let { o, e } = find(ex, mine.id, "顾青 · 合同");
-    expect(ex.act({ action: { kind: "click", window: mine.id, target: e.id }, epoch: o.epoch }).status).toBe("ok");
-    ({ o, e } = find(ex, mine.id, "回复"));
-    expect(ex.act({ action: { kind: "click", window: mine.id, target: e.id }, epoch: o.epoch }).status).toBe("ok");
-    ({ o, e } = find(ex, mine.id, "回复内容"));
-    expect(ex.act({ action: { kind: "set_value", window: mine.id, target: e.id, value: "收到" }, epoch: o.epoch }).status).toBe("ok");
-    ({ o, e } = find(ex, mine.id, "发送"));
-    const send: Action = { kind: "click", window: mine.id, target: e.id };
-    const r = ex.act({ action: send, epoch: o.epoch });
+    expect((await ex.snapshot()).windows.find((x) => x.id === mine.id)?.owner).toBe("task");
+    expect((await click(ex, mine.id, "顾青 · 合同")).status).toBe("ok");
+    expect((await click(ex, mine.id, "回复")).status).toBe("ok");
+    const { o, e } = await find(ex, mine.id, "回复内容");
+    expect((await ex.act({ action: { kind: "set_value", window: mine.id, target: e.id, value: "收到" }, epoch: o.epoch })).status).toBe("ok");
+    const { o: o2, e: e2 } = await find(ex, mine.id, "发送");
+    const send: Action = { kind: "click", window: mine.id, target: e2.id };
+    const r = await ex.act({ action: send, epoch: o2.epoch });
     expect(r.status).toBe("needs_consent");
     expect(r.consequence).toBe("external");
     expect(r.challenge?.text).toContain("发送");
     expect(sim.mailState(mine.id).replies).toEqual([]);
     // the app signs the challenge; the same action with the token goes through; the token is spent
     const token = app.forAction(r.challenge!);
-    const ok = ex.act({ action: send, epoch: r.epoch, consent: token });
+    const ok = await ex.act({ action: send, epoch: r.epoch, consent: token });
     expect(ok.status).toBe("ok");
     expect(sim.mailState(mine.id).replies).toEqual([{ to: "a1", body: "收到" }]);
-    const again = ex.act({ action: send, epoch: ok.epoch, consent: token });
+    const again = await ex.act({ action: send, epoch: ok.epoch, consent: token });
     expect(again.status).not.toBe("ok");
   });
 });
 
 describe("executor: consent tokens", () => {
-  it("a token for another action, a forged one, an expired one and a lower class are refused", () => {
-    const { ex, w, sim } = setup();
+  it("a token for another action, a forged one, an expired one and a lower class are refused", async () => {
     let now = 1_000_000;
-    const app = ConsentSigner.fresh(() => now);
-    const ex2 = new Executor(sim, { task: "t1", publicKey: app.publicKey, now: () => now });
-    ex2.begin();
-    const { o, e } = find(ex2, w.id, "林晓 · Q3 预算");
-    const click: Action = { kind: "click", window: w.id, target: e.id };
-    const r = ex2.act({ action: click, epoch: o.epoch });
+    const { ex, w, app, sim } = setup(() => now);
+    await ex.begin();
+    const { o, e } = await find(ex, w.id, "林晓 · Q3 预算");
+    const click1: Action = { kind: "click", window: w.id, target: e.id };
+    const r = await ex.act({ action: click1, epoch: o.epoch });
     expect(r.status).toBe("needs_consent");
     const other = app.forAction({ ...r.challenge!, digest: digestOf({ kind: "close_window", window: w.id }, `window:${w.id}`, "modify_user") });
-    expect(ex2.act({ action: click, epoch: r.epoch, consent: other }).why).toContain("another action");
+    expect((await ex.act({ action: click1, epoch: r.epoch, consent: other })).why).toContain("another action");
     const forged = { ...app.forAction(r.challenge!), sig: Buffer.from("nope").toString("base64") };
-    expect(ex2.act({ action: click, epoch: r.epoch, consent: forged }).why).toContain("signature");
+    expect((await ex.act({ action: click1, epoch: r.epoch, consent: forged })).why).toContain("signature");
     const stranger = ConsentSigner.fresh().forAction(r.challenge!);
-    expect(ex2.act({ action: click, epoch: r.epoch, consent: stranger }).why).toContain("signature");
+    expect((await ex.act({ action: click1, epoch: r.epoch, consent: stranger })).why).toContain("signature");
     const expired = app.forAction(r.challenge!, 10);
     now += 11;
-    expect(ex2.act({ action: click, epoch: r.epoch, consent: expired }).why).toContain("expired");
+    expect((await ex.act({ action: click1, epoch: r.epoch, consent: expired })).why).toContain("expired");
     const low = app.forObject(`window:${w.id}`, "create", "t1");
-    expect(ex2.act({ action: click, epoch: r.epoch, consent: low }).why).toContain("covers create");
+    expect((await ex.act({ action: click1, epoch: r.epoch, consent: low })).why).toContain("covers create");
     expect(sim.mailState(w.id).selected).toBeNull();
-    void ex;
   });
 
-  it("an object-scoped token covers every action on that object in this task, not in another", () => {
+  it("an object-scoped token covers every action on that object in this task, not in another", async () => {
     const { ex, w, app, sim } = setup();
-    ex.begin();
+    await ex.begin();
     const token = app.forObject(`window:${w.id}`, "modify_user", "t1");
-    let { o, e } = find(ex, w.id, "林晓 · Q3 预算");
-    expect(ex.act({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch, consent: token }).status).toBe("ok");
-    ({ o, e } = find(ex, w.id, "加旗标"));
-    expect(ex.act({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch, consent: token }).status).toBe("ok");
+    expect((await click(ex, w.id, "林晓 · Q3 预算", { consent: token })).status).toBe("ok");
+    expect((await click(ex, w.id, "加旗标", { consent: token })).status).toBe("ok");
     expect(sim.mailState(w.id).flagged).toContain("m1");
     // sending is external: the object token (modify_user) does not reach it
-    ({ o, e } = find(ex, w.id, "回复"));
-    expect(ex.act({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch, consent: token }).status).toBe("ok");
-    ({ o, e } = find(ex, w.id, "发送"));
-    expect(ex.act({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch, consent: token }).status).toBe("needs_consent");
+    expect((await click(ex, w.id, "回复", { consent: token })).status).toBe("ok");
+    expect((await click(ex, w.id, "发送", { consent: token })).status).toBe("needs_consent");
     const otherTask = new Executor(sim, { task: "t2", publicKey: app.publicKey });
-    otherTask.begin();
-    ({ o, e } = find(otherTask, w.id, "取消"));
-    expect(otherTask.act({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch, consent: token }).why).toContain("another task");
+    await otherTask.begin();
+    expect((await click(otherTask, w.id, "取消", { consent: token })).why).toContain("another task");
   });
 
-  it("a rule token is kept and covers later actions matching its pattern", () => {
+  it("a rule token is kept and covers later actions matching its pattern", async () => {
     const { ex, w, app, sim } = setup();
-    ex.begin();
+    await ex.begin();
     const rule = app.forRule("关我的邮件窗口不用问", `window:${w.id}`, "modify_user");
-    expect(ex.act({ action: { kind: "close_window", window: w.id }, epoch: ex.snapshot().epoch, consent: rule }).status).toBe("ok");
+    expect((await ex.act({ action: { kind: "close_window", window: w.id }, epoch: (await ex.snapshot()).epoch, consent: rule })).status).toBe("ok");
     expect(sim.wins.length).toBe(0);
   });
 });
 
 describe("executor: stop, lock, stale", () => {
-  it("after stop every action is refused; a locked screen is an environment stop; a stale epoch is refused", () => {
+  it("after stop every action is refused; a locked screen is an environment stop; a stale epoch is refused", async () => {
     const { ex, w, sim } = setup();
-    const s = ex.begin();
-    const { o, e } = find(ex, w.id, "取消旗标");
-    void e;
+    const s = await ex.begin();
+    const { o } = await find(ex, w.id, "取消旗标");
     sim.lock();
-    const locked = ex.act({ action: { kind: "wait", ms: 1 }, epoch: o.epoch });
-    expect(locked.status).toBe("environment");
+    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: o.epoch })).status).toBe("environment");
     sim.lock(false);
-    const stale = ex.act({ action: { kind: "wait", ms: 1 }, epoch: s.epoch });
-    expect(stale.status).toBe("stale");
-    const fresh = ex.snapshot();
-    expect(ex.act({ action: { kind: "wait", ms: 1 }, epoch: fresh.epoch }).status).toBe("ok");
+    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: s.epoch })).status).toBe("stale");
+    const fresh = await ex.snapshot();
+    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: fresh.epoch })).status).toBe("ok");
     ex.stop();
-    expect(ex.act({ action: { kind: "wait", ms: 1 }, epoch: ex.snapshot().epoch }).status).toBe("stopped");
+    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: (await ex.snapshot()).epoch })).status).toBe("stopped");
     expect(ex.receipts.map((r) => r.result.status)).toEqual(["environment", "stale", "ok", "stopped"]);
   });
 
-  it("verify hands back the windows the task touched, observed again", () => {
-    const { ex, app, sim } = setup();
-    const s = ex.begin();
-    const r = ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: s.epoch });
+  it("verify hands back the windows the task touched, observed again", async () => {
+    const { ex } = setup();
+    const s = await ex.begin();
+    const r = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: s.epoch });
     const mine = r.after!.window.id;
-    const { o, e } = find(ex, mine, "新建文档");
-    expect(ex.act({ action: { kind: "click", window: mine, target: e.id }, epoch: o.epoch }).status).toBe("ok");
-    const v = ex.verify();
+    expect((await click(ex, mine, "新建文档")).status).toBe("ok");
+    const v = await ex.verify();
     expect(v.windows.map((x) => x.window.id)).toEqual([mine]);
     expect(v.windows[0]!.elements.some((x) => x.label === "正文")).toBe(true);
     expect(v.receipts.length).toBe(2);
-    void app; void sim;
   });
 });

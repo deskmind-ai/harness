@@ -15,10 +15,12 @@
     "eval": "tsx src/eval/run.ts",
     "schemas": "tsx src/protocol/export.ts",
     "gym": "tsx src/eval/gym.ts",
-    "app": "tsx src/cli/app.ts"
+    "app": "tsx src/cli/app.ts",
+    "bundle": "node scripts/bundle.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "0.28.2",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"

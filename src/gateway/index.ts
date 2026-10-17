@@ -234,8 +234,11 @@ export class Gateway {
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user, timeoutMs)
         : this.scripted(role, sys, user);
-      for (let i = 0; i < 2 && (backend === "openrouter" || backend === "openai") && (partial.outcome === "error" || partial.outcome === "timeout") && !/HTTP 4/.test(partial.error ?? ""); i++) {
-        await new Promise((r) => setTimeout(r, 2000));                 // transient network failure: retry, then report
+      // a transient failure (network, a 5xx, or a 429 rate limit when several runs share one key) is asked again
+      // with a growing pause; any other 4xx is final
+      const transient = (p: Partial<Reply>) => (p.outcome === "error" || p.outcome === "timeout") && (!/HTTP 4/.test(p.error ?? "") || /HTTP 429/.test(p.error ?? ""));
+      for (let i = 0; i < 4 && (backend === "openrouter" || backend === "openai") && transient(partial); i++) {
+        await new Promise((r) => setTimeout(r, /HTTP 429/.test(partial.error ?? "") ? 5000 * (i + 1) * (i + 1) : 2000));
         partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens);
       }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;

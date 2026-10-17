@@ -26,3 +26,16 @@ OPENROUTER_API_KEY=... pnpm eval -- --tasks <tasks.json> --config B0-luna --spli
 ```
 
 与 Python 版的对应关系：同一份任务与金标准、同一条评分规则；六组题都能跑。差异只在实现语言，数字按组可比。
+
+## 给 app 用的入口和打包（0.5）
+
+`src/cli/app.ts` 是 DeskMind Hands.app 启动的子进程：事件先写进运行记录（`runs/app/<run_id>/events.jsonl`，带 `seq`，先落盘再发），再以每行一个 JSON 写到 stdout；卡片的回答从 stdin 读回来（`{"ask_id": …, "option": n}` 或 `{"ask_id": …, "text": "…"}`）。事件协议在 `src/protocol/events.ts`（start / preparing / plan / step / ask / waiting / resumed / consent / refused / answer_given / task_done），app 不认识的种类直接忽略。
+
+```bash
+echo '{"raw":"开一个编辑器窗口，新建文档，写上「你好」","config":"yy-luna"}' | pnpm app app-run     # 事件流在 stdout
+pnpm app --selftest                                   # 不用模型：执行层 + 一轮脚本化的运行时，输出 {"ok":true,…}
+pnpm bundle && node dist/harness.mjs --selftest       # esbuild 打成单文件（约 1.6 MB），基础教程在打包时嵌入
+DESKMIND_MACTOOLS=/path/to/mactools                   # app 带预编译的 Swift 小工具时指过去，不再在用户机器上现编
+```
+
+Node 固定 `>=22.19`（pi 的要求），本机用 `.node-version` 里的 24。

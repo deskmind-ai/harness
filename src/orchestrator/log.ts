@@ -71,6 +71,8 @@ export class State {
   externalChanges: string[] = [];       // paths another program changed while we were running (facts, not our effects)
   n: Record<string, number> = {};
   skillUsed: string | null = null;
+  /** The skill chosen for this request (skill.chosen): undefined until asked, null when none applies. */
+  skillChosen: string | null | undefined = undefined;
   skillNotice: string | null = null;              // what the used skill's last revision changed (plan.accepted)
   planConfirmed = false;                         // the user approved the current plan (plan.confirmed)
   /** Answers to "which reading?" questions: the readings offered and what the user picked (option index into
@@ -183,6 +185,9 @@ export class State {
         break;
       case "plan.confirmed":
         this.planConfirmed = true;
+        break;
+      case "skill.chosen":                       // once per run, before the goal; null when none applies
+        this.skillChosen = e.skill ?? null;
         break;
       case "env.changed":
         this.revs.evidence_epoch += 1;

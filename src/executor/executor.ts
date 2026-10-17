@@ -11,7 +11,7 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
-import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, Observation, Receipt, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, Observation, PerformResult, Receipt, Snapshot, WindowInfo } from "./types.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
 import { Ledger } from "./ledger.js";
@@ -43,8 +43,8 @@ export class Executor {
 
   private emit(kind: string, body: Record<string, unknown> = {}) { this.opts.onEvent?.(kind, body); }
 
-  begin(paths: string[] = []): Snapshot {
-    const raw = this.driver.snapshot();
+  async begin(paths: string[] = []): Promise<Snapshot> {
+    const raw = await this.driver.snapshot();
     this.ledger.begin(raw, paths);
     this.epoch = raw.epoch;
     this.last = this.ledger.stamp(raw);
@@ -52,15 +52,15 @@ export class Executor {
     return this.last;
   }
 
-  snapshot(): Snapshot {
-    const s = this.ledger.stamp(this.driver.snapshot());
+  async snapshot(): Promise<Snapshot> {
+    const s = this.ledger.stamp(await this.driver.snapshot());
     this.epoch = s.epoch;
     this.last = s;
     return s;
   }
 
-  observe(windowId: string, opts?: { screenshot?: boolean }): Observation {
-    const o = this.driver.observe(windowId, opts);
+  async observe(windowId: string, opts?: { screenshot?: boolean }): Promise<Observation> {
+    const o = await this.driver.observe(windowId, opts);
     const stamped: Observation = { ...o, window: { ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) } };
     this.epoch = o.epoch;
     this.lastObs.set(windowId, stamped);
@@ -95,7 +95,7 @@ export class Executor {
     return { consequence, object: f.object, needs_consent: needs, floor_why: f.why };
   }
 
-  act(req: ActRequest): ActResult {
+  async act(req: ActRequest): Promise<ActResult> {
     const f = this.floor(req.action);
     const consequence = higher(f.consequence, req.consequence ?? "read");
     const base = { consequence, object: f.object };
@@ -106,7 +106,7 @@ export class Executor {
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
-    const now = this.driver.snapshot();
+    const now = await this.driver.snapshot();
     if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
     if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
@@ -120,33 +120,44 @@ export class Executor {
       }
     }
     const before = "window" in req.action ? this.lastObs.get(req.action.window) ?? null : null;
-    const r = this.driver.perform(req.action);
+    // a real driver can fail on either side of the action: that is a result the model reads, never an exception
+    let r: PerformResult;
+    try { r = await this.driver.perform(req.action); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (r.new_window) this.ledger.created(`window:${r.new_window.id}`);
-    const after = this.driver.snapshot();
+    let after: Snapshot;
+    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
     this.epoch = after.epoch;
+    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch });
     const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
     const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
-      const obs = this.observe(win);
-      out.after = obs;
-      out.changed = diffObs(before, obs, after.windows.filter((w) => !now.windows.some((x) => x.id === w.id)).map((w) => w.id));
+      try {
+        const obs = await this.observe(win);
+        out.after = obs;
+        out.changed = diffObs(before, obs, after.windows.filter((w) => !now.windows.some((x) => x.id === w.id)).map((w) => w.id));
+      } catch (e) {
+        if (out.status === "ok") out.status = "unverified";
+        out.why = `${out.why ?? ""}; the window could not be read back: ${e instanceof Error ? e.message : e}`.replace(/^; /, "");
+      }
     }
     return done(out);
   }
 
   /** The evidence for a final judgement: the computer now, and every window the task touched or created, observed
    *  again. Who judges is the runtime's `verify` role; what it judges on is this. */
-  verify(): { snapshot: Snapshot; windows: Observation[]; receipts: Receipt[] } {
-    const s = this.snapshot();
+  async verify(): Promise<{ snapshot: Snapshot; windows: Observation[]; receipts: Receipt[] }> {
+    const s = await this.snapshot();
     const touched = new Set<string>();
     for (const r of this.receipts) if ("window" in r.request.action && r.result.status === "ok") touched.add(r.request.action.window);
     for (const o of this.ledger.taskObjects()) if (o.startsWith("window:")) touched.add(o.slice(7));
-    const windows = [...touched].filter((id) => s.windows.some((w) => w.id === id)).map((id) => this.observe(id));
+    const windows: Observation[] = [];
+    for (const id of touched) if (s.windows.some((w) => w.id === id)) windows.push(await this.observe(id));
     return { snapshot: s, windows, receipts: this.receipts };
   }
 
-  end(): { receipts: Receipt[]; task_objects: string[] } {
+  async end(): Promise<{ receipts: Receipt[]; task_objects: string[] }> {
+    await this.driver.end?.();
     this.emit("executor.end", { receipts: this.receipts.length });
     return { receipts: this.receipts, task_objects: this.ledger.taskObjects() };
   }
