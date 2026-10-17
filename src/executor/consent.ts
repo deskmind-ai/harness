@@ -48,12 +48,17 @@ export class ConsentSigner {
 /** The executor's side: public key, spent nonces, rules. */
 export class ConsentVerifier {
   private readonly spent = new Set<string>();
+  /** Challenges this executor issued: an action token answers one of these, never a challenge from another run
+   *  (the app's key is the same for every run, so without this a hoarded token would do; review 10-18, T5). */
+  private readonly issued = new Set<string>();
   readonly rules: ConsentToken[] = [];
 
   constructor(private readonly publicKey: KeyObject, private readonly now: () => number = Date.now) {}
 
   challenge(action: Action, object: string, consequence: Consequence, text: string, ttlMs = 5 * 60_000): Challenge {
-    return { nonce: randomBytes(16).toString("hex"), digest: digestOf(action, object, consequence), object, consequence, text, expires_at: this.now() + ttlMs };
+    const nonce = randomBytes(16).toString("hex");
+    this.issued.add(nonce);
+    return { nonce, digest: digestOf(action, object, consequence), object, consequence, text, expires_at: this.now() + ttlMs };
   }
 
   private valid(t: ConsentToken): string | null {
@@ -72,6 +77,7 @@ export class ConsentVerifier {
       if (bad) return bad;
       if (rank(t.consequence) < rank(consequence)) return `consent covers ${t.consequence}, the action is ${consequence}`;
       if (t.scope === "action") {
+        if (!this.issued.has(t.nonce)) return "consent answers a challenge this executor did not issue";
         if (t.digest !== digestOf(action, object, consequence)) return "consent is for another action";
         if (this.spent.has(t.nonce)) return "consent already used";
         return null;

@@ -43,7 +43,11 @@ export class HandsDriver implements Driver {
     });
     this.proc.stderr.setEncoding("utf-8");
     this.proc.stderr.on("data", (c: string) => { this.log.push(c.trim().slice(0, 500)); });
-    this.proc.on("exit", (code) => { for (const p of this.pending.values()) p.reject(new Error(`hands executor exited (${code})`)); this.pending.clear(); this.proc = null; });
+    const fail = (why: string) => { for (const p of this.pending.values()) p.reject(new Error(why)); this.pending.clear(); };
+    this.proc.on("exit", (code) => { fail(`hands executor exited (${code})`); this.proc = null; });
+    // a wedged or dead child closes its pipes: every waiting call learns at once, and nothing is thrown at the process
+    this.proc.on("error", (e) => fail(`hands executor: ${e.message}`));
+    this.proc.stdin.on("error", (e) => { fail(`hands executor stdin: ${e.message}`); this.proc?.kill(); this.proc = null; });
   }
 
   private call<T>(op: string, body: Record<string, unknown> = {}): Promise<T> {
@@ -52,7 +56,8 @@ export class HandsDriver implements Driver {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => { if (this.pending.delete(id)) reject(new Error(`hands ${op}: no answer in ${this.opts.timeoutMs ?? 120_000} ms`)); }, this.opts.timeoutMs ?? 120_000);
       this.pending.set(id, { resolve: (v) => { clearTimeout(timer); resolve(v as T); }, reject: (e) => { clearTimeout(timer); reject(e); } });
-      this.proc!.stdin.write(JSON.stringify({ id, op, ...body }) + "\n");
+      try { this.proc!.stdin.write(JSON.stringify({ id, op, ...body }) + "\n"); }
+      catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e instanceof Error ? e : new Error(String(e))); }
     });
   }
 

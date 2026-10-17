@@ -133,7 +133,16 @@ export class FrontierRuntime {
     this.emit("consent.asked", { object: c.object, consequence: c.consequence, picked: got?.option?.kind ?? null });
     if (!got) return null;
     if (got.option?.kind === "approve") { const t = this.o.signer.forAction(c); this.consents.push({ scope: "action", object: c.object, consequence: c.consequence }); return t; }
-    return got.option?.kind === "cancel" ? "cancel" : "declined";
+    if (got.option?.kind === "cancel") return "cancel";
+    this.count("declined");
+    return "declined";
+  }
+
+  /** A declined card is an answer the model has to work with; asking for consent over and over is not (the asks
+   *  budget bounds it, as it bounds questions). */
+  private declined(msg: string): AgentToolResult {
+    if ((this.counters["declined"] ?? 0) >= this.budget.asks) return this.end("failed", "the user declined repeatedly");
+    return err(msg);
   }
 
   // --- tools ---------------------------------------------------------------------------------------------------------
@@ -212,7 +221,7 @@ export class FrontierRuntime {
       const t = await this.consentFor(r.challenge);
       if (t === null) return this.end("failed", "no answer from the user");
       if (t === "cancel") return this.end("cancelled", "the user stopped the task");
-      if (t === "declined") return err(`用户不同意这一步：${r.challenge.text}。换一种不需要它的做法，或者 finish 说明。`);
+      if (t === "declined") return this.declined(`用户不同意这一步：${r.challenge.text}。换一种不需要它的做法，或者 finish 说明。`);
       r = await this.o.executor.act({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t });
     }
     this.count("actions"); this.count(`actions:${r.status}`);
@@ -270,15 +279,21 @@ export class FrontierRuntime {
         const t = await this.consentFor(c);
         if (t === null) return this.end("failed", "no answer from the user");
         if (t === "cancel") return this.end("cancelled", "the user stopped the task");
-        if (t === "declined") return err(`用户不同意：${described}`);
+        if (t === "declined") return this.declined(`用户不同意：${described}`);
         const again = ex.consent.check({ kind: "wait", ms: 0 }, object, consequence, this.o.task, t);
         if (again) return err(`同意凭证无效：${again}`);
       }
     }
+    const existed = fp.writes.filter((p) => ws.exists(p));
     const r = cap.execute(ws, args);
     ws.invalidate();
     this.count("actions"); this.count(`fs:${r.status}`);
-    if (r.status === "ok") { for (const p of fp.writes) ex.ledger.created(`path:${p}`); if (cap.effect !== "observe") this.effects.push(described); }
+    if (r.status === "ok") {
+      // ownership follows content: a user's file moved elsewhere is still the user's at its new path (review 10-18, T1)
+      const gone = existed.filter((p) => !ws.exists(p));
+      for (const p of fp.writes) if (!existed.includes(p) && ws.exists(p)) { if (gone.length) ex.ledger.inherits(`path:${p}`, `path:${gone[0]}`); else ex.ledger.created(`path:${p}`); }
+      if (cap.effect !== "observe") this.effects.push(described);
+    }
     this.emit("fs.act", { cap: cap.id, args, status: r.status, consequence });
     return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence })) : err(J({ status: r.status, why: r.why, consequence }));
   }
@@ -335,9 +350,16 @@ export class FrontierRuntime {
 
   async run(): Promise<RuntimeResult> {
     const ex = this.o.executor;
-    const snap = await ex.begin(this.o.workspace ? Object.keys(this.o.workspace.entries()) : []);
+    let snap;
+    try { snap = await ex.begin(this.o.workspace ? Object.keys(this.o.workspace.entries()) : []); }
+    catch (e) {
+      // the computer could not be read at all (hands missing, no permission): an environment stop, said as such
+      this.status = "environment"; this.reason = `cannot read the computer: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200);
+      await ex.end().catch(() => undefined);
+      return this.result();
+    }
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
-    if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; return this.result(); }
+    if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await ex.end().catch(() => undefined); return this.result(); }
     const context: AgentContext = {
       messages: [
         { role: "system", content: this.systemPrompt(), timestamp: Date.now() },
@@ -379,7 +401,7 @@ export class FrontierRuntime {
       if (!this.status) { this.status = "failed"; this.reason = `loop error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200); }
     }
     if (!this.status) { this.status = "failed"; this.reason = "the model stopped without finishing"; }
-    await ex.end();
+    await ex.end().catch(() => undefined);
     return this.result();
   }
 

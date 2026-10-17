@@ -76,13 +76,14 @@ export class Executor {
     if (a.kind === "open_window") return { consequence: "create", object, why: "a window of the task's own" };
     const owner = this.ledger.ownerOf(object);
     if (a.kind === "close_window") return owner === "user" ? { consequence: "modify_user", object, why: "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
-    const el = "target" in a && a.target ? this.lastObs.get(a.window)?.elements.find((e) => e.id === a.target) : undefined;
+    const obs = this.lastObs.get(a.window);
+    const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
     if (el?.sends) return { consequence: "external", object, why: `「${el.label}」 sends something out` };
-    if (a.kind === "key" && /\b(return|enter)\b/i.test(a.chord)) {
-      // Return in a window whose focused element sends: the same as pressing it
-      const focused = this.lastObs.get(a.window)?.elements.find((e) => e.focused);
-      if (focused?.sends) return { consequence: "external", object, why: `Return on 「${focused.label}」 sends` };
-    }
+    // Return (any chord with it) or a typed newline in a window that has a sending control: in every compose form the
+    // focus is on the text, the default button sends, so this is the same as pressing it (review 10-18, T3)
+    const submits = (a.kind === "key" && /\b(return|enter)\b/i.test(a.chord)) || (a.kind === "type" && a.text.includes("\n"));
+    const sender = obs?.elements.find((e) => e.sends);
+    if (submits && sender) return { consequence: "external", object, why: `Return in a window where 「${sender.label}」 sends` };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
   }
 
@@ -111,6 +112,11 @@ export class Executor {
     if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
     if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
+    // an element is addressed only through the window's last observation: a guessed id would skip the structural
+    // floor (a `sends` button never seen is not known to send), so it is refused, not executed (review 10-18, T2)
+    const obs = target ? this.lastObs.get(target) : undefined;
+    if ("target" in req.action && req.action.target && !obs?.elements.some((e) => e.id === (req.action as { target: string }).target)) return done({ ...base, status: "stale", why: `element ${req.action.target} is not in the last observation of ${target}; observe the window first`, epoch: now.epoch });
+    if (target && (req.action.kind === "key" || req.action.kind === "type") && !obs) return done({ ...base, status: "stale", why: `window ${target} was never observed; observe it first`, epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
       const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent);
       if (why) {
@@ -149,7 +155,7 @@ export class Executor {
   async verify(): Promise<{ snapshot: Snapshot; windows: Observation[]; receipts: Receipt[] }> {
     const s = await this.snapshot();
     const touched = new Set<string>();
-    for (const r of this.receipts) if ("window" in r.request.action && r.result.status === "ok") touched.add(r.request.action.window);
+    for (const r of this.receipts) if ("window" in r.request.action && (r.result.status === "ok" || r.result.status === "unverified")) touched.add(r.request.action.window);
     for (const o of this.ledger.taskObjects()) if (o.startsWith("window:")) touched.add(o.slice(7));
     const windows: Observation[] = [];
     for (const id of touched) if (s.windows.some((w) => w.id === id)) windows.push(await this.observe(id));

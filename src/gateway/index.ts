@@ -236,7 +236,7 @@ export class Gateway {
         : this.scripted(role, sys, user);
       // a transient failure (network, a 5xx, or a 429 rate limit when several runs share one key) is asked again
       // with a growing pause; any other 4xx is final
-      const transient = (p: Partial<Reply>) => (p.outcome === "error" || p.outcome === "timeout") && (!/HTTP 4/.test(p.error ?? "") || /HTTP 429/.test(p.error ?? ""));
+      const transient = (p: Partial<Reply>) => p.outcome === "timeout" || (p.outcome === "error" && /HTTP 5|HTTP 429|fetch failed|ECONN|socket|network|EAI_AGAIN/i.test(p.error ?? ""));
       for (let i = 0; i < 4 && (backend === "openrouter" || backend === "openai") && transient(partial); i++) {
         await new Promise((r) => setTimeout(r, /HTTP 429/.test(partial.error ?? "") ? 5000 * (i + 1) * (i + 1) : 2000));
         partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens);

@@ -41,9 +41,13 @@ export class LineReader {
   private waiting: ((line: string) => void)[] = [];
   private queued: string[] = [];
   constructor(input: NodeJS.ReadableStream) {
-    readline.createInterface({ input, terminal: false }).on("line", (l) => { if (!l.trim()) return; const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l); });
+    const rl = readline.createInterface({ input, terminal: false });
+    rl.on("line", (l) => { if (!l.trim()) return; const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l); });
+    // the app went away (stdin closed): every open card is answered with nothing, so the run ends instead of hanging
+    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); });
   }
-  next(): Promise<string> { const q = this.queued.shift(); return q !== undefined ? Promise.resolve(q) : new Promise((r) => this.waiting.push(r)); }
+  closed = false;
+  next(): Promise<string> { const q = this.queued.shift(); return q !== undefined ? Promise.resolve(q) : this.closed ? Promise.resolve("") : new Promise((r) => this.waiting.push(r)); }
 }
 
 /** Every card is an `ask` event; the run waits (`waiting`) for the matching answer line, then goes on (`resumed`).
@@ -56,7 +60,9 @@ export class StdioUser implements RuntimeUser {
     this.log.emit({ kind: "waiting", ask_id });
     for (;;) {
       let a: Record<string, unknown>;
-      try { a = JSON.parse(await this.input.next()); } catch { continue; }
+      const line = await this.input.next();
+      if (!line && this.input.closed) return null;           // the app is gone: no answer, the run ends honestly
+      try { a = JSON.parse(line); } catch { continue; }
       if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
       this.log.emit({ kind: "resumed", ask_id });
       if (typeof a.option === "number" && a.option >= 0 && a.option < card.options.length) return { option: a.option };

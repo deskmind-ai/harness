@@ -23,6 +23,13 @@ export class Ledger {
     if (!this.userOwned.has(object)) this.taskOwned.add(object);
   }
 
+  /** The user's content moved to a new place (a rename, a move): the new object is the user's too, so discarding it
+   *  later still needs consent. Ownership follows the content, not the path. */
+  inherits(object: string, from: string) {
+    if (this.ownerOf(from) === "user") { this.userOwned.add(object); this.taskOwned.delete(object); }
+    else this.created(object);
+  }
+
   /** An object neither seen at begin nor created by the task appeared (the user opened it): the user's. */
   ownerOf(object: string): Owner {
     if (!this.begun) throw new Error("ledger: begin() first");
