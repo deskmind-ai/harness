@@ -21,6 +21,10 @@ import { ConsentSigner } from "../executor/consent.js";
 import { Executor } from "../executor/executor.js";
 import { SimComputer } from "../executor/sim.js";
 import { HandsDriver } from "../executor/hands.js";
+import { SkillStore } from "../skills/agentskills.js";
+import type { SkillSource } from "../runtime/loop.js";
+import * as os from "node:os";
+import { fileURLToPath } from "node:url";
 import type { Driver } from "../executor/types.js";
 import { FrontierRuntime, type RuntimeUser } from "../runtime/loop.js";
 import { loopModel } from "../runtime/model.js";
@@ -30,7 +34,7 @@ import type { Answer, Card } from "../orchestrator/index.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
 
-export interface Request { run_id?: string; raw: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands" }
+export interface Request { run_id?: string; raw: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string }
 
 /** JSON lines in: a line is `{ask_id, option}` or `{ask_id, text}`; the first line may be the request itself. */
 export class LineReader {
@@ -78,6 +82,20 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
   }
 }
 
+/** The tutorials the model may read: the shipped ones beside this code and the user's (`skills` in the request, or
+ *  ~/.deskmind/skills), filtered by structure (the request's apps, the folder's file types) — never by the words of
+ *  the request (skills-layer-2026-10-18.md §检索). The base skill is the system prompt already, so it is not a candidate. */
+function skillsFor(req: Request, ws?: Workspace): SkillSource {
+  const dirs = [path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "skills"), req.skills ?? path.join(os.homedir(), ".deskmind", "skills")].filter((d) => fs.existsSync(d));
+  const fileTypes = ws ? [...new Set(Object.keys(ws.entries()).map((p) => p.includes(".") ? p.slice(p.lastIndexOf(".") + 1).toLowerCase() : "").filter(Boolean))] : [];
+  const facts = { apps: req.apps ?? [], fileTypes, objects: req.scope ? [req.scope] : [] };
+  const sources = dirs.map((d) => new SkillStore(d).source(facts));
+  return {
+    candidates: (raw) => sources.flatMap((s) => s.candidates(raw)).filter((c) => c.name !== "deskmind-computer-use"),
+    read: (name) => sources.map((s) => s.read(name)).find((t) => t !== null) ?? null,
+  };
+}
+
 function driverFor(name: Request["driver"], scope?: string): Driver {
   if (name === "hands") return new HandsDriver();
   return new SimComputer(scope);
@@ -98,6 +116,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
     ...(ws ? { workspace: ws, registry: fileRegistry() } : {}),
+    skills: skillsFor(req, ws),
     onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); },
   });
   const r = await rt.run();
