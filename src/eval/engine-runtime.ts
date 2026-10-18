@@ -2,7 +2,7 @@
  * The check set through the frontier runtime (`pnpm eval -- --engine runtime`): the same tasks, workspace, simulated
  * user and scorer as the orchestrator path, so the two engines compare on the same 105 tasks with the same model.
  *
- * Not carried over for this engine: task hooks (external changes, goal updates, crashes, GUI disturbances) and the
+ * Not carried over for this engine: the crash hook (no journal to recover from yet) and the
  * skill library (group 5 teach / learn): the row says `skills: "unsupported"`, and the GUI group runs on the simulated
  * editor window (the user's, since it is on screen at begin, so acting in it is consented on a card).
  */
@@ -34,8 +34,11 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   const ws = new Workspace(root);
   const start = ws.tree();
   const sim = new SimComputer(root);
+  const ex_taskWindows: string[] = [];
   const open = task.hooks?.gui?.open as string | undefined;
   if (task.caps === "gui") sim.addEditor("编辑器", open ? { title: path.basename(open), text: ws.read(open), path: open } : null);
+  // a window with the user's unsaved work is a user window; a bare editor is the task's to use (opened for it)
+  if (task.caps === "gui" && !open) { const w = sim.wins.find((x) => x.kind === "editor"); if (w) ex_taskWindows.push(w.id); }
   const app = ConsentSigner.fresh();
   const events: Record<string, unknown>[] = [];
   let tick = 0;
@@ -46,15 +49,34 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   const h = task.hooks ?? {};
   const fired = { ext: false, upd: false };
   let rt: FrontierRuntime | null = null;
+  // the GUI disturbances, as run.ts injects them into EditorSim: after the k-th screen action that went through, the
+  // focus goes to another app (the user is active: the next action waits), a modal covers the window, or the window
+  // is rebuilt (every element id changes); the focus comes back after the next model call
+  const gui = h.gui as { at_step?: number; disturb?: "focus" | "modal" | "layout" } | undefined;
+  let guiActs = 0, disturbed = false, restoreAfter = -1;
+  const editor = () => sim.wins.find((x) => x.kind === "editor");
   const onEvent = (kind: string, body: Record<string, unknown>) => {
     tick += 1;
     events.push({ seq: tick, kind, ...body });
     if (kind === "fs.act" && body.consequence !== "read") writes.push({ ok: body.status === "ok", at: tick });
+    if (kind === "executor.act" && gui && body.status === "ok" && (body.action as { kind?: string })?.kind !== "file") {
+      guiActs += 1;
+      if (!disturbed && guiActs === (gui.at_step ?? 1)) {
+        disturbed = true;
+        const w = editor();
+        if (gui.disturb === "modal" && w) sim.modal(w.id, "有新版本可用", ["稍后", "立即更新"]);
+        else if (gui.disturb === "layout" && w) sim.relayout(w.id);
+        else if (gui.disturb === "focus") { sim.user_active = true; restoreAfter = tick; }
+        events.push({ seq: ++tick, kind: "hook.gui", disturb: gui.disturb });
+      }
+    }
+    if (kind === "tool.call" && restoreAfter >= 0 && tick > restoreAfter + 1) { sim.user_active = false; restoreAfter = -1; }
     const effects = writes.filter((w) => w.ok).length;
     if (h.external && !fired.ext && effects >= h.external.after_action) { fired.ext = true; build(root, h.external.set); ws.invalidate(); events.push({ seq: ++tick, kind: "hook.external", set: Object.keys(h.external.set) }); }
     if (h.goal_update && !fired.upd && rt && kind === "tool.call" && (rt.counters["model_calls"] ?? 0) >= h.goal_update.after_decisions) { fired.upd = true; rt.steer(h.goal_update.raw); }
   };
   const ex = new Executor(sim, { task: task.id, publicKey: app.publicKey, onEvent });
+  for (const id of ex_taskWindows) ex.ledger.created(`window:${id}`);
   // every card the user answers is noted with its pick, in order with the writes
   const cardUser: RuntimeUser = {
     ask(card: Card): Answer | null | Promise<Answer | null> {
@@ -73,6 +95,7 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     clarify: user.clarifies, authorize: user.authorizes, wrote: writes.some((w) => w.ok),
     askedBeforeFirstWrite: firstAsk >= 0 && (firstWrite < 0 || firstAsk < firstWrite),
     clarified: last?.kind === "missing" || last?.kind === "ambiguity", declinedPlan: last?.kind === "plan" && last.picked !== "approve" && last.picked !== "cancel", cancelled: last?.picked === "cancel",
+    plans: seen.filter((s) => s.kind === "plan").length,
   };
   const summ: Summary = { status: STATUS[r.status], reason: r.reason, counters: { ...r.counters, actions: r.counters["actions"] ?? 0 }, ops: Object.fromEntries(r.effects.map((_, i) => [`op_${i + 1}`, "ok"])) };
   const bytesAt = (p: string) => { try { return fs.readFileSync(path.join(root, p)); } catch { return null; } };
