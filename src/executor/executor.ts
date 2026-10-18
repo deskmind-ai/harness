@@ -150,7 +150,8 @@ export class Executor {
 
   private emit(kind: string, body: Record<string, unknown> = {}) { this.opts.onEvent?.(kind, body); }
 
-  async begin(paths: string[] = []): Promise<Snapshot> {
+  async begin(paths: string[] = [], rules: ConsentToken[] = []): Promise<Snapshot> {
+    if (rules.length) { const r = this.consent.loadRules(rules); this.emit("executor.rules", r); }
     const raw = await this.driver.snapshot();
     const ws = this.opts.files?.workspace;
     if (ws) {

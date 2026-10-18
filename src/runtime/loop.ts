@@ -45,6 +45,8 @@ export interface RuntimeOptions {
   signal?: AbortSignal;
   /** The language of what the user reads on cards (default zh). */
   lang?: Lang;
+  /** The user's standing rules (rule-tier consent tokens the app signed), handed to the executor at begin. */
+  rules?: ConsentToken[];
 }
 
 export interface RuntimeResult {
@@ -358,7 +360,7 @@ export class FrontierRuntime {
   async run(): Promise<RuntimeResult> {
     const ex = this.o.executor;
     let snap;
-    try { snap = await ex.begin(this.o.workspace ? Object.keys(this.o.workspace.entries()) : []); }
+    try { snap = await ex.begin(this.o.workspace ? Object.keys(this.o.workspace.entries()) : [], this.o.rules ?? []); }
     catch (e) {
       // the computer could not be read at all (hands missing, no permission): an environment stop, said as such
       this.status = "environment"; this.reason = `cannot read the computer: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200);
@@ -432,7 +434,8 @@ export class FrontierRuntime {
     const options: CardOption[] = [{ kind: "approve", text: this.t.fine }];
     if (u.reversible) options.push({ kind: "undo", text: this.t.undo });
     const consented = this.consents.filter((c) => c.scope !== "action" || c.consequence === "external").map((c) => c.object);
-    const text = [this.t.did(this.effects.slice(-6)), ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(u.reversible ? [] : [this.t.noUndo(u.steps.find((x) => !x.can)?.why ?? this.t.undoable)])].join("\n");
+    const rules = [...this.o.executor.consent.rulesUsed];
+    const text = [this.t.did(this.effects.slice(-6)), ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(u.reversible ? [] : [this.t.noUndo(u.steps.find((x) => !x.can)?.why ?? this.t.undoable)])].join("\n");
     return { kind: "result", text, options, free_text: false, blocking: false };
   }
 

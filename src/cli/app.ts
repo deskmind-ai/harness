@@ -25,7 +25,7 @@ import { SkillStore } from "../skills/agentskills.js";
 import type { SkillSource } from "../runtime/loop.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
-import type { Driver } from "../executor/types.js";
+import type { ConsentToken, Driver } from "../executor/types.js";
 import { FrontierRuntime, type RuntimeUser } from "../runtime/loop.js";
 import { loopModel } from "../runtime/model.js";
 import { scriptedStream } from "../runtime/scripted.js";
@@ -34,7 +34,7 @@ import type { Answer, Card } from "../orchestrator/index.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
 
-export interface Request { run_id?: string; raw: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string }
+export interface Request { run_id?: string; raw: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string; rules?: ConsentToken[] }
 
 /** JSON lines in: a line is `{ask_id, option}` or `{ask_id, text}`; the first line may be the request itself. */
 export class LineReader {
@@ -132,7 +132,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
     ...(ws ? { workspace: ws, registry: fileRegistry() } : {}),
-    skills: skillsFor(req, ws), lang: req.lang ?? "zh",
+    skills: skillsFor(req, ws), lang: req.lang ?? "zh", ...(req.rules ? { rules: req.rules } : {}),
     onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); },
   });
   o.input.onStop = () => { log.emit({ kind: "refused", what: "the task", why: "stopped by the app", by: "user" }); rt.stop("stopped by the app"); };

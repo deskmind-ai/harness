@@ -431,3 +431,22 @@ describe("executor: the journal and a crash", () => {
     expect(ex3.recovered).toBeNull();
   });
 });
+
+describe("executor: standing rules from the app", () => {
+  it("rules handed over at begin cover matching actions and are named on use; a rule for sending or a forged one is dropped", async () => {
+    const app = ConsentSigner.fresh();
+    const { sim, w } = mailSim();
+    const events: Record<string, unknown>[] = [];
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, onEvent: (k, b) => events.push({ k, ...b }) });
+    const ok = app.forRule("关我的邮件窗口不用问", `window:${w.id}`, "modify_user");
+    const sendRule = app.forRule("发邮件不用问", `window:${w.id}`, "external");
+    const forged = { ...ok, sig: Buffer.from("x").toString("base64") };
+    await ex.begin([], [ok, sendRule, forged]);
+    const loaded = events.find((e) => e.k === "executor.rules") as { kept: number; dropped: string[] };
+    expect(loaded.kept).toBe(1);
+    expect(loaded.dropped.length).toBe(2);
+    await ex.plan({ steps: [] });
+    expect((await ex.act({ action: { kind: "close_window", window: w.id }, epoch: (await ex.snapshot()).epoch })).status).toBe("ok");
+    expect([...ex.consent.rulesUsed]).toEqual(["关我的邮件窗口不用问"]);
+  });
+});

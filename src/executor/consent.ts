@@ -52,6 +52,21 @@ export class ConsentVerifier {
    *  (the app's key is the same for every run, so without this a hoarded token would do; review 10-18, T5). */
   private readonly issued = new Set<string>();
   readonly rules: ConsentToken[] = [];
+  /** Rules that covered an action this task (their text), for the result card: 「按你以前定的规则做的」. */
+  readonly rulesUsed = new Set<string>();
+
+  /** The user's standing rules, handed over by the app at begin: only validly signed rule tokens are kept; anything
+   *  else (another scope, a bad signature, expired) is dropped and reported. The executor never persists rules itself —
+   *  a runtime between app and executor cannot add one. */
+  loadRules(tokens: ConsentToken[]): { kept: number; dropped: string[] } {
+    const dropped: string[] = [];
+    for (const t of tokens) {
+      const bad = t.scope !== "rule" ? "not a rule" : t.consequence === "external" ? "a rule may not cover sending" : this.valid(t);
+      if (bad) { dropped.push(`${t.rule ?? t.nonce}: ${bad}`); continue; }
+      if (!this.rules.some((r) => r.nonce === t.nonce)) this.rules.push(t);
+    }
+    return { kept: this.rules.length, dropped };
+  }
 
   constructor(private readonly publicKey: KeyObject, private readonly now: () => number = Date.now) {}
 
@@ -93,11 +108,12 @@ export class ConsentVerifier {
       const why = covers(token);
       if (why) return why;
       if (token.scope === "action") this.spent.add(token.nonce);
-      if (token.scope === "rule" && !this.rules.some((r) => r.nonce === token.nonce)) this.rules.push(token);
+      if (token.scope === "rule") { if (token.consequence === "external") return "a rule may not cover sending"; if (!this.rules.some((r) => r.nonce === token.nonce)) this.rules.push(token); this.rulesUsed.add(token.rule ?? token.nonce); }
       return null;
     }
     const rule = this.rules.find((r) => covers(r) === null);
-    return rule ? null : "no consent";
+    if (rule) { this.rulesUsed.add(rule.rule ?? rule.nonce); return null; }
+    return "no consent";
   }
 }
 

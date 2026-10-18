@@ -12,6 +12,7 @@ const ZH = {
   at: (where: string) => `在 ${where} `, click: (l: string) => `点「${l}」`, set: (l: string, v: string) => `把「${l}」设为「${v}」`, type: (l: string, t: string) => `在「${l}」里输入「${t}」`,
   select: (l: string, o: string) => `把「${l}」选成「${o}」`, key: (c: string) => `按 ${c}`, closeWindow: "关闭窗口", openWindow: (a: string) => `打开 ${a}`, focusWindow: "切到窗口", scroll: "滚动", wait: "等待",
   sends: "这会把内容发出去", modifies: "这会改动你的东西", modifiesFile: "这会改动你的文件", undoable: "界面上的操作撤不回", noUndoFor: (cap: string) => `${cap} 没有撤回的办法`,
+  byRule: (rules: string[]) => `按你以前定的规则做的：${rules.join("、")}`,
 };
 const EN: typeof ZH = {
   ok: "OK", okPlan: "OK, go ahead", skipStep: "Skip this step", cancel: "Stop here", delegate: "You decide", fine: "Fine", undo: "Undo",
@@ -21,5 +22,6 @@ const EN: typeof ZH = {
   at: (where: string) => `In ${where}: `, click: (l: string) => `click "${l}"`, set: (l: string, v: string) => `set "${l}" to "${v}"`, type: (l: string, t: string) => `type "${t}" into "${l}"`,
   select: (l: string, o: string) => `choose "${o}" in "${l}"`, key: (c: string) => `press ${c}`, closeWindow: "close the window", openWindow: (a: string) => `open ${a}`, focusWindow: "switch to the window", scroll: "scroll", wait: "wait",
   sends: "this sends something out", modifies: "this changes your things", modifiesFile: "this changes your file", undoable: "an action on screen cannot be undone", noUndoFor: (cap: string) => `${cap} cannot be undone`,
+  byRule: (rules: string[]) => `Under your standing rule: ${rules.join(", ")}`,
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);
