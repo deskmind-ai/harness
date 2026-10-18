@@ -61,7 +61,10 @@ export class Judge {
     /** adaptive routing: skip a lower tier on question kinds it never settles */ stats?: TierStats;
     /** measurement: after a lower tier settles, ask the top tier too and report whether they agree (costs the top
      *  call). true: every time; a number in (0, 1): that share of settled answers, at random — the audit sample that
-     *  keeps the agreement routing learning in production at a tenth of the cost */ shadow?: boolean | number } = {}) {}
+     *  keeps the agreement routing learning in production at a tenth of the cost */ shadow?: boolean | number;
+    /** the top tier is asked at the same time as the lower ones; when a lower tier settles, the top call is aborted
+     *  (its cost saved when the service honours the abort), otherwise its answer is already on its way — a refusing
+     *  fast tier costs no time (10-19: Brain refuses most file-task questions, which made those runs no faster) */ race?: boolean } = {}) {}
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. */
   async choose(question: string, context: unknown, options: JudgeOption[], role?: Role): Promise<JudgeAnswer | null> {
@@ -72,11 +75,17 @@ export class Judge {
     const ids = options.map((o) => o.id) as [string, ...string[]];
     const kind = TierStats.kindOf(question, context);
     let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null;
+    const prompt = P.choicePrompt(question, context, options);
+    const topTier = this.tiers[this.tiers.length - 1]!;
+    const lowerAsked = this.tiers.slice(0, -1).some((t) => !this.opts.stats?.skip(t.name, kind));
+    // the race: the top tier starts now, alongside the lower tiers; abortable
+    const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Awaited<ReturnType<Gateway["ask"]>>> | null } : null;
+    if (raced) raced.promise = topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids), "", raced.controller.signal);
     for (const tier of this.tiers) {
-      const final = tier === this.tiers[this.tiers.length - 1];
+      const final = tier === topTier;
       if (!final && this.opts.stats?.skip(tier.name, kind)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
-      const rep = await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
+      const rep = final && raced?.promise ? await raced.promise : await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids));
       if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
@@ -86,11 +95,11 @@ export class Judge {
       // "no" blocked right actions in the 10-18 probe), and "not enough evidence" is never final below the top
       const canSettle = last.choice === options[0]?.id && confidence !== undefined && confidence >= (tier.floor ?? 0);
       this.opts.stats?.note(tier.name, kind, canSettle);
-      if (canSettle) { settled = true; settledBy = tier; break; }
+      if (canSettle) { settled = true; settledBy = tier; if (raced) { raced.controller.abort(); this.opts.onEvent?.("judge.raced", { won: tier.name }); } break; }
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
-    const shadowNow = this.opts.shadow === true || (typeof this.opts.shadow === "number" && Math.random() < this.opts.shadow);
+    const shadowNow = !raced && (this.opts.shadow === true || (typeof this.opts.shadow === "number" && Math.random() < this.opts.shadow));
     if (settled && settledBy && shadowNow) {
       const top = this.tiers[this.tiers.length - 1]!;
       const rep = await top.gateway.ask(role ?? top.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
@@ -135,7 +144,7 @@ export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Re
   const stats = new TierStats(process.env.DESKMIND_JUDGE_STATS || undefined);
   const shadowEnv = process.env.DESKMIND_JUDGE_SHADOW;
   const shadow = shadowEnv === "1" ? true : shadowEnv && Number(shadowEnv) > 0 && Number(shadowEnv) < 1 ? Number(shadowEnv) : false;
-  return new Judge(tiers, { onEvent, stats, shadow });
+  return new Judge(tiers, { onEvent, stats, shadow, race: process.env.DESKMIND_JUDGE_RACE === "1" });
 }
 
 /** `backend:model` → a first judge tier; null when unset or malformed (then the frontier judges alone). */

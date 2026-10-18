@@ -423,6 +423,18 @@ describe("judge: adaptive routing and shadow", () => {
     expect(stats2.snapshot().low!["程序即将执行这个动作？|window"]).toMatchObject({ compared: 10, agreed: 0 });
     const r2 = await j2.choose("程序即将执行这个动作？", { 对象: "path:a.txt" }, opts);   // file actions: still the fast tier
     expect(r2?.by).toBe("low");
+    // the race: the top tier is started alongside; a settling lower tier wins and the top call is abandoned, a
+    // refusing one lets the top answer (already in flight) decide — one top call either way
+    const low3 = new Gateway(table), top3 = new Gateway(table);
+    const ev3: string[] = [];
+    const j3 = new Judge([{ name: "low", gateway: low3, floor: 0.9 }, { name: "top", gateway: top3 }], { race: true, budget: 1000, onEvent: (k) => ev3.push(k) });
+    low3.script = [() => ({ choice: "matches", scores: { matches: 0.99 } }), () => ({ choice: "mismatch", scores: { mismatch: 0.99 } })];
+    top3.script = [() => ({ choice: "matches" }), () => ({ choice: "matches" })];
+    expect((await j3.choose("q", { a: 1 }, opts))?.by).toBe("low");
+    expect(ev3).toContain("judge.raced");
+    expect(top3.script.length).toBe(1);                                                        // started once, abandoned
+    expect((await j3.choose("q", { a: 2 }, opts))).toMatchObject({ by: "top", choice: "matches" });
+    expect(top3.script.length).toBe(0);
   });
 });
 

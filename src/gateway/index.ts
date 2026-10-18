@@ -250,15 +250,17 @@ export class Gateway {
    *  process decoding greedily, so the same prompt gives the same bad JSON again. A cut-off answer would be cut again.
    *  Both attempts are logged; the second says it is a retry. A retry is not counted against the run's model-call
    *  budget (the orchestrator sees one reply). */
-  async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = ""): Promise<Reply<z.infer<S>>> {
-    const first = await this.askOnce(role, system, user, schema, runId, null);
+  /** `signal`: the caller may abort the call (the judge's race: the cloud answer is no longer needed once the local
+   *  tier settled); an aborted call is an error that is never retried. */
+  async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = "", signal?: AbortSignal): Promise<Reply<z.infer<S>>> {
+    const first = await this.askOnce(role, system, user, schema, runId, null, signal);
     const { backend } = this.table[role];
-    const again = (first.outcome === "timeout" && backend === "claude_cli")
-      || (first.outcome === "invalid" && first.error !== TRUNCATED && (backend === "claude_cli" || backend === "openrouter" || backend === "openai"));
-    return again ? this.askOnce(role, system, user, schema, runId, first.outcome) : first;
+    const again = !signal?.aborted && ((first.outcome === "timeout" && backend === "claude_cli")
+      || (first.outcome === "invalid" && first.error !== TRUNCATED && (backend === "claude_cli" || backend === "openrouter" || backend === "openai")));
+    return again ? this.askOnce(role, system, user, schema, runId, first.outcome, signal) : first;
   }
 
-  private async askOnce<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId: string, retryOf: Outcome | null): Promise<Reply<z.infer<S>>> {
+  private async askOnce<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId: string, retryOf: Outcome | null, signal?: AbortSignal): Promise<Reply<z.infer<S>>> {
     const { backend, model } = this.table[role];
     const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" });
     const sys = `${system}\n\n只输出一个 JSON 对象，不要别的文字。字段名必须和这个 JSON Schema 完全一致（例如判别字段叫 kind 就写 kind）：\n${JSON.stringify(jsonSchema)}`;
@@ -270,7 +272,7 @@ export class Gateway {
       const t0 = performance.now();
       const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens, think = this.table[role].think;
       let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens)
-        : backend === "openai" ? await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think)
+        : backend === "openai" ? await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think, signal)
         : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? (role === "transform" ? LOCAL_TRANSFORM_MAX_TOKENS : LOCAL_MAX_TOKENS))
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user, timeoutMs)
@@ -278,9 +280,9 @@ export class Gateway {
       // a transient failure (network, a 5xx, or a 429 rate limit when several runs share one key) is asked again
       // with a growing pause; any other 4xx is final
       const transient = (p: Partial<Reply>) => p.outcome === "timeout" || (p.outcome === "error" && /HTTP 5|HTTP 429|fetch failed|ECONN|socket|network|EAI_AGAIN/i.test(p.error ?? ""));
-      for (let i = 0; i < 4 && (backend === "openrouter" || backend === "openai") && transient(partial); i++) {
+      for (let i = 0; i < 4 && (backend === "openrouter" || backend === "openai") && transient(partial) && !signal?.aborted; i++) {
         await new Promise((r) => setTimeout(r, /HTTP 429/.test(partial.error ?? "") ? 5000 * (i + 1) * (i + 1) : 2000));
-        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think);
+        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think, signal);
       }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;
       rep.latencyMs ||= performance.now() - t0;
@@ -370,11 +372,11 @@ export class Gateway {
   }
 
   /** A keyed OpenAI-compatible service (PROVIDERS): the model string names the provider. */
-  private openaiCompat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, think?: boolean): Promise<Partial<Reply>> {
+  private openaiCompat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, think?: boolean, signal?: AbortSignal): Promise<Partial<Reply>> {
     const p = providerOf(model);
     if ("error" in p) return Promise.resolve({ outcome: "error", error: p.error });
     if (!p.key) return Promise.resolve({ outcome: "error", error: `${PROVIDERS[p.name]!.keyEnv} not set` });
-    return this.chatCompletions(p.url, p.key, p.model, system, user, jsonSchema, timeoutMs, maxTokens, extraBodyFor(p.name, think));
+    return this.chatCompletions(p.url, p.key, p.model, system, user, jsonSchema, timeoutMs, maxTokens, extraBodyFor(p.name, think), signal);
   }
 
   /** Models whose service rejects our (non-strict) JSON Schema: asked for a JSON object instead, the schema stays in
@@ -384,24 +386,24 @@ export class Gateway {
   private readonly jsonObjectOnly = new Set<string>();
   static schemaRejected(error: string): boolean { return /Invalid schema|response_format|json_schema/i.test(error); }
 
-  private async chatCompletions(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}): Promise<Partial<Reply>> {
+  private async chatCompletions(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}, signal?: AbortSignal): Promise<Partial<Reply>> {
     const k = `${url}|${model}`;
-    const r = await this.chatCompletionsOnce(url, key, model, system, user, this.jsonObjectOnly.has(k) ? null : jsonSchema, timeoutMs, maxTokens, extra);
+    const r = await this.chatCompletionsOnce(url, key, model, system, user, this.jsonObjectOnly.has(k) ? null : jsonSchema, timeoutMs, maxTokens, extra, signal);
     if (r.outcome === "error" && r.error && Gateway.schemaRejected(r.error) && !this.jsonObjectOnly.has(k)) {
       this.jsonObjectOnly.add(k);
-      return this.chatCompletionsOnce(url, key, model, system, user, null, timeoutMs, maxTokens, extra);
+      return this.chatCompletionsOnce(url, key, model, system, user, null, timeoutMs, maxTokens, extra, signal);
     }
     return r;
   }
 
-  private async chatCompletionsOnce(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown | null, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}): Promise<Partial<Reply>> {
+  private async chatCompletionsOnce(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown | null, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}, signal?: AbortSignal): Promise<Partial<Reply>> {
     const body = { model, temperature: 0, ...extra, ...(maxTokens ? { max_tokens: maxTokens } : {}),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       response_format: jsonSchema ? { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } : { type: "json_object" } };
     const t0 = performance.now();
     let res: Response;
     try {
-      res = await fetch(versionedBase(url) + "/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+      res = await fetch(versionedBase(url) + "/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(body), signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       return { outcome: msg.includes("Timeout") ? "timeout" : "error", error: msg.slice(0, 300) };
