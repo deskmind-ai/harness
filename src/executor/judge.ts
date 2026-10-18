@@ -59,7 +59,9 @@ export class Judge {
   calls = 0;
   constructor(readonly tiers: JudgeTier[], readonly opts: { budget?: number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
     /** adaptive routing: skip a lower tier on question kinds it never settles */ stats?: TierStats;
-    /** measurement: after a lower tier settles, ask the top tier too and report whether they agree (costs the top call) */ shadow?: boolean } = {}) {}
+    /** measurement: after a lower tier settles, ask the top tier too and report whether they agree (costs the top
+     *  call). true: every time; a number in (0, 1): that share of settled answers, at random — the audit sample that
+     *  keeps the agreement routing learning in production at a tenth of the cost */ shadow?: boolean | number } = {}) {}
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. */
   async choose(question: string, context: unknown, options: JudgeOption[], role?: Role): Promise<JudgeAnswer | null> {
@@ -88,7 +90,8 @@ export class Judge {
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
-    if (settled && settledBy && this.opts.shadow) {
+    const shadowNow = this.opts.shadow === true || (typeof this.opts.shadow === "number" && Math.random() < this.opts.shadow);
+    if (settled && settledBy && shadowNow) {
       const top = this.tiers[this.tiers.length - 1]!;
       const rep = await top.gateway.ask(role ?? top.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
@@ -130,7 +133,9 @@ export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Re
   tiers.push({ name: "frontier", gateway });
   // adaptive routing across runs (DESKMIND_JUDGE_STATS names the file; unset: per process); shadow measurement opt-in
   const stats = new TierStats(process.env.DESKMIND_JUDGE_STATS || undefined);
-  return new Judge(tiers, { onEvent, stats, shadow: process.env.DESKMIND_JUDGE_SHADOW === "1" });
+  const shadowEnv = process.env.DESKMIND_JUDGE_SHADOW;
+  const shadow = shadowEnv === "1" ? true : shadowEnv && Number(shadowEnv) > 0 && Number(shadowEnv) < 1 ? Number(shadowEnv) : false;
+  return new Judge(tiers, { onEvent, stats, shadow });
 }
 
 /** `backend:model` → a first judge tier; null when unset or malformed (then the frontier judges alone). */
