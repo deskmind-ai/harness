@@ -323,6 +323,9 @@ export class Executor {
     const before = "window" in req.action ? this.lastObs.get(req.action.window) ?? null : null;
     // a real driver can fail on either side of the action: that is a result the model reads, never an exception
     let r: PerformResult;
+    // the stop switch is read again here, after the waits above (the judge, the user's consent): a stop that arrived
+    // meanwhile must not be followed by the effect (review of deskmind#80, 10-18)
+    if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
     if (consequence !== "read") this.journal("intent", { action: req.action, object: f.object, consequence, text: describeAction(req.action, obs, consequence) });
     try { r = await this.driver.perform(req.action); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
@@ -380,6 +383,7 @@ export class Executor {
         return { ...base, status: "needs_consent", why, challenge };
       }
     }
+    if (this.stopped) return { ...base, status: "stopped", why: "the app stopped the task" };   // read again after the waits above
     const existed = fp.writes.filter((p) => ws.exists(p));
     const undo_prep = cap.prepareUndo?.(ws, a.args);
     const versions_before: Record<string, string> = {};

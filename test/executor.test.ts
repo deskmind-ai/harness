@@ -303,6 +303,39 @@ describe("judge tiers", () => {
   });
 });
 
+describe("executor: a stop that arrives while an action waits", () => {
+  it("a stop during the judge's or the user's wait is seen before the effect: the file is not written", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge } = await import("../src/executor/judge.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ex-stop-"));
+    const { build } = await import("../src/registry/workspace.js");
+    build(root, { "todo.txt": "交房租\n" });
+    const ws = new Workspace(root), app = ConsentSigner.fresh();
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const gw = new Gateway(table);
+    const ex = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, judge: new Judge([{ name: "t", gateway: gw }]), raw: "在 todo.txt 末尾加一行 买牛奶" });
+    await started(ex);
+    // the judge approves, but the stop switch is thrown while it deliberates (the user's file: the judge is asked)
+    gw.script = [() => { ex.stop(); return { choice: "matches" }; }];
+    const r = await ex.act({ action: { kind: "file", capability: "fs.append_line", args: { target: "todo.txt", line: "买牛奶" } }, epoch: ex.currentEpoch, consent: app.forObject("path:todo.txt", "modify_user", "t1") });
+    expect(r.status).toBe("stopped");
+    expect(fs.readFileSync(path.join(root, "todo.txt"), "utf-8")).toBe("交房租\n");
+    // the same on the screen: the stop lands during the judge, the click does not happen
+    const { ex: ex2, w, app: app2 } = setup();
+    const gw2 = new Gateway(table);
+    ex2.opts.judge = new Judge([{ name: "t", gateway: gw2 }]); ex2.setRequest("给林晓那封邮件加旗标");
+    await started(ex2);
+    gw2.script = [() => { ex2.stop(); return { choice: "matches" }; }];
+    const c = await click(ex2, w.id, "林晓 · Q3 预算", { consent: app2.forObject(`window:${w.id}`, "modify_user", "t1") });
+    expect(c.status).toBe("stopped");
+    const o = await ex2.observe(w.id);
+    expect(o.elements.find((e) => e.label.includes("林晓 · Q3 预算"))!.focused).not.toBe(true);   // the row was never selected
+  });
+});
+
 describe("executor: the user's answers reach the judge", () => {
   it("an answer given during the task is in every judge question's context, next to the request", async () => {
     const { Gateway } = await import("../src/gateway/index.js");
