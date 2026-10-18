@@ -23,7 +23,7 @@ export class Judge {
   constructor(readonly tiers: JudgeTier[], readonly opts: { budget?: number; onEvent?: (kind: string, body: Record<string, unknown>) => void } = {}) {}
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. */
-  async choose(question: string, context: unknown, options: JudgeOption[]): Promise<JudgeAnswer | null> {
+  async choose(question: string, context: unknown, options: JudgeOption[], role?: Role): Promise<JudgeAnswer | null> {
     const key = createHash("sha256").update(JSON.stringify({ question, context, options })).digest("hex").slice(0, 24);
     const hit = this.cache.get(key);
     if (hit) return { ...hit, cached: true };
@@ -32,7 +32,7 @@ export class Judge {
     let last: JudgeAnswer | null = null;
     for (const tier of this.tiers) {
       this.calls += 1;
-      const rep = await tier.gateway.ask(tier.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
+      const rep = await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
@@ -73,3 +73,17 @@ export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Re
   tiers.push({ name: "frontier", gateway });
   return new Judge(tiers, { onEvent });
 }
+
+/** The completion audit, as a choice: Codex's wording (ext/goal/templates/goals/continuation.md) — completion is
+ *  unproven until the current state proves every requirement; weak or indirect evidence is not achieved. */
+export const VERIFY_QUESTION = [
+  "任务做成了没有？核对的做法：先从用户的要求里列出每一条具体要求（每个文件、每句话、每个动作、每个问题的答案），再逐条在证据里找能证明它的东西。",
+  "证据只认现在的状态（窗口的元素和文字、文件内容、执行回执）；模型自称做完了、动作「发出去了」但没读回结果、只和要求「相符」但证明不了，都不算。",
+  "一条要求的证据范围要和它一样宽：用一个窄的检查不能支持一个宽的结论。任务期间别的程序改过的文件，那些改动不是本任务造成的，保留它们不算违反要求。",
+  "每条都被证明才选 pass；有一条证据矛盾选 fail；有一条证据不够、没有或间接，选 unknown。reason 里写明哪一条、缺什么。",
+].join("\n");
+export const VERIFY_OPTIONS: JudgeOption[] = [
+  { id: "pass", text: "做成了：每一条要求都有现在状态的证据" },
+  { id: "fail", text: "没做成：有证据和要求矛盾" },
+  { id: "unknown", text: "确认不了：有要求没有足够的证据" },
+];

@@ -18,7 +18,7 @@ import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
 import { Ledger } from "./ledger.js";
-import { INTENT_OPTIONS, INTENT_QUESTION, type Judge } from "./judge.js";
+import { INTENT_OPTIONS, INTENT_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import type { KeyObject } from "node:crypto";
 
 export interface ExecutorOptions {
@@ -54,6 +54,8 @@ export class Executor {
    *  itself wrote (content ownership), and what other programs changed meanwhile. */
   private seen: Record<string, string> = {};
   private taskContent = new Set<string>();           // "path@version" the task wrote
+  /** The folder as the task found it (small files with their text): what "unchanged" and "renamed from" are proved against. */
+  private startTree: { versions: Record<string, string>; contents: Record<string, string> } | null = null;
   readonly externalChanges: ExternalChange[] = [];
   /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
   private planAccepted: PlanProposal | null = null;
@@ -111,7 +113,14 @@ export class Executor {
   async begin(paths: string[] = []): Promise<Snapshot> {
     const raw = await this.driver.snapshot();
     const ws = this.opts.files?.workspace;
-    if (ws) { for (const p of Object.keys(ws.entries())) { this.seen[p] = ws.version(p); if (!paths.includes(p)) paths = [...paths, p]; } }
+    if (ws) {
+      const contents: Record<string, string> = {};
+      for (const [p, v] of Object.entries(ws.entries())) {
+        this.seen[p] = ws.version(p); if (!paths.includes(p)) paths = [...paths, p];
+        if (v !== "dir" && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= 1000) contents[p] = t; }
+      }
+      this.startTree = { versions: { ...this.seen }, contents };
+    }
     this.ledger.begin(raw, paths);
     this.epoch = raw.epoch;
     this.last = this.ledger.stamp(raw);
@@ -308,6 +317,30 @@ export class Executor {
     const windows: Observation[] = [];
     for (const id of touched) if (s.windows.some((w) => w.id === id)) windows.push(await this.observe(id));
     return { snapshot: s, windows, receipts: this.receipts, external_changes: this.externalChanges };
+  }
+
+  /** The finish gate's verdict: the independent judge reads the computer and the folder as they are now, every window
+   *  the task touched, the receipts, what other programs changed, and the runtime's own account (effects, an answer,
+   *  the model's claim) — and says pass / fail / unknown. unknown is not done. The runtime and the MCP service call
+   *  the same method, so a run cannot end "done" on any runtime without it. */
+  async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string }> {
+    const ev = await this.verify();
+    const ws = this.opts.files?.workspace;
+    const evidence: Record<string, unknown> = {
+      任务结束时整台电脑: ev.snapshot,
+      任务碰过的窗口现在的样子: ev.windows.map((o) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) })),
+      执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
+      ...(ev.external_changes.length ? { "任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）": ev.external_changes.map((c) => c.path) } : {}),
+      ...(ws ? { 任务目录现在的内容: ws.listing() } : {}),
+      ...(this.startTree ? { "任务开始时的目录（路径 → 版本；小文件带内容）": this.startTree } : {}),
+      ...extra,
+      模型自称: summary,
+    };
+    if (!this.opts.judge) return { verdict: "unknown", reason: "no judge to verify with" };
+    const ans = await this.opts.judge.choose(VERIFY_QUESTION, { 用户原文: this.opts.raw ?? "", 证据: evidence }, VERIFY_OPTIONS, "verify");
+    if (!ans) return { verdict: "unknown", reason: "the judge could not answer" };
+    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "" });
+    return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by };
   }
 
   async end(): Promise<{ receipts: Receipt[]; task_objects: string[] }> {

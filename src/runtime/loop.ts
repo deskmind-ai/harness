@@ -16,8 +16,6 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Gateway } from "../gateway/index.js";
 import type { Answer, Card, CardOption } from "../orchestrator/index.js";
-import * as P from "../orchestrator/prompts.js";
-import { VerifyAnswer } from "../protocol/roles.js";
 import type { Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import { canon } from "../executor/consent.js";
@@ -101,9 +99,6 @@ export class FrontierRuntime {
   private summary = "";
   private answer: string | null = null;
   private lastSig = "";
-  /** The folder as the task found it: versions of every path and the text of small files, so the verdict can tell
-   *  "unchanged" and "renamed from" apart from guesses (the orchestrator records the same at run.start). */
-  private startTree: { versions: Record<string, string>; contents: Record<string, string> } | null = null;
   private repeats = 0;
   private readonly budget: typeof RUNTIME_BUDGET;
   private readonly abort = new AbortController();
@@ -333,31 +328,9 @@ export class FrontierRuntime {
 
   /** The independent verdict: the computer and files after, every window the task touched, what it did, its claim. */
   private async verify(summary: string): Promise<{ verdict: string; reason: string }> {
-    const ev = await this.o.executor.verify();
-    const evidence: Record<string, unknown> = {
-      任务结束时整台电脑: ev.snapshot,
-      任务碰过的窗口现在的样子: ev.windows.map((o) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) })),
-      本任务做过的动作: this.effects,
-      执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
-      ...(ev.external_changes.length ? { "任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）": ev.external_changes.map((c) => c.path) } : {}),
-      ...(this.o.workspace ? { 任务目录现在的内容: this.o.workspace.listing() } : {}),
-      ...(this.startTree ? { "任务开始时的目录（路径 → 版本；小文件带内容）": this.startTree } : {}),
-      ...(this.answer !== null ? { 给用户的答案: this.answer } : {}),
-      模型自称: summary,
-    };
-    const req = { statement: "用户的要求已经做到，最终状态和要求一致；用户问的是问题则答案有依据", check: { kind: "semantic" } };
-    // the audit's wording follows Codex's completion audit (ext/goal/templates/goals/continuation.md): completion is
-    // unproven until the current state proves every requirement; weak or indirect evidence is not achieved
-    const audit = [
-      "核对的做法：先从用户的要求里列出每一条具体要求（每个文件、每句话、每个动作、每个问题的答案），再逐条在证据里找能证明它的东西。",
-      "证据只认现在的状态（窗口的元素和文字、文件内容、执行回执）；模型自称做完了、动作「发出去了」但没读回结果、只和要求「相符」但证明不了，都不算。",
-      "一条要求的证据范围要和它一样宽：用一个窄的检查不能支持一个宽的结论。",
-      "每条都被证明才 pass；有一条证据矛盾就 fail；有一条证据不够、没有或间接，就 unknown。reason 里写明哪一条、缺什么。",
-    ].join("\n");
-    const rep = await this.o.gateway.ask("verify", P.SYSTEM, P.verifyPrompt(req, this.raw, evidence) + "\n" + audit, VerifyAnswer, this.o.task);
     this.count("model_calls");
-    if (rep.outcome !== "answered") return { verdict: "unknown", reason: `verify ${rep.outcome}: ${rep.error}` };
-    return { verdict: rep.data!.verdict, reason: rep.data!.reason };
+    const v = await this.o.executor.verdict(summary, { 本任务做过的动作: this.effects, ...(this.answer !== null ? { 给用户的答案: this.answer } : {}) });
+    return { verdict: v.verdict, reason: v.reason };
   }
 
   // --- the loop --------------------------------------------------------------------------------------------------------
@@ -378,11 +351,6 @@ export class FrontierRuntime {
       this.status = "environment"; this.reason = `cannot read the computer: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200);
       await ex.end().catch(() => undefined);
       return this.result();
-    }
-    if (this.o.workspace) {
-      const ws = this.o.workspace, versions: Record<string, string> = {}, contents: Record<string, string> = {};
-      for (const [p, v] of Object.entries(ws.entries())) { versions[p] = v; if (v !== "dir" && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= 1000) contents[p] = t; } }
-      this.startTree = { versions, contents };
     }
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await ex.end().catch(() => undefined); return this.result(); }

@@ -31,7 +31,7 @@ function runtime(driver: Driver, steps: Step[], u: RuntimeUser, extra: Record<st
   const app = ConsentSigner.fresh();
   const ex = new Executor(driver, { task: "t1", publicKey: app.publicKey });
   const gw = new Gateway(scriptedTable);
-  gw.script = Array(5).fill((role: string) => (role === "verify" ? { verdict: "pass", reason: "ok" } : { outcome: "error", error: "unexpected role " + role }));
+  gw.script = Array(20).fill((role: string) => (role === "verify" ? { choice: "pass", reason: "ok" } : role === "intent" ? { choice: "matches" } : { outcome: "error", error: "unexpected role " + role }));
   const seen: Message[][] = [];
   const rt = new FrontierRuntime({ task: "t1", raw: "x", executor: ex, signer: app, user: u, gateway: gw, model: { ...model, streamFn: scriptedStream(steps, seen) }, ...extra } as any);
   return { rt, ex };

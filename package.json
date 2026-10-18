@@ -16,7 +16,8 @@
     "schemas": "tsx src/protocol/export.ts",
     "gym": "tsx src/eval/gym.ts",
     "app": "tsx src/cli/app.ts",
-    "bundle": "node scripts/bundle.mjs"
+    "bundle": "node scripts/bundle.mjs",
+    "mcp": "tsx src/cli/mcp.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
