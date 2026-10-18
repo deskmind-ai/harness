@@ -409,6 +409,20 @@ describe("judge: adaptive routing and shadow", () => {
     expect(a?.by).toBe("low");
     expect(events.find((e) => e.k === "judge.shadow")).toMatchObject({ tier: "low", choice: "matches", top: "matches", agree: true });
     expect(stats.snapshot().low!["程序即将执行这个动作？"]).toEqual({ asked: 8, settled: 0 });
+    // agreement routing: a kind the slow tier keeps disagreeing on (measured by shadow) is taken away from the fast tier
+    const stats2 = new TierStats();
+    const low2 = new Gateway(table), top2 = new Gateway(table);
+    const j2 = new Judge([{ name: "low", gateway: low2, floor: 0.9 }, { name: "top", gateway: top2 }], { stats: stats2, shadow: true, budget: 1000, onEvent: (k, b) => events.push({ k, ...b }) });
+    low2.script = Array(100).fill(() => ({ choice: "matches", scores: { matches: 0.99 } }));
+    top2.script = Array(100).fill(() => ({ choice: "insufficient" }));                        // the slow tier would ask the user
+    for (let i = 0; i < 10; i++) await j2.choose("程序即将执行这个动作？", { 对象: `window:w${i}`, i }, opts);
+    const before = low2.script.length;
+    const r = await j2.choose("程序即将执行这个动作？", { 对象: "window:w99" }, opts);
+    expect(low2.script.length).toBe(before);                                                   // not asked any more on window actions
+    expect(r?.by).toBe("top");
+    expect(stats2.snapshot().low!["程序即将执行这个动作？|window"]).toMatchObject({ compared: 10, agreed: 0 });
+    const r2 = await j2.choose("程序即将执行这个动作？", { 对象: "path:a.txt" }, opts);   // file actions: still the fast tier
+    expect(r2?.by).toBe("low");
   });
 });
 

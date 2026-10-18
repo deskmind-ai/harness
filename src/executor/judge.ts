@@ -23,22 +23,33 @@ export interface JudgeAnswer { choice: string; by: string; confidence?: number; 
  *  the evidence questions share a prefix), kept across tasks when a path is given: a tier that never settles a kind
  *  is not asked it any more, except for an occasional probe, so its latency is not paid for nothing. */
 export class TierStats {
-  private readonly data: Record<string, Record<string, { asked: number; settled: number }>> = {};
+  private readonly data: Record<string, Record<string, { asked: number; settled: number; compared?: number; agreed?: number }>> = {};
   constructor(private readonly path?: string) {
     if (path) { try { Object.assign(this.data, JSON.parse(readFileSync(path, "utf-8"))); } catch { /* fresh */ } }
   }
-  static kindOf(question: string): string { return question.slice(0, 12); }
-  note(tier: string, kind: string, settled: boolean) {
-    const t = (this.data[tier] ??= {}); const k = (t[kind] ??= { asked: 0, settled: 0 });
-    k.asked += 1; if (settled) k.settled += 1;
-    if (this.path) { try { mkdirSync(dirname(this.path), { recursive: true }); writeFileSync(this.path, JSON.stringify(this.data)); } catch { /* best effort */ } }
+  /** A question's kind: its first words, and what the action is on (a window, a path, an app) — the fast tier agrees
+   *  with the slow one far less on window actions than on file actions (10-19: 46% vs 95%), so they are routed apart. */
+  static kindOf(question: string, context?: unknown): string {
+    const obj = (context as { 对象?: unknown } | undefined)?.对象;
+    const where = typeof obj === "string" ? obj.split(":")[0] : "";
+    return question.slice(0, 12) + (where ? `|${where}` : "");
   }
-  /** Skip the tier for this kind: asked at least `min` times, settled under `floor` of them — and not a probe turn. */
-  skip(tier: string, kind: string, min = 8, floor = 0.2, probeEvery = 20): boolean {
+  private save() { if (this.path) { try { mkdirSync(dirname(this.path), { recursive: true }); writeFileSync(this.path, JSON.stringify(this.data)); } catch { /* best effort */ } } }
+  private at(tier: string, kind: string) { const t = (this.data[tier] ??= {}); return (t[kind] ??= { asked: 0, settled: 0 }); }
+  note(tier: string, kind: string, settled: boolean) { const k = this.at(tier, kind); k.asked += 1; if (settled) k.settled += 1; this.save(); }
+  /** A shadow comparison: did the slow tier agree with what the fast tier settled? */
+  noteAgreement(tier: string, kind: string, agree: boolean) { const k = this.at(tier, kind); k.compared = (k.compared ?? 0) + 1; if (agree) k.agreed = (k.agreed ?? 0) + 1; this.save(); }
+  /** Skip the tier for this kind when it has shown it is not worth asking: it settles under `floor` of the questions
+   *  (asked at least `min` times), or — measured by shadow comparisons — the slow tier agreed with its settled
+   *  answers under `agreeFloor` of the time (compared at least `minCompared` times). A probe turn now and then keeps
+   *  the numbers alive. */
+  skip(tier: string, kind: string, min = 8, floor = 0.2, probeEvery = 20, minCompared = 10, agreeFloor = 0.9): boolean {
     const k = this.data[tier]?.[kind];
-    if (!k || k.asked < min) return false;
-    if (k.asked % probeEvery === 0) return false;
-    return k.settled / k.asked < floor;
+    if (!k) return false;
+    if (k.asked > 0 && k.asked % probeEvery === 0) return false;
+    if (k.asked >= min && k.settled / k.asked < floor) return true;
+    if ((k.compared ?? 0) >= minCompared && (k.agreed ?? 0) / k.compared! < agreeFloor) return true;
+    return false;
   }
   snapshot() { return JSON.parse(JSON.stringify(this.data)) as typeof this.data; }
 }
@@ -57,7 +68,7 @@ export class Judge {
     if (hit) return { ...hit, cached: true };
     if (this.calls >= (this.opts.budget ?? 40)) { this.opts.onEvent?.("judge.budget", {}); return null; }
     const ids = options.map((o) => o.id) as [string, ...string[]];
-    const kind = TierStats.kindOf(question);
+    const kind = TierStats.kindOf(question, context);
     let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null;
     for (const tier of this.tiers) {
       const final = tier === this.tiers[this.tiers.length - 1];
@@ -80,7 +91,9 @@ export class Judge {
     if (settled && settledBy && this.opts.shadow) {
       const top = this.tiers[this.tiers.length - 1]!;
       const rep = await top.gateway.ask(role ?? top.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
-      this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, question_kind: kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree: rep.outcome === "answered" ? rep.data!.choice === last!.choice : null });
+      const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
+      if (agree !== null) this.opts.stats?.noteAgreement(settledBy.name, kind, agree);
+      this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, question_kind: kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree });
     }
     // every tier above a lower tier's refusal failed: that refusal does not become final by default — the caller takes
     // the conservative branch (the user decides), the same as when no tier answered
