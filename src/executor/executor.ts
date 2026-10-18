@@ -13,7 +13,9 @@
  */
 import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
-import type { Capability, Registry } from "../registry/capability.js";
+import { Crash, type Capability, type Registry } from "../registry/capability.js";
+import { reconcile as reconcileVersions } from "../registry/reconcile.js";
+import * as fs from "node:fs";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
@@ -28,6 +30,11 @@ export interface ExecutorOptions {
   judge?: Judge;
   /** The user's words, for the judge; the runtime updates it when the user changes the request (steer). */
   raw?: string;
+  /** A journal (jsonl): every state-changing action is written down before it runs and receipted after, so a process
+   *  that died in between is found on restart (an intent without a receipt) and reconciled, never repeated blindly. */
+  journal?: string;
+  /** Test hook: die after the first effect, before its receipt (what a power cut at the wrong moment does). */
+  crashAfterFirstEffect?: boolean;
   /** The task folder and the file capabilities: files are objects like windows (owner, version, last seen). */
   files?: { workspace: Workspace; registry: Registry };
 }
@@ -62,8 +69,36 @@ export class Executor {
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
 
+  /** What a restart found: an action the previous process started and never receipted, and what became of it. */
+  recovered: { action: Action; finding: "happened" | "not_happened" | "unknown"; text: string } | null = null;
+  private crashed = false;
+
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
+  }
+
+  private journal(kind: "intent" | "receipt", body: Record<string, unknown>) {
+    if (!this.opts.journal) return;
+    const fd = fs.openSync(this.opts.journal, "a");
+    try { fs.writeSync(fd, JSON.stringify({ t: this.opts.now?.() ?? Date.now(), kind, ...body }) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  }
+
+  /** On begin: the last intent of an earlier process with no receipt. A file action is reconciled from the versions
+   *  it recorded (happened / not happened / unknown); a screen action is unknown by nature — both are told to the
+   *  runtime, which looks before acting again. */
+  private recover() {
+    const p = this.opts.journal;
+    if (!p || !fs.existsSync(p)) return;
+    const lines = fs.readFileSync(p, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    const last = lines.at(-1);
+    if (!last || last.kind !== "intent") return;
+    const action = last.action as Action;
+    let finding: "happened" | "not_happened" | "unknown" = "unknown";
+    const ws = this.opts.files?.workspace;
+    if (action.kind === "file" && ws && last.versions_before && last.expect_after) finding = reconcileVersions(ws, last.versions_before as Record<string, string>, last.expect_after as Record<string, string>);
+    this.recovered = { action, finding, text: String(last.text ?? "") };
+    this.journal("receipt", { recovered: true, finding });
+    this.emit("executor.recovered", { action, finding });
   }
 
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
@@ -124,6 +159,7 @@ export class Executor {
       this.startTree = { versions: { ...this.seen }, contents };
     }
     this.ledger.begin(raw, paths);
+    this.recover();
     this.epoch = raw.epoch;
     this.last = this.ledger.stamp(raw);
     this.emit("executor.begin", { windows: this.last.windows.length, locked: this.last.locked });
@@ -239,7 +275,10 @@ export class Executor {
     const before = "window" in req.action ? this.lastObs.get(req.action.window) ?? null : null;
     // a real driver can fail on either side of the action: that is a result the model reads, never an exception
     let r: PerformResult;
+    if (consequence !== "read") this.journal("intent", { action: req.action, object: f.object, consequence, text: describeAction(req.action, obs, consequence) });
     try { r = await this.driver.perform(req.action); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
+    if (consequence !== "read") this.journal("receipt", { status: r.status });
     if (r.new_window) this.ledger.created(`window:${r.new_window.id}`);
     let after: Snapshot;
     try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
@@ -295,9 +334,14 @@ export class Executor {
     }
     const existed = fp.writes.filter((p) => ws.exists(p));
     const undo_prep = cap.prepareUndo?.(ws, a.args);
+    const versions_before: Record<string, string> = {};
+    for (const p of [...fp.reads, ...fp.writes]) versions_before[p] = ws.version(p);
+    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {} });
     let r: ReturnType<Capability["execute"]>;
-    try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
+    if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && cap.effect !== "observe") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
+    if (cap.effect !== "observe") this.journal("receipt", { status: r.status });
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
     if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));
@@ -388,6 +432,21 @@ export class Executor {
       this.emit("executor.undone", { seq: step.seq, text: step.text });
     }
     return { undone, total: plan.steps.length, refused: null };
+  }
+
+  /** What changed in the task folder since begin, for the result: paths made, changed and gone (external changes
+   *  are listed apart, as what another program did). */
+  changes(): { created: string[]; modified: string[]; deleted: string[]; external: string[] } {
+    const ws = this.opts.files?.workspace, start = this.startTree?.versions ?? {};
+    if (!ws) return { created: [], modified: [], deleted: [], external: this.externalChanges.map((c) => c.path) };
+    const now = ws.entries();
+    const external = new Set(this.externalChanges.map((c) => c.path));
+    return {
+      created: Object.keys(now).filter((p) => !(p in start) && !external.has(p)),
+      modified: Object.keys(now).filter((p) => p in start && start[p] !== (now[p] === "dir" ? ws.version(p) : now[p]) && now[p] !== "dir" && !external.has(p)),
+      deleted: Object.keys(start).filter((p) => !(p in now)),
+      external: [...external],
+    };
   }
 
   async end(): Promise<{ receipts: Receipt[]; task_objects: string[] }> {

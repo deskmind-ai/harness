@@ -274,3 +274,28 @@ describe("frontier runtime: the result card", () => {
     expect(r.result_card?.text).toContain("撤不回");
   });
 });
+
+describe("frontier runtime: a crash", () => {
+  it("the loop dies with the crash; the next run is told what the journal found and finishes without redoing it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "rt-crash-"));
+    build(root, { "todo.txt": "交房租\n" });
+    const ws = new Workspace(root);
+    const { Crash } = await import("../src/registry/capability.js");
+    const journal = path.join(root, "..", `rt-journal-${Date.now()}.jsonl`);
+    const steps1: Step[] = [{ calls: [{ name: "fs_create_text", args: { parent: ".", name: "备忘.txt", text: "买牛奶" } }] }];
+    const app = ConsentSigner.fresh();
+    const gw = new Gateway(scriptedTable);
+    gw.script = Array(20).fill((role: string) => (role === "verify" ? { choice: "pass", reason: "ok" } : { choice: "matches" }));
+    const mk = (crash: boolean, steps: Step[], seen: Message[][]) => {
+      const ex = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, journal, ...(crash ? { crashAfterFirstEffect: true } : {}) });
+      return new FrontierRuntime({ task: "t1", raw: "新建 备忘.txt 写上买牛奶", executor: ex, signer: app, user: user(approveAll), gateway: gw, model: { ...model, streamFn: scriptedStream(steps, seen) }, workspace: ws, registry: fileRegistry() });
+    };
+    await expect(mk(true, steps1, []).run()).rejects.toBeInstanceOf(Crash);
+    const seen: Message[][] = [];
+    const r = await mk(false, [{ calls: [{ name: "finish", args: { outcome: "done", summary: "备忘.txt 已存在" } }] }], seen).run();
+    expect(r.status).toBe("succeeded");
+    expect((seen[0]![1] as any).content).toContain("上一次运行在做");
+    expect((seen[0]![1] as any).content).toContain("已经生效");
+    expect(ws.read("备忘.txt")).toBe("买牛奶");
+  });
+});

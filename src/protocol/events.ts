@@ -28,7 +28,7 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("consent"), object: z.string(), consequence: Consequence, scope: z.enum(["action", "object", "rule"]), picked: z.string().nullable() }),
   z.object({ kind: z.literal("refused"), what: z.string(), why: z.string(), by: z.enum(["user", "executor"]) }),
   z.object({ kind: z.literal("answer_given"), text: z.string() }),
-  z.object({ kind: z.literal("task_done"), status: z.string(), reason: z.string(), summary: z.string(), result_card: CardEvent.nullable(), answer: z.string().nullable().optional() }),
+  z.object({ kind: z.literal("task_done"), status: z.string(), reason: z.string(), summary: z.string(), result_card: CardEvent.nullable(), answer: z.string().nullable().optional(), changes: z.object({ created: z.array(z.string()), modified: z.array(z.string()), deleted: z.array(z.string()), external: z.array(z.string()) }).optional().optional() }),
   // the user's response to a result card after the run (respond): recorded; what it does is the runtime's to add
   z.object({ kind: z.literal("result_response"), picked: z.string().nullable(), text: z.string().optional(), effect: z.string() }),
 ]);

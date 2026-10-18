@@ -2,7 +2,7 @@
  * The check set through the frontier runtime (`pnpm eval -- --engine runtime`): the same tasks, workspace, simulated
  * user and scorer as the orchestrator path, so the two engines compare on the same 105 tasks with the same model.
  *
- * Not carried over for this engine: the crash hook (no journal to recover from yet) and the
+ * Not carried over for this engine: the
  * skill library (group 5 teach / learn): the row says `skills: "unsupported"`, and the GUI group runs on the simulated
  * editor window (the user's, since it is on screen at begin, so acting in it is consented on a card).
  */
@@ -12,6 +12,7 @@ import * as path from "node:path";
 import type { Gateway } from "../gateway/index.js";
 import { ConsentSigner } from "../executor/consent.js";
 import { Executor } from "../executor/executor.js";
+import { Crash } from "../registry/capability.js";
 import { SimComputer } from "../executor/sim.js";
 import type { Answer, Card } from "../orchestrator/index.js";
 import { FrontierRuntime, type RuntimeStatus, type RuntimeUser } from "../runtime/loop.js";
@@ -75,8 +76,11 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     if (h.external && !fired.ext && effects >= h.external.after_action) { fired.ext = true; build(root, h.external.set); ws.invalidate(); events.push({ seq: ++tick, kind: "hook.external", set: Object.keys(h.external.set) }); }
     if (h.goal_update && !fired.upd && rt && kind === "tool.call" && (rt.counters["model_calls"] ?? 0) >= h.goal_update.after_decisions) { fired.upd = true; rt.steer(h.goal_update.raw); }
   };
-  const ex = new Executor(sim, { task: task.id, publicKey: app.publicKey, onEvent });
-  for (const id of ex_taskWindows) ex.ledger.created(`window:${id}`);
+  // a crash task dies after its first effect; the next process finds the intent without a receipt in the journal,
+  // reconciles it, and the model is told (as the orchestrator engine recovers from its log)
+  const journal = path.join(runDir, "journal.jsonl");
+  const makeExecutor = (crash: boolean) => { const e = new Executor(sim, { task: task.id, publicKey: app.publicKey, onEvent, journal, ...(crash ? { crashAfterFirstEffect: true } : {}) }); for (const id of ex_taskWindows) e.ledger.created(`window:${id}`); return e; };
+  let ex = makeExecutor(!!h.crash);
   // every card the user answers is noted with its pick, in order with the writes
   const cardUser: RuntimeUser = {
     ask(card: Card): Answer | null | Promise<Answer | null> {
@@ -86,8 +90,19 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     },
   };
   const t0 = Date.now(), calls0 = gw.calls, spent0 = gw.spentUsd;
-  rt = new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, model, workspace: ws, registry, onEvent });
-  const r = await rt.run();
+  const makeRuntime = () => new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, model, workspace: ws, registry, onEvent });
+  rt = makeRuntime();
+  let crashed = false;
+  let r: Awaited<ReturnType<FrontierRuntime["run"]>>;
+  try { r = await rt.run(); }
+  catch (e) {
+    if (!(e instanceof Crash)) throw e;
+    crashed = true;
+    if (h.after_crash_set) { build(root, h.after_crash_set); ws.invalidate(); }
+    ex = makeExecutor(false);
+    rt = makeRuntime();
+    r = await rt.run();
+  }
   const firstAsk = seen.find((s) => s.kind === "missing" || s.kind === "ambiguity" || s.kind === "plan")?.at ?? -1;
   const firstWrite = writes[0]?.at ?? -1;
   const last = seen.at(-1);
@@ -102,7 +117,7 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   const sc = score(task, start, ws.tree(), summ, sim.log, talk, bytesAt);
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: `${gw.name}@runtime`, engine: "runtime", status: summ.status, runtime_status: r.status, reason: r.reason,
-    ...sc, crashed: false, counters: summ.counters, model_calls: gw.calls - calls0 + (r.counters["model_calls"] ?? 0), loop_calls: r.counters["model_calls"] ?? 0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
+    ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0 + (r.counters["model_calls"] ?? 0), loop_calls: r.counters["model_calls"] ?? 0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
     tokens_in: r.counters["tokens_in"] ?? 0, tokens_out: r.counters["tokens_out"] ?? 0,
     category: task.category, policy: {}, skill: null, skills: task.group === 5 ? "unsupported" : null, taught: null, learned: null, asked: user.asked, approvals: user.approvals, result_response: null, sim: user.sim,
     ask_decisions: [], consents: r.consents, cards: seen.map((s) => `${s.kind}:${s.picked ?? "-"}`), verdicts: r.verdicts, answer: r.answer, summary: r.summary,

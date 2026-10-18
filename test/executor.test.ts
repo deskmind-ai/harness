@@ -401,3 +401,33 @@ describe("executor: undo", () => {
     expect(ws.read("b.txt")).toBe("someone else");
   });
 });
+
+describe("executor: the journal and a crash", () => {
+  it("an effect without a receipt is found on restart and reconciled from versions, not repeated", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const { Crash } = await import("../src/registry/capability.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ex-crash-"));
+    build(root, { "todo.txt": "交房租\n" });
+    const ws = new Workspace(root), app = ConsentSigner.fresh();
+    const journal = path.join(root, "..", `journal-${Date.now()}.jsonl`);
+    const ex = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, journal, crashAfterFirstEffect: true });
+    await started(ex);
+    await expect(ex.act({ action: { kind: "file", capability: "fs.create_text", args: { parent: ".", name: "备忘.txt", text: "买牛奶" } }, epoch: ex.currentEpoch })).rejects.toBeInstanceOf(Crash);
+    expect(ws.read("备忘.txt")).toBe("买牛奶");                                   // the effect happened; the receipt was never written
+    const lines = fs.readFileSync(journal, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.kind)).toEqual(["intent"]);
+    // the next process: the intent is found, the versions say it happened, and that is told, not redone
+    const ex2 = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, journal });
+    await ex2.begin();
+    expect(ex2.recovered).toMatchObject({ finding: "happened", action: { kind: "file", capability: "fs.create_text" } });
+    expect(ex2.recovered!.text).toContain("备忘.txt");
+    const after = fs.readFileSync(journal, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(after.at(-1)).toMatchObject({ kind: "receipt", recovered: true, finding: "happened" });
+    // a third start finds nothing pending
+    const ex3 = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, journal });
+    await ex3.begin();
+    expect(ex3.recovered).toBeNull();
+  });
+});

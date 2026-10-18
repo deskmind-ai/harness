@@ -22,6 +22,7 @@ import type { Workspace } from "../registry/workspace.js";
 import { canon } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
 import { Executor, describeAction } from "../executor/executor.js";
+import { Crash } from "../registry/capability.js";
 import { defaultJudge } from "../executor/judge.js";
 import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading } from "../executor/types.js";
 
@@ -105,6 +106,7 @@ export class FrontierRuntime {
   private repeats = 0;
   private readonly budget: typeof RUNTIME_BUDGET;
   private readonly abort = new AbortController();
+  private crash: Crash | null = null;
 
   constructor(readonly o: RuntimeOptions) {
     this.raw = o.raw;
@@ -236,7 +238,9 @@ export class FrontierRuntime {
     const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
     let consent = this.tokens.get(pre.object);
     if (consent && rank(consent.consequence) < rank(pre.consequence)) consent = undefined;
-    let r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent });
+    let r: ActResult;
+    try { r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
+    catch (e) { if (e instanceof Crash) { this.crash = e; this.abort.abort(); return { ...text("crash"), terminate: true }; } throw e; }
     if (r.status === "needs_consent" && r.challenge) {
       const t = await this.consentFor(r.challenge);
       if (t === null) return this.end("failed", "no answer from the user");
@@ -357,10 +361,12 @@ export class FrontierRuntime {
     }
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await ex.end().catch(() => undefined); return this.result(); }
+    const rec = ex.recovered;
+    const recovery = rec ? `\n\n注意：上一次运行在做「${rec.text}」时中断了，${rec.finding === "happened" ? "那一步已经生效" : rec.finding === "not_happened" ? "那一步没有发生" : "不知道那一步做成没有"}。先看现在的状态再决定，不要盲目重做。` : "";
     const context: AgentContext = {
       messages: [
         { role: "system", content: this.systemPrompt(), timestamp: Date.now() },
-        { role: "user", content: `用户的要求：${this.o.raw}\n\n现在整台电脑的状态：${J(snap)}`, timestamp: Date.now() },
+        { role: "user", content: `用户的要求：${this.o.raw}\n\n现在整台电脑的状态：${J(snap)}${recovery}`, timestamp: Date.now() },
       ],
       tools: this.tools(),
     };
@@ -405,6 +411,7 @@ export class FrontierRuntime {
     } catch (e) {
       if (!this.status) { this.status = "failed"; this.reason = `loop error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200); }
     }
+    if (this.crash) throw this.crash;                       // the process dies here: the journal is what survives
     if (!this.status) { this.status = "failed"; this.reason = "the model stopped without finishing"; }
     await ex.end().catch(() => undefined);
     return this.result();

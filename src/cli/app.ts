@@ -42,11 +42,17 @@ export class LineReader {
   private queued: string[] = [];
   constructor(input: NodeJS.ReadableStream) {
     const rl = readline.createInterface({ input, terminal: false });
-    rl.on("line", (l) => { if (!l.trim()) return; const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l); });
+    rl.on("line", (l) => {
+      if (!l.trim()) return;
+      // the app's stop can arrive at any moment, card or no card: it never waits in the answer queue
+      try { const j = JSON.parse(l); if (j && j.stop === true) { this.onStop?.(); return; } } catch { /* an answer line */ }
+      const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l);
+    });
     // the app went away (stdin closed): every open card is answered with nothing, so the run ends instead of hanging
     rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); });
   }
   closed = false;
+  onStop: (() => void) | null = null;
   next(): Promise<string> { const q = this.queued.shift(); return q !== undefined ? Promise.resolve(q) : this.closed ? Promise.resolve("") : new Promise((r) => this.waiting.push(r)); }
 }
 
@@ -129,9 +135,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     skills: skillsFor(req, ws),
     onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); },
   });
+  o.input.onStop = () => { log.emit({ kind: "refused", what: "the task", why: "stopped by the app", by: "user" }); rt.stop("stopped by the app"); };
   const r = await rt.run();
   const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
-  log.emit({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer });
+  log.emit({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes() } as never);
   // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
   // seconds for `{ "respond": <option index> }` on stdin, then exit
   if (card && o.linger > 0) {
