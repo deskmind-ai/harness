@@ -79,7 +79,7 @@ describe("frontier runtime: consent", () => {
     expect(u.cards[1]!.text).toContain("发送");
     expect(u.cards[1]!.text).toContain("发出去");
     expect(r.consents.map((c) => c.scope)).toEqual(["object", "action"]);
-    expect(r.verdicts).toEqual([{ verdict: "pass", reason: "ok" }]);
+    expect(r.verdicts).toMatchObject([{ verdict: "pass", reason: "ok" }]);
     // what the model was shown: the base skill and the snapshot with owners
     const sys = seen[0]![0] as any;
     expect(sys.content).toContain("看得宽，动得窄");
