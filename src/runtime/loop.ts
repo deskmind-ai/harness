@@ -99,6 +99,9 @@ export class FrontierRuntime {
   private summary = "";
   private answer: string | null = null;
   private lastSig = "";
+  /** The folder as the task found it: versions of every path and the text of small files, so the verdict can tell
+   *  "unchanged" and "renamed from" apart from guesses (the orchestrator records the same at run.start). */
+  private startTree: { versions: Record<string, string>; contents: Record<string, string> } | null = null;
   private repeats = 0;
   private readonly budget: typeof RUNTIME_BUDGET;
   private readonly abort = new AbortController();
@@ -349,6 +352,7 @@ export class FrontierRuntime {
       本任务做过的动作: this.effects,
       执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
       ...(this.o.workspace ? { 任务目录现在的内容: this.o.workspace.listing() } : {}),
+      ...(this.startTree ? { 任务开始时的目录（路径 → 版本；小文件带内容）: this.startTree } : {}),
       ...(this.answer !== null ? { 给用户的答案: this.answer } : {}),
       模型自称: summary,
     };
@@ -385,6 +389,11 @@ export class FrontierRuntime {
       this.status = "environment"; this.reason = `cannot read the computer: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200);
       await ex.end().catch(() => undefined);
       return this.result();
+    }
+    if (this.o.workspace) {
+      const ws = this.o.workspace, versions: Record<string, string> = {}, contents: Record<string, string> = {};
+      for (const [p, v] of Object.entries(ws.entries())) { versions[p] = v; if (v !== "dir" && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= 1000) contents[p] = t; } }
+      this.startTree = { versions, contents };
     }
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await ex.end().catch(() => undefined); return this.result(); }
