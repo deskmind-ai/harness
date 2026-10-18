@@ -414,7 +414,7 @@ describe("judge: adaptive routing and shadow", () => {
     const low2 = new Gateway(table), top2 = new Gateway(table);
     const j2 = new Judge([{ name: "low", gateway: low2, floor: 0.9 }, { name: "top", gateway: top2 }], { stats: stats2, shadow: true, budget: 1000, onEvent: (k, b) => events.push({ k, ...b }) });
     low2.script = Array(100).fill(() => ({ choice: "matches", scores: { matches: 0.99 } }));
-    top2.script = Array(100).fill(() => ({ choice: "insufficient" }));                        // the slow tier would ask the user
+    top2.script = Array(100).fill(() => ({ choice: "mismatch" }));                            // the slow tier keeps disagreeing
     for (let i = 0; i < 10; i++) await j2.choose("程序即将执行这个动作？", { 对象: `window:w${i}`, i }, opts);
     const before = low2.script.length;
     const r = await j2.choose("程序即将执行这个动作？", { 对象: "window:w99" }, opts);
