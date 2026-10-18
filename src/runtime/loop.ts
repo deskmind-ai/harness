@@ -352,7 +352,7 @@ export class FrontierRuntime {
       本任务做过的动作: this.effects,
       执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
       ...(this.o.workspace ? { 任务目录现在的内容: this.o.workspace.listing() } : {}),
-      ...(this.startTree ? { 任务开始时的目录（路径 → 版本；小文件带内容）: this.startTree } : {}),
+      ...(this.startTree ? { "任务开始时的目录（路径 → 版本；小文件带内容）": this.startTree } : {}),
       ...(this.answer !== null ? { 给用户的答案: this.answer } : {}),
       模型自称: summary,
     };
