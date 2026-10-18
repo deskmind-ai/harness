@@ -303,6 +303,43 @@ describe("judge tiers", () => {
   });
 });
 
+describe("executor: files an app writes are the task's", () => {
+  it("a save through the app's own window is credited to the task; reads are never refused as stale; folders do not count", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ex-save-"));
+    build(root, { "old.txt": "旧\n" });
+    const ws = new Workspace(root), app = ConsentSigner.fresh();
+    const sim = new SimComputer(root);
+    const events: Record<string, unknown>[] = [];
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, onEvent: (k, b) => events.push({ k, ...b }) });
+    await started(ex);
+    // the task opens its own editor window and saves with cmd+s: the file the app wrote is the task's, not "external"
+    const opened = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: ex.currentEpoch });
+    const win = opened.after!.window.id;
+    const w = sim.wins.find((x) => x.id === win)!;
+    w.state.doc = { title: "note.txt", text: "你好", path: "note.txt" };
+    const saved = await ex.act({ action: { kind: "key", window: win, chord: "cmd+s" }, epoch: ex.currentEpoch });
+    expect(saved.status).toBe("ok");
+    expect(saved.files).toEqual(["note.txt"]);
+    expect(fs.readFileSync(path.join(root, "note.txt"), "utf-8")).toBe("你好");
+    expect(ex.changes()).toMatchObject({ created: ["note.txt"], external: [] });
+    expect(events.some((e) => e.k === "executor.files_written")).toBe(true);
+    // reading it right after is a read, not a stale write
+    expect((await ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "note.txt" } }, epoch: ex.currentEpoch })).status).toBe("ok");
+    // another program changes old.txt: listing the folder and reading the file go ahead (the change is a recorded fact), writing it is refused until read
+    build(root, { "old.txt": "别人改的\n" }); ws.invalidate();
+    expect((await ex.act({ action: { kind: "file", capability: "fs.list", args: { path: "." } }, epoch: ex.currentEpoch })).status).toBe("ok");
+    expect(ex.externalChanges.map((c) => c.path)).toEqual([]);                                    // a folder is not an external change
+    build(root, { "old.txt": "别人又改了\n" }); ws.invalidate();
+    const r = await ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "old.txt" } }, epoch: ex.currentEpoch });
+    expect(r.status).toBe("ok");
+    expect(ex.externalChanges.map((c) => c.path)).toEqual(["old.txt"]);
+    expect(ex.changes().external).toEqual(["old.txt"]);
+  });
+});
+
 describe("executor: a stop that arrives while an action waits", () => {
   it("a stop during the judge's or the user's wait is seen before the effect: the file is not written", async () => {
     const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");

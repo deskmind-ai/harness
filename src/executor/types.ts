@@ -104,6 +104,7 @@ export interface ActResult {
   epoch: number;                     // after the action
   consequence: Consequence;          // the class the executor settled on
   object: string;                    // what it touched (a window id, a tab id, a path)
+  files?: string[];                  // task-folder paths a screen action wrote (an app's save), credited to the task
   challenge?: Challenge;             // with needs_consent
   /** What changed, in structure: the window's elements before / after, for the step check. */
   changed?: { elements: number; focus?: string; modal?: string | null; new_windows?: string[] };

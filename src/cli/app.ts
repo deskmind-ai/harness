@@ -83,7 +83,7 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
   // a model fills optional fields with "" and 0: the step the app shows is the action without them
   const s = (x: unknown) => (typeof x === "string" ? x : JSON.stringify(x, (_, v) => (v === "" || v === 0 ? undefined : v)));
   switch (kind) {
-    case "tool.call": return body.name === "computer_act" ? { kind: "step", text: s((body.args as any)?.action), purpose: s((body.args as any)?.purpose ?? ""), consequence: (body.args as any)?.consequence } : null;
+    case "tool.call": return body.name === "computer_act" ? { kind: "step", text: s((body.args as any)?.action), purpose: s((body.args as any)?.purpose ?? ""), consequence: (body.args as any)?.consequence, ...((body.args as any)?.action?.window ? { object: `window:${(body.args as any).action.window}` } : {}) } : null;
     case "fs.act": return { kind: "step", text: `${s(body.cap)} ${s(body.args)}`, status: s(body.status), consequence: body.consequence as never };
     // an action that went out but could not be read back (hands: "dispatched, unverified") is a step with that status,
     // not a refusal; the executor's refusals (stale, stopped, environment, blocked, error) are

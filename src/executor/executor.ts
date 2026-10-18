@@ -132,6 +132,28 @@ export class Executor {
     this.emit("executor.recovered", { action, finding, external });
   }
 
+  /** After a screen action: what changed in the task folder is the action's doing — versions noted as seen, new
+   *  files as the task's objects, contents as the task's. Returns the paths (files only). */
+  private creditFiles(): string[] {
+    const ws = this.opts.files?.workspace;
+    if (!ws) return [];
+    ws.invalidate();
+    const now = ws.entries(), wrote: string[] = [];
+    for (const p of Object.keys(now)) {
+      const v = ws.version(p);
+      if (this.seen[p] === v) continue;
+      const isNew = !(p in this.seen);
+      this.seen[p] = v;
+      if (now[p] === "dir") continue;
+      wrote.push(p);
+      this.taskContent.add(`${p}@${v}`);
+      if (isNew) this.ledger.created(`path:${p}`);
+    }
+    for (const p of Object.keys(this.seen)) if (!(p in now)) { delete this.seen[p]; wrote.push(p); }
+    if (wrote.length) this.emit("executor.files_written", { paths: wrote });
+    return wrote;
+  }
+
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
   attachFiles(workspace: Workspace, registry: Registry) { this.opts.files = { workspace, registry }; }
 
@@ -331,12 +353,15 @@ export class Executor {
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
     if (r.new_window) this.ledger.created(`window:${r.new_window.id}`);
+    // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
+    // credited to it here, not found later as "changed by another program" (rc.1 end-to-end: hello.txt, 10-18)
+    const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles() : [];
     let after: Snapshot;
     try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
     this.epoch = after.epoch;
     if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch });
     const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
-    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch };
+    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}) };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
       try {
@@ -360,13 +385,18 @@ export class Executor {
     const f = this.fileOf(a);
     if ("error" in f) return { ...base, status: "error", why: f.error };
     const { cap, fp, ws } = f;
-    const touched = [...new Set([...fp.reads, ...fp.writes])].filter((p) => ws.exists(p));
-    const changed = touched.filter((p) => this.seen[p] !== ws.version(p));
+    // Files (not folders: a folder's version moves with its children) that changed since the task last saw them were
+    // changed by someone else — a fact, recorded. A write on such a file is refused until the task has read it again;
+    // a read is that reading, so it goes ahead (refusing a read with "read it first" went in circles in rc.1).
+    const touched = [...new Set([...fp.reads, ...fp.writes])].filter((p) => ws.exists(p) && !ws.isDir(p));
+    const changed = touched.filter((p) => p in this.seen && this.seen[p] !== ws.version(p));
     if (changed.length) {
       for (const p of changed) { this.externalChanges.push({ path: p, seen: this.seen[p] ?? "absent", now: ws.version(p), at: this.opts.now?.() ?? Date.now() }); this.seen[p] = ws.version(p); }
       this.emit("executor.external_change", { paths: changed });
-      return { ...base, status: "stale", why: `changed since you last saw it (by another program, or never read): ${changed.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
+      if (cap.effect !== "observe") return { ...base, status: "stale", why: `changed since you last saw it (by another program): ${changed.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
     }
+    const unseen = fp.writes.filter((p) => ws.exists(p) && !ws.isDir(p) && !(p in this.seen));
+    if (unseen.length && cap.effect !== "observe") return { ...base, status: "stale", why: `never read: ${unseen.join(", ")}. Read it first, then decide.` };
     const pre = cap.preconditions(ws, a.args);
     if (pre) return { ...base, status: "error", why: `precondition: ${pre}` };
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return { ...base, status: "needs_plan", why: "changing the user's files or sending something out needs a plan first: call plan with the paths, your readings and their evidence" };
