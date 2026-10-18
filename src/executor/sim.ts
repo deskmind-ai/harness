@@ -144,7 +144,10 @@ export class SimComputer implements Driver {
     if (a.kind === "wait") return { status: "ok" };
     if (a.kind === "file") return { status: "unsupported", why: "files are the executor's, not the desktop driver's" };
     if (a.kind === "open_window") {
-      const w = a.app === "mail" ? null : a.app.toLowerCase().includes("浏览") || a.app.toLowerCase().includes("safari") || a.url ? this.addBrowser(a.app, [{ title: a.url ?? "新标签页", url: a.url ?? "about:blank" }]) : this.addEditor(a.app);
+      // which fake app opens: the kind an app of that name already has on this desktop (as a real one is resolved
+      // from the running apps), a browser when a URL is asked for, otherwise an editor — no app names in code
+      const known = this.wins.find((x) => x.app.toLowerCase() === a.app.toLowerCase())?.kind;
+      const w = known === "mail" ? null : known === "browser" || (!known && a.url) ? this.addBrowser(a.app, [{ title: a.url ?? "新标签页", url: a.url ?? "about:blank" }]) : this.addEditor(a.app);
       if (!w) return { status: "unsupported", why: `cannot open ${a.app}` };
       for (const x of this.wins) x.focused = x === w;
       this.log.push({ opened: w.id });
