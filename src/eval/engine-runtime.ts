@@ -41,10 +41,18 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   let tick = 0;
   const seen: Seen[] = [];
   const writes: { ok: boolean; at: number }[] = [];
+  // the task's hooks, as the orchestrator engine fires them: another program changes files after N effects; the user
+  // changes the request after N model calls (steer). Crash and GUI disturbances are not carried over.
+  const h = task.hooks ?? {};
+  const fired = { ext: false, upd: false };
+  let rt: FrontierRuntime | null = null;
   const onEvent = (kind: string, body: Record<string, unknown>) => {
     tick += 1;
     events.push({ seq: tick, kind, ...body });
     if (kind === "fs.act" && body.consequence !== "read") writes.push({ ok: body.status === "ok", at: tick });
+    const effects = writes.filter((w) => w.ok).length;
+    if (h.external && !fired.ext && effects >= h.external.after_action) { fired.ext = true; build(root, h.external.set); ws.invalidate(); events.push({ seq: ++tick, kind: "hook.external", set: Object.keys(h.external.set) }); }
+    if (h.goal_update && !fired.upd && rt && kind === "tool.call" && (rt.counters["model_calls"] ?? 0) >= h.goal_update.after_decisions) { fired.upd = true; rt.steer(h.goal_update.raw); }
   };
   const ex = new Executor(sim, { task: task.id, publicKey: app.publicKey, onEvent });
   // every card the user answers is noted with its pick, in order with the writes
@@ -56,7 +64,7 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     },
   };
   const t0 = Date.now(), calls0 = gw.calls, spent0 = gw.spentUsd;
-  const rt = new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, model, workspace: ws, registry, onEvent });
+  rt = new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, model, workspace: ws, registry, onEvent });
   const r = await rt.run();
   const firstAsk = seen.find((s) => s.kind === "missing" || s.kind === "ambiguity" || s.kind === "plan")?.at ?? -1;
   const firstWrite = writes[0]?.at ?? -1;

@@ -92,6 +92,9 @@ export class FrontierRuntime {
   readonly verdicts: RuntimeResult["verdicts"] = [];
   private tokens = new Map<string, ConsentToken>();       // object → consent from an approved plan
   private status: RuntimeStatus | null = null;
+  /** The request as it stands: the app can change it mid-run (steer); the verdict judges against the latest. */
+  raw: string;
+  private steers: string[] = [];
   private reason = "";
   private summary = "";
   private answer: string | null = null;
@@ -101,12 +104,22 @@ export class FrontierRuntime {
   private readonly abort = new AbortController();
 
   constructor(readonly o: RuntimeOptions) {
+    this.raw = o.raw;
     this.budget = { ...RUNTIME_BUDGET, ...(o.budget ?? {}) };
     o.signal?.addEventListener("abort", () => this.stop("the app stopped the task"));
   }
 
   private count(k: string, by = 1) { this.counters[k] = (this.counters[k] ?? 0) + by; }
   private emit(kind: string, b: Record<string, unknown> = {}) { this.o.onEvent?.(kind, b); }
+
+  /** The user changed what they want mid-run (the protocol's steer): the new words replace the request for every
+   *  later judgement, and the model hears them before its next turn. Effects so far stay. */
+  steer(raw: string) {
+    this.raw = raw;
+    this.steers.push(raw);
+    this.count("steers");
+    this.emit("steer", { raw });
+  }
 
   /** The app's stop: the executor refuses every later action, and the loop is aborted. */
   stop(why = "stopped") { this.o.executor.stop(); if (!this.status) { this.status = "stopped"; this.reason = why; } this.abort.abort(); }
@@ -348,7 +361,7 @@ export class FrontierRuntime {
       "一条要求的证据范围要和它一样宽：用一个窄的检查不能支持一个宽的结论。",
       "每条都被证明才 pass；有一条证据矛盾就 fail；有一条证据不够、没有或间接，就 unknown。reason 里写明哪一条、缺什么。",
     ].join("\n");
-    const rep = await this.o.gateway.ask("verify", P.SYSTEM, P.verifyPrompt(req, this.o.raw, evidence) + "\n" + audit, VerifyAnswer, this.o.task);
+    const rep = await this.o.gateway.ask("verify", P.SYSTEM, P.verifyPrompt(req, this.raw, evidence) + "\n" + audit, VerifyAnswer, this.o.task);
     this.count("model_calls");
     if (rep.outcome !== "answered") return { verdict: "unknown", reason: `verify ${rep.outcome}: ${rep.error}` };
     return { verdict: rep.data!.verdict, reason: rep.data!.reason };
@@ -394,6 +407,7 @@ export class FrontierRuntime {
         return undefined;
       },
       afterToolCall: async ({ toolCall, result, isError }) => { this.emit("tool.result", { name: toolCall.name, isError, text: result.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("").slice(0, 300) }); return undefined; },
+      getSteeringMessages: async () => this.steers.splice(0).map((r) => ({ role: "user" as const, content: `用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：${r}`, timestamp: Date.now() })),
       finishTurn: async (turn) => {
         turns += 1; this.count("turns");
         if (this.status) return { action: "end" };

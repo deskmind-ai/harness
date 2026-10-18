@@ -138,6 +138,32 @@ describe("frontier runtime: consent", () => {
   });
 });
 
+describe("frontier runtime: steer", () => {
+  it("a changed request reaches the model before its next turn and is what the verdict judges against", async () => {
+    const { sim, w } = mail();
+    let steered = false;
+    const steps: Step[] = [
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      (ms) => { if (!steered) { steered = true; rt.steer("算了，不用回复了，告诉我那封邮件里会议几点就行"); } return { calls: [{ name: "computer_observe", args: { window: w } }] }; },
+      { calls: [{ name: "answer", args: { text: "14:00" } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "已回答会议时间" } }] },
+    ];
+    const { rt, seen, gw } = runtime(sim, steps, user(approveAll));
+    const asked: string[] = [];
+    gw.script = Array(3).fill((role: string, _sys: string, u: string) => { asked.push(u); return { verdict: "pass", reason: "ok" }; });
+    const r = await rt.run();
+    expect(r.status).toBe("succeeded");
+    expect(r.counters["steers"]).toBe(1);
+    // the third model call saw the new words as a user message after the steer
+    const third = seen[2]!.map((m: any) => (typeof m.content === "string" ? m.content : "")).join("\n");
+    expect(third).toContain("用户改了要求");
+    expect(third).toContain("会议几点");
+    // the verdict was asked about the new request, not the old one
+    expect(asked[0]).toContain("会议几点");
+    expect(asked[0]).not.toContain("收到，谢谢");
+  });
+});
+
 describe("frontier runtime: stop, lock, files", () => {
   it("a locked screen ends as an environment stop before any model call", async () => {
     const { sim } = mail();
