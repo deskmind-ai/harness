@@ -60,6 +60,8 @@ export class Executor {
   private epoch = 0;
   private last: Snapshot | null = null;
   private lastObs = new Map<string, Observation>();
+  /** Each window as the task first saw it: what "that row was X and is now gone" is proved against. */
+  private firstObs = new Map<string, Observation>();
   /** Files: the version of each path as the task last saw it (begin, a read, its own write), the versions the task
    *  itself wrote (content ownership), and what other programs changed meanwhile. */
   private seen: Record<string, string> = {};
@@ -182,6 +184,7 @@ export class Executor {
     const stamped: Observation = { ...o, window: { ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) } };
     this.epoch = o.epoch;
     this.lastObs.set(windowId, stamped);
+    if (!this.firstObs.has(windowId)) this.firstObs.set(windowId, stamped);
     return stamped;
   }
 
@@ -363,7 +366,9 @@ export class Executor {
    *  again. Who judges is the runtime's `verify` role; what it judges on is this. */
   async verify(): Promise<{ snapshot: Snapshot; windows: Observation[]; receipts: Receipt[]; external_changes: ExternalChange[] }> {
     const s = await this.snapshot();
-    const touched = new Set<string>();
+    // every window the task looked at or made, not only the ones it changed: a judge has to see the state of a
+    // window a refused action never reached, too
+    const touched = new Set<string>(this.lastObs.keys());
     for (const r of this.receipts) if ("window" in r.request.action && (r.result.status === "ok" || r.result.status === "unverified")) touched.add(r.request.action.window);
     for (const o of this.ledger.taskObjects()) if (o.startsWith("window:")) touched.add(o.slice(7));
     const windows: Observation[] = [];
@@ -378,9 +383,11 @@ export class Executor {
   async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string }> {
     const ev = await this.verify();
     const ws = this.opts.files?.workspace;
+    const brief = (o: Observation) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) });
     const evidence: Record<string, unknown> = {
       任务结束时整台电脑: ev.snapshot,
-      任务碰过的窗口现在的样子: ev.windows.map((o) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) })),
+      任务看过的窗口现在的样子: ev.windows.map(brief),
+      "任务第一次看到这些窗口时的样子（和现在逐条比：少了的行就是被删或移走的，多了的就是新建的；元素 id 在两边是同一个）": ev.windows.map((o) => this.firstObs.get(o.window.id)).filter((o): o is Observation => !!o).map(brief),
       执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
       ...(ev.external_changes.length ? { "任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）": ev.external_changes.map((c) => c.path) } : {}),
       ...(ws ? { 任务目录现在的内容: ws.listing(), "任务目录现在的版本（路径 → 版本，和开始时逐条比就知道哪些没动过）": ws.entries() } : {}),

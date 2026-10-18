@@ -104,6 +104,8 @@ export class FrontierRuntime {
   /** The request as it stands: the app can change it mid-run (steer); the verdict judges against the latest. */
   raw: string;
   private steers: string[] = [];
+  /** What the user answered to the model's questions: evidence for the verdict, like their words. */
+  private answers: { question: string; text: string }[] = [];
   private reason = "";
   private summary = "";
   private answer: string | null = null;
@@ -209,6 +211,7 @@ export class FrontierRuntime {
         if (!got) return this.end("failed", "no answer from the user");
         if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
         this.emit("answer", { question: p.question, text: got.text });
+        this.answers.push({ question: p.question, text: got.option?.kind === "delegate" ? "由你决定" : got.text });
         return text(got.option?.kind === "delegate" ? "用户说：由你决定。" : `用户回答：${got.text}`);
       },
     }));
@@ -344,7 +347,7 @@ export class FrontierRuntime {
   /** The independent verdict: the computer and files after, every window the task touched, what it did, its claim. */
   private async verify(summary: string): Promise<{ verdict: string; reason: string }> {
     this.count("model_calls");
-    const v = await this.o.executor.verdict(summary, { 本任务做过的动作: this.effects, ...(this.answer !== null ? { 给用户的答案: this.answer } : {}) });
+    const v = await this.o.executor.verdict(summary, { 本任务做过的动作: this.effects, ...(this.answers.length ? { "用户对提问的回答（和原话一样是证据）": this.answers } : {}), ...(this.answer !== null ? { 给用户的答案: this.answer } : {}) });
     return { verdict: v.verdict, reason: v.reason };
   }
 
