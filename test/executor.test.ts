@@ -296,6 +296,10 @@ describe("judge tiers", () => {
     low.script = [() => ({ choice: "matches", scores: { matches: 0.6, mismatch: 0.4 } })];
     top.script = [() => ({ choice: "insufficient", scores: {} })];
     expect(await judge().choose("q3", {}, opts)).toMatchObject({ by: "top", choice: "insufficient", confidence: undefined });
+    // the top tier fails (the service is down): a lower tier's refusal does not become final — null, the user decides
+    low.script = [() => ({ choice: "mismatch", scores: { matches: 0, mismatch: 1 } })];
+    top.script = [() => ({ outcome: "error", error: "HTTP 503" })];
+    expect(await judge().choose("q4", {}, opts)).toBeNull();
   });
 });
 

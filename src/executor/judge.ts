@@ -8,7 +8,7 @@
  * the executor goes (docs/0.5-decisions.md 结论 3).
  */
 import { createHash } from "node:crypto";
-import { Gateway } from "../gateway/index.js";
+import { Gateway, type RoleTable } from "../gateway/index.js";
 import type { Role } from "../protocol/roles.js";
 import * as P from "../orchestrator/prompts.js";
 import * as R from "../protocol/roles.js";
@@ -29,7 +29,7 @@ export class Judge {
     if (hit) return { ...hit, cached: true };
     if (this.calls >= (this.opts.budget ?? 40)) { this.opts.onEvent?.("judge.budget", {}); return null; }
     const ids = options.map((o) => o.id) as [string, ...string[]];
-    let last: JudgeAnswer | null = null;
+    let last: JudgeAnswer | null = null, settled = false;
     for (const tier of this.tiers) {
       this.calls += 1;
       const rep = await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
@@ -38,13 +38,16 @@ export class Judge {
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
       last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason };
       const final = tier === this.tiers[this.tiers.length - 1];
-      if (final) break;
+      if (final) { settled = true; break; }
       // a lower tier may approve on its own when confident; refusing is the top tier's call (a cheap model's confident
       // "no" blocked right actions in the 10-18 probe), and "not enough evidence" is never final below the top
       const canSettle = last.choice === options[0]?.id && confidence !== undefined && confidence >= (tier.floor ?? 0);
-      if (canSettle) break;
+      if (canSettle) { settled = true; break; }
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
     }
+    // every tier above a lower tier's refusal failed: that refusal does not become final by default — the caller takes
+    // the conservative branch (the user decides), the same as when no tier answered
+    if (last && !settled) { this.opts.onEvent?.("judge.unsettled", { by: last.by, choice: last.choice }); last = null; }
     if (last) this.cache.set(key, last);
     this.opts.onEvent?.("judge.answer", { question: question.slice(0, 80), answer: last });
     return last;
@@ -70,10 +73,10 @@ export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取
 export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Record<string, unknown>) => void): Judge {
   const tiers: JudgeTier[] = [];
   const url = process.env.DESKMIND_BRAIN_URL;
-  const table = (backend: string, model: string) => Object.fromEntries(R.ROLES.map((r) => [r, { backend, model }])) as ConstructorParameters<typeof Gateway>[0];
+  const table = (backend: string, model: string) => Object.fromEntries(R.ROLES.map((r) => [r, { backend, model }])) as RoleTable;
   if (url && process.env.DESKMIND_BRAIN_JUDGE === "1") tiers.push({ name: "brain", gateway: new Gateway(table("systemone", url)), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9) });
   const first = firstTier(process.env.DESKMIND_JUDGE_FIRST, process.env.DESKMIND_JUDGE_FIRST_FLOOR);
-  if (first) tiers.push({ name: first.name, gateway: new Gateway(table(first.backend, first.model)), floor: first.floor });
+  if (first) { const t = table(first.backend, first.model); for (const r of R.ROLES) t[r] = { ...t[r], think: false }; tiers.push({ name: first.name, gateway: new Gateway(t), floor: first.floor }); }   // a choice wants a fast answer
   tiers.push({ name: "frontier", gateway });
   return new Judge(tiers, { onEvent });
 }

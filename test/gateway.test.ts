@@ -32,6 +32,12 @@ describe("service URLs", () => {
     expect(providerOf("volcengine|doubao-seed-evolving")).toMatchObject({ url: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-evolving" });
     if (saved !== undefined) process.env.VOLCENGINE_URL = saved;
   });
+  it("a role that wants a fast answer turns reasoning off where the service has a switch", async () => {
+    const { extraBodyFor } = await import("../src/gateway/index.js");
+    expect(extraBodyFor("volcengine", false)).toEqual({ thinking: { type: "disabled" } });
+    expect(extraBodyFor("volcengine", undefined)).toEqual({});
+    expect(extraBodyFor("yy", false)).toEqual({});
+  });
   it("a first judge tier is any backend:model the gateway can reach", async () => {
     const { firstTier } = await import("../src/executor/judge.js");
     expect(firstTier("openai:volcengine|doubao-seed-2-1-lite-260915", "0.8")).toEqual({ name: "first:doubao-seed-2-1-lite-260915", backend: "openai", model: "volcengine|doubao-seed-2-1-lite-260915", floor: 0.8 });

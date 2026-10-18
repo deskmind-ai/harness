@@ -29,15 +29,22 @@ export type Backend = "openrouter" | "openai" | "local_chat" | "systemone" | "cl
  * `<provider>|<model>` (e.g. `yy|gpt-6-luna`), the provider's URL and key come from the environment and are never
  * logged. Adding a service is one line here, not a new backend.
  */
-export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: string }> = {
+export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: string; noThinking?: Record<string, unknown> }> = {
   yy: { urlEnv: "YY_URL", keyEnv: "YY_API_KEY" },
   openrouter: { urlEnv: "OPENROUTER_URL", keyEnv: "OPENROUTER_API_KEY", url: "https://openrouter.ai/api/v1" },
   // DeepSeek's own API: `deepseek-flash` is DeepSeek-V4.1-Flash-1017 (the API takes the family name, /v1/models lists
   // deepseek-flash and deepseek-v4-pro); it rejects json_schema, so the gateway falls back to json_object
-  deepseek: { urlEnv: "DEEPSEEK_URL", keyEnv: "DEEPSEEK_API_KEY", url: "https://api.deepseek.com" },
-  // Volcengine Ark (doubao): the API lives under /api/v3, not /v1 — a provider URL carries its own version segment
-  volcengine: { urlEnv: "VOLCENGINE_URL", keyEnv: "VOLCENGINE_API_KEY", url: "https://ark.cn-beijing.volces.com/api/v3" },
+  deepseek: { urlEnv: "DEEPSEEK_URL", keyEnv: "DEEPSEEK_API_KEY", url: "https://api.deepseek.com", noThinking: { thinking: { type: "disabled" } } },
+  // Volcengine Ark (doubao): the API lives under /api/v3, not /v1 — a provider URL carries its own version segment.
+  // `noThinking` is how this service turns reasoning off: a role that wants a fast answer (think: false) sends it —
+  // doubao-seed-2.1-lite answered a judge question in 1.6 s without thinking, 76 s with (10-18)
+  volcengine: { urlEnv: "VOLCENGINE_URL", keyEnv: "VOLCENGINE_API_KEY", url: "https://ark.cn-beijing.volces.com/api/v3", noThinking: { thinking: { type: "disabled" } } },
 };
+/** The request fields a role's wish for a fast answer (`think: false`) becomes on this provider; none when the
+ *  service has no switch or the role did not ask. */
+export function extraBodyFor(provider: string, think: boolean | undefined): Record<string, unknown> {
+  return think === false && PROVIDERS[provider]?.noThinking ? { ...PROVIDERS[provider]!.noThinking } : {};
+}
 /** A service base URL with its version segment: `https://host` → `https://host/v1`; `…/api/v3` stays. */
 export const versionedBase = (url: string) => { const u = url.replace(/\/+$/, ""); return /\/v\d+$/.test(u) ? u : u + "/v1"; };
 export function providerOf(model: string): { url: string; key: string | undefined; model: string; name: string } | { error: string } {
@@ -50,7 +57,9 @@ export function providerOf(model: string): { url: string; key: string | undefine
 }
 /** Per role, beyond backend and model: maxOutputTokens, the most it may write in one answer (sent as max_tokens);
  *  contextTokens, how much it can read; timeoutMs, how long one call may take. Unset, the backend's defaults below. */
-export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutputTokens?: number; contextTokens?: number; timeoutMs?: number }>;
+export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutputTokens?: number; contextTokens?: number; timeoutMs?: number;
+  /** false: this role wants a fast plain answer (a judge's choice); providers with a reasoning switch turn it off. */
+  think?: boolean }>;
 
 /** What a backend's models can read in one call and how long a call may take, when the table does not say. The
  *  context sizes are those of the models we configure (gpt-6 family 128k, Claude 200k, local MLX models 32k); a choice-only
@@ -242,9 +251,9 @@ export class Gateway {
       rep = { ...base, outcome: "error", error: "budget: gateway cost cap reached" };
     } else {
       const t0 = performance.now();
-      const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens;
+      const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens, think = this.table[role].think;
       let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens)
-        : backend === "openai" ? await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens)
+        : backend === "openai" ? await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think)
         : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? (role === "transform" ? LOCAL_TRANSFORM_MAX_TOKENS : LOCAL_MAX_TOKENS))
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user, timeoutMs)
@@ -254,7 +263,7 @@ export class Gateway {
       const transient = (p: Partial<Reply>) => p.outcome === "timeout" || (p.outcome === "error" && /HTTP 5|HTTP 429|fetch failed|ECONN|socket|network|EAI_AGAIN/i.test(p.error ?? ""));
       for (let i = 0; i < 4 && (backend === "openrouter" || backend === "openai") && transient(partial); i++) {
         await new Promise((r) => setTimeout(r, /HTTP 429/.test(partial.error ?? "") ? 5000 * (i + 1) * (i + 1) : 2000));
-        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens);
+        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think);
       }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;
       rep.latencyMs ||= performance.now() - t0;
@@ -344,11 +353,11 @@ export class Gateway {
   }
 
   /** A keyed OpenAI-compatible service (PROVIDERS): the model string names the provider. */
-  private openaiCompat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
+  private openaiCompat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, think?: boolean): Promise<Partial<Reply>> {
     const p = providerOf(model);
     if ("error" in p) return Promise.resolve({ outcome: "error", error: p.error });
     if (!p.key) return Promise.resolve({ outcome: "error", error: `${PROVIDERS[p.name]!.keyEnv} not set` });
-    return this.chatCompletions(p.url, p.key, p.model, system, user, jsonSchema, timeoutMs, maxTokens);
+    return this.chatCompletions(p.url, p.key, p.model, system, user, jsonSchema, timeoutMs, maxTokens, extraBodyFor(p.name, think));
   }
 
   /** Models whose service rejects our (non-strict) JSON Schema: asked for a JSON object instead, the schema stays in
@@ -358,18 +367,18 @@ export class Gateway {
   private readonly jsonObjectOnly = new Set<string>();
   static schemaRejected(error: string): boolean { return /Invalid schema|response_format|json_schema/i.test(error); }
 
-  private async chatCompletions(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
+  private async chatCompletions(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}): Promise<Partial<Reply>> {
     const k = `${url}|${model}`;
-    const r = await this.chatCompletionsOnce(url, key, model, system, user, this.jsonObjectOnly.has(k) ? null : jsonSchema, timeoutMs, maxTokens);
+    const r = await this.chatCompletionsOnce(url, key, model, system, user, this.jsonObjectOnly.has(k) ? null : jsonSchema, timeoutMs, maxTokens, extra);
     if (r.outcome === "error" && r.error && Gateway.schemaRejected(r.error) && !this.jsonObjectOnly.has(k)) {
       this.jsonObjectOnly.add(k);
-      return this.chatCompletionsOnce(url, key, model, system, user, null, timeoutMs, maxTokens);
+      return this.chatCompletionsOnce(url, key, model, system, user, null, timeoutMs, maxTokens, extra);
     }
     return r;
   }
 
-  private async chatCompletionsOnce(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown | null, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
-    const body = { model, temperature: 0, ...(maxTokens ? { max_tokens: maxTokens } : {}),
+  private async chatCompletionsOnce(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown | null, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}): Promise<Partial<Reply>> {
+    const body = { model, temperature: 0, ...extra, ...(maxTokens ? { max_tokens: maxTokens } : {}),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
       response_format: jsonSchema ? { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } : { type: "json_object" } };
     const t0 = performance.now();
