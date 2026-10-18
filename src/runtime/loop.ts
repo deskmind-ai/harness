@@ -212,6 +212,7 @@ export class FrontierRuntime {
         if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
         this.emit("answer", { question: p.question, text: got.text });
         this.answers.push({ question: p.question, text: got.option?.kind === "delegate" ? "由你决定" : got.text });
+        this.o.executor.addAnswer(p.question, got.option?.kind === "delegate" ? "由你决定" : got.text);
         return text(got.option?.kind === "delegate" ? "用户说：由你决定。" : `用户回答：${got.text}`);
       },
     }));
@@ -299,7 +300,8 @@ export class FrontierRuntime {
       if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
       const chosen = got.option?.kind === "reading" ? got.text : got.option?.kind === "delegate" ? r.reading : null;
       this.emit("reading.settled", { point: r.point, reading: chosen ?? got.text, by: got.option?.kind ?? "words" });
-      this.answers.push({ question: this.t.ambiguity(r.point), text: chosen ?? got.text });     // the verdict reads it like any answer
+      this.answers.push({ question: this.t.ambiguity(r.point), text: chosen ?? got.text });     // the judges read it like any answer
+      this.o.executor.addAnswer(this.t.ambiguity(r.point), chosen ?? got.text);
       if (chosen === null) return text(`用户对「${r.point}」的回答：${got.text}。按这个重新理解，再交一次计划。`);
       settled = settled.map((x) => (x === r ? { ...x, reading: chosen, alternatives: [], evidence: [`用户的回答：${chosen}`] } : x));
     }

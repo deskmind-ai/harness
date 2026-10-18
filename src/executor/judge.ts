@@ -60,7 +60,7 @@ export const INTENT_OPTIONS: JudgeOption[] = [
   { id: "mismatch", text: "不是：参数弄反、对象弄错、内容改写、违反了约束，或者用户没要求这件事" },
   { id: "insufficient", text: "证据不够：动作里有的值是猜的，或看不出对象是不是用户说的那个" },
 ];
-export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取好参数）。这是完成用户要求过程中的一步，不是全部：只判断这一步和用户原话是否一致——对象是不是用户说的那个、内容是不是用户给的、有没有做用户没要求的事。一步只做了一部分不算「不是」。只看给出的材料，不替用户补充意图。";
+export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取好参数）。这是完成用户要求过程中的一步，不是全部：只判断这一步和用户的话（原话，以及用户对提问的回答）是否一致——对象是不是用户说的那个、内容是不是用户给的、有没有做用户没要求的事。一步只做了一部分不算「不是」。只为把路让开的中间步骤——关掉挡住的弹窗（选「稍后」「取消」这种不改东西的项）、滚动、切换窗口——不算「用户没要求的事」，只要它本身不改用户的内容、不往外发；点「立即更新」「确定删除」这类会改东西的项才要和用户的话对得上。只看给出的材料，不替用户补充意图。";
 
 /** The judge a runtime gets by default: the gateway's intent role, with an optional first tier that answers first and
  *  may approve on its own above its floor, never refuse alone:

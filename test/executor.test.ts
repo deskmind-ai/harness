@@ -303,6 +303,26 @@ describe("judge tiers", () => {
   });
 });
 
+describe("executor: the user's answers reach the judge", () => {
+  it("an answer given during the task is in every judge question's context, next to the request", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge } = await import("../src/executor/judge.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const gw = new Gateway(table);
+    const prompts: string[] = [];
+    gw.script = Array(6).fill((role: string, _s: string, user: string) => { prompts.push(user); return role === "verify" ? { choice: "pass" } : { choice: "matches" }; });
+    const { sim, w } = mailSim();
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, judge: new Judge([{ name: "t", gateway: gw }]), raw: "给那封邮件加旗标" });
+    await started(ex);
+    ex.addAnswer("哪封邮件？", "林晓的 Q3 预算");
+    await click(ex, w.id, "林晓 · Q3 预算", { consent: app.forObject(`window:${w.id}`, "modify_user", "t1") });
+    await ex.verdict("done");
+    expect(prompts.length).toBeGreaterThanOrEqual(2);
+    for (const p of prompts) { expect(p).toContain("给那封邮件加旗标"); expect(p).toContain("林晓的 Q3 预算"); }
+  });
+});
+
 describe("executor: the start gate", () => {
   it("nothing of the user's is touched before a plan; a plan is accepted when its readings are settled", async () => {
     const { ex, w, app } = setup();

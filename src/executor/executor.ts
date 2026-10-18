@@ -137,6 +137,13 @@ export class Executor {
 
   setRequest(raw: string) { this.opts.raw = raw; }
 
+  /** What the user answered when asked during the task: their words as much as the request, read by every judge
+   *  question (intent, evidence, verdict) — a judge that saw only the request refused the step the user had just asked
+   *  for (10-18, "点稍后关掉弹窗"). */
+  private answers: { question: string; text: string }[] = [];
+  addAnswer(question: string, text: string) { this.answers.push({ question, text }); }
+  private userWords(): Record<string, unknown> { return { 用户原文: this.opts.raw ?? "", ...(this.answers.length ? { "用户对提问的回答（和原话一样是用户的话）": this.answers } : {}) }; }
+
   /** The start gate, mirror of the finish gate: nothing of the user's is touched and nothing is sent until a plan is
    *  in. A plan is accepted when every reading it rests on is settled — no alternatives, or evidence the judge says
    *  tells the readings apart (the orchestrator's evidence judge, same wording). Readings the judge cannot settle are
@@ -148,7 +155,7 @@ export class Executor {
       const evidence = r.evidence.filter((e) => e.trim() && !(this.opts.raw ?? "").includes(e.trim()));   // the request cannot settle its own ambiguity
       if (!evidence.length || !this.opts.judge) { open.push(r); continue; }
       const options = [r.reading, ...r.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
-      const ans = await this.opts.judge.choose(P.evidenceQuestion(r.point), { 用户原文: this.opts.raw ?? "", 证据: evidence }, options);
+      const ans = await this.opts.judge.choose(P.evidenceQuestion(r.point), { ...this.userWords(), 证据: evidence }, options);
       if (ans?.choice !== "r0") open.push(r);
     }
     this.emit("executor.plan", { steps: p.steps.length, readings: (p.readings ?? []).length, open: open.map((r) => r.point) });
@@ -166,7 +173,7 @@ export class Executor {
   private async judgeIntent(a: Action, consequence: Consequence, object: string, evidence: Record<string, unknown>, text: string): Promise<{ verdict: "matches" | "mismatch" | "insufficient" | "unavailable"; reason: string; by?: string }> {
     const j = this.opts.judge;
     if (!j || !this.opts.raw) return { verdict: "unavailable", reason: "no judge" };
-    const ctx = { 用户原文: this.opts.raw, 即将执行的动作: text, 后果类别: consequence, 对象: object, 证据: evidence };
+    const ctx = { ...this.userWords(), 即将执行的动作: text, 后果类别: consequence, 对象: object, 证据: evidence };
     const ans = await j.choose(INTENT_QUESTION, ctx, INTENT_OPTIONS);
     if (!ans) return { verdict: "unavailable", reason: "the judge could not answer" };
     this.emit("executor.intent", { action: a, verdict: ans.choice, by: ans.by, confidence: ans.confidence, reason: ans.reason ?? "" });
@@ -425,7 +432,7 @@ export class Executor {
       模型自称: summary,
     };
     if (!this.opts.judge) return { verdict: "unknown", reason: "no judge to verify with" };
-    const ans = await this.opts.judge.choose(VERIFY_QUESTION, { 用户原文: this.opts.raw ?? "", 证据: evidence }, VERIFY_OPTIONS, "verify");
+    const ans = await this.opts.judge.choose(VERIFY_QUESTION, { ...this.userWords(), 证据: evidence }, VERIFY_OPTIONS, "verify");
     if (!ans) return { verdict: "unknown", reason: "the judge could not answer" };
     this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "" });
     return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by };
