@@ -103,7 +103,7 @@ function skillsFor(req: Request, ws?: Workspace): SkillSource {
 }
 
 function driverFor(name: Request["driver"], scope?: string): Driver {
-  if (name === "hands") return new HandsDriver();
+  if (name === "hands") return new HandsDriver(scope ? { workspace: path.resolve(scope) } : {});
   return new SimComputer(scope);
 }
 

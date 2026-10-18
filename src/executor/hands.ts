@@ -19,7 +19,7 @@ export class HandsDriver implements Driver {
   private buf = "";
   readonly log: string[] = [];
 
-  constructor(private readonly opts: { cmd?: string; dir?: string; scratch?: string; timeoutMs?: number } = {}) {}
+  constructor(private readonly opts: { cmd?: string; dir?: string; scratch?: string; workspace?: string; timeoutMs?: number } = {}) {}
 
   private start() {
     if (this.proc) return;
@@ -62,7 +62,7 @@ export class HandsDriver implements Driver {
   }
 
   private begun = false;
-  async begin(): Promise<Snapshot> { this.begun = true; return this.call<Snapshot>("begin", { ...(this.opts.scratch ? { scratch: this.opts.scratch } : {}) }); }
+  async begin(): Promise<Snapshot> { this.begun = true; return this.call<Snapshot>("begin", { ...(this.opts.scratch ? { scratch: this.opts.scratch } : {}), ...(this.opts.workspace ? { workspace: this.opts.workspace } : {}) }); }
   async snapshot(): Promise<Snapshot> { if (!this.begun) return this.begin(); return this.call<Snapshot>("snapshot"); }
   async observe(windowId: string, o?: { screenshot?: boolean }): Promise<Observation> { if (!this.begun) await this.begin(); return this.call<Observation>("observe", { window: windowId, screenshot: !!o?.screenshot }); }
   async perform(action: Action): Promise<PerformResult> { if (!this.begun) await this.begin(); return this.call<PerformResult>("perform", { action }); }
