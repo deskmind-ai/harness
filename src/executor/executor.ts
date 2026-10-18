@@ -142,7 +142,14 @@ export class Executor {
    *  for (10-18, "点稍后关掉弹窗"). */
   private answers: { question: string; text: string }[] = [];
   addAnswer(question: string, text: string) { this.answers.push({ question, text }); }
-  private userWords(): Record<string, unknown> { return { 用户原文: this.opts.raw ?? "", ...(this.answers.length ? { "用户对提问的回答（和原话一样是用户的话）": this.answers } : {}) }; }
+  /** A tutorial the runtime is following this task (one the user taught or admitted): what "整理一下" means here, so
+   *  a judge does not refuse the moves the tutorial prescribes as "not what the user asked" (10-18, skills-002/003). */
+  private skillsInUse: { name: string; text: string }[] = [];
+  addSkill(name: string, text: string) { if (!this.skillsInUse.some((s) => s.name === name)) this.skillsInUse.push({ name, text: text.slice(0, 4000) }); }
+  private userWords(): Record<string, unknown> {
+    return { 用户原文: this.opts.raw ?? "", ...(this.answers.length ? { "用户对提问的回答（和原话一样是用户的话）": this.answers } : {}),
+      ...(this.skillsInUse.length ? { "本次在用的教程（用户教过、收下的做法；按它做的步骤是用户要的）": this.skillsInUse } : {}) };
+  }
 
   /** The start gate, mirror of the finish gate: nothing of the user's is touched and nothing is sent until a plan is
    *  in. A plan is accepted when every reading it rests on is settled — no alternatives, or evidence the judge says

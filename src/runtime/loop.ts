@@ -224,7 +224,7 @@ export class FrontierRuntime {
     if (this.o.skills) tools.push(tool({
       name: "read_skill", label: "读教程", description: "读一份教程的全文（开头列出的候选之一）。",
       parameters: Type.Object({ name: Type.String() }),
-      execute: async (_id, p: { name: string }) => { const t = this.o.skills!.read(p.name); this.count("skills_read"); return t ? text(t) : err(`没有叫 ${p.name} 的教程`); },
+      execute: async (_id, p: { name: string }) => { const t = this.o.skills!.read(p.name); this.count("skills_read"); if (t) this.o.executor.addSkill(p.name, t); return t ? text(t) : err(`没有叫 ${p.name} 的教程`); },
     }));
     tools.push(tool({
       name: "finish", label: "结束", description: "结束任务。done = 做成了（程序会独立核对，没过会告诉你缺什么）；unconfirmed = 做了但确认不了；cannot = 做不到。summary 写清楚改了什么、哪些是用户的东西、答案是什么。",

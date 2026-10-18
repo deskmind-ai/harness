@@ -316,10 +316,11 @@ describe("executor: the user's answers reach the judge", () => {
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, judge: new Judge([{ name: "t", gateway: gw }]), raw: "给那封邮件加旗标" });
     await started(ex);
     ex.addAnswer("哪封邮件？", "林晓的 Q3 预算");
+    ex.addSkill("flag-budget-mail", "## 怎么做\n预算邮件都加旗标");
     await click(ex, w.id, "林晓 · Q3 预算", { consent: app.forObject(`window:${w.id}`, "modify_user", "t1") });
     await ex.verdict("done");
     expect(prompts.length).toBeGreaterThanOrEqual(2);
-    for (const p of prompts) { expect(p).toContain("给那封邮件加旗标"); expect(p).toContain("林晓的 Q3 预算"); }
+    for (const p of prompts) { expect(p).toContain("给那封邮件加旗标"); expect(p).toContain("林晓的 Q3 预算"); expect(p).toContain("预算邮件都加旗标"); }
   });
 });
 
