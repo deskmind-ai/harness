@@ -8,6 +8,8 @@
  * the executor goes (docs/0.5-decisions.md 结论 3).
  */
 import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { Gateway, type RoleTable } from "../gateway/index.js";
 import type { Role } from "../protocol/roles.js";
 import * as P from "../orchestrator/prompts.js";
@@ -17,10 +19,36 @@ export interface JudgeTier { name: string; gateway: Gateway; role?: Role; floor?
 export interface JudgeOption { id: string; text: string }
 export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean }
 
+/** How often a lower tier settles each kind of question (kinds: the question's first words — intent, verify, and
+ *  the evidence questions share a prefix), kept across tasks when a path is given: a tier that never settles a kind
+ *  is not asked it any more, except for an occasional probe, so its latency is not paid for nothing. */
+export class TierStats {
+  private readonly data: Record<string, Record<string, { asked: number; settled: number }>> = {};
+  constructor(private readonly path?: string) {
+    if (path) { try { Object.assign(this.data, JSON.parse(readFileSync(path, "utf-8"))); } catch { /* fresh */ } }
+  }
+  static kindOf(question: string): string { return question.slice(0, 12); }
+  note(tier: string, kind: string, settled: boolean) {
+    const t = (this.data[tier] ??= {}); const k = (t[kind] ??= { asked: 0, settled: 0 });
+    k.asked += 1; if (settled) k.settled += 1;
+    if (this.path) { try { mkdirSync(dirname(this.path), { recursive: true }); writeFileSync(this.path, JSON.stringify(this.data)); } catch { /* best effort */ } }
+  }
+  /** Skip the tier for this kind: asked at least `min` times, settled under `floor` of them — and not a probe turn. */
+  skip(tier: string, kind: string, min = 8, floor = 0.2, probeEvery = 20): boolean {
+    const k = this.data[tier]?.[kind];
+    if (!k || k.asked < min) return false;
+    if (k.asked % probeEvery === 0) return false;
+    return k.settled / k.asked < floor;
+  }
+  snapshot() { return JSON.parse(JSON.stringify(this.data)) as typeof this.data; }
+}
+
 export class Judge {
   private readonly cache = new Map<string, JudgeAnswer>();
   calls = 0;
-  constructor(readonly tiers: JudgeTier[], readonly opts: { budget?: number; onEvent?: (kind: string, body: Record<string, unknown>) => void } = {}) {}
+  constructor(readonly tiers: JudgeTier[], readonly opts: { budget?: number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
+    /** adaptive routing: skip a lower tier on question kinds it never settles */ stats?: TierStats;
+    /** measurement: after a lower tier settles, ask the top tier too and report whether they agree (costs the top call) */ shadow?: boolean } = {}) {}
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. */
   async choose(question: string, context: unknown, options: JudgeOption[], role?: Role): Promise<JudgeAnswer | null> {
@@ -29,21 +57,30 @@ export class Judge {
     if (hit) return { ...hit, cached: true };
     if (this.calls >= (this.opts.budget ?? 40)) { this.opts.onEvent?.("judge.budget", {}); return null; }
     const ids = options.map((o) => o.id) as [string, ...string[]];
-    let last: JudgeAnswer | null = null, settled = false;
+    const kind = TierStats.kindOf(question);
+    let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null;
     for (const tier of this.tiers) {
+      const final = tier === this.tiers[this.tiers.length - 1];
+      if (!final && this.opts.stats?.skip(tier.name, kind)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, kind }); continue; }
       this.calls += 1;
       const rep = await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
       last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason };
-      const final = tier === this.tiers[this.tiers.length - 1];
       if (final) { settled = true; break; }
       // a lower tier may approve on its own when confident; refusing is the top tier's call (a cheap model's confident
       // "no" blocked right actions in the 10-18 probe), and "not enough evidence" is never final below the top
       const canSettle = last.choice === options[0]?.id && confidence !== undefined && confidence >= (tier.floor ?? 0);
-      if (canSettle) { settled = true; break; }
+      this.opts.stats?.note(tier.name, kind, canSettle);
+      if (canSettle) { settled = true; settledBy = tier; break; }
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
+    }
+    // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
+    if (settled && settledBy && this.opts.shadow) {
+      const top = this.tiers[this.tiers.length - 1]!;
+      const rep = await top.gateway.ask(role ?? top.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
+      this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree: rep.outcome === "answered" ? rep.data!.choice === last!.choice : null });
     }
     // every tier above a lower tier's refusal failed: that refusal does not become final by default — the caller takes
     // the conservative branch (the user decides), the same as when no tier answered
@@ -78,7 +115,9 @@ export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Re
   const first = firstTier(process.env.DESKMIND_JUDGE_FIRST, process.env.DESKMIND_JUDGE_FIRST_FLOOR);
   if (first) { const t = table(first.backend, first.model); for (const r of R.ROLES) t[r] = { ...t[r], think: false }; tiers.push({ name: first.name, gateway: new Gateway(t), floor: first.floor }); }   // a choice wants a fast answer
   tiers.push({ name: "frontier", gateway });
-  return new Judge(tiers, { onEvent });
+  // adaptive routing across runs (DESKMIND_JUDGE_STATS names the file; unset: per process); shadow measurement opt-in
+  const stats = new TierStats(process.env.DESKMIND_JUDGE_STATS || undefined);
+  return new Judge(tiers, { onEvent, stats, shadow: process.env.DESKMIND_JUDGE_SHADOW === "1" });
 }
 
 /** `backend:model` → a first judge tier; null when unset or malformed (then the frontier judges alone). */

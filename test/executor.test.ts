@@ -386,6 +386,32 @@ describe("executor: double_click", () => {
   });
 });
 
+describe("judge: adaptive routing and shadow", () => {
+  it("a lower tier that never settles a kind of question is skipped for it (with probes); shadow reports agreement", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge, TierStats } = await import("../src/executor/judge.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const low = new Gateway(table), top = new Gateway(table);
+    const opts = [{ id: "matches", text: "yes" }, { id: "mismatch", text: "no" }];
+    const events: Record<string, unknown>[] = [];
+    const stats = new TierStats();
+    const judge = new Judge([{ name: "low", gateway: low, floor: 0.9 }, { name: "top", gateway: top }], { stats, shadow: true, onEvent: (k, b) => events.push({ k, ...b }), budget: 1000 });
+    low.script = Array(100).fill(() => ({ choice: "mismatch", scores: { matches: 0, mismatch: 1 } }));   // never settles
+    top.script = Array(100).fill(() => ({ choice: "matches" }));
+    for (let i = 0; i < 8; i++) await judge.choose("程序即将执行这个动作？", { i }, opts);
+    const lowCalls = low.script.length;
+    await judge.choose("程序即将执行这个动作？", { i: 99 }, opts);                                   // the 9th: skipped
+    expect(low.script.length).toBe(lowCalls);
+    expect(events.some((e) => e.k === "judge.skipped")).toBe(true);
+    // another kind of question is still asked of the lower tier, and a settled answer gets a shadow check
+    low.script = [() => ({ choice: "matches", scores: { matches: 0.99, mismatch: 0.01 } })];
+    const a = await judge.choose("任务做成了没有？", {}, opts);
+    expect(a?.by).toBe("low");
+    expect(events.find((e) => e.k === "judge.shadow")).toMatchObject({ tier: "low", choice: "matches", top: "matches", agree: true });
+    expect(stats.snapshot().low!["程序即将执行这个动作？"]).toEqual({ asked: 8, settled: 0 });
+  });
+});
+
 describe("executor: the user's answers reach the judge", () => {
   it("an answer given during the task is in every judge question's context, next to the request", async () => {
     const { Gateway } = await import("../src/gateway/index.js");
