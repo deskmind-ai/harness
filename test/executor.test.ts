@@ -159,3 +159,66 @@ describe("executor: stop, lock, stale", () => {
     expect(v.receipts.length).toBe(2);
   });
 });
+
+describe("executor: files under the same guard", () => {
+  const fsSetup = async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ex-files-"));
+    build(root, { "todo.txt": "交房租\n", "other.txt": "x" });
+    const ws = new Workspace(root), app = ConsentSigner.fresh(), sim = new SimComputer(root);
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
+    const s = await ex.begin();
+    const file = (capability: string, args: Record<string, string>, consent?: any) => ex.act({ action: { kind: "file", capability, args }, epoch: ex.currentEpoch, consent });
+    return { fs, ws, app, ex, file, root, s };
+  };
+
+  it("a file another program changed since the task saw it is refused, recorded as an external change, and writable again after a read", async () => {
+    const { fs, ws, file, ex, root } = await fsSetup();
+    fs.writeFileSync(`${root}/todo.txt`, "交房租\n别人加的一行\n"); ws.invalidate();
+    const r = await file("fs.append_line", { target: "todo.txt", line: "买牛奶" });
+    expect(r.status).toBe("stale");
+    expect(r.why).toContain("todo.txt");
+    expect(ex.externalChanges.map((c) => c.path)).toEqual(["todo.txt"]);
+    expect(ws.read("todo.txt")).toBe("交房租\n别人加的一行\n");
+    // reading it is the observation; the append then goes on top of the other program's line (with consent: the user's file)
+    expect((await file("fs.read_text", { target: "todo.txt" })).status).toBe("ok");
+    const again = await file("fs.append_line", { target: "todo.txt", line: "买牛奶" });
+    expect(again.status).toBe("needs_consent");
+    expect(again.consequence).toBe("modify_user");
+    const stranger = await file("fs.append_line", { target: "todo.txt", line: "买牛奶" }, ConsentSigner.fresh().forAction(again.challenge!));
+    expect(stranger.status).not.toBe("ok");                 // a stranger's signature
+  });
+
+  it("creating a new file needs no consent; discarding content the task did not write does, even on a file the task created", async () => {
+    const { ws, file, app, fs, root } = await fsSetup();
+    expect((await file("fs.create_text", { parent: ".", name: "备忘.txt", text: "买牛奶" })).status).toBe("ok");
+    expect(ws.read("备忘.txt")).toBe("买牛奶");
+    // the task's own content: replacing it is the task's business
+    expect((await file("fs.replace_text", { target: "备忘.txt", text: "买鸡蛋" })).status).toBe("ok");
+    // another program rewrote the task's file: the content is not the task's any more, so it is stale first…
+    fs.writeFileSync(`${root}/备忘.txt`, "用户改的"); ws.invalidate();
+    expect((await file("fs.replace_text", { target: "备忘.txt", text: "x" })).status).toBe("stale");
+    await file("fs.read_text", { target: "备忘.txt" });
+    // …and, once read, discarding it is modify_user
+    const r = await file("fs.replace_text", { target: "备忘.txt", text: "x" });
+    expect(r.status).toBe("needs_consent");
+    expect(r.why).toBe("no consent");
+    const ok = await file("fs.replace_text", { target: "备忘.txt", text: "x" }, app.forAction(r.challenge!));
+    expect(ok.status).toBe("ok");
+    expect(ws.read("备忘.txt")).toBe("x");
+    // trashing a user's file asks too
+    expect((await file("fs.trash", { target: "other.txt" })).status).toBe("needs_consent");
+  });
+
+  it("a moved user file stays the user's at its new path", async () => {
+    const { ws, file, app } = await fsSetup();
+    const mv = await file("fs.move", { source: "todo.txt", destination: "moved.txt" });
+    expect(mv.status).toBe("needs_consent");
+    expect((await file("fs.move", { source: "todo.txt", destination: "moved.txt" }, app.forAction(mv.challenge!))).status).toBe("ok");
+    expect(ws.exists("moved.txt")).toBe(true);
+    expect((await file("fs.trash", { target: "moved.txt" })).status).toBe("needs_consent");
+    expect((await file("fs.read_text", { target: "moved.txt" })).output).toEqual({ text: "交房租\n" });
+  });
+});

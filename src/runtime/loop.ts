@@ -109,6 +109,7 @@ export class FrontierRuntime {
 
   constructor(readonly o: RuntimeOptions) {
     this.raw = o.raw;
+    if (o.workspace && o.registry && !o.executor.opts.files) o.executor.attachFiles(o.workspace, o.registry);
     this.budget = { ...RUNTIME_BUDGET, ...(o.budget ?? {}) };
     o.signal?.addEventListener("abort", () => this.stop("the app stopped the task"));
   }
@@ -220,13 +221,13 @@ export class FrontierRuntime {
       for (const [k, f] of Object.entries(cap.schema.properties)) props[k] = Type.String({ description: f.description });
       tools.push(tool({
         name: "fs_" + cap.id.split(".").slice(1).join("_"), label: cap.id, description: `${cap.description} 路径相对任务目录。`,
-        parameters: Type.Object(props), execute: async (_id, args) => this.fileAct(cap.id, args as Record<string, string>),
+        parameters: Type.Object(props), execute: async (_id, args) => this.act({ action: { kind: "file", capability: cap.id, args: args as Record<string, string> }, epoch: ex.currentEpoch, consequence: "read", purpose: cap.description.split("；")[0]! }),
       }));
     }
     return tools;
   }
 
-  private async act(p: { action: Static<typeof ActionSchema>; epoch: number; consequence: Consequence; purpose: string }): Promise<AgentToolResult> {
+  private async act(p: { action: Static<typeof ActionSchema> | Extract<Action, { kind: "file" }>; epoch: number; consequence: Consequence; purpose: string }): Promise<AgentToolResult> {
     const a = p.action as unknown as Action;
     const bad = checkAction(a);
     if (bad) return err(bad);
@@ -242,10 +243,13 @@ export class FrontierRuntime {
       r = await this.o.executor.act({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t });
     }
     this.count("actions"); this.count(`actions:${r.status}`);
-    if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(`${p.purpose}：${describeAction(a, r.after, r.consequence)}`);
+    const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
+    if (a.kind === "file") this.emit("fs.act", { cap: a.capability, args: a.args, status: r.status, consequence: r.consequence, why: r.why ?? "" });
+    if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(a.kind === "file" ? describeAction(a, undefined, r.consequence, cap) : `${p.purpose}：${describeAction(a, r.after, r.consequence)}`);
     if (r.status === "environment") return this.end("environment", r.why ?? "environment");
     if (r.status === "stopped") return this.end("stopped", r.why ?? "stopped");
-    const { after, ...rest } = r;
+    const { after, challenge: _c, ...rest } = r;
+    if (a.kind === "file") return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence: r.consequence })) : err(J({ status: r.status, why: r.why, consequence: r.consequence }));
     const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: after.window, modal: after.modal, elements: after.elements, text: after.text } } : {}) };
     // the step check: a state change with nothing visibly changed is said so, in the result the model reads
     const noChange = r.status === "ok" && rank(r.consequence) >= rank("create") && r.changed && r.changed.elements === 0 && !r.changed.new_windows?.length;
@@ -291,45 +295,6 @@ export class FrontierRuntime {
     return [...out];
   }
 
-  /** A file capability as a tool, under the same rule: a path that existed at begin is the user's. */
-  private async fileAct(capId: string, args: Record<string, string>): Promise<AgentToolResult> {
-    const ws = this.o.workspace!, cap = this.o.registry!.get(capId)!, ex = this.o.executor;
-    const bad = cap.typecheck(args);
-    if (bad) return err(bad);
-    const pre = cap.preconditions(ws, args);
-    if (pre) return err(`前置条件不成立：${pre}`);
-    const fp = cap.footprint(ws, args);
-    const userPaths = fp.writes.filter((p) => ws.exists(p) && ex.ledger.ownerOf(`path:${p}`) === "user");
-    const consequence: Consequence = cap.effect === "observe" ? "read" : cap.effect === "external" ? "external" : userPaths.length ? "modify_user" : "create";
-    const described = `${cap.description.split("；")[0]}：${Object.entries(args).map(([k, v]) => `${k}=「${v.slice(0, 80)}」`).join("，")}`;
-    if (NEEDS_CONSENT.has(consequence)) {
-      const object = consequence === "external" ? `cap:${cap.id}` : `path:${userPaths[0]}`;
-      const held = this.tokens.get(object);
-      const why = ex.consent.check({ kind: "wait", ms: 0 }, object, consequence, this.o.task, held);
-      if (why) {
-        const c = ex.consent.challenge({ kind: "wait", ms: 0 }, object, consequence, `${described}（${consequence === "external" ? "这会把内容发出去" : "这会改动你的文件 " + userPaths.join("、")}）`);
-        const t = await this.consentFor(c);
-        if (t === null) return this.end("failed", "no answer from the user");
-        if (t === "cancel") return this.end("cancelled", "the user stopped the task");
-        if (t === "declined") return this.declined(`用户不同意：${described}`);
-        const again = ex.consent.check({ kind: "wait", ms: 0 }, object, consequence, this.o.task, t);
-        if (again) return err(`同意凭证无效：${again}`);
-      }
-    }
-    const existed = fp.writes.filter((p) => ws.exists(p));
-    const r = cap.execute(ws, args);
-    ws.invalidate();
-    this.count("actions"); this.count(`fs:${r.status}`);
-    if (r.status === "ok") {
-      // ownership follows content: a user's file moved elsewhere is still the user's at its new path (review 10-18, T1)
-      const gone = existed.filter((p) => !ws.exists(p));
-      for (const p of fp.writes) if (!existed.includes(p) && ws.exists(p)) { if (gone.length) ex.ledger.inherits(`path:${p}`, `path:${gone[0]}`); else ex.ledger.created(`path:${p}`); }
-      if (cap.effect !== "observe") this.effects.push(described);
-    }
-    this.emit("fs.act", { cap: cap.id, args, status: r.status, consequence });
-    return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence })) : err(J({ status: r.status, why: r.why, consequence }));
-  }
-
   private async finish(p: { outcome: "done" | "unconfirmed" | "cannot"; summary: string; missing?: string[] }): Promise<AgentToolResult> {
     this.summary = p.summary;
     this.emit("finish.claimed", { outcome: p.outcome, summary: p.summary, missing: p.missing ?? [] });
@@ -352,6 +317,7 @@ export class FrontierRuntime {
       任务碰过的窗口现在的样子: ev.windows.map((o) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) })),
       本任务做过的动作: this.effects,
       执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
+      ...(ev.external_changes.length ? { "任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）": ev.external_changes.map((c) => c.path) } : {}),
       ...(this.o.workspace ? { 任务目录现在的内容: this.o.workspace.listing() } : {}),
       ...(this.startTree ? { "任务开始时的目录（路径 → 版本；小文件带内容）": this.startTree } : {}),
       ...(this.answer !== null ? { 给用户的答案: this.answer } : {}),

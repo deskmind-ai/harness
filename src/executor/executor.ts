@@ -53,6 +53,12 @@ export class Executor {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
   }
 
+  /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
+  attachFiles(workspace: Workspace, registry: Registry) { this.opts.files = { workspace, registry }; }
+
+  /** The epoch of the last snapshot / observation: what a file action, which has no window to observe, cites. */
+  get currentEpoch(): number { return this.epoch; }
+
   private emit(kind: string, body: Record<string, unknown> = {}) { this.opts.onEvent?.(kind, body); }
 
   async begin(paths: string[] = []): Promise<Snapshot> {
