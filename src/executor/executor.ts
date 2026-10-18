@@ -11,7 +11,8 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
-import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, Receipt, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, Snapshot, WindowInfo } from "./types.js";
+import * as P from "../orchestrator/prompts.js";
 import type { Capability, Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
@@ -54,6 +55,8 @@ export class Executor {
   private seen: Record<string, string> = {};
   private taskContent = new Set<string>();           // "path@version" the task wrote
   readonly externalChanges: ExternalChange[] = [];
+  /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
+  private planAccepted: PlanProposal | null = null;
 
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
@@ -63,6 +66,28 @@ export class Executor {
   attachFiles(workspace: Workspace, registry: Registry) { this.opts.files = { workspace, registry }; }
 
   setRequest(raw: string) { this.opts.raw = raw; }
+
+  /** The start gate, mirror of the finish gate: nothing of the user's is touched and nothing is sent until a plan is
+   *  in. A plan is accepted when every reading it rests on is settled — no alternatives, or evidence the judge says
+   *  tells the readings apart (the orchestrator's evidence judge, same wording). Readings the judge cannot settle are
+   *  handed back for the user to choose; without a judge every open reading is the user's to settle. */
+  async plan(p: PlanProposal): Promise<PlanVerdict> {
+    const open: Reading[] = [];
+    for (const r of p.readings ?? []) {
+      if (!r.alternatives.length) continue;
+      const evidence = r.evidence.filter((e) => e.trim() && !(this.opts.raw ?? "").includes(e.trim()));   // the request cannot settle its own ambiguity
+      if (!evidence.length || !this.opts.judge) { open.push(r); continue; }
+      const options = [r.reading, ...r.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
+      const ans = await this.opts.judge.choose(P.evidenceQuestion(r.point), { 用户原文: this.opts.raw ?? "", 证据: evidence }, options);
+      if (ans?.choice !== "r0") open.push(r);
+    }
+    this.emit("executor.plan", { steps: p.steps.length, readings: (p.readings ?? []).length, open: open.map((r) => r.point) });
+    if (open.length) return { accepted: false, open, why: `依据不够，先问用户：${open.map((r) => r.point).join("、")}` };
+    this.planAccepted = p;
+    return { accepted: true, steps: p.steps };
+  }
+
+  get hasPlan(): boolean { return this.planAccepted !== null; }
 
   /** Codex's guardian, in the executor: before an action that changes the user's things or sends something out, an
    *  independent judge reads the user's words, the action in words and the evidence around it. A mismatch is refused
@@ -184,6 +209,7 @@ export class Executor {
     const obs = target ? this.lastObs.get(target) : undefined;
     if ("target" in req.action && req.action.target && !obs?.elements.some((e) => e.id === (req.action as { target: string }).target)) return done({ ...base, status: "stale", why: `element ${req.action.target} is not in the last observation of ${target}; observe the window first`, epoch: now.epoch });
     if (target && (req.action.kind === "key" || req.action.kind === "type") && !obs) return done({ ...base, status: "stale", why: `window ${target} was never observed; observe it first`, epoch: now.epoch });
+    if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
       const text = describeAction(req.action, this.lastObs.get("window" in req.action ? req.action.window : ""), consequence);
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
@@ -239,6 +265,7 @@ export class Executor {
     }
     const pre = cap.preconditions(ws, a.args);
     if (pre) return { ...base, status: "error", why: `precondition: ${pre}` };
+    if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return { ...base, status: "needs_plan", why: "changing the user's files or sending something out needs a plan first: call plan with the paths, your readings and their evidence" };
     if (NEEDS_CONSENT.has(consequence)) {
       const text = describeAction(a, undefined, consequence, cap);
       const evidence: Record<string, unknown> = {};

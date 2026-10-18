@@ -84,9 +84,12 @@ describe("frontier runtime: consent", () => {
     expect((seen[0]![1] as any).content).toContain('"owner":"user"');
   });
 
-  it("without a plan, the first touch of the user's window asks on the spot; a declined send is never sent and the run does not claim success", async () => {
+  it("without a plan, touching the user's window is refused; after the plan, a declined send is never sent and the run does not claim success", async () => {
     const { sim, w } = mail();
     const steps: Step[] = [
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "modify_user"),                 // refused: no plan yet
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "打开并回复", objects: [`window:${w}`], consequence: "modify_user" }, { purpose: "发送", objects: [`window:${w}`], consequence: "external" }] } }] },
       { calls: [{ name: "computer_observe", args: { window: w } }] },
       act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "modify_user"),
       act({ kind: "click", window: w, target: `${w}:0:reply` }, "create"),          // the model under-classes: the floor still says modify_user
@@ -95,13 +98,34 @@ describe("frontier runtime: consent", () => {
       { calls: [{ name: "finish", args: { outcome: "cannot", summary: "用户不让发送" } }] },
     ];
     const u = user((c) => (c.kind === "action" && c.text.includes("发送") ? { option: c.options.findIndex((o) => o.kind === "skip_step") } : approveAll(c)));
-    const { rt } = runtime(sim, steps, u);
+    const { rt, seen } = runtime(sim, steps, u);
     const r = await rt.run();
     expect(r.status).toBe("failed");
     expect(r.reason).toContain("cannot");
     expect(sim.mailState(w).replies).toEqual([]);
-    expect(u.cards.filter((c) => c.kind === "action").length).toBe(4);     // every action in the user's window asked, then the send
+    expect((seen[2]!.at(-1) as any).content[0].text).toContain("先交计划");
+    expect(u.cards.map((c) => c.kind)).toEqual(["plan", "action"]);              // one plan card; the send asked and declined
     expect(u.cards.at(-1)!.text).toContain("发出去");
+    expect(r.counters["needs_plan"]).toBe(1);
+  });
+
+  it("a reading the plan cannot back with evidence is put to the user before anything is touched", async () => {
+    const { sim, w } = mail();
+    const steps: Step[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "给那封加旗标", objects: [`window:${w}`], consequence: "modify_user" }], readings: [{ point: "林晓那封", reading: "Q3 预算", alternatives: ["周会纪要"], evidence: [] }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      act({ kind: "click", window: w, target: `${w}:0:row:m2` }, "modify_user"),
+      act({ kind: "click", window: w, target: `${w}:0:flag` }, "modify_user"),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "已加旗标" } }] },
+    ];
+    const u = user((c) => (c.kind === "ambiguity" ? { option: 1 } : approveAll(c)));        // the user means 周会纪要
+    const { rt, seen } = runtime(sim, steps, u);
+    const r = await rt.run();
+    expect(u.cards.map((c) => c.kind)).toEqual(["ambiguity", "plan"]);
+    expect(u.cards[0]!.text).toContain("林晓那封");
+    expect(u.cards[0]!.options.map((o) => o.text).slice(0, 2)).toEqual(["Q3 预算", "周会纪要"]);
+    expect(r.status).toBe("succeeded");
+    void seen;
   });
 
   it("a model that claims done with nothing done is not believed: the verdict fails, and the honest end is unconfirmed", async () => {
@@ -196,6 +220,8 @@ describe("frontier runtime: stop, lock, files", () => {
     const sim = new SimComputer(root);
     const steps: Step[] = [
       { calls: [{ name: "fs_create_text", args: { parent: ".", name: "备忘.txt", text: "买牛奶" } }] },
+      { calls: [{ name: "fs_append_line", args: { target: "todo.txt", line: "买牛奶" } }] },           // refused: the user's file, no plan
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "在 todo.txt 末尾加一行", objects: ["path:todo.txt"], consequence: "modify_user" }] } }] },
       { calls: [{ name: "fs_append_line", args: { target: "todo.txt", line: "买牛奶" } }] },
       { calls: [{ name: "finish", args: { outcome: "done", summary: "新建了 备忘.txt，并在 todo.txt 末尾加了一行" } }] },
     ];
@@ -205,8 +231,8 @@ describe("frontier runtime: stop, lock, files", () => {
     expect(r.status).toBe("succeeded");
     expect(ws.read("备忘.txt")).toBe("买牛奶");
     expect(ws.read("todo.txt")).toBe("交房租\n买牛奶\n");
-    expect(u.cards.map((c) => c.kind)).toEqual(["action"]);
+    expect(u.cards.map((c) => c.kind)).toEqual(["plan"]);
     expect(u.cards[0]!.text).toContain("todo.txt");
-    expect(r.consents).toEqual([{ scope: "action", object: "path:todo.txt", consequence: "modify_user" }]);
+    expect(r.consents).toEqual([{ scope: "object", object: "path:todo.txt", consequence: "modify_user" }]);
   });
 });

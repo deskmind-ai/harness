@@ -88,7 +88,15 @@ export interface ActRequest {
   consent?: ConsentToken;
 }
 
-export type ActStatus = "ok" | "unverified" | "stale" | "needs_consent" | "refused" | "blocked" | "error" | "stopped" | "environment";
+export type ActStatus = "ok" | "unverified" | "stale" | "needs_consent" | "needs_plan" | "refused" | "blocked" | "error" | "stopped" | "environment";
+
+/** One place the request can be read more than one way: the reading the plan takes, the others, and the evidence
+ *  for the choice (things seen: a window title, a file name, a line of a file, the user's answer — never the
+ *  request's own words). The judge decides whether the evidence settles it; if not, the user is asked first. */
+export interface Reading { point: string; reading: string; alternatives: string[]; evidence: string[] }
+export interface PlanStep { purpose: string; objects: string[]; consequence: Consequence }
+export interface PlanProposal { steps: PlanStep[]; readings?: Reading[] }
+export type PlanVerdict = { accepted: true; steps: PlanStep[] } | { accepted: false; open: Reading[]; why: string };
 
 export interface ActResult {
   status: ActStatus;

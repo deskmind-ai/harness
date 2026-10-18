@@ -57,6 +57,9 @@ describe("review: guarantee 2 — nothing of the user's changes without consent"
     build(root, { "todo.txt": "交房租\n" });
     const ws = new Workspace(root);
     const steps: Step[] = [
+      // the start gate (added later) wants a plan before the user's file is touched; the plan names only the move, so
+      // the trash of the moved content is outside it and has to be consented on its own
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "move", objects: ["path:todo.txt"], consequence: "modify_user" }] } }] },
       { calls: [{ name: "fs_move", args: { source: "todo.txt", destination: "moved.txt" } }] },
       { calls: [{ name: "fs_trash", args: { target: "moved.txt" } }] },
       { calls: [{ name: "finish", args: { outcome: "cannot", summary: "stop here" } }] },
@@ -64,8 +67,9 @@ describe("review: guarantee 2 — nothing of the user's changes without consent"
     const u = user(approveAll);
     const { rt } = runtime(new SimComputer(root), steps, u, { workspace: ws, registry: fileRegistry() });
     await rt.run();
-    // the move was consented (one card); trashing the user's content under its new name must be consented too
-    expect(u.cards.filter((c) => c.kind === "action").length).toBe(2);
+    // the move was consented (the plan); trashing the user's content under its new name must be consented too
+    expect(u.cards.map((c) => c.kind)).toEqual(["plan", "action"]);
+    expect(u.cards[1]!.text).toContain("moved.txt");
   });
 
   it("a click on an element the executor never observed skips the `sends` floor: the mail goes out with no consent", async () => {
@@ -93,6 +97,7 @@ describe("review: guarantee 2 — nothing of the user's changes without consent"
     const exA = new Executor(a.sim, { task: "run-a", publicKey: app.publicKey });
     const exB = new Executor(b.sim, { task: "run-b", publicKey: app.publicKey });
     await exA.begin(); await exB.begin();
+    await exA.plan({ steps: [] }); await exB.plan({ steps: [] });
     const oa = await exA.observe(a.w.id);
     const row = oa.elements.find((e) => e.role === "row")!;
     const action = { kind: "click" as const, window: a.w.id, target: row.id };

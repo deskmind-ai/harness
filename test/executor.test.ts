@@ -26,6 +26,8 @@ function setup(now?: () => number) {
   const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, now, onEvent: (k) => events.push(k) });
   return { app, sim, w, ex, events };
 }
+/** begin, and open the start gate with an empty plan (the gate has tests of its own below). */
+const started = async (ex: Executor) => { const s = await ex.begin(); await ex.plan({ steps: [] }); return s; };
 
 const find = async (ex: Executor, win: string, label: string) => { const o = await ex.observe(win); const e = o.elements.find((x) => x.label.includes(label))!; return { o, e }; };
 const click = async (ex: Executor, win: string, label: string, extra: Record<string, unknown> = {}) => { const { o, e } = await find(ex, win, label); return ex.act({ action: { kind: "click", window: win, target: e.id }, epoch: o.epoch, ...extra }); };
@@ -58,7 +60,7 @@ describe("executor: ownership and the consequence floor", () => {
 
   it("an element marked as sending floors at external, even in the task's own window", async () => {
     const { ex, sim, app } = setup();
-    await ex.begin();
+    await started(ex);
     // the task's own mail window (the sim lets a test add one after begin)
     const mine = sim.addMail({ app: "信鸽", texts: ZH_MAIL_TEXTS, flagged: [], inbox: [{ id: "a1", from: "顾青", subject: "合同", body: ["x"], time: "10:00" }] });
     ex.ledger.created(`window:${mine.id}`);
@@ -88,7 +90,7 @@ describe("executor: consent tokens", () => {
   it("a token for another action, a forged one, an expired one and a lower class are refused", async () => {
     let now = 1_000_000;
     const { ex, w, app, sim } = setup(() => now);
-    await ex.begin();
+    await started(ex);
     const { o, e } = await find(ex, w.id, "林晓 · Q3 预算");
     const click1: Action = { kind: "click", window: w.id, target: e.id };
     const r = await ex.act({ action: click1, epoch: o.epoch });
@@ -109,7 +111,7 @@ describe("executor: consent tokens", () => {
 
   it("an object-scoped token covers every action on that object in this task, not in another", async () => {
     const { ex, w, app, sim } = setup();
-    await ex.begin();
+    await started(ex);
     const token = app.forObject(`window:${w.id}`, "modify_user", "t1");
     expect((await click(ex, w.id, "林晓 · Q3 预算", { consent: token })).status).toBe("ok");
     expect((await click(ex, w.id, "加旗标", { consent: token })).status).toBe("ok");
@@ -118,13 +120,13 @@ describe("executor: consent tokens", () => {
     expect((await click(ex, w.id, "回复", { consent: token })).status).toBe("ok");
     expect((await click(ex, w.id, "发送", { consent: token })).status).toBe("needs_consent");
     const otherTask = new Executor(sim, { task: "t2", publicKey: app.publicKey });
-    await otherTask.begin();
+    await started(otherTask);
     expect((await click(otherTask, w.id, "取消", { consent: token })).why).toContain("another task");
   });
 
   it("a rule token is kept and covers later actions matching its pattern", async () => {
     const { ex, w, app, sim } = setup();
-    await ex.begin();
+    await started(ex);
     const rule = app.forRule("关我的邮件窗口不用问", `window:${w.id}`, "modify_user");
     expect((await ex.act({ action: { kind: "close_window", window: w.id }, epoch: (await ex.snapshot()).epoch, consent: rule })).status).toBe("ok");
     expect(sim.wins.length).toBe(0);
@@ -169,7 +171,7 @@ describe("executor: files under the same guard", () => {
     build(root, { "todo.txt": "交房租\n", "other.txt": "x" });
     const ws = new Workspace(root), app = ConsentSigner.fresh(), sim = new SimComputer(root);
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
-    const s = await ex.begin();
+    const s = await started(ex);
     const file = (capability: string, args: Record<string, string>, consent?: any) => ex.act({ action: { kind: "file", capability, args }, epoch: ex.currentEpoch, consent });
     return { fs, ws, app, ex, file, root, s };
   };
@@ -233,7 +235,7 @@ describe("executor: the judge before a consequential action", () => {
     const { sim, w } = mailSim();
     const events: Record<string, unknown>[] = [];
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, judge: new Judge([{ name: "test", gateway: gw }]), raw: "把林晓那封 Q3 预算的邮件加旗标", onEvent: (k, b) => events.push({ k, ...b }) });
-    await ex.begin();
+    await started(ex);
     return { ex, sim, w, app, events, gw };
   };
 
@@ -294,5 +296,41 @@ describe("judge tiers", () => {
     low.script = [() => ({ choice: "matches", scores: { matches: 0.6, mismatch: 0.4 } })];
     top.script = [() => ({ choice: "insufficient", scores: {} })];
     expect(await judge().choose("q3", {}, opts)).toMatchObject({ by: "top", choice: "insufficient", confidence: undefined });
+  });
+});
+
+describe("executor: the start gate", () => {
+  it("nothing of the user's is touched before a plan; a plan is accepted when its readings are settled", async () => {
+    const { ex, w, app } = setup();
+    await ex.begin();
+    const r = await click(ex, w.id, "林晓 · Q3 预算", { consent: app.forObject(`window:${w.id}`, "modify_user", "t1") });
+    expect(r.status).toBe("needs_plan");
+    expect((await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: (await ex.snapshot()).epoch })).status).toBe("ok");   // the task's own things need no plan
+    // a reading with alternatives and no evidence (or evidence that is the request's own words) is the user's to settle
+    const open = await ex.plan({ steps: [{ purpose: "加旗标", objects: [`window:${w.id}`], consequence: "modify_user" }], readings: [{ point: "那封", reading: "Q3 预算", alternatives: ["周会纪要"], evidence: [] }] });
+    expect(open).toMatchObject({ accepted: false });
+    expect(ex.hasPlan).toBe(false);
+    const settled = await ex.plan({ steps: [{ purpose: "加旗标", objects: [`window:${w.id}`], consequence: "modify_user" }], readings: [{ point: "那封", reading: "Q3 预算", alternatives: [], evidence: ["用户的回答：Q3 预算"] }] });
+    expect(settled.accepted).toBe(true);
+    expect((await click(ex, w.id, "林晓 · Q3 预算", { consent: app.forObject(`window:${w.id}`, "modify_user", "t1") })).status).toBe("ok");
+  });
+
+  it("with a judge, evidence that tells the readings apart settles them; evidence that does not hands them back", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge } = await import("../src/executor/judge.js");
+    const gw = new Gateway(Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any);
+    const asked: string[] = [];
+    gw.script = [(_r: string, _s: string, u: string) => { asked.push(u); return { choice: "r0" }; }, () => ({ choice: "r2" })];
+    const app = ConsentSigner.fresh();
+    const { sim, w } = mailSim();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, judge: new Judge([{ name: "t", gateway: gw }]), raw: "给林晓那封邮件加旗标" });
+    await ex.begin();
+    const reading = { point: "那封", reading: "林晓 · Q3 预算", alternatives: ["林晓 · 周会纪要"], evidence: ["林晓 · Q3 预算", "林晓 · 周会纪要"] };
+    expect((await ex.plan({ steps: [], readings: [reading] })).accepted).toBe(true);
+    expect(asked[0]).toContain("那封");
+    const ex2 = new Executor(sim, { task: "t2", publicKey: app.publicKey, judge: new Judge([{ name: "t", gateway: gw }]), raw: "给林晓那封邮件加旗标" });
+    await ex2.begin();
+    expect(await ex2.plan({ steps: [], readings: [reading] })).toMatchObject({ accepted: false, open: [reading] });
+    void w;
   });
 });

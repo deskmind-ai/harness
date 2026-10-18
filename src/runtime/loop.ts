@@ -24,7 +24,7 @@ import { canon } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
 import { Executor, describeAction } from "../executor/executor.js";
 import { defaultJudge } from "../executor/judge.js";
-import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken } from "../executor/types.js";
+import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading } from "../executor/types.js";
 
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
 /** What signs consent: the app (keychain) in production, a ConsentSigner in tests and the CLI. */
@@ -186,9 +186,9 @@ export class FrontierRuntime {
       execute: async (_id, p: { action: Static<typeof ActionSchema>; epoch: number; consequence: Consequence; purpose: string }) => this.act(p),
     }));
     tools.push(tool({
-      name: "plan", label: "计划", description: "动手前列出步骤：目的、涉及的对象（窗口 id / 标签页 id / 文件路径）、后果类别。有「改用户的东西」或「往外发」的步骤时，程序把计划给用户过目，同意后改用户东西的步骤不再逐步打扰。",
-      parameters: Type.Object({ steps: Type.Array(Type.Object({ purpose: Type.String(), objects: Type.Array(Type.String()), consequence: lit(CONSEQUENCES) })) }),
-      execute: async (_id, p: { steps: { purpose: string; objects: string[]; consequence: Consequence }[] }) => this.plan(p.steps),
+      name: "plan", label: "计划", description: "动手前列出步骤：目的、涉及的对象（窗口 id / 标签页 id / 文件路径）、后果类别。要碰用户的东西或往外发，必须先有计划。readings：原话里能有不止一种理解的地方，每处写你选的理解、其他理解、以及区分它们的依据（看到的东西：窗口标题、文件名、文件里的一行、用户的回答；原话本身不算）。依据不够的，程序会先问用户。程序把计划给用户过目，同意后改用户东西的步骤不再逐步打扰。",
+      parameters: Type.Object({ steps: Type.Array(Type.Object({ purpose: Type.String(), objects: Type.Array(Type.String()), consequence: lit(CONSEQUENCES) })), readings: Type.Optional(Type.Array(Type.Object({ point: Type.String(), reading: Type.String(), alternatives: Type.Array(Type.String()), evidence: Type.Array(Type.String()) }))) }),
+      execute: async (_id, p: { steps: { purpose: string; objects: string[]; consequence: Consequence }[]; readings?: Reading[] }) => this.plan(p.steps, p.readings ?? []),
     }));
     tools.push(tool({
       name: "ask_user", label: "问用户", description: "只有用户知道的信息（要写什么、哪一个、放哪）才问；能自己看到的不要问。options 是从证据里拿的候选，2–6 个，可以为空。",
@@ -250,6 +250,7 @@ export class FrontierRuntime {
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     if (a.kind === "file") this.emit("fs.act", { cap: a.capability, args: a.args, status: r.status, consequence: r.consequence, why: r.why ?? "" });
     if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(a.kind === "file" ? describeAction(a, undefined, r.consequence, cap) : `${p.purpose}：${describeAction(a, r.after, r.consequence)}`);
+    if (r.status === "needs_plan") { this.count("needs_plan"); return err(`先交计划：${r.why}`); }
     if (r.status === "environment") return this.end("environment", r.why ?? "environment");
     if (r.status === "stopped") return this.end("stopped", r.why ?? "stopped");
     const { after, challenge: _c, ...rest } = r;
@@ -264,10 +265,27 @@ export class FrontierRuntime {
     return { ...(r.status === "ok" || r.status === "unverified" ? text(J(view)) : err(J(view))), ...(notes.length ? { content: [{ type: "text", text: J(view) + "\n" + notes.join("\n") }] } : {}) };
   }
 
-  private async plan(steps: { purpose: string; objects: string[]; consequence: Consequence }[]): Promise<AgentToolResult> {
+  private async plan(steps: { purpose: string; objects: string[]; consequence: Consequence }[], readings: Reading[]): Promise<AgentToolResult> {
     this.count("plans");
     const need = steps.filter((s) => NEEDS_CONSENT.has(s.consequence));
-    this.emit("plan", { steps });
+    this.emit("plan", { steps, readings });
+    // the start gate: readings the judge cannot settle are the user's to settle, one card each, before anything else
+    let settled = readings;
+    for (;;) {
+      const v = await this.o.executor.plan({ steps, readings: settled });
+      if (v.accepted) break;
+      const r = v.open[0]!;
+      this.count("asks");
+      const card: Card = { kind: "ambiguity", text: `「${r.point}」可以有几种理解，你指的是哪一种？`, free_text: true, blocking: true, options: [
+        ...[r.reading, ...r.alternatives].map((t) => ({ kind: "reading" as const, text: t })), { kind: "delegate", text: "由你决定" }, { kind: "cancel", text: "先别做了" }] };
+      const got = await this.askCard(card);
+      if (!got) return this.end("failed", "no answer from the user");
+      if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
+      const chosen = got.option?.kind === "reading" ? got.text : got.option?.kind === "delegate" ? r.reading : null;
+      this.emit("reading.settled", { point: r.point, reading: chosen ?? got.text, by: got.option?.kind ?? "words" });
+      if (chosen === null) return text(`用户对「${r.point}」的回答：${got.text}。按这个重新理解，再交一次计划。`);
+      settled = settled.map((x) => (x === r ? { ...x, reading: chosen, alternatives: [], evidence: [`用户的回答：${chosen}`] } : x));
+    }
     if (!need.length) return text("计划记下了；这些步骤不需要用户同意，直接做。");
     const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${s.consequence === "modify_user" ? "——改你的东西" : s.consequence === "external" ? "——往外发，到时候再确认一次" : ""}`);
     const card: Card = { kind: "plan", text: `我打算这样做：\n${lines.join("\n")}\n可以吗？`, free_text: true, blocking: true, options: [{ kind: "approve", text: "可以，就这样做" }, { kind: "cancel", text: "先别做了" }] };
