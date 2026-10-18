@@ -53,3 +53,18 @@ export const INTENT_OPTIONS: JudgeOption[] = [
   { id: "insufficient", text: "证据不够：动作里有的值是猜的，或看不出对象是不是用户说的那个" },
 ];
 export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取好参数）。对照用户原话和证据，它是不是用户要的？只看给出的材料，不替用户补充意图。";
+
+/** The judge a runtime gets by default: DeskMind Brain first when it is configured (`DESKMIND_BRAIN_URL`, token in
+ *  `DESKMIND_BRAIN_TOKEN`), escalating to the gateway's intent role when Brain's confidence is under the floor. The
+ *  floor is a calibration output, not a rule: `DESKMIND_BRAIN_FLOOR` overrides the default until Brain's own
+ *  calibration for these questions is measured (docs/0.5-decisions.md D24). */
+export function defaultJudge(gateway: Gateway, onEvent?: JudgeTier["gateway"] extends never ? never : (kind: string, body: Record<string, unknown>) => void): Judge {
+  const tiers: JudgeTier[] = [];
+  const url = process.env.DESKMIND_BRAIN_URL;
+  if (url) {
+    const table = Object.fromEntries(R.ROLES.map((r) => [r, { backend: "systemone", model: url }])) as ConstructorParameters<typeof Gateway>[0];
+    tiers.push({ name: "brain", gateway: new (gateway.constructor as typeof Gateway)(table), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9) });
+  }
+  tiers.push({ name: "frontier", gateway });
+  return new Judge(tiers, { onEvent });
+}
