@@ -8,13 +8,15 @@ for a in sys.argv[1:]:
     if a.startswith("--price="): price = tuple(float(x) for x in a[8:].split(","))
 def load(d):
     rows = [json.loads(l) for l in open(d + "/results.jsonl")]
-    judge = collections.Counter(); esc = 0; unsettled = 0; qs = 0
+    judge = collections.Counter(); esc = 0; unsettled = 0; qs = 0; skipped = 0; shadow = [0, 0]   # [agree, compared]
     for f in glob.glob(d + "/**/events.jsonl", recursive=True):
         for l in open(f):
             e = json.loads(l); k = e.get("kind")
             if k == "judge.answer" and e.get("answer"): judge[e["answer"].get("by", "?")] += 1; qs += 1
             if k == "judge.escalate": esc += 1
             if k == "judge.unsettled": unsettled += 1
+            if k == "judge.skipped": skipped += 1
+            if k == "judge.shadow" and e.get("agree") is not None: shadow[1] += 1; shadow[0] += int(bool(e.get("agree")))
     # the gateway's log: every cloud call outside the actor's loop (judge tiers, teach); the local Brain tier is not
     # logged here, so what is missing in B against A is what stayed on the machine
     gw = {"calls": 0, "tokens_in": 0, "tokens_out": 0, "latency_ms": 0, "user_chars": 0}
@@ -26,6 +28,7 @@ def load(d):
                 gw["latency_ms"] += e.get("latency_ms", 0); gw["user_chars"] += e.get("user_chars", 0) + e.get("system_chars", 0)
     except OSError:
         pass
+    gw["skipped"] = skipped; gw["shadow"] = shadow
     return rows, judge, esc, unsettled, qs, gw
 def summ(rows):
     n = len(rows); cats = collections.defaultdict(list)
@@ -48,6 +51,7 @@ for name, d in zip("AB", args[:2]):
     s["judge_cloud_calls"] = gw["calls"] / n; s["judge_tokens_in"] = gw["tokens_in"] / n; s["judge_tokens_out"] = gw["tokens_out"] / n
     s["judge_latency_s"] = gw["latency_ms"] / 1000 / n; s["judge_chars_cloud"] = gw["user_chars"] / n
     s["usd_all"] = s["usd"] + (gw["tokens_in"] * price[0] + gw["tokens_out"] * price[1]) / n
+    s["skipped"] = gw["skipped"]; s["shadow"] = gw["shadow"]
     out[name] = s
 A, B = out.get("A"), out.get("B")
 def pct(x): return f"{100*x:.0f}%"
@@ -70,6 +74,8 @@ row("判官问题数（总）", A["judge_questions"], B["judge_questions"], str)
 row("  本地（Brain）定的", A["judge_by"].get("brain", 0), B["judge_by"].get("brain", 0), str)
 row("  本地占比", A["local_share"], B["local_share"], pct)
 row("  升云端 / unsettled", (A["escalations"], A["unsettled"]), (B["escalations"], B["unsettled"]), lambda v: "/".join(map(str, v)))
+row("  自适应跳过（没问快档）", A["skipped"], B["skipped"], str)
+row("  影子核对 一致/比较", tuple(A["shadow"]), tuple(B["shadow"]), lambda v: "/".join(map(str, v)))
 print("\n按类正确数:")
 for c in sorted(set(A["by_cat"]) | set(B["by_cat"])):
     print(f"  {c:12} A {pct(A['by_cat'].get(c,0)):>5}  B {pct(B['by_cat'].get(c,0)):>5}")
