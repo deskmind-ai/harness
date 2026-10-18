@@ -21,6 +21,7 @@ import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
+import { T, type Lang } from "../runtime/text.js";
 import type { KeyObject } from "node:crypto";
 
 export interface ExecutorOptions {
@@ -30,6 +31,8 @@ export interface ExecutorOptions {
   judge?: Judge;
   /** The user's words, for the judge; the runtime updates it when the user changes the request (steer). */
   raw?: string;
+  /** The language of what the user reads (consent card texts). */
+  lang?: Lang;
   /** A journal (jsonl): every state-changing action is written down before it runs and receipted after, so a process
    *  that died in between is found on restart (an intent without a receipt) and reconciled, never repeated blindly. */
   journal?: string;
@@ -261,7 +264,7 @@ export class Executor {
     if (target && (req.action.kind === "key" || req.action.kind === "type") && !obs) return done({ ...base, status: "stale", why: `window ${target} was never observed; observe it first`, epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
-      const text = describeAction(req.action, this.lastObs.get("window" in req.action ? req.action.window : ""), consequence);
+      const text = describeAction(req.action, this.lastObs.get("window" in req.action ? req.action.window : ""), consequence, undefined, this.opts.lang);
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
       const judged = await this.judgeIntent(req.action, consequence, f.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
       if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
@@ -320,7 +323,7 @@ export class Executor {
     if (pre) return { ...base, status: "error", why: `precondition: ${pre}` };
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return { ...base, status: "needs_plan", why: "changing the user's files or sending something out needs a plan first: call plan with the paths, your readings and their evidence" };
     if (NEEDS_CONSENT.has(consequence)) {
-      const text = describeAction(a, undefined, consequence, cap);
+      const text = describeAction(a, undefined, consequence, cap, this.opts.lang);
       const evidence: Record<string, unknown> = {};
       for (const p of touched) if (!ws.isDir(p)) evidence[`文件 ${p} 现在的内容（前 600 字）`] = ws.readForModel(p, 600);
       const judged = await this.judgeIntent(a, consequence, object, evidence, text);
@@ -399,9 +402,10 @@ export class Executor {
     for (const r of [...this.receipts].reverse()) {
       if (r.result.status !== "ok" || r.result.consequence === "read") continue;
       const a = r.request.action;
-      if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap), can: false, why: `${a.capability} 没有撤回的办法` }); continue; }
-      if (a.kind === "open_window") { steps.push({ seq: r.seq, text: `打开 ${a.app}`, can: true }); continue; }
-      steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence), can: false, why: "界面上的操作撤不回" });
+      const t = T(this.opts.lang);
+      if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap, this.opts.lang), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap, this.opts.lang), can: false, why: t.noUndoFor(a.capability) }); continue; }
+      if (a.kind === "open_window") { steps.push({ seq: r.seq, text: t.openWindow(a.app), can: true }); continue; }
+      steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, undefined, this.opts.lang), can: false, why: t.undoable });
     }
     return { reversible: steps.every((s) => s.can), steps };
   }
@@ -465,21 +469,22 @@ function diffObs(before: Observation | null, after: Observation, newWindows: str
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
-export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability): string {
+export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability, lang?: Lang): string {
+  const t = T(lang);
   if (a.kind === "file") {
     const what = `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}：${Object.entries(a.args).map(([k, v]) => `${k}=「${v.slice(0, 80)}」`).join("，")}`;
-    return consequence === "external" ? `${what}（这会把内容发出去）` : consequence === "modify_user" ? `${what}（这会改动你的文件）` : what;
+    return consequence === "external" ? `${what}（${t.sends}）` : consequence === "modify_user" ? `${what}（${t.modifiesFile}）` : what;
   }
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
   const where = obs ? `${obs.window.app}「${obs.window.title}」` : "window" in a ? a.window : "";
-  const what = a.kind === "click" ? `点「${el?.label ?? a.target}」`
-    : a.kind === "set_value" ? `把「${el?.label ?? a.target}」设为「${a.value}」`
-    : a.kind === "type" ? `在「${el?.label ?? a.target}」里输入「${a.text}」`
-    : a.kind === "select" ? `把「${el?.label ?? a.target}」选成「${a.option}」`
-    : a.kind === "key" ? `按 ${a.chord}`
-    : a.kind === "close_window" ? "关闭窗口" : a.kind === "open_window" ? `打开 ${a.app}` : a.kind === "focus_window" ? "切到窗口" : a.kind === "scroll" ? "滚动" : "等待";
-  const cls = consequence === "external" ? "这会把内容发出去" : consequence === "modify_user" ? "这会改动你的东西" : "";
-  return `${where ? "在 " + where + " " : ""}${what}${cls ? "（" + cls + "）" : ""}`;
+  const what = a.kind === "click" ? t.click(el?.label ?? a.target)
+    : a.kind === "set_value" ? t.set(el?.label ?? a.target, a.value)
+    : a.kind === "type" ? t.type(el?.label ?? a.target, a.text)
+    : a.kind === "select" ? t.select(el?.label ?? a.target, a.option)
+    : a.kind === "key" ? t.key(a.chord)
+    : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? t.openWindow(a.app) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
+  const cls = consequence === "external" ? t.sends : consequence === "modify_user" ? t.modifies : "";
+  return `${where ? t.at(where) : ""}${what}${cls ? "（" + cls + "）" : ""}`;
 }
 
 export type { WindowInfo };

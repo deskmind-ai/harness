@@ -299,3 +299,28 @@ describe("frontier runtime: a crash", () => {
     expect(ws.read("备忘.txt")).toBe("买牛奶");
   });
 });
+
+describe("frontier runtime: the cards' language", () => {
+  it("with lang en the user reads English cards and consent texts; the model is spoken to as before", async () => {
+    const { sim, w } = mail();
+    const steps: Step[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "flag it", objects: [`window:${w}`], consequence: "modify_user" }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "modify_user"),
+      act({ kind: "click", window: w, target: `${w}:0:reply` }, "modify_user"),
+      act({ kind: "set_value", window: w, target: `${w}:0:compose_body`, value: "ok" }, "modify_user"),
+      act({ kind: "click", window: w, target: `${w}:0:send` }, "external"),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "replied" } }] },
+    ];
+    const u = user(approveAll);
+    const { rt, seen } = runtime(sim, steps, u, { verdict: "pass", reason: "ok" }, { lang: "en" } as any);
+    const r = await rt.run();
+    expect(r.status).toBe("succeeded");
+    expect(u.cards[0]!.text.startsWith("Here is what I plan to do:")).toBe(true);
+    expect(u.cards[0]!.options.map((o) => o.text)).toEqual(["OK, go ahead", "Stop here"]);
+    expect(u.cards[1]!.text).toContain("this sends something out");
+    expect(u.cards[1]!.options.map((o) => o.text)).toEqual(["OK", "Skip this step", "Stop here"]);
+    expect(r.result_card?.options.map((o) => o.text)).toEqual(["Fine"]);
+    expect((seen[0]![0] as any).content).toContain("看得宽，动得窄");
+  });
+});

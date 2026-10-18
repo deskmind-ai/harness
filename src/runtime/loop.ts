@@ -10,6 +10,7 @@
  */
 import { Type, type Static, type TSchema, type Message } from "@earendil-works/pi-ai";
 import { compact } from "./compact.js";
+import { T, type Lang } from "./text.js";
 import type { Model } from "@earendil-works/pi-ai";
 import { runAgentLoop, type AgentContext, type AgentEvent, type AgentLoopConfig, type AgentTool, type AgentToolResult, type StreamFn } from "@earendil-works/pi-agent-core";
 import * as fs from "node:fs";
@@ -42,6 +43,8 @@ export interface RuntimeOptions {
   budget?: Partial<typeof RUNTIME_BUDGET>;
   onEvent?: (kind: string, body: Record<string, unknown>) => void;
   signal?: AbortSignal;
+  /** The language of what the user reads on cards (default zh). */
+  lang?: Lang;
 }
 
 export interface RuntimeResult {
@@ -107,9 +110,12 @@ export class FrontierRuntime {
   private readonly budget: typeof RUNTIME_BUDGET;
   private readonly abort = new AbortController();
   private crash: Crash | null = null;
+  private readonly t: ReturnType<typeof T>;
 
   constructor(readonly o: RuntimeOptions) {
     this.raw = o.raw;
+    this.t = T(o.lang);
+    o.executor.opts.lang = o.lang ?? "zh";
     if (o.workspace && o.registry && !o.executor.opts.files) o.executor.attachFiles(o.workspace, o.registry);
     o.executor.setRequest(o.raw);
     if (!o.executor.opts.judge) o.executor.opts.judge = defaultJudge(o.gateway, (k, b) => this.emit(k, b));
@@ -150,7 +156,7 @@ export class FrontierRuntime {
 
   /** The user is asked for this one action; a yes becomes a signed, single-use token. */
   private async consentFor(c: Challenge): Promise<ConsentToken | "declined" | "cancel" | null> {
-    const card: Card = { kind: "action", text: c.text, free_text: false, blocking: true, options: [{ kind: "approve", text: "可以" }, { kind: "skip_step", text: "这一步不要" }, { kind: "cancel", text: "先别做了" }] };
+    const card: Card = { kind: "action", text: c.text, free_text: false, blocking: true, options: [{ kind: "approve", text: this.t.ok }, { kind: "skip_step", text: this.t.skipStep }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     this.emit("consent.asked", { object: c.object, consequence: c.consequence, picked: got?.option?.kind ?? null });
     if (!got) return null;
@@ -196,7 +202,7 @@ export class FrontierRuntime {
       execute: async (_id, p: { question: string; options: string[] }) => {
         if ((this.counters["asks"] ?? 0) >= this.budget.asks) return err("问得太多了：先按已知的做，或者 finish 说明缺什么");
         this.count("asks");
-        const card: Card = { kind: "missing", text: p.question, free_text: true, blocking: true, options: [...p.options.slice(0, 6).map((t) => ({ kind: "value" as const, text: t })), { kind: "delegate", text: "由你决定" }, { kind: "cancel", text: "先别做了" }] };
+        const card: Card = { kind: "missing", text: p.question, free_text: true, blocking: true, options: [...p.options.slice(0, 6).map((t) => ({ kind: "value" as const, text: t })), { kind: "delegate", text: this.t.delegate }, { kind: "cancel", text: this.t.cancel }] };
         const got = await this.askCard(card);
         if (!got) return this.end("failed", "no answer from the user");
         if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
@@ -278,8 +284,8 @@ export class FrontierRuntime {
       if (v.accepted) break;
       const r = v.open[0]!;
       this.count("asks");
-      const card: Card = { kind: "ambiguity", text: `「${r.point}」可以有几种理解，你指的是哪一种？`, free_text: true, blocking: true, options: [
-        ...[r.reading, ...r.alternatives].map((t) => ({ kind: "reading" as const, text: t })), { kind: "delegate", text: "由你决定" }, { kind: "cancel", text: "先别做了" }] };
+      const card: Card = { kind: "ambiguity", text: this.t.ambiguity(r.point), free_text: true, blocking: true, options: [
+        ...[r.reading, ...r.alternatives].map((t) => ({ kind: "reading" as const, text: t })), { kind: "delegate", text: this.t.delegate }, { kind: "cancel", text: this.t.cancel }] };
       const got = await this.askCard(card);
       if (!got) return this.end("failed", "no answer from the user");
       if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
@@ -289,8 +295,8 @@ export class FrontierRuntime {
       settled = settled.map((x) => (x === r ? { ...x, reading: chosen, alternatives: [], evidence: [`用户的回答：${chosen}`] } : x));
     }
     if (!need.length) return text("计划记下了；这些步骤不需要用户同意，直接做。");
-    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${s.consequence === "modify_user" ? "——改你的东西" : s.consequence === "external" ? "——往外发，到时候再确认一次" : ""}`);
-    const card: Card = { kind: "plan", text: `我打算这样做：\n${lines.join("\n")}\n可以吗？`, free_text: true, blocking: true, options: [{ kind: "approve", text: "可以，就这样做" }, { kind: "cancel", text: "先别做了" }] };
+    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${s.consequence === "modify_user" ? this.t.modifyYours : s.consequence === "external" ? this.t.external : ""}`);
+    const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     if (!got) return this.end("failed", "no answer from the user");
     if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
@@ -423,10 +429,10 @@ export class FrontierRuntime {
   resultCard(): Card | null {
     if (this.status !== "succeeded" || !this.effects.length) return null;
     const u = this.o.executor.undoable();
-    const options: CardOption[] = [{ kind: "approve", text: "好的" }];
-    if (u.reversible) options.push({ kind: "undo", text: "撤回" });
+    const options: CardOption[] = [{ kind: "approve", text: this.t.fine }];
+    if (u.reversible) options.push({ kind: "undo", text: this.t.undo });
     const consented = this.consents.filter((c) => c.scope !== "action" || c.consequence === "external").map((c) => c.object);
-    const text = [`做了：${this.effects.slice(-6).join("；")}`, ...(consented.length ? [`改动了你的：${[...new Set(consented)].join("、")}`] : []), ...(u.reversible ? [] : [`（${u.steps.find((x) => !x.can)?.why ?? "有的动作撤不回"}）`])].join("\n");
+    const text = [this.t.did(this.effects.slice(-6)), ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(u.reversible ? [] : [this.t.noUndo(u.steps.find((x) => !x.can)?.why ?? this.t.undoable)])].join("\n");
     return { kind: "result", text, options, free_text: false, blocking: false };
   }
 

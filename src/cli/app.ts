@@ -132,7 +132,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
     ...(ws ? { workspace: ws, registry: fileRegistry() } : {}),
-    skills: skillsFor(req, ws),
+    skills: skillsFor(req, ws), lang: req.lang ?? "zh",
     onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); },
   });
   o.input.onStop = () => { log.emit({ kind: "refused", what: "the task", why: "stopped by the app", by: "user" }); rt.stop("stopped by the app"); };
