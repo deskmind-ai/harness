@@ -18,21 +18,22 @@ DeskMind 的「想」：理解要求、计划、调工具、核对，在用户�
 
 | 目录 | 内容 |
 |---|---|
-| `src/executor/` | `types.ts` 执行层契约（快照、观察、动作、后果类别、凭证）；`ledger.ts` 归属清单；`consent.ts` 挑战与凭证（签名 / 验签 / 三档范围 / 一次性）；`executor.ts` 把关（锁屏、过期观察、停止、下限 ⊔ 模型类别、验签）、回执、核对用的证据；`sim.ts` 模拟桌面（邮件、编辑器、浏览器、系统设置，用户窗口和任务窗口）；`hands.ts` 真机驱动，对接 hands 的 `deskmind_hands.executor` |
-| `src/runtime/` | `loop.ts` 前沿配置的单循环：工具（看电脑、看窗口、动手、计划、文件能力、问用户、回答、读教程、结束），把关在 `beforeToolCall`，每步核对和原地打转在动作结果里，不核对不让结束在 `finishTurn`；`model.ts` pi-ai 模型；`scripted.ts` 测试用的脚本化模型 |
-| `src/skills/` | `agentskills.ts` SKILL.md 文件夹的读写、按结构筛候选、模型选；`library.ts` 教材的学会 / 收下 / 用 / 修订 / 按归因停用，可执行规则在 `rules.ts` |
+| `src/executor/` | `types.ts` 执行层契约（快照、观察、动作、后果类别、凭证、计划）；`ledger.ts` 归属清单；`consent.ts` 挑战与凭证（签名 / 验签 / 三档范围 / 一次性 / 登记挑战）；`judge.ts` 判官——执行层唯一会调模型的地方，只做选择题，分层（Brain 本地 → 前沿）、低层只能批准不能单独拒绝、有缓存和预算；`executor.ts` 把关（锁屏、用户活跃、过期观察、停止、下限 ⊔ 模型类别、验签）、文件也是对象（版本代替 epoch、内容归属、外来改动记事实）、开始闸门（没有过判官的计划不碰用户的东西）、动前意图核对、结束核对 `verdict`、撤回、回执日志与崩溃恢复；`sim.ts` 模拟桌面；`hands.ts` 真机驱动，对接 hands 的 `deskmind_hands.executor` |
+| `src/runtime/` | `loop.ts` 前沿配置的单循环：工具（看电脑、看窗口、动手、计划、文件能力、问用户、回答、读教程、结束），把关在 `beforeToolCall`，每步核对和原地打转在动作结果里，不核对不让结束在 `finishTurn`，中途改要求（steer），结果卡和撤回；`compact.ts` 上下文压缩；`text.ts` 卡片文字的 zh / en；`model.ts` pi-ai 模型；`scripted.ts` 测试用的脚本化模型 |
+| `src/skills/` | `agentskills.ts` SKILL.md 文件夹的读写、按结构筛候选、模型选；`teach.ts` 运行时这条路的学教材（自然语言 SKILL.md + 确认过的例子，重放一致才收下；反例修订）；`library.ts` 老编排器的教材（可执行规则在 `rules.ts`） |
 | `src/orchestrator/` | 本地配置的编排器：七个角色（goal / plan / bind / intent / choice / skill / verify / transform），运行日志折叠出状态 |
 | `src/gateway/` | 模型网关：`openai`（任何 OpenAI 兼容服务，`<provider>|<model>`，key 只从环境变量来）、OpenRouter、本地 mlx、Brain 的 systemone、`claude -p`（只在开发时）、脚本化（测试） |
 | `src/registry/` | 工作目录（资源版本）与文件能力 |
 | `src/protocol/` | 协议对象、各角色回答的 zod schema、给 app 的事件协议 |
-| `src/cli/` | app 的入口（见下） |
+| `src/cli/` | `app.ts` app 的入口（见下）；`mcp.ts` 执行层的 MCP 服务——七个工具（begin / snapshot / observe / plan / act / verify / stop / end），Codex、Claude Code 接上就带着三条底线 |
 | `src/eval/` | 检查集 / 考卷的跑分（两个引擎：`--engine orchestrator|runtime`），练习场 `gym.ts`（模拟桌面上的邮件任务，按应用真实状态判分） |
 | `skills/` | 自带的基础技能 `deskmind-computer-use` |
 | `test/` | 守护测试：脚本化的对抗模型，验证每一道保护；`executor.test.ts`、`runtime.test.ts` 专测三条底线 |
 
 ```bash
 pnpm install
-pnpm test                                                      # 228 项，不用模型
+pnpm test                                                      # 260+ 项，不用模型
+pnpm mcp -- --driver sim --config yy-luna                      # 执行层的 MCP 服务（stdio）；--driver hands 接真机
 pnpm typecheck
 YY_URL=… YY_API_KEY=… pnpm gym -- --config yy-luna --seeds 1-40  # 练习场：邮件任务 × 真实模型，判分看应用真实状态
 pnpm eval -- --tasks <tasks-check.json> --config yy-luna --split check                  # 编排器
