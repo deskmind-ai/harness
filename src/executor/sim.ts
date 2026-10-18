@@ -142,6 +142,7 @@ export class SimComputer implements Driver {
 
   perform(a: Action): ReturnType<Driver["perform"]> {
     if (a.kind === "wait") return { status: "ok" };
+    if (a.kind === "file") return { status: "unsupported", why: "files are the executor's, not the desktop driver's" };
     if (a.kind === "open_window") {
       const w = a.app === "mail" ? null : a.app.toLowerCase().includes("浏览") || a.app.toLowerCase().includes("safari") || a.url ? this.addBrowser(a.app, [{ title: a.url ?? "新标签页", url: a.url ?? "about:blank" }]) : this.addEditor(a.app);
       if (!w) return { status: "unsupported", why: `cannot open ${a.app}` };

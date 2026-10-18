@@ -11,19 +11,26 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
-import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, Observation, PerformResult, Receipt, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, Receipt, Snapshot, WindowInfo } from "./types.js";
+import type { Capability, Registry } from "../registry/capability.js";
+import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import type { KeyObject } from "node:crypto";
 
-export interface ExecutorOptions { task: string; publicKey: KeyObject; now?: () => number; onEvent?: (kind: string, body: Record<string, unknown>) => void }
+export interface ExecutorOptions {
+  task: string; publicKey: KeyObject; now?: () => number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
+  /** The task folder and the file capabilities: files are objects like windows (owner, version, last seen). */
+  files?: { workspace: Workspace; registry: Registry };
+}
 
 /** What an action touches: the object the guard and the consent are about. */
-export function objectOf(a: Action): string {
+export function objectOf(a: Action, fp?: { reads: string[]; writes: string[] }, cap?: Capability): string {
   switch (a.kind) {
     case "open_window": return `app:${a.app}`;
     case "wait": return "";
+    case "file": return cap?.effect === "external" ? `cap:${a.capability}` : fp?.writes[0] ? `path:${fp.writes[0]}` : fp?.reads[0] ? `path:${fp.reads[0]}` : `cap:${a.capability}`;
     default: return `window:${a.window}`;
   }
 }
@@ -36,6 +43,11 @@ export class Executor {
   private epoch = 0;
   private last: Snapshot | null = null;
   private lastObs = new Map<string, Observation>();
+  /** Files: the version of each path as the task last saw it (begin, a read, its own write), the versions the task
+   *  itself wrote (content ownership), and what other programs changed meanwhile. */
+  private seen: Record<string, string> = {};
+  private taskContent = new Set<string>();           // "path@version" the task wrote
+  readonly externalChanges: ExternalChange[] = [];
 
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
@@ -45,6 +57,8 @@ export class Executor {
 
   async begin(paths: string[] = []): Promise<Snapshot> {
     const raw = await this.driver.snapshot();
+    const ws = this.opts.files?.workspace;
+    if (ws) { for (const p of Object.keys(ws.entries())) { this.seen[p] = ws.version(p); if (!paths.includes(p)) paths = [...paths, p]; } }
     this.ledger.begin(raw, paths);
     this.epoch = raw.epoch;
     this.last = this.ledger.stamp(raw);
@@ -69,8 +83,32 @@ export class Executor {
 
   stop() { this.stopped = true; this.emit("executor.stopped"); }
 
+  /** A file action's capability and footprint, or why it cannot be looked at. */
+  private fileOf(a: Extract<Action, { kind: "file" }>): { cap: Capability; fp: { reads: string[]; writes: string[] }; ws: Workspace } | { error: string } {
+    const f = this.opts.files;
+    if (!f) return { error: "this executor has no task folder" };
+    const cap = f.registry.get(a.capability);
+    if (!cap) return { error: `unknown capability ${a.capability}` };
+    const bad = cap.typecheck(a.args);
+    if (bad) return { error: bad };
+    try { return { cap, fp: cap.footprint(f.workspace, a.args), ws: f.workspace }; } catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
+  }
+
   /** The minimum class an action can have, from structure alone. */
   floor(a: Action): { consequence: Consequence; object: string; why: string } {
+    if (a.kind === "file") {
+      const f = this.fileOf(a);
+      if ("error" in f) return { consequence: "read", object: `cap:${a.capability}`, why: f.error };
+      const object = objectOf(a, f.fp, f.cap);
+      if (f.cap.effect === "observe") return { consequence: "read", object, why: "reads only" };
+      if (f.cap.effect === "external") return { consequence: "external", object, why: "sends something out" };
+      const userPaths = f.fp.writes.filter((p) => f.ws.exists(p) && this.ledger.ownerOf(`path:${p}`) === "user");
+      if (userPaths.length) return { consequence: "modify_user", object, why: `changes the user's ${userPaths.join(", ")}` };
+      // discarding content the task did not write (replace, trash) is the user's loss even on a path the task made
+      const foreign = f.cap.discards ? f.fp.writes.filter((p) => f.ws.exists(p) && !f.ws.isDir(p) && !this.taskContent.has(`${p}@${f.ws.version(p)}`)) : [];
+      if (foreign.length) return { consequence: "modify_user", object, why: `discards content the task did not write: ${foreign.join(", ")}` };
+      return { consequence: "create", object, why: "creates, or changes the task's own files" };
+    }
     const object = objectOf(a);
     if (a.kind === "wait" || a.kind === "focus_window" || a.kind === "scroll") return { consequence: "read", object, why: "changes no content" };
     if (a.kind === "open_window") return { consequence: "create", object, why: "a window of the task's own" };
@@ -109,6 +147,7 @@ export class Executor {
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
     const now = await this.driver.snapshot();
     if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+    if (req.action.kind === "file") return done(await this.actFile(req.action, req.consent, consequence, f.object, now.epoch));
     if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
     if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
@@ -150,16 +189,58 @@ export class Executor {
     return done(out);
   }
 
+  /** A file capability under the same guard as a window action. Versions stand in for the observation epoch: every
+   *  path the action reads or writes must be as the task last saw it (at begin, in a read, or by its own write); one
+   *  that changed since was changed by someone else — recorded as a fact, and the action is refused until the task
+   *  reads the file again and decides anew. Nothing here "corrects" another program's work. */
+  private async actFile(a: Extract<Action, { kind: "file" }>, consent: ConsentToken | undefined, consequence: Consequence, object: string, epoch: number): Promise<ActResult> {
+    const base = { consequence, object, epoch };
+    const f = this.fileOf(a);
+    if ("error" in f) return { ...base, status: "error", why: f.error };
+    const { cap, fp, ws } = f;
+    const touched = [...new Set([...fp.reads, ...fp.writes])].filter((p) => ws.exists(p));
+    const changed = touched.filter((p) => this.seen[p] !== ws.version(p));
+    if (changed.length) {
+      for (const p of changed) { this.externalChanges.push({ path: p, seen: this.seen[p] ?? "absent", now: ws.version(p), at: this.opts.now?.() ?? Date.now() }); this.seen[p] = ws.version(p); }
+      this.emit("executor.external_change", { paths: changed });
+      return { ...base, status: "stale", why: `changed since you last saw it (by another program, or never read): ${changed.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
+    }
+    const pre = cap.preconditions(ws, a.args);
+    if (pre) return { ...base, status: "error", why: `precondition: ${pre}` };
+    if (NEEDS_CONSENT.has(consequence)) {
+      const why = this.consent.check(a, object, consequence, this.opts.task, consent);
+      if (why) {
+        const challenge = this.consent.challenge(a, object, consequence, describeAction(a, undefined, consequence, cap));
+        this.emit("executor.consent_needed", { why, consequence, object });
+        return { ...base, status: "needs_consent", why, challenge };
+      }
+    }
+    const existed = fp.writes.filter((p) => ws.exists(p));
+    let r: ReturnType<Capability["execute"]>;
+    try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    ws.invalidate();
+    if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
+    const gone = existed.filter((p) => !ws.exists(p));
+    for (const p of fp.writes) {
+      const v = ws.version(p);
+      this.seen[p] = v;
+      if (ws.exists(p) && !ws.isDir(p)) this.taskContent.add(`${p}@${v}`);
+      if (!existed.includes(p) && ws.exists(p)) { if (gone.length) this.ledger.inherits(`path:${p}`, `path:${gone[0]}`); else this.ledger.created(`path:${p}`); }
+    }
+    for (const p of fp.reads) this.seen[p] = ws.version(p);        // a read is an observation
+    return { ...base, status: "ok", output: r.output ?? {} };
+  }
+
   /** The evidence for a final judgement: the computer now, and every window the task touched or created, observed
    *  again. Who judges is the runtime's `verify` role; what it judges on is this. */
-  async verify(): Promise<{ snapshot: Snapshot; windows: Observation[]; receipts: Receipt[] }> {
+  async verify(): Promise<{ snapshot: Snapshot; windows: Observation[]; receipts: Receipt[]; external_changes: ExternalChange[] }> {
     const s = await this.snapshot();
     const touched = new Set<string>();
     for (const r of this.receipts) if ("window" in r.request.action && (r.result.status === "ok" || r.result.status === "unverified")) touched.add(r.request.action.window);
     for (const o of this.ledger.taskObjects()) if (o.startsWith("window:")) touched.add(o.slice(7));
     const windows: Observation[] = [];
     for (const id of touched) if (s.windows.some((w) => w.id === id)) windows.push(await this.observe(id));
-    return { snapshot: s, windows, receipts: this.receipts };
+    return { snapshot: s, windows, receipts: this.receipts, external_changes: this.externalChanges };
   }
 
   async end(): Promise<{ receipts: Receipt[]; task_objects: string[] }> {
@@ -178,7 +259,11 @@ function diffObs(before: Observation | null, after: Observation, newWindows: str
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
-export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence): string {
+export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability): string {
+  if (a.kind === "file") {
+    const what = `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}：${Object.entries(a.args).map(([k, v]) => `${k}=「${v.slice(0, 80)}」`).join("，")}`;
+    return consequence === "external" ? `${what}（这会把内容发出去）` : consequence === "modify_user" ? `${what}（这会改动你的文件）` : what;
+  }
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
   const where = obs ? `${obs.window.app}「${obs.window.title}」` : "window" in a ? a.window : "";
   const what = a.kind === "click" ? `点「${el?.label ?? a.target}」`

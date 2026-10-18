@@ -82,6 +82,7 @@ function checkAction(a: Action): string | null {
     case "set_value": return need("window") ?? need("target") ?? need("value");
     case "type": return need("window") ?? need("target") ?? need("text");
     case "select": return need("window") ?? need("target") ?? need("option");
+    case "file": return need("capability") ?? need("args");
   }
 }
 

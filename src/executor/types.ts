@@ -56,8 +56,13 @@ export type Action =
   | { kind: "open_window"; app: string; url?: string }
   | { kind: "close_window"; window: string }
   | { kind: "focus_window"; window: string }
-  | { kind: "wait"; ms: number };
+  | { kind: "wait"; ms: number }
+  /** A file capability (registry) on the task folder: the same guard, with versions in place of observation epochs. */
+  | { kind: "file"; capability: string; args: Record<string, string> };
 export type ActionKind = Action["kind"];
+
+/** A file another program changed while the task ran: a fact for the verdict, never something to "correct". */
+export interface ExternalChange { path: string; seen: string; now: string; at: number }
 
 /** The consent an action carries: a token the app signed for a challenge the executor issued (consent.ts). */
 export interface ConsentToken {
@@ -95,6 +100,7 @@ export interface ActResult {
   /** What changed, in structure: the window's elements before / after, for the step check. */
   changed?: { elements: number; focus?: string; modal?: string | null; new_windows?: string[] };
   after?: Observation;               // the window after the action (re-observed)
+  output?: Record<string, unknown>;  // a file capability's output (a read's text, a listing)
 }
 
 export interface PerformResult { status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo }
