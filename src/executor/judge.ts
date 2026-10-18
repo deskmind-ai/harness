@@ -10,7 +10,8 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { Gateway, type RoleTable } from "../gateway/index.js";
+import { Gateway, type Reply, type RoleTable } from "../gateway/index.js";
+import type { z } from "zod";
 import type { Role } from "../protocol/roles.js";
 import * as P from "../orchestrator/prompts.js";
 import * as R from "../protocol/roles.js";
@@ -79,7 +80,8 @@ export class Judge {
     const topTier = this.tiers[this.tiers.length - 1]!;
     const lowerAsked = this.tiers.slice(0, -1).some((t) => !this.opts.stats?.skip(t.name, kind));
     // the race: the top tier starts now, alongside the lower tiers; abortable
-    const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Awaited<ReturnType<Gateway["ask"]>>> | null } : null;
+    type Answer = Reply<z.infer<ReturnType<typeof R.choiceAnswer>>>;
+    const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
     if (raced) raced.promise = topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids), "", raced.controller.signal);
     for (const tier of this.tiers) {
       const final = tier === topTier;
