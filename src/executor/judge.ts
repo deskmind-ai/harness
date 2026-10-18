@@ -61,7 +61,7 @@ export class Judge {
     let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null;
     for (const tier of this.tiers) {
       const final = tier === this.tiers[this.tiers.length - 1];
-      if (!final && this.opts.stats?.skip(tier.name, kind)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, kind }); continue; }
+      if (!final && this.opts.stats?.skip(tier.name, kind)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
       const rep = await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
       if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
@@ -80,7 +80,7 @@ export class Judge {
     if (settled && settledBy && this.opts.shadow) {
       const top = this.tiers[this.tiers.length - 1]!;
       const rep = await top.gateway.ask(role ?? top.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
-      this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree: rep.outcome === "answered" ? rep.data!.choice === last!.choice : null });
+      this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, question_kind: kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree: rep.outcome === "answered" ? rep.data!.choice === last!.choice : null });
     }
     // every tier above a lower tier's refusal failed: that refusal does not become final by default — the caller takes
     // the conservative branch (the user decides), the same as when no tier answered

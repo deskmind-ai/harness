@@ -15,8 +15,11 @@ def load(d):
             if k == "judge.answer" and e.get("answer"): judge[e["answer"].get("by", "?")] += 1; qs += 1
             if k == "judge.escalate": esc += 1
             if k == "judge.unsettled": unsettled += 1
-            if k == "judge.skipped": skipped += 1
-            if k == "judge.shadow" and e.get("agree") is not None: shadow[1] += 1; shadow[0] += int(bool(e.get("agree")))
+            # the first runs with these events recorded them under the question's kind (the body's `kind` key
+            # overwrote the event's); recognised by their fields
+            keys = set(e.keys()) - {"seq", "t", "kind"}
+            if k == "judge.skipped" or keys == {"tier"}: skipped += 1
+            if (k == "judge.shadow" or {"tier", "choice", "top", "agree"} <= keys) and e.get("agree") is not None: shadow[1] += 1; shadow[0] += int(bool(e.get("agree")))
     # the gateway's log: every cloud call outside the actor's loop (judge tiers, teach); the local Brain tier is not
     # logged here, so what is missing in B against A is what stayed on the machine
     gw = {"calls": 0, "tokens_in": 0, "tokens_out": 0, "latency_ms": 0, "user_chars": 0}
