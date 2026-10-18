@@ -127,7 +127,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const gw = new Gateway(config, { log: (r) => fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n") });
   const signer = ConsentSigner.fresh();
   const ws = req.scope ? new Workspace(req.scope) : undefined;
-  const executor = new Executor(driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); } });
+  // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
+  // process did without a receipt and tells the model (D10)
+  const executor = new Executor(driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); } });
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
