@@ -299,6 +299,7 @@ export class FrontierRuntime {
       if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
       const chosen = got.option?.kind === "reading" ? got.text : got.option?.kind === "delegate" ? r.reading : null;
       this.emit("reading.settled", { point: r.point, reading: chosen ?? got.text, by: got.option?.kind ?? "words" });
+      this.answers.push({ question: this.t.ambiguity(r.point), text: chosen ?? got.text });     // the verdict reads it like any answer
       if (chosen === null) return text(`用户对「${r.point}」的回答：${got.text}。按这个重新理解，再交一次计划。`);
       settled = settled.map((x) => (x === r ? { ...x, reading: chosen, alternatives: [], evidence: [`用户的回答：${chosen}`] } : x));
     }
