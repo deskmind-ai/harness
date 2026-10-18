@@ -139,6 +139,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
     ...(ws ? { workspace: ws, registry: fileRegistry() } : {}),
     skills: skillsFor(req, ws), lang: req.lang ?? "zh", ...(req.rules ? { rules: req.rules } : {}),
+    // a real desktop takes more looks than the check set's folders: a pixel-mode app needs an observation per step
+    // and the old engine used ~20 actions on the music sample; the evaluation keeps the default budget
+    budget: req.driver === "hands" ? { tool_calls: 90, turns: 60 } : {},
     onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); },
   });
   o.input.onStop = () => { log.emit({ kind: "refused", what: "the task", why: "stopped by the app", by: "user" }); rt.stop("stopped by the app"); };
