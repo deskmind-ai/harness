@@ -38,7 +38,7 @@ export class TierStats {
   private at(tier: string, kind: string) { const t = (this.data[tier] ??= {}); return (t[kind] ??= { asked: 0, settled: 0 }); }
   note(tier: string, kind: string, settled: boolean) { const k = this.at(tier, kind); k.asked += 1; if (settled) k.settled += 1; this.save(); }
   /** A shadow comparison: did the slow tier agree with what the fast tier settled? */
-  noteAgreement(tier: string, kind: string, agree: boolean) { const k = this.at(tier, kind); k.compared = (k.compared ?? 0) + 1; if (agree) k.agreed = (k.agreed ?? 0) + 1; this.save(); }
+  noteAgreement(tier: string, kind: string, agree: boolean) { const k = this.at(tier, kind); k.compared = (k.compared ?? 0) + 1; k.agreed = (k.agreed ?? 0) + (agree ? 1 : 0); this.save(); }
   /** Skip the tier for this kind when it has shown it is not worth asking: it settles under `floor` of the questions
    *  (asked at least `min` times), or — measured by shadow comparisons — the slow tier agreed with its settled
    *  answers under `agreeFloor` of the time (compared at least `minCompared` times). A probe turn now and then keeps
