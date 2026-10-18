@@ -45,3 +45,25 @@ describe("service URLs", () => {
     expect(firstTier("nonsense")).toBeNull();
   });
 });
+
+describe("model configurations by name or spec", () => {
+  it("a CONFIGS name, or openai:<provider>|<model> for every role; anything else is unknown", async () => {
+    const { configTable } = await import("../src/gateway/index.js");
+    expect(configTable("ds-flash")!.goal).toEqual({ backend: "openai", model: "deepseek|deepseek-flash" });
+    const t = configTable("openai:custom|my-model")!;
+    expect(t.goal).toEqual({ backend: "openai", model: "custom|my-model" });
+    expect(t.verify).toEqual({ backend: "openai", model: "custom|my-model" });
+    expect(configTable("nonsense")).toBeNull();
+    expect(PROVIDERS.custom).toEqual({ urlEnv: "CUSTOM_URL", keyEnv: "CUSTOM_API_KEY" });
+  });
+  it("model-check reports an unreachable model without leaking the key", async () => {
+    const { modelCheck } = await import("../src/cli/app.js");
+    expect(await modelCheck("no-such-config")).toEqual({ ok: false, error: "unknown config no-such-config" });
+    const saved = { url: process.env.CUSTOM_URL, key: process.env.CUSTOM_API_KEY };
+    process.env.CUSTOM_URL = "http://127.0.0.1:9"; process.env.CUSTOM_API_KEY = "sk-secretsecretsecret";
+    const r = await modelCheck("openai:custom|m");
+    expect(r.ok).toBe(false); expect(r.model).toBe("custom|m"); expect(r.error ?? "").not.toContain("secretsecret");
+    if (saved.url === undefined) delete process.env.CUSTOM_URL; else process.env.CUSTOM_URL = saved.url;
+    if (saved.key === undefined) delete process.env.CUSTOM_API_KEY; else process.env.CUSTOM_API_KEY = saved.key;
+  }, 30_000);   // the gateway retries a connection failure a few times before giving up
+});

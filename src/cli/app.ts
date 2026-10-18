@@ -6,6 +6,7 @@
  *   app-run [--request <file>] [--runs <dir>]   stdin line 1 (or the file): {run_id?, raw, scope?, config?, engine?, lang?, driver?}
  *   respond --run <id> [--runs <dir>]           stdin line 1: {option} | {text}  — the user's answer to the result card
  *   --selftest                                  no model, no network: the packaged binary's health check
+ *   model-check --config <name|openai:prov|model> one tiny question to the configured model: {ok, model, ms} or {ok:false, error} — the app's "test" button
  *
  * Consent: the executor verifies Ed25519 tokens with a public key; the private key is the app's (keychain / Secure
  * Enclave, docs/0.5-decisions.md D4). Until the app signs, this process holds a fresh pair per run — the model never
@@ -16,7 +17,8 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
-import { CONFIGS, Gateway } from "../gateway/index.js";
+import { configTable, Gateway } from "../gateway/index.js";
+import * as R from "../protocol/roles.js";
 import { ConsentSigner } from "../executor/consent.js";
 import { Executor } from "../executor/executor.js";
 import { SimComputer } from "../executor/sim.js";
@@ -122,9 +124,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
   log.emit({ kind: "start", raw: req.raw, lang: req.lang ?? "zh", engine: req.engine ?? "runtime", config, ...(req.scope ? { scope: req.scope } : {}) });
-  const table = CONFIGS[config];
+  const table = configTable(config);
   if (!table) { log.emit({ kind: "task_done", status: "failed", reason: `unknown config ${config}`, summary: "", result_card: null }); return; }
-  const gw = new Gateway(config, { log: (r) => fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n") });
+  const gw = new Gateway(table, { log: (r) => fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n") });
   const signer = ConsentSigner.fresh();
   const ws = req.scope ? new Workspace(req.scope) : undefined;
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
@@ -181,13 +183,25 @@ export async function selftest(): Promise<Record<string, unknown>> {
   return { ok, node: process.version, windows: snap.windows.length, floor: pre.consequence, runtime: r.status, tool_calls: r.counters["tool_calls"] ?? 0 };
 }
 
+/** Can the configured model be reached with the keys in the environment? One choice question; the key never
+ *  appears in the answer (a service's error text is cut and stripped of anything that looks like one). */
+export async function modelCheck(config: string): Promise<{ ok: boolean; model?: string; ms?: number; error?: string }> {
+  const table = configTable(config);
+  if (!table) return { ok: false, error: `unknown config ${config}` };
+  const t0 = Date.now();
+  const rep = await new Gateway(table).ask("choice", "只输出 JSON。", "问题：1+1=2 吗？选项 yes / no。", R.choiceAnswer(["yes", "no"]), "model-check");
+  const scrub = (e: string) => e.replace(/(sk-|Bearer )[A-Za-z0-9_-]{8,}/g, "$1…").slice(0, 200);
+  return rep.outcome === "answered" ? { ok: true, model: table.choice.model, ms: Date.now() - t0 } : { ok: false, model: table.choice.model, error: scrub(`${rep.outcome}: ${rep.error ?? ""}`) };
+}
+
 async function main() {
   const { values: a, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true, options: { linger: { type: "string", default: "0" },
-    request: { type: "string" }, runs: { type: "string", default: "runs/app" }, run: { type: "string" }, selftest: { type: "boolean", default: false },
+    request: { type: "string" }, runs: { type: "string", default: "runs/app" }, run: { type: "string" }, selftest: { type: "boolean", default: false }, config: { type: "string", default: "ds-flash" },
   } });
   const out = (ev: AppEvent) => process.stdout.write(JSON.stringify(ev) + "\n");
   if (a.selftest) { const r = await selftest(); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
   const cmd = positionals[0];
+  if (cmd === "model-check") { const r = await modelCheck(a.config!); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
   const input = new LineReader(process.stdin);
   if (cmd === "app-run") {
     const req: Request = JSON.parse(a.request ? fs.readFileSync(a.request, "utf-8") : await input.next());
@@ -200,7 +214,7 @@ async function main() {
     respond(a.run, path.resolve(a.runs!), JSON.parse(await input.next()), out);
     process.exit(0);
   }
-  console.error("usage: app-run [--request <file>] [--runs <dir>] | respond --run <id> | --selftest");
+  console.error("usage: app-run [--request <file>] [--runs <dir>] | respond --run <id> | model-check --config <name> | --selftest");
   process.exit(2);
 }
 

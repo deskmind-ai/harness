@@ -39,7 +39,15 @@ export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: s
   // `noThinking` is how this service turns reasoning off: a role that wants a fast answer (think: false) sends it —
   // doubao-seed-2.1-lite answered a judge question in 1.6 s without thinking, 76 s with (10-18)
   volcengine: { urlEnv: "VOLCENGINE_URL", keyEnv: "VOLCENGINE_API_KEY", url: "https://ark.cn-beijing.volces.com/api/v3", noThinking: { thinking: { type: "disabled" } } },
+  // any other OpenAI-compatible service the user names in the app's settings (URL, key, model id)
+  custom: { urlEnv: "CUSTOM_URL", keyEnv: "CUSTOM_API_KEY" },
 };
+/** A model configuration by name (CONFIGS) or by spec: `openai:<provider>|<model>` — every role on that model. */
+export function configTable(spec: string): RoleTable | null {
+  if (CONFIGS[spec]) return CONFIGS[spec]!;
+  const m = /^(\w+):(.+)$/s.exec(spec);
+  return m ? all(m[1] as Backend, m[2]!) : null;
+}
 /** The request fields a role's wish for a fast answer (`think: false`) becomes on this provider; none when the
  *  service has no switch or the role did not ask. */
 export function extraBodyFor(provider: string, think: boolean | undefined): Record<string, unknown> {
