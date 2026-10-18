@@ -32,6 +32,9 @@ export type Backend = "openrouter" | "openai" | "local_chat" | "systemone" | "cl
 export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: string }> = {
   yy: { urlEnv: "YY_URL", keyEnv: "YY_API_KEY" },
   openrouter: { urlEnv: "OPENROUTER_URL", keyEnv: "OPENROUTER_API_KEY", url: "https://openrouter.ai/api/v1" },
+  // DeepSeek's own API: `deepseek-flash` is DeepSeek-V4.1-Flash-1017 (the API takes the family name, /v1/models lists
+  // deepseek-flash and deepseek-v4-pro); it rejects json_schema, so the gateway falls back to json_object
+  deepseek: { urlEnv: "DEEPSEEK_URL", keyEnv: "DEEPSEEK_API_KEY", url: "https://api.deepseek.com" },
 };
 export function providerOf(model: string): { url: string; key: string | undefined; model: string; name: string } | { error: string } {
   const [name, ...rest] = model.split("|");
@@ -77,6 +80,8 @@ export const CONFIGS: Record<string, RoleTable> = {
   "yy-sol": all("openai", "yy|gpt-6.1-sol"),
   // the same model through OpenRouter (when YY is down; same provider table, different URL and key)
   "or-luna": all("openai", "openrouter|openai/gpt-6-luna"),
+  // DeepSeek V4.1 Flash (10-17 release) through DeepSeek's API: a cheap second frontier for the same comparisons
+  "ds-flash": all("openai", "deepseek|deepseek-flash"),
   "yy-mix": { ...all("openai", "yy|gpt-6.1-sol"), choice: { backend: "openai", model: "yy|gpt-6-luna" }, transform: { backend: "openai", model: "yy|gpt-6-luna", timeoutMs: TRANSFORM_TIMEOUT_MS } },
 };
 
@@ -340,13 +345,15 @@ export class Gateway {
 
   /** Models whose service rejects our (non-strict) JSON Schema: asked for a JSON object instead, the schema stays in
    *  the system prompt and zod still validates the answer (gpt-6.1-sol behind a Responses-API proxy insists on
-   *  strict schemas with every property required, which our optional fields and records are not). */
+   *  strict schemas with every property required, which our optional fields and records are not; DeepSeek's API
+   *  does not offer json_schema at all). */
   private readonly jsonObjectOnly = new Set<string>();
+  static schemaRejected(error: string): boolean { return /Invalid schema|response_format|json_schema/i.test(error); }
 
   private async chatCompletions(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
     const k = `${url}|${model}`;
     const r = await this.chatCompletionsOnce(url, key, model, system, user, this.jsonObjectOnly.has(k) ? null : jsonSchema, timeoutMs, maxTokens);
-    if (r.outcome === "error" && /Invalid schema/i.test(r.error ?? "") && !this.jsonObjectOnly.has(k)) {
+    if (r.outcome === "error" && r.error && Gateway.schemaRejected(r.error) && !this.jsonObjectOnly.has(k)) {
       this.jsonObjectOnly.add(k);
       return this.chatCompletionsOnce(url, key, model, system, user, null, timeoutMs, maxTokens);
     }
