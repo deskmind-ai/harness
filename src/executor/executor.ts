@@ -389,6 +389,8 @@ export class Executor {
       任务看过的窗口现在的样子: ev.windows.map(brief),
       "任务第一次看到这些窗口时的样子（和现在逐条比：少了的行就是被删或移走的，多了的就是新建的；元素 id 在两边是同一个）": ev.windows.map((o) => this.firstObs.get(o.window.id)).filter((o): o is Observation => !!o).map(brief),
       执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
+      // what the task read (file reads, listings): the content it decided on is evidence the judge can quote
+      "任务读到过的内容（文件读取的输出，每条最多 1500 字）": ev.receipts.filter((r) => r.request.action.kind === "file" && r.result.output && Object.keys(r.result.output).length).slice(-8).map((r) => ({ action: r.request.action, output: JSON.stringify(r.result.output).slice(0, 1500) })),
       ...(ev.external_changes.length ? { "任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）": ev.external_changes.map((c) => c.path) } : {}),
       ...(ws ? { 任务目录现在的内容: ws.listing(), "任务目录现在的版本（路径 → 版本，和开始时逐条比就知道哪些没动过；文件夹的版本随内容变）": Object.fromEntries(Object.keys(ws.entries()).map((p) => [p, ws.version(p)])) } : {}),
       ...(this.startTree ? { "任务开始时的目录（路径 → 版本；小文件带内容）": this.startTree } : {}),
