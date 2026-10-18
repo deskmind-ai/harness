@@ -8,7 +8,8 @@
  * Tools: computer_snapshot / computer_observe / computer_act (the executor), plan (one consent for the user's objects
  * a plan names), fs_* (the file capabilities, same ownership rule), ask_user, answer, read_skill, finish.
  */
-import { Type, type Static, type TSchema } from "@earendil-works/pi-ai";
+import { Type, type Static, type TSchema, type Message } from "@earendil-works/pi-ai";
+import { compact } from "./compact.js";
 import type { Model } from "@earendil-works/pi-ai";
 import { runAgentLoop, type AgentContext, type AgentEvent, type AgentLoopConfig, type AgentTool, type AgentToolResult, type StreamFn } from "@earendil-works/pi-agent-core";
 import * as fs from "node:fs";
@@ -366,6 +367,13 @@ export class FrontierRuntime {
     let turns = 0, calls = 0, nudge = false;
     const config: AgentLoopConfig = {
       model: this.o.model.model, apiKey: this.o.model.apiKey, convertToLlm: (m) => m as never, toolExecution: "sequential",
+      // what the model is sent is cut to its window; the transcript keeps everything, the cut is an event
+      transformContext: async (messages) => {
+        const budget = Math.floor((this.o.model.model.contextWindow ?? 128_000) * 0.6);
+        const { messages: out, compaction } = compact(messages as Message[], budget);
+        if (compaction) { this.count("compactions"); this.emit("compaction", compaction as unknown as Record<string, unknown>); }
+        return out as typeof messages;
+      },
       maxRetries: 4, maxRetryDelayMs: 60_000,            // 429s when several runs share a key: pi-ai backs off
       beforeToolCall: async ({ toolCall }) => {
         if (this.status) return { block: true, reason: `已经结束：${this.status}`, terminate: true };
