@@ -63,11 +63,15 @@ export class Workspace {
   /** A cheap fingerprint of the tree's shape and mtimes; when it is unchanged the digest snapshot is reused. */
   private stamp(): string {
     const parts: string[] = [];
+    const gone = (e: unknown) => (e as { code?: string }).code === "ENOENT";
     const walk = (dir: string) => {
-      for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+      let names: fs.Dirent[];
+      try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && dir !== this.root) return; throw e; }   // vanished meanwhile: not there
+      for (const d of names) {
         if (d.name === TRASH || d.name === TMP || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
-        const st = fs.lstatSync(full);              // a link (even a dangling one) is not followed
+        let st: fs.Stats;
+        try { st = fs.lstatSync(full); } catch (e) { if (gone(e)) continue; throw e; }   // a link (even a dangling one) is not followed
         parts.push(`${full}:${st.mtimeMs}:${st.size}`);
         if (d.isDirectory()) walk(full);
       }
@@ -87,12 +91,18 @@ export class Workspace {
     const mtimes = this.stamp();
     if (this.cache && this.cache.mtimes === mtimes) return this.cache.entries;
     const out: Record<string, string> = {};
+    // a folder other programs use too (a scope like /tmp): an entry that vanishes between the listing and its read
+    // is simply not there — the listing is of what exists now, not a reason to fail the task (10-18, app-run on /tmp)
+    const gone = (e: unknown) => (e as { code?: string }).code === "ENOENT";
     const walk = (dir: string, rel: string) => {
-      const names = fs.readdirSync(dir, { withFileTypes: true });
+      let names: fs.Dirent[];
+      try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && rel) { delete out[rel]; return; } throw e; }
       const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP).map((d) => d.name).sort();
       const files = names.filter((d) => d.isFile() && d.name !== ".keep").map((d) => d.name).sort();
       for (const d of dirs) out[rel ? `${rel}/${d}` : d] = "dir";
-      for (const f of files) out[rel ? `${rel}/${f}` : f] = sha(fs.readFileSync(path.join(dir, f)));
+      for (const f of files) {
+        try { out[rel ? `${rel}/${f}` : f] = sha(fs.readFileSync(path.join(dir, f))); } catch (e) { if (!gone(e)) throw e; }
+      }
       for (const d of dirs) walk(path.join(dir, d), rel ? `${rel}/${d}` : d);
     };
     walk(this.root, "");
