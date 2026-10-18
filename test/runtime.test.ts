@@ -238,3 +238,39 @@ describe("frontier runtime: stop, lock, files", () => {
     expect(r.consents).toEqual([{ scope: "object", object: "path:todo.txt", consequence: "modify_user" }]);
   });
 });
+
+describe("frontier runtime: the result card", () => {
+  it("a run that changed files offers undo when every step can be taken back; undo takes them back and ends cancelled", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "rt-undo-"));
+    build(root, { "todo.txt": "交房租\n" });
+    const ws = new Workspace(root);
+    const steps: Step[] = [
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "备忘.txt", text: "买牛奶" } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "新建了 备忘.txt" } }] },
+    ];
+    const { rt } = runtime(new SimComputer(root), steps, user(approveAll), { verdict: "pass", reason: "ok" }, { workspace: ws, registry: fileRegistry(), raw: "新建 备忘.txt 写上买牛奶" } as any);
+    const r = await rt.run();
+    expect(r.status).toBe("succeeded");
+    expect(r.result_card?.options.map((o) => o.kind)).toEqual(["approve", "undo"]);
+    expect(r.result_card?.text).toContain("备忘.txt");
+    const u = await rt.respond({ option: 1 });
+    expect(u).toEqual({ undone: 1, total: 1, refused: null });
+    expect(ws.exists("备忘.txt")).toBe(false);
+  });
+
+  it("a screen action the task cannot take back leaves the card without undo and says why", async () => {
+    const { sim, w } = mail();
+    const steps: Step[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "加旗标", objects: [`window:${w}`], consequence: "modify_user" }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "modify_user"),
+      act({ kind: "click", window: w, target: `${w}:0:flag` }, "modify_user"),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "已加旗标" } }] },
+    ];
+    const { rt } = runtime(sim, steps, user(approveAll));
+    const r = await rt.run();
+    expect(r.status).toBe("succeeded");
+    expect(r.result_card?.options.map((o) => o.kind)).toEqual(["approve"]);
+    expect(r.result_card?.text).toContain("撤不回");
+  });
+});

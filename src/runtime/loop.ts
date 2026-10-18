@@ -46,6 +46,8 @@ export interface RuntimeResult {
   status: RuntimeStatus; reason: string; summary: string; answer: string | null;
   counters: Record<string, number>; consents: { scope: string; object: string; consequence: Consequence }[];
   effects: string[]; verdicts: { verdict: string; reason: string }[];
+  /** Shown with the result, not blocking: 「好的」, and 「撤回」 when every effect can be taken back. */
+  result_card: Card | null;
 }
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -400,8 +402,35 @@ export class FrontierRuntime {
     return this.result();
   }
 
+  /** The card shown with a result that changed something: what was done, and undo when every step has one (a file
+   *  action through its capability, a window the task opened; a screen action makes the run irreversible, and the
+   *  card then says so instead of offering it). */
+  resultCard(): Card | null {
+    if (this.status !== "succeeded" || !this.effects.length) return null;
+    const u = this.o.executor.undoable();
+    const options: CardOption[] = [{ kind: "approve", text: "好的" }];
+    if (u.reversible) options.push({ kind: "undo", text: "撤回" });
+    const consented = this.consents.filter((c) => c.scope !== "action" || c.consequence === "external").map((c) => c.object);
+    const text = [`做了：${this.effects.slice(-6).join("；")}`, ...(consented.length ? [`改动了你的：${[...new Set(consented)].join("、")}`] : []), ...(u.reversible ? [] : [`（${u.steps.find((x) => !x.can)?.why ?? "有的动作撤不回"}）`])].join("\n");
+    return { kind: "result", text, options, free_text: false, blocking: false };
+  }
+
+  /** The user's answer to the result card: undo takes everything back (all or nothing) and the run ends cancelled. */
+  async respond(answer: Answer): Promise<{ undone: number; total: number; refused: string | null } | null> {
+    const card = this.resultCard();
+    if (!card || !("option" in answer)) return null;
+    const pick = card.options[answer.option];
+    this.emit("result.response", { picked: pick?.kind ?? null });
+    if (pick?.kind !== "undo") return null;
+    const u = await this.o.executor.undo();
+    if (!u.refused) { this.status = "cancelled"; this.reason = "the user undid the result"; this.effects.push(`撤回了 ${u.undone} 步`); }
+    else this.emit("note", { text: u.undone ? `撤回了 ${u.undone} 步后停下：${u.refused}` : `没有撤回：${u.refused}` });
+    this.emit("result.undo", u);
+    return u;
+  }
+
   private result(): RuntimeResult {
-    const r: RuntimeResult = { status: this.status!, reason: this.reason, summary: this.summary, answer: this.answer, counters: { ...this.counters }, consents: this.consents, effects: this.effects, verdicts: this.verdicts };
+    const r: RuntimeResult = { status: this.status!, reason: this.reason, summary: this.summary, answer: this.answer, counters: { ...this.counters }, consents: this.consents, effects: this.effects, verdicts: this.verdicts, result_card: this.resultCard() };
     this.emit("run.end", { status: r.status, reason: r.reason });
     return r;
   }

@@ -348,3 +348,56 @@ describe("executor: the user at the keyboard", () => {
     expect((await click(ex, mine, "新建文档")).status).toBe("ok");
   });
 });
+
+describe("executor: undo", () => {
+  it("file actions are taken back newest first; a window the task opened is closed; a screen action makes the run irreversible", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ex-undo-"));
+    build(root, { "todo.txt": "交房租\n" });
+    const ws = new Workspace(root), app = ConsentSigner.fresh(), sim = new SimComputer(root);
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
+    await started(ex);
+    const file = (capability: string, args: Record<string, string>, consent?: any) => ex.act({ action: { kind: "file", capability, args }, epoch: ex.currentEpoch, consent });
+    expect((await file("fs.create_text", { parent: ".", name: "备忘.txt", text: "买牛奶" })).status).toBe("ok");
+    const tok = app.forObject("path:todo.txt", "modify_user", "t1");
+    expect((await file("fs.append_line", { target: "todo.txt", line: "买牛奶" }, tok)).status).toBe("ok");
+    const win = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: ex.currentEpoch });
+    expect(ex.undoable()).toMatchObject({ reversible: true });
+    expect(ex.undoable().steps.map((s) => s.text)).toEqual(["打开 编辑器", expect.stringContaining("追加"), expect.stringContaining("新建")]);
+    const u = await ex.undo();
+    expect(u).toEqual({ undone: 3, total: 3, refused: null });
+    expect(ws.read("todo.txt")).toBe("交房租\n");
+    expect(ws.exists("备忘.txt")).toBe(false);
+    expect(sim.wins.some((w) => w.id === win.after!.window.id)).toBe(false);
+  });
+
+  it("nothing is touched when one step cannot be taken back, or when a file changed since", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ex-undo2-"));
+    build(root, { "todo.txt": "交房租\n" });
+    const ws = new Workspace(root), app = ConsentSigner.fresh(), sim = new SimComputer(root);
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
+    await started(ex);
+    const file = (capability: string, args: Record<string, string>, consent?: any) => ex.act({ action: { kind: "file", capability, args }, epoch: ex.currentEpoch, consent });
+    expect((await file("fs.create_text", { parent: ".", name: "a.txt", text: "1" })).status).toBe("ok");
+    // the task's own text replaced: fs.replace_text has no undo, so the run is not reversible as a whole
+    expect((await file("fs.replace_text", { target: "a.txt", text: "2" })).status).toBe("ok");
+    expect(ex.undoable().reversible).toBe(false);
+    expect((await ex.undo()).undone).toBe(0);
+    expect(ws.read("a.txt")).toBe("2");
+    // a reversible run whose file someone changed since: refused by the capability, nothing else undone either
+    const ex2 = new Executor(new SimComputer(root), { task: "t2", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
+    await started(ex2);
+    const file2 = (capability: string, args: Record<string, string>) => ex2.act({ action: { kind: "file", capability, args }, epoch: ex2.currentEpoch });
+    expect((await file2("fs.create_text", { parent: ".", name: "b.txt", text: "1" })).status).toBe("ok");
+    fs.writeFileSync(path.join(root, "b.txt"), "someone else"); ws.invalidate();
+    const u = await ex2.undo();
+    expect(u.undone).toBe(0);
+    expect(u.refused).toBeTruthy();
+    expect(ws.read("b.txt")).toBe("someone else");
+  });
+});

@@ -59,6 +59,8 @@ export class Executor {
   readonly externalChanges: ExternalChange[] = [];
   /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
   private planAccepted: PlanProposal | null = null;
+  /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
+  private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
 
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
@@ -292,10 +294,12 @@ export class Executor {
       }
     }
     const existed = fp.writes.filter((p) => ws.exists(p));
+    const undo_prep = cap.prepareUndo?.(ws, a.args);
     let r: ReturnType<Capability["execute"]>;
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
+    if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));
     for (const p of fp.writes) {
       const v = ws.version(p);
@@ -341,6 +345,49 @@ export class Executor {
     if (!ans) return { verdict: "unknown", reason: "the judge could not answer" };
     this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "" });
     return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by };
+  }
+
+  /** Which of the task's effects can be taken back, newest first, and why not: a file action through its capability's
+   *  undo (create, move, copy, append have one; a replaced text or a trashed file do not), a window the task opened by
+   *  closing it. Anything else done on screen cannot be undone. The whole run is reversible only when every step is. */
+  undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string }[] } {
+    const steps: { seq: number; text: string; can: boolean; why?: string }[] = [];
+    for (const r of [...this.receipts].reverse()) {
+      if (r.result.status !== "ok" || r.result.consequence === "read") continue;
+      const a = r.request.action;
+      if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap), can: false, why: `${a.capability} 没有撤回的办法` }); continue; }
+      if (a.kind === "open_window") { steps.push({ seq: r.seq, text: `打开 ${a.app}`, can: true }); continue; }
+      steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence), can: false, why: "界面上的操作撤不回" });
+    }
+    return { reversible: steps.every((s) => s.can), steps };
+  }
+
+  /** Take every effect back, newest first; nothing is touched unless all of them can be (the orchestrator's rule).
+   *  A file a later program changed is refused by the capability's own check. */
+  async undo(): Promise<{ undone: number; total: number; refused: string | null }> {
+    const plan = this.undoable();
+    if (!plan.reversible) return { undone: 0, total: plan.steps.length, refused: plan.steps.find((s) => !s.can)?.why ?? "cannot undo" };
+    const ws = this.opts.files?.workspace;
+    let undone = 0;
+    for (const step of plan.steps) {
+      const r = this.receipts.find((x) => x.seq === step.seq)!;
+      const a = r.request.action;
+      let err: string | null = null;
+      if (a.kind === "file") {
+        const f = this.fileReceipts.get(r.seq)!;
+        err = f.cap.undo!(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never);
+        ws!.invalidate();
+        if (!err) for (const p of f.cap.footprint(ws!, f.args).writes) this.seen[p] = ws!.version(p);
+      } else if (a.kind === "open_window") {
+        const id = r.result.after?.window.id;
+        const snap = await this.driver.snapshot();
+        if (id && snap.windows.some((w) => w.id === id)) { const pr = await this.driver.perform({ kind: "close_window", window: id }); if (pr.status !== "ok") err = pr.why ?? pr.status; }
+      }
+      if (err) { this.emit("executor.undo_refused", { seq: step.seq, why: err, undone }); return { undone, total: plan.steps.length, refused: err }; }
+      undone += 1;
+      this.emit("executor.undone", { seq: step.seq, text: step.text });
+    }
+    return { undone, total: plan.steps.length, refused: null };
   }
 
   async end(): Promise<{ receipts: Receipt[]; task_objects: string[] }> {

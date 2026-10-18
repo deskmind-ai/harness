@@ -111,7 +111,7 @@ function driverFor(name: Request["driver"], scope?: string): Driver {
   return new SimComputer(scope);
 }
 
-export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader }) {
+export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "yy-luna";
@@ -130,7 +130,22 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); },
   });
   const r = await rt.run();
-  log.emit({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: null, answer: r.answer });
+  const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
+  log.emit({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer });
+  // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
+  // seconds for `{ "respond": <option index> }` on stdin, then exit
+  if (card && o.linger > 0) {
+    const line = await Promise.race([o.input.next(), new Promise<string>((res) => setTimeout(() => res(""), o.linger * 1000))]);
+    if (line) {
+      try {
+        const a = JSON.parse(line) as { respond?: number };
+        if (typeof a.respond === "number") {
+          const u = await rt.respond({ option: a.respond });
+          log.emit({ kind: "result_response", picked: card.options[a.respond]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted" } as never);
+        }
+      } catch { /* not an answer */ }
+    }
+  }
 }
 
 export function respond(runId: string, runs: string, answer: Record<string, unknown>, out: (ev: AppEvent) => void) {
@@ -158,7 +173,7 @@ export async function selftest(): Promise<Record<string, unknown>> {
 }
 
 async function main() {
-  const { values: a, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true, options: {
+  const { values: a, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true, options: { linger: { type: "string", default: "0" },
     request: { type: "string" }, runs: { type: "string", default: "runs/app" }, run: { type: "string" }, selftest: { type: "boolean", default: false },
   } });
   const out = (ev: AppEvent) => process.stdout.write(JSON.stringify(ev) + "\n");
@@ -168,7 +183,7 @@ async function main() {
   if (cmd === "app-run") {
     const req: Request = JSON.parse(a.request ? fs.readFileSync(a.request, "utf-8") : await input.next());
     if (!req.raw) throw new Error("request needs raw");
-    await appRun(req, { runs: path.resolve(a.runs!), out, input });
+    await appRun(req, { runs: path.resolve(a.runs!), out, input, linger: Number(a.linger ?? 0) });
     process.exit(0);
   }
   if (cmd === "respond") {
