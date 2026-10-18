@@ -136,6 +136,10 @@ const PRICES: Record<string, [number, number]> = {
   "openai/gpt-6-sol": [2e-6, 10e-6],
   "anthropic/claude-sonnet-5.5": [2e-6, 10e-6],
   "anthropic/claude-opus-5.5": [4e-6, 20e-6],
+  // the keyed services, by their `<provider>|<model>` names: DeepSeek V4.1 Flash list price (standard hours, 10-2026);
+  // doubao-seed-evolving as third-party price pages list the Ark price (no official USD page found)
+  "deepseek|deepseek-flash": [0.30e-6, 1.20e-6],
+  "volcengine|doubao-seed-evolving": [0.89e-6, 4.45e-6],
 };
 
 export type Outcome = "answered" | "refusal" | "invalid" | "error" | "timeout";
