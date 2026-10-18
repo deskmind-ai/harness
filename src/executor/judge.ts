@@ -8,7 +8,7 @@
  * the executor goes (docs/0.5-decisions.md 结论 3).
  */
 import { createHash } from "node:crypto";
-import type { Gateway } from "../gateway/index.js";
+import { Gateway } from "../gateway/index.js";
 import type { Role } from "../protocol/roles.js";
 import * as P from "../orchestrator/prompts.js";
 import * as R from "../protocol/roles.js";
@@ -58,12 +58,12 @@ export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取
  *  `DESKMIND_BRAIN_TOKEN`), escalating to the gateway's intent role when Brain's confidence is under the floor. The
  *  floor is a calibration output, not a rule: `DESKMIND_BRAIN_FLOOR` overrides the default until Brain's own
  *  calibration for these questions is measured (docs/0.5-decisions.md D24). */
-export function defaultJudge(gateway: Gateway, onEvent?: JudgeTier["gateway"] extends never ? never : (kind: string, body: Record<string, unknown>) => void): Judge {
+export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Record<string, unknown>) => void): Judge {
   const tiers: JudgeTier[] = [];
   const url = process.env.DESKMIND_BRAIN_URL;
   if (url) {
     const table = Object.fromEntries(R.ROLES.map((r) => [r, { backend: "systemone", model: url }])) as ConstructorParameters<typeof Gateway>[0];
-    tiers.push({ name: "brain", gateway: new (gateway.constructor as typeof Gateway)(table), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9) });
+    tiers.push({ name: "brain", gateway: new Gateway(table), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9) });
   }
   tiers.push({ name: "frontier", gateway });
   return new Judge(tiers, { onEvent });
