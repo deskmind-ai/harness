@@ -120,7 +120,7 @@ function driverFor(name: Request["driver"], scope?: string): Driver {
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
-  const config = req.config ?? "yy-luna";
+  const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
   log.emit({ kind: "start", raw: req.raw, lang: req.lang ?? "zh", engine: req.engine ?? "runtime", config, ...(req.scope ? { scope: req.scope } : {}) });
   const table = CONFIGS[config];
   if (!table) { log.emit({ kind: "task_done", status: "failed", reason: `unknown config ${config}`, summary: "", result_card: null }); return; }

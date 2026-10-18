@@ -33,7 +33,7 @@ DeskMind 的「想」：理解要求、计划、调工具、核对，在用户�
 ```bash
 pnpm install
 pnpm test                                                      # 260+ 项，不用模型
-pnpm mcp -- --driver sim --config yy-luna                      # 执行层的 MCP 服务（stdio）；--driver hands 接真机
+pnpm mcp -- --driver sim --config ds-flash                     # 执行层的 MCP 服务（stdio）；--driver hands 接真机
 pnpm typecheck
 YY_URL=… YY_API_KEY=… pnpm gym -- --config yy-luna --seeds 1-40  # 练习场：邮件任务 × 真实模型，判分看应用真实状态
 pnpm eval -- --tasks <tasks-check.json> --config yy-luna --split check                  # 编排器

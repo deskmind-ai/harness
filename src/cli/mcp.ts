@@ -3,7 +3,7 @@
  * Claude Code, our own) gets the same ownership, consequence floor, consent, start gate, intent check and completion
  * verdict. The judge and the verdict use the gateway config; the runtime above only sees refusals and reasons.
  *
- *   pnpm mcp -- --driver sim|hands [--scope <dir>] [--config yy-luna] [--consent auto|none]
+ *   pnpm mcp -- --driver sim|hands [--scope <dir>] [--config ds-flash] [--consent auto|none]
  *
  * Consent: with `--consent none` (the default) a consequential action returns `needs_consent` with the challenge, and
  * the host has to come back with a token the app signed (the MCP elicitation path is for the app integration). With
@@ -98,7 +98,7 @@ export class McpExecutorServer {
 }
 
 async function main() {
-  const { values: a } = parseArgs({ args: process.argv.slice(2).filter((x) => x !== "--"), options: { driver: { type: "string", default: "sim" }, scope: { type: "string" }, config: { type: "string", default: "yy-luna" }, consent: { type: "string", default: "none" } } });
+  const { values: a } = parseArgs({ args: process.argv.slice(2).filter((x) => x !== "--"), options: { driver: { type: "string", default: "sim" }, scope: { type: "string" }, config: { type: "string", default: "ds-flash" }, consent: { type: "string", default: "none" } } });
   if (!CONFIGS[a.config!]) throw new Error(`unknown config ${a.config}`);
   const gw = new Gateway(a.config!);
   const ws = a.scope ? new Workspace(a.scope) : undefined;
