@@ -97,7 +97,7 @@ export class Judge {
       // "no" blocked right actions in the 10-18 probe), and "not enough evidence" is never final below the top
       const canSettle = last.choice === options[0]?.id && confidence !== undefined && confidence >= (tier.floor ?? 0);
       this.opts.stats?.note(tier.name, kind, canSettle);
-      if (canSettle) { settled = true; settledBy = tier; if (raced) { raced.controller.abort(); this.opts.onEvent?.("judge.raced", { won: tier.name }); } break; }
+      if (canSettle) { settled = true; settledBy = tier; if (raced) { raced.promise?.catch(() => undefined); raced.controller.abort(); this.opts.onEvent?.("judge.raced", { won: tier.name }); } break; }
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)

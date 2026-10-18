@@ -408,7 +408,12 @@ export class Gateway {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       return { outcome: msg.includes("Timeout") ? "timeout" : "error", error: msg.slice(0, 300) };
     }
-    const raw = await res.text(), latencyMs = performance.now() - t0;
+    let raw: string;
+    try { raw = await res.text(); } catch (e) {        // aborted while the body was arriving (the judge's race)
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return { outcome: "error", error: msg.slice(0, 300), latencyMs: performance.now() - t0 };
+    }
+    const latencyMs = performance.now() - t0;
     if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
     try {
       const out = JSON.parse(raw);
@@ -445,7 +450,12 @@ export class Gateway {
     } catch (e) {
       return { outcome: "error", error: (e instanceof Error ? e.message : String(e)).slice(0, 300) };
     }
-    const raw = await res.text(), latencyMs = performance.now() - t0;
+    let raw: string;
+    try { raw = await res.text(); } catch (e) {        // aborted while the body was arriving (the judge's race)
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return { outcome: "error", error: msg.slice(0, 300), latencyMs: performance.now() - t0 };
+    }
+    const latencyMs = performance.now() - t0;
     if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
     try {
       const a = JSON.parse(raw).answers[name];
