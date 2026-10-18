@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ConsentSigner, digestOf } from "../src/executor/consent.js";
-import { Executor } from "../src/executor/executor.js";
+import { Executor, describeAction } from "../src/executor/executor.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import type { Action } from "../src/executor/types.js";
 
@@ -382,7 +382,7 @@ describe("executor: double_click", () => {
     expect(pre.consequence).toBe("modify_user");
     const r = await ex.act({ action: { kind: "double_click", window: w.id, target: e.id }, epoch: o.epoch, consent: app.forObject(`window:${w.id}`, "modify_user", "t1") });
     expect(r.status).toBe("ok");
-    expect(ex.describeAction({ kind: "double_click", window: w.id, target: e.id }, o, "modify_user")).toContain("双击");
+    expect(describeAction({ kind: "double_click", window: w.id, target: e.id }, o, "modify_user")).toContain("双击");
   });
 });
 
