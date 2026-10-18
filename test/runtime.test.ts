@@ -86,6 +86,16 @@ describe("frontier runtime: consent", () => {
     expect((seen[0]![1] as any).content).toContain('"owner":"user"');
   });
 
+  it("the user saying stop in their own words ends the run cancelled, with nothing verified or claimed", async () => {
+    const { sim } = mail();
+    const steps: Step[] = [{ calls: [{ name: "finish", args: { outcome: "stopped", summary: "用户说取消，不复制了；没有改动任何东西" } }] }];
+    const { rt } = runtime(sim, steps, user(approveAll));
+    const r = await rt.run();
+    expect(r.status).toBe("cancelled");
+    expect(r.reason).toContain("the user stopped the task");
+    expect(rt.counters["verify_failed"] ?? 0).toBe(0);
+  });
+
   it("without a plan, touching the user's window is refused; after the plan, a declined send is never sent and the run does not claim success", async () => {
     const { sim, w } = mail();
     const steps: Step[] = [

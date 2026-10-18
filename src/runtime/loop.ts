@@ -227,9 +227,9 @@ export class FrontierRuntime {
       execute: async (_id, p: { name: string }) => { const t = this.o.skills!.read(p.name); this.count("skills_read"); if (t) this.o.executor.addSkill(p.name, t); return t ? text(t) : err(`没有叫 ${p.name} 的教程`); },
     }));
     tools.push(tool({
-      name: "finish", label: "结束", description: "结束任务。done = 做成了（程序会独立核对，没过会告诉你缺什么）；unconfirmed = 做了但确认不了；cannot = 做不到。summary 写清楚改了什么、哪些是用户的东西、答案是什么。",
-      parameters: Type.Object({ outcome: Type.Union([Type.Literal("done"), Type.Literal("unconfirmed"), Type.Literal("cannot")]), summary: Type.String(), missing: Type.Optional(Type.Array(Type.String())) }),
-      execute: async (_id, p: { outcome: "done" | "unconfirmed" | "cannot"; summary: string; missing?: string[] }) => this.finish(p),
+      name: "finish", label: "结束", description: "结束任务。done = 做成了（程序会独立核对，没过会告诉你缺什么）；unconfirmed = 做了但确认不了；cannot = 做不到；stopped = 用户用自己的话让你停下 / 取消 / 先不做了（选项里的「先别做了」程序会自己处理，这个用于用户写在回答里的）。summary 写清楚改了什么、哪些是用户的东西、答案是什么。",
+      parameters: Type.Object({ outcome: Type.Union([Type.Literal("done"), Type.Literal("unconfirmed"), Type.Literal("cannot"), Type.Literal("stopped")]), summary: Type.String(), missing: Type.Optional(Type.Array(Type.String())) }),
+      execute: async (_id, p: { outcome: "done" | "unconfirmed" | "cannot" | "stopped"; summary: string; missing?: string[] }) => this.finish(p),
     }));
     if (ws && reg) for (const cap of reg.list()) {
       if (cap.channel === "gui") continue;
@@ -336,10 +336,13 @@ export class FrontierRuntime {
     return [...out];
   }
 
-  private async finish(p: { outcome: "done" | "unconfirmed" | "cannot"; summary: string; missing?: string[] }): Promise<AgentToolResult> {
+  private async finish(p: { outcome: "done" | "unconfirmed" | "cannot" | "stopped"; summary: string; missing?: string[] }): Promise<AgentToolResult> {
     this.summary = p.summary;
     this.emit("finish.claimed", { outcome: p.outcome, summary: p.summary, missing: p.missing ?? [] });
     if (p.outcome === "cannot") return this.end("failed", "cannot: " + p.summary.slice(0, 200));
+    // the user said stop in their own words (a card's free text): the run is cancelled like a picked "先别做了" — not a
+    // success, so there is nothing to verify and nothing to gain by claiming it (doubao ended three such runs "done")
+    if (p.outcome === "stopped") return this.end("cancelled", "the user stopped the task: " + p.summary.slice(0, 200));
     if (p.outcome === "unconfirmed") return this.end("unconfirmed", (p.missing ?? []).join("; ") || p.summary.slice(0, 200));
     // "done" is a claim: the verdict comes from an independent judge reading the final state the executor hands over
     const v = await this.verify(p.summary);
