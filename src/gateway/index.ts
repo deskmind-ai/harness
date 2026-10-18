@@ -112,6 +112,7 @@ export const CONFIGS: Record<string, RoleTable> = {
   "ark-lite": all("openai", "volcengine|doubao-seed-2-1-lite-260915"),
   // the local actor experiment (docs/localization-2026-10-19.md): the bundled Qwen2.5-7B through mlx_lm.server
   "local-qwen7b": all("openai", "local|mlx-community/Qwen2.5-7B-Instruct-4bit"),
+  "local-qwen30b": all("openai", "local|mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"),
   "yy-mix": { ...all("openai", "yy|gpt-6.1-sol"), choice: { backend: "openai", model: "yy|gpt-6-luna" }, transform: { backend: "openai", model: "yy|gpt-6-luna", timeoutMs: TRANSFORM_TIMEOUT_MS } },
 };
 
