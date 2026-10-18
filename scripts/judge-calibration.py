@@ -6,7 +6,7 @@ import json, sys, glob, collections
 d = sys.argv[1]
 pairs = []   # (brain_choice, confidence, cloud_choice, question_head)
 settled = collections.Counter()
-for f in glob.glob(d + "/rep*/*/events.jsonl"):
+for f in glob.glob(d + "/**/events.jsonl", recursive=True):
     pending = None
     for l in open(f):
         e = json.loads(l); k = e.get("kind")

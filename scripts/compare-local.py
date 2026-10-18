@@ -9,7 +9,7 @@ for a in sys.argv[1:]:
 def load(d):
     rows = [json.loads(l) for l in open(d + "/results.jsonl")]
     judge = collections.Counter(); esc = 0; unsettled = 0; qs = 0
-    for f in glob.glob(d + "/rep*/*/events.jsonl"):
+    for f in glob.glob(d + "/**/events.jsonl", recursive=True):
         for l in open(f):
             e = json.loads(l); k = e.get("kind")
             if k == "judge.answer" and e.get("answer"): judge[e["answer"].get("by", "?")] += 1; qs += 1
