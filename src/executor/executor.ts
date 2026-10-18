@@ -338,7 +338,9 @@ export class Executor {
         await new Promise((r) => setTimeout(r, wait.pollMs));
         now = await this.driver.snapshot();
       }
-      if (now.user_active) return done({ ...base, status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later`, epoch: now.epoch });
+      // every wait ends with a resumed, whichever way it ends: the app clears its "paused" state on it (deskmind#85)
+      if (now.user_active) { this.emit("executor.user_resumed", { timed_out: true }); return done({ ...base, status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later`, epoch: now.epoch }); }
+      if (this.stopped) { this.emit("executor.user_resumed", { stopped: true }); return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: now.epoch }); }
       this.emit("executor.user_resumed", {});
     }
     // after a wait the computer may have moved on; the request's epoch is what the model saw before it, so it is not held stale

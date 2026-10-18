@@ -461,6 +461,7 @@ describe("executor: the user at the keyboard", () => {
     const t0 = Date.now();
     const b = await click(ex, mine, "新建文档");
     expect(b.status).toBe("blocked"); expect(Date.now() - t0).toBeGreaterThanOrEqual(280);   // waited the limit, then gave up
+    expect(events.filter((e) => e === "executor.user_wait").length).toBe(events.filter((e) => e === "executor.user_resumed").length);   // every wait ends with a resumed
     void w;
   });
 
