@@ -276,3 +276,23 @@ describe("executor: the judge before a consequential action", () => {
     expect(calls).toBe(0);
   });
 });
+
+describe("judge tiers", () => {
+  it("a lower tier approves on its own when confident, never refuses alone; empty scores are no confidence", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge } = await import("../src/executor/judge.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const low = new Gateway(table), top = new Gateway(table);
+    const opts = [{ id: "matches", text: "yes" }, { id: "mismatch", text: "no" }, { id: "insufficient", text: "?" }];
+    const judge = () => new Judge([{ name: "low", gateway: low, floor: 0.9 }, { name: "top", gateway: top }]);
+    low.script = [() => ({ choice: "matches", scores: { matches: 0.95, mismatch: 0.05 } })];
+    top.script = [() => ({ choice: "mismatch" })];
+    expect((await judge().choose("q1", {}, opts))?.by).toBe("low");
+    low.script = [() => ({ choice: "mismatch", scores: { matches: 0.02, mismatch: 0.98 } })];
+    top.script = [() => ({ choice: "matches" })];
+    expect(await judge().choose("q2", {}, opts)).toMatchObject({ by: "top", choice: "matches" });
+    low.script = [() => ({ choice: "matches", scores: { matches: 0.6, mismatch: 0.4 } })];
+    top.script = [() => ({ choice: "insufficient", scores: {} })];
+    expect(await judge().choose("q3", {}, opts)).toMatchObject({ by: "top", choice: "insufficient", confidence: undefined });
+  });
+});
