@@ -75,6 +75,8 @@ export const CONFIGS: Record<string, RoleTable> = {
   // YY (an OpenAI-compatible gateway, cheap): the same two models the OpenRouter configs use
   "yy-luna": all("openai", "yy|gpt-6-luna"),
   "yy-sol": all("openai", "yy|gpt-6.1-sol"),
+  // the same model through OpenRouter (when YY is down; same provider table, different URL and key)
+  "or-luna": all("openai", "openrouter|openai/gpt-6-luna"),
   "yy-mix": { ...all("openai", "yy|gpt-6.1-sol"), choice: { backend: "openai", model: "yy|gpt-6-luna" }, transform: { backend: "openai", model: "yy|gpt-6-luna", timeoutMs: TRANSFORM_TIMEOUT_MS } },
 };
 
