@@ -17,10 +17,16 @@ import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
 import { Ledger } from "./ledger.js";
+import { INTENT_OPTIONS, INTENT_QUESTION, type Judge } from "./judge.js";
 import type { KeyObject } from "node:crypto";
 
 export interface ExecutorOptions {
   task: string; publicKey: KeyObject; now?: () => number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
+  /** The independent judge (judge.ts): asked before every action that changes the user's things or sends something
+   *  out whether it is what the user asked for. Without one, consent alone gates those actions. */
+  judge?: Judge;
+  /** The user's words, for the judge; the runtime updates it when the user changes the request (steer). */
+  raw?: string;
   /** The task folder and the file capabilities: files are objects like windows (owner, version, last seen). */
   files?: { workspace: Workspace; registry: Registry };
 }
@@ -55,6 +61,22 @@ export class Executor {
 
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
   attachFiles(workspace: Workspace, registry: Registry) { this.opts.files = { workspace, registry }; }
+
+  setRequest(raw: string) { this.opts.raw = raw; }
+
+  /** Codex's guardian, in the executor: before an action that changes the user's things or sends something out, an
+   *  independent judge reads the user's words, the action in words and the evidence around it. A mismatch is refused
+   *  with the judge's reason; "not enough evidence" and a judge that cannot answer fall through to the user's consent
+   *  (no contributor is an implicit allow — the user decides). Read-only and task-own actions are never judged. */
+  private async judgeIntent(a: Action, consequence: Consequence, object: string, evidence: Record<string, unknown>, text: string): Promise<{ verdict: "matches" | "mismatch" | "insufficient" | "unavailable"; reason: string; by?: string }> {
+    const j = this.opts.judge;
+    if (!j || !this.opts.raw) return { verdict: "unavailable", reason: "no judge" };
+    const ctx = { 用户原文: this.opts.raw, 即将执行的动作: text, 后果类别: consequence, 对象: object, 证据: evidence };
+    const ans = await j.choose(INTENT_QUESTION, ctx, INTENT_OPTIONS);
+    if (!ans) return { verdict: "unavailable", reason: "the judge could not answer" };
+    this.emit("executor.intent", { action: a, verdict: ans.choice, by: ans.by, confidence: ans.confidence, reason: ans.reason ?? "" });
+    return { verdict: ans.choice as "matches" | "mismatch" | "insufficient", reason: ans.reason ?? "", by: ans.by };
+  }
 
   /** The epoch of the last snapshot / observation: what a file action, which has no window to observe, cites. */
   get currentEpoch(): number { return this.epoch; }
@@ -163,9 +185,13 @@ export class Executor {
     if ("target" in req.action && req.action.target && !obs?.elements.some((e) => e.id === (req.action as { target: string }).target)) return done({ ...base, status: "stale", why: `element ${req.action.target} is not in the last observation of ${target}; observe the window first`, epoch: now.epoch });
     if (target && (req.action.kind === "key" || req.action.kind === "type") && !obs) return done({ ...base, status: "stale", why: `window ${target} was never observed; observe it first`, epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
+      const text = describeAction(req.action, this.lastObs.get("window" in req.action ? req.action.window : ""), consequence);
+      const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
+      const judged = await this.judgeIntent(req.action, consequence, f.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
       const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent);
       if (why) {
-        const challenge = this.consent.challenge(req.action, f.object, consequence, describeAction(req.action, this.lastObs.get("window" in req.action ? req.action.window : ""), consequence));
+        const challenge = this.consent.challenge(req.action, f.object, consequence, text);
         this.emit("executor.consent_needed", { why, consequence, object: f.object });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
@@ -214,9 +240,14 @@ export class Executor {
     const pre = cap.preconditions(ws, a.args);
     if (pre) return { ...base, status: "error", why: `precondition: ${pre}` };
     if (NEEDS_CONSENT.has(consequence)) {
+      const text = describeAction(a, undefined, consequence, cap);
+      const evidence: Record<string, unknown> = {};
+      for (const p of touched) if (!ws.isDir(p)) evidence[`文件 ${p} 现在的内容（前 600 字）`] = ws.readForModel(p, 600);
+      const judged = await this.judgeIntent(a, consequence, object, evidence, text);
+      if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
-        const challenge = this.consent.challenge(a, object, consequence, describeAction(a, undefined, consequence, cap));
+        const challenge = this.consent.challenge(a, object, consequence, text);
         this.emit("executor.consent_needed", { why, consequence, object });
         return { ...base, status: "needs_consent", why, challenge };
       }

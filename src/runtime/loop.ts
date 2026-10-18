@@ -23,6 +23,7 @@ import type { Workspace } from "../registry/workspace.js";
 import { canon } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
 import { Executor, describeAction } from "../executor/executor.js";
+import { Judge } from "../executor/judge.js";
 import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken } from "../executor/types.js";
 
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
@@ -110,6 +111,8 @@ export class FrontierRuntime {
   constructor(readonly o: RuntimeOptions) {
     this.raw = o.raw;
     if (o.workspace && o.registry && !o.executor.opts.files) o.executor.attachFiles(o.workspace, o.registry);
+    o.executor.setRequest(o.raw);
+    if (!o.executor.opts.judge) o.executor.opts.judge = new Judge([{ name: "intent", gateway: o.gateway }], { onEvent: (k, b) => this.emit(k, b) });
     this.budget = { ...RUNTIME_BUDGET, ...(o.budget ?? {}) };
     o.signal?.addEventListener("abort", () => this.stop("the app stopped the task"));
   }
@@ -121,6 +124,7 @@ export class FrontierRuntime {
    *  later judgement, and the model hears them before its next turn. Effects so far stay. */
   steer(raw: string) {
     this.raw = raw;
+    this.o.executor.setRequest(raw);
     this.steers.push(raw);
     this.count("steers");
     this.emit("steer", { raw });

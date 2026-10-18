@@ -222,3 +222,57 @@ describe("executor: files under the same guard", () => {
     expect((await file("fs.read_text", { target: "moved.txt" })).output).toEqual({ text: "交房租\n" });
   });
 });
+
+describe("executor: the judge before a consequential action", () => {
+  const withJudge = async (answer: (role: string, user: string) => unknown) => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge } = await import("../src/executor/judge.js");
+    const gw = new Gateway(Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any);
+    gw.script = Array(20).fill((role: string, _s: string, u: string) => answer(role, u));
+    const app = ConsentSigner.fresh();
+    const { sim, w } = mailSim();
+    const events: Record<string, unknown>[] = [];
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, judge: new Judge([{ name: "test", gateway: gw }]), raw: "把林晓那封 Q3 预算的邮件加旗标", onEvent: (k, b) => events.push({ k, ...b }) });
+    await ex.begin();
+    return { ex, sim, w, app, events, gw };
+  };
+
+  it("a mismatch is refused with the judge's reason; nothing is performed and no consent is asked", async () => {
+    const seen: string[] = [];
+    const { ex, sim, w, app, events } = await withJudge((role, u) => { seen.push(u); return { choice: "mismatch", reason: "用户说的是林晓的 Q3 预算，这是苏然的" }; });
+    const token = app.forObject(`window:${w.id}`, "modify_user", "t1");
+    const r = await click(ex, w.id, "苏然 · Q3 预算", { consent: token });
+    expect(r.status).toBe("refused");
+    expect(r.why).toContain("苏然");
+    expect(sim.mailState(w.id).selected).toBeNull();
+    expect(events.some((e) => e.k === "executor.consent_needed")).toBe(false);
+    // the judge saw the user's words, the action and the element
+    expect(seen[0]).toContain("把林晓那封");
+    expect(seen[0]).toContain("苏然 · Q3 预算");
+  });
+
+  it("matches goes on to consent as before; the same action is judged once (cache)", async () => {
+    let calls = 0;
+    const { ex, w, app } = await withJudge(() => { calls += 1; return { choice: "matches" }; });
+    const r = await click(ex, w.id, "林晓 · Q3 预算");
+    expect(r.status).toBe("needs_consent");
+    expect((await click(ex, w.id, "林晓 · Q3 预算", { consent: app.forAction(r.challenge!) })).status).toBe("ok");
+    expect(calls).toBe(1);
+  });
+
+  it("a judge that cannot answer, or says the evidence is not enough, leaves the decision to the user", async () => {
+    const { ex, w } = await withJudge(() => ({ outcome: "error", error: "down" }));
+    expect((await click(ex, w.id, "林晓 · Q3 预算")).status).toBe("needs_consent");
+    const { ex: ex2, w: w2 } = await withJudge(() => ({ choice: "insufficient", reason: "看不出是哪封" }));
+    expect((await click(ex2, w2.id, "林晓 · Q3 预算")).status).toBe("needs_consent");
+  });
+
+  it("read-only and task-own actions are never judged", async () => {
+    let calls = 0;
+    const { ex } = await withJudge(() => { calls += 1; return { choice: "mismatch" }; });
+    const r = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: (await ex.snapshot()).epoch });
+    expect(r.status).toBe("ok");
+    expect((await click(ex, r.after!.window.id, "新建文档")).status).toBe("ok");
+    expect(calls).toBe(0);
+  });
+});

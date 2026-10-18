@@ -48,7 +48,8 @@ function runtime(sim: SimComputer, steps: Step[], u: RuntimeUser, verify: unknow
   const app = ConsentSigner.fresh();
   const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey });
   const gw = new Gateway(scriptedTable);
-  gw.script = Array(5).fill((role: string) => (role === "verify" ? verify : { outcome: "error", error: "unexpected role " + role }));
+  // the judge asks the intent role before every consequential action; unanswered, it falls through to consent
+  gw.script = Array(60).fill((role: string) => (role === "verify" ? verify : role === "intent" ? { choice: "matches" } : { outcome: "error", error: "unexpected role " + role }));
   const seen: Message[][] = [];
   const rt = new FrontierRuntime({ task: "t1", raw: "在信鸽里回复林晓关于“Q3 预算”的邮件：“收到，谢谢”", executor: ex, signer: app, user: u, gateway: gw, model: { ...model, streamFn: scriptedStream(steps, seen) }, ...extra });
   return { rt, ex, gw, seen };
@@ -150,7 +151,7 @@ describe("frontier runtime: steer", () => {
     ];
     const { rt, seen, gw } = runtime(sim, steps, user(approveAll));
     const asked: string[] = [];
-    gw.script = Array(3).fill((role: string, _sys: string, u: string) => { asked.push(u); return { verdict: "pass", reason: "ok" }; });
+    gw.script = Array(30).fill((role: string, _sys: string, u: string) => { if (role === "intent") return { choice: "matches" }; asked.push(u); return { verdict: "pass", reason: "ok" }; });
     const r = await rt.run();
     expect(r.status).toBe("succeeded");
     expect(r.counters["steers"]).toBe(1);
