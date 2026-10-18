@@ -74,15 +74,17 @@ export class Executor {
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
 
-  /** What a restart found: an action the previous process started and never receipted, and what became of it. */
-  recovered: { action: Action; finding: "happened" | "not_happened" | "unknown"; text: string } | null = null;
+  /** What a restart found: an action the previous process started and never receipted, what became of it, and the
+   *  files other programs changed while no process was watching (from the journal's versions, so they are facts of
+   *  the task, not its new starting point). */
+  recovered: { action: Action; finding: "happened" | "not_happened" | "unknown"; text: string; external: string[] } | null = null;
   private crashed = false;
 
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
   }
 
-  private journal(kind: "intent" | "receipt", body: Record<string, unknown>) {
+  private journal(kind: "begin" | "intent" | "receipt", body: Record<string, unknown>) {
     if (!this.opts.journal) return;
     const fd = fs.openSync(this.opts.journal, "a");
     try { fs.writeSync(fd, JSON.stringify({ t: this.opts.now?.() ?? Date.now(), kind, ...body }) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
@@ -101,9 +103,33 @@ export class Executor {
     let finding: "happened" | "not_happened" | "unknown" = "unknown";
     const ws = this.opts.files?.workspace;
     if (action.kind === "file" && ws && last.versions_before && last.expect_after) finding = reconcileVersions(ws, last.versions_before as Record<string, string>, last.expect_after as Record<string, string>);
-    this.recovered = { action, finding, text: String(last.text ?? "") };
-    this.journal("receipt", { recovered: true, finding });
-    this.emit("executor.recovered", { action, finding });
+    // the folder as the earlier process last knew it: the begin record, plus every file write it receipted and the
+    // lost one when it happened; whatever differs now was changed by someone else while no process was watching
+    const external: string[] = [];
+    if (ws) {
+      const known: Record<string, string> = {};
+      for (let i = 0; i < lines.length; i += 1) {
+        const l = lines[i]!;
+        if (l.kind === "begin" && l.versions) Object.assign(known, l.versions as Record<string, string>);
+        if (l.kind === "intent" && l.versions_before && lines[i + 1]?.kind === "receipt" && (i + 1 < lines.length - 1 || last.kind !== "intent")) {
+          Object.assign(known, l.versions_before as Record<string, string>);                          // what it saw before writing
+          if ((lines[i + 1] as { versions_after?: Record<string, string> }).versions_after) Object.assign(known, (lines[i + 1] as { versions_after: Record<string, string> }).versions_after);
+        }
+      }
+      if (finding === "happened") Object.assign(known, last.expect_after as Record<string, string>);
+      if (Object.keys(known).length) {
+        for (const [path, v] of Object.entries(known)) {
+          const now = ws.version(path);
+          if (v === now || (v === "file:*" && now !== "absent" && !now.startsWith("dir:")) || (v === "dir:*" && now.startsWith("dir:"))) continue;
+          external.push(path);
+          this.externalChanges.push({ path, seen: v, now, at: this.opts.now?.() ?? Date.now() });
+        }
+        if (external.length) this.emit("executor.external_change", { paths: external, while: "down" });
+      }
+    }
+    this.recovered = { action, finding, text: String(last.text ?? ""), external };
+    this.journal("receipt", { recovered: true, finding, external });
+    this.emit("executor.recovered", { action, finding, external });
   }
 
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
@@ -166,6 +192,7 @@ export class Executor {
     }
     this.ledger.begin(raw, paths);
     this.recover();
+    if (ws && !this.recovered) this.journal("begin", { versions: { ...this.seen } });     // what a restart compares against
     this.epoch = raw.epoch;
     this.last = this.ledger.stamp(raw);
     this.emit("executor.begin", { windows: this.last.windows.length, locked: this.last.locked });
@@ -348,7 +375,7 @@ export class Executor {
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && cap.effect !== "observe") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
-    if (cap.effect !== "observe") this.journal("receipt", { status: r.status });
+    if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {} });
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
     if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));

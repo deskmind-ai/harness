@@ -417,14 +417,19 @@ describe("executor: the journal and a crash", () => {
     await expect(ex.act({ action: { kind: "file", capability: "fs.create_text", args: { parent: ".", name: "备忘.txt", text: "买牛奶" } }, epoch: ex.currentEpoch })).rejects.toBeInstanceOf(Crash);
     expect(ws.read("备忘.txt")).toBe("买牛奶");                                   // the effect happened; the receipt was never written
     const lines = fs.readFileSync(journal, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
-    expect(lines.map((l) => l.kind)).toEqual(["intent"]);
-    // the next process: the intent is found, the versions say it happened, and that is told, not redone
+    expect(lines.map((l) => l.kind)).toEqual(["begin", "intent"]);                 // begin: the folder's versions, for a restart to compare against
+    // while no process was watching, another program rewrote todo.txt
+    build(root, { "todo.txt": "全被改了\n" }); ws.invalidate();
+    // the next process: the intent is found, the versions say it happened, and that is told, not redone; the change
+    // by someone else is a fact of the task (not its new starting point), the task's own write is not one
     const ex2 = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, journal });
     await ex2.begin();
-    expect(ex2.recovered).toMatchObject({ finding: "happened", action: { kind: "file", capability: "fs.create_text" } });
+    expect(ex2.recovered).toMatchObject({ finding: "happened", action: { kind: "file", capability: "fs.create_text" }, external: ["todo.txt"] });
     expect(ex2.recovered!.text).toContain("备忘.txt");
+    expect(ex2.externalChanges.map((c) => c.path)).toEqual(["todo.txt"]);
+    expect(ex2.changes().external).toEqual(["todo.txt"]);
     const after = fs.readFileSync(journal, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
-    expect(after.at(-1)).toMatchObject({ kind: "receipt", recovered: true, finding: "happened" });
+    expect(after.at(-1)).toMatchObject({ kind: "receipt", recovered: true, finding: "happened", external: ["todo.txt"] });
     // a third start finds nothing pending
     const ex3 = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() }, journal });
     await ex3.begin();

@@ -377,7 +377,7 @@ export class FrontierRuntime {
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await ex.end().catch(() => undefined); return this.result(); }
     const rec = ex.recovered;
-    const recovery = rec ? `\n\n注意：上一次运行在做「${rec.text}」时中断了，${rec.finding === "happened" ? "那一步已经生效" : rec.finding === "not_happened" ? "那一步没有发生" : "不知道那一步做成没有"}。先看现在的状态再决定，不要盲目重做。` : "";
+    const recovery = rec ? `\n\n注意：上一次运行在做「${rec.text}」时中断了，${rec.finding === "happened" ? "那一步已经生效" : rec.finding === "not_happened" ? "那一步没有发生" : "不知道那一步做成没有"}。${rec.external.length ? `中断期间这些文件被别的程序改过：${rec.external.join("、")}——那些改动不是你的，不要撤销；先读一遍，再看用户的要求在现在的内容上还成不成立，拿不准就问用户。` : ""}先看现在的状态再决定，不要盲目重做。` : "";
     const context: AgentContext = {
       messages: [
         { role: "system", content: this.systemPrompt(), timestamp: Date.now() },

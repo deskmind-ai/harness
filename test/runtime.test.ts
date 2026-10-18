@@ -291,11 +291,13 @@ describe("frontier runtime: a crash", () => {
       return new FrontierRuntime({ task: "t1", raw: "新建 备忘.txt 写上买牛奶", executor: ex, signer: app, user: user(approveAll), gateway: gw, model: { ...model, streamFn: scriptedStream(steps, seen) }, workspace: ws, registry: fileRegistry() });
     };
     await expect(mk(true, steps1, []).run()).rejects.toBeInstanceOf(Crash);
+    build(root, { "todo.txt": "全被改了\n" }); ws.invalidate();                     // someone else, while no process ran
     const seen: Message[][] = [];
     const r = await mk(false, [{ calls: [{ name: "finish", args: { outcome: "done", summary: "备忘.txt 已存在" } }] }], seen).run();
     expect(r.status).toBe("succeeded");
     expect((seen[0]![1] as any).content).toContain("上一次运行在做");
     expect((seen[0]![1] as any).content).toContain("已经生效");
+    expect((seen[0]![1] as any).content).toContain("中断期间这些文件被别的程序改过：todo.txt");
     expect(ws.read("备忘.txt")).toBe("买牛奶");
   });
 });
