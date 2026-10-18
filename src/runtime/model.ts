@@ -1,7 +1,7 @@
 /**
  * The frontier runtime's model: a pi-ai model built from the gateway's provider table (`<provider>|<model>`), so one
  * environment variable pair names a service for both the role gateway and the agent loop. Streaming, tool calls,
- * usage and abort come from pi-ai (openjev docs/research/harness-survey-2026-10-18.md §运行时和模型接口).
+ * usage and abort come from pi-ai (design notes docs/research/harness-survey-2026-10-18.md §运行时和模型接口).
  */
 import type { Model } from "@earendil-works/pi-ai";
 import { stream as streamCompletions } from "@earendil-works/pi-ai/api/openai-completions";

@@ -1,5 +1,5 @@
 /**
- * The app protocol (hands.sock, next version; openjev docs/design/harness-app-integration-2026-10-17.md §2 and the
+ * The app protocol (hands.sock, next version; design notes docs/design/harness-app-integration-2026-10-17.md §2 and the
  * 10-18 revision): every persistent event carries a sequence number and is written to disk before it is sent, so an
  * app that reconnects says the last `seq` it saw and gets the rest (`EventLog.since`). The app ignores kinds it does
  * not know, so adding one never breaks an older app.

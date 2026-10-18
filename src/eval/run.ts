@@ -1,8 +1,8 @@
 /**
- * Run the B0 evaluation set through the TS runtime. The task file (gold included) stays in openjev and is passed by
+ * Run the B0 evaluation set through the TS runtime. The task file (gold included) stays in the design-notes repository and is passed by
  * path, so both implementations are scored against the same tasks by the same rule.
  *
- *   pnpm eval -- --tasks ../../gxcsoccer/openjev/experiments/harness-b0/evalset/tasks.json --config dev-claude --split dev --groups 1 --limit 2 -v
+ *   pnpm eval -- --tasks <design-notes repo>/experiments/harness-b0/evalset/tasks.json --config dev-claude --split dev --groups 1 --limit 2 -v
  *   OPENROUTER_API_KEY=... pnpm eval -- --tasks <path> --config B0-luna --split dev --max-cost 3
  *   pnpm eval -- --report runs/B0-luna-dev/results.jsonl
  *

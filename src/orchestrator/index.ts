@@ -28,7 +28,7 @@ import * as P from "./prompts.js";
 /** A user's answer: a picked option (index into the options shown) or free text. */
 export type Answer = { option: number } | { text: string };
 
-/** What an option means. The runtime acts on this, never on the option's words (openjev
+/** What an option means. The runtime acts on this, never on the option's words (design notes
  *  docs/design/interaction-cards-2026-10-09.md). */
 export type OptionKind = "approve" | "reading" | "value" | "proposal" | "skip_step" | "delegate" | "undo" | "undo_and_reading" | "other" | "cancel" | "never_ask_this";
 export interface CardOption {

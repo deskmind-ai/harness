@@ -1,6 +1,6 @@
 /**
  * The frontier runtime: one model runs the whole loop (see, think, act) through tools, on pi-agent-core. Our part is
- * what the survey found no harness has (openjev docs/research/harness-survey-2026-10-18.md): the executor's guard on
+ * what the survey found no harness has (design notes docs/research/harness-survey-2026-10-18.md): the executor's guard on
  * every action, consent the app signs, a step check after every state change, and an end that needs an independent
  * verdict — in pi's hooks: beforeToolCall (stop switch, budget), afterToolCall (step check, no-progress), finishTurn
  * (no finish without a verdict).

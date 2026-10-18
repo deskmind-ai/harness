@@ -1,5 +1,5 @@
 /**
- * The execution layer's contract (openjev docs/design/computer-use-2026-10-16.md, skills-layer-2026-10-18.md §底线下沉).
+ * The execution layer's contract (design notes docs/design/computer-use-2026-10-16.md, skills-layer-2026-10-18.md §底线下沉).
  *
  * The runtime (ours, Codex, Claude Code…) sees the whole computer in one format, acts through a few generic actions,
  * and never touches the user's things or sends anything out without a consent token the app signed. Ownership and

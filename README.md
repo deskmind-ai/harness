@@ -1,6 +1,6 @@
 # DeskMind harness（TypeScript）
 
-DeskMind 的「想」：理解要求、计划、调工具、核对，在用户的 Mac 上把事做成。0.5 起分成四层（openjev
+DeskMind 的「想」：理解要求、计划、调工具、核对，在用户的 Mac 上把事做成。0.5 起分成四层（设计稿
 `docs/design/skills-layer-2026-10-18.md`）：
 
 | 层 | 在这里 | 可以换成 |
@@ -41,7 +41,7 @@ pnpm eval -- --engine runtime --tasks <tasks-check.json> --config yy-luna --spli
 pnpm eval -- --report runs/a/results.jsonl runs/b/results.jsonl                        # 并排比较
 ```
 
-模型配置在 `src/gateway/index.ts` 的 `CONFIGS`（`yy-luna`、`yy-sol`、`yy-mix`、`or-luna`、`ds-flash`、`ark-evolving`、`ark-lite`、`B0-luna`、`dev-claude`）；供应商在 `PROVIDERS`（YY、OpenRouter、DeepSeek、火山引擎，各自的 URL 和密钥只从环境变量读；加一家是一行）。判官的快档：`DESKMIND_JUDGE_FIRST=openai:volcengine|doubao-seed-2-1-lite-260915`（只能放行不能否决，门限 `DESKMIND_JUDGE_FIRST_FLOOR`）；`--role goal=openai:yy|gpt-6.1-sol` 可以单独换一个角色。
+模型配置在 `src/gateway/index.ts` 的 `CONFIGS`（`yy-luna`、`yy-sol`、`yy-mix`、`or-luna`、`ds-flash`、`ark-evolving`、`ark-lite`、`B0-luna`、`dev-claude`）；供应商在 `PROVIDERS`（网关 `yy`、OpenRouter、DeepSeek、火山引擎，各自的 URL 和密钥只从环境变量读；加一家是一行）。判官的快档：`DESKMIND_JUDGE_FIRST=openai:volcengine|doubao-seed-2-1-lite-260915`（只能放行不能否决，门限 `DESKMIND_JUDGE_FIRST_FLOOR`）；`--role goal=openai:yy|gpt-6.1-sol` 可以单独换一个角色。
 
 ## 给 app 用的入口和打包（0.5）
 

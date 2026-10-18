@@ -1,5 +1,5 @@
 /**
- * The app's entry point (DeskMind Hands.app runs this as a child process; openjev
+ * The app's entry point (DeskMind Hands.app runs this as a child process; design notes
  * docs/design/harness-app-integration-2026-10-17.md §2): JSON events out on stdout, one per line, each written to the
  * run's event log first (protocol/events.ts); answers to cards come back on stdin as JSON lines.
  *

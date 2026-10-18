@@ -1,5 +1,5 @@
 /**
- * Executable skills: the rule language of openjev experiments/stress-2026-10-07/skills2.py, in TypeScript.
+ * Executable skills: the rule language of design notes experiments/stress-2026-10-07/skills2.py, in TypeScript.
  *
  *   match     one regex or a list (alternatives), searched case-insensitively in the file name
  *   content   regex(es) searched in the file's text, for files whose name says nothing

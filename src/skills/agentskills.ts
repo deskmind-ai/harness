@@ -1,5 +1,5 @@
 /**
- * Skills in the Agent Skills format (openjev docs/design/skills-layer-2026-10-18.md): one folder per skill, SKILL.md
+ * Skills in the Agent Skills format (design notes docs/design/skills-layer-2026-10-18.md): one folder per skill, SKILL.md
  * with `name`, `description` and our own `metadata.deskmind` (source, status, version, scope, effects), the body in
  * natural language for whatever runtime reads it; beside it what only our runtimes use — `rules.json` (the executable
  * rules of skills/rules.ts), `examples/confirmed.jsonl`, `examples/counter.jsonl`, `checks.md`. Another runtime

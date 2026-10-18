@@ -6,7 +6,7 @@
  * A skill instantiates into plan nodes (fs.mkdir / fs.move) whose arguments the rules computed; the orchestrator still
  * runs the intent check and every execution guard on them. Files the rules cannot place are handed back to the planner.
  *
- * Revision (openjev docs/design/skill-revision-2026-10-12.md, after Sakana MASS): a skill carries checks of its own
+ * Revision (design notes docs/design/skill-revision-2026-10-12.md, after Sakana MASS): a skill carries checks of its own
  * (expect), every use is recorded, and a use that went wrong but ended right becomes a counterexample. The skill role
  * writes a revised version; code replays both on every example the skill has (teaching, variants, past correct uses,
  * the counterexample) and the new version replaces the old only if it gets the counterexample right and breaks

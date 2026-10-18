@@ -1,6 +1,6 @@
 /**
  * Independent scoring: the gold trees and the allowed paths from the task file, never the orchestrator's verdict.
- * Port of openjev experiments/harness-b0/evalset/score.py, extended for evalset v2 (openjev experiments/evalset-v2):
+ * Port of design notes experiments/harness-b0/evalset/score.py, extended for evalset v2 (design notes experiments/evalset-v2):
  *  - gold.outcomes: every final tree that counts as correct (the first match is reported);
  *  - gold.asked_ok: stopping to ask the user, with nothing changed, is also correct;
  *  - task.must_ask: nothing in the directory settles the ambiguity, so writing before any question is a wrong action;

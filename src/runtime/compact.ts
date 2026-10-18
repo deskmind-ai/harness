@@ -1,5 +1,5 @@
 /**
- * Context compaction for the loop (openjev docs/research/harness-survey-2026-10-18.md §上下文压缩): when the
+ * Context compaction for the loop (design notes docs/research/harness-survey-2026-10-18.md §上下文压缩): when the
  * transcript outgrows the model's window, old observations are cut down to a stub, oldest first, images first; the
  * user's words are never touched (they are the evidence), nor are the model's own turns (tool calls must stay paired
  * with their results), nor the newest results (what the model is working from). Applied to the copy sent to the

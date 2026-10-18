@@ -1,4 +1,4 @@
-/** Interaction cards (openjev docs/design/interaction-cards-2026-10-09.md): every interaction offers options with a
+/** Interaction cards (design notes docs/design/interaction-cards-2026-10-09.md): every interaction offers options with a
  *  fixed meaning; the runtime acts on the meaning only. */
 import * as fs from "node:fs";
 import * as os from "node:os";
