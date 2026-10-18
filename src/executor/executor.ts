@@ -583,7 +583,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
   }
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
   const where = obs ? `${obs.window.app}「${obs.window.title}」` : "window" in a ? a.window : "";
-  const what = a.kind === "click" ? t.click(el?.label ?? a.target)
+  const what = a.kind === "click" ? t.click(el?.label ?? a.target) : a.kind === "double_click" ? t.doubleClick(el?.label ?? a.target)
     : a.kind === "set_value" ? t.set(el?.label ?? a.target, a.value)
     : a.kind === "type" ? t.type(el?.label ?? a.target, a.text)
     : a.kind === "select" ? t.select(el?.label ?? a.target, a.option)

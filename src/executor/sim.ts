@@ -143,6 +143,7 @@ export class SimComputer implements Driver {
   perform(a: Action): ReturnType<Driver["perform"]> {
     if (a.kind === "wait") return { status: "ok" };
     if (a.kind === "file") return { status: "unsupported", why: "files are the executor's, not the desktop driver's" };
+    if (a.kind === "double_click") a = { ...a, kind: "click" };     // the fake apps open on a click; a real one may need two
     if (a.kind === "open_window") {
       // which fake app opens: the kind an app of that name already has on this desktop (as a real one is resolved
       // from the running apps), a browser when a URL is asked for, otherwise an editor — no app names in code

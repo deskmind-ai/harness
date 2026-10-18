@@ -373,6 +373,19 @@ describe("executor: a stop that arrives while an action waits", () => {
   });
 });
 
+describe("executor: double_click", () => {
+  it("is an action like click (same floor, same consent), described as a double-click", async () => {
+    const { ex, w, app } = setup();
+    await started(ex);
+    const { o, e } = await find(ex, w.id, "林晓 · Q3 预算");
+    const pre = ex.preview({ action: { kind: "double_click", window: w.id, target: e.id }, epoch: o.epoch });
+    expect(pre.consequence).toBe("modify_user");
+    const r = await ex.act({ action: { kind: "double_click", window: w.id, target: e.id }, epoch: o.epoch, consent: app.forObject(`window:${w.id}`, "modify_user", "t1") });
+    expect(r.status).toBe("ok");
+    expect(ex.describeAction({ kind: "double_click", window: w.id, target: e.id }, o, "modify_user")).toContain("双击");
+  });
+});
+
 describe("executor: the user's answers reach the judge", () => {
   it("an answer given during the task is in every judge question's context, next to the request", async () => {
     const { Gateway } = await import("../src/gateway/index.js");

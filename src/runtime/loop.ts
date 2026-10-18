@@ -68,7 +68,7 @@ const tool = <T extends TSchema>(t: { name: string; label: string; description: 
 
 const lit = <T extends string>(xs: readonly T[]) => Type.Union(xs.map((k) => Type.Literal(k)));
 const ActionSchema = Type.Object({
-  kind: lit(["click", "set_value", "type", "select", "key", "scroll", "open_window", "close_window", "focus_window", "wait"] as const),
+  kind: lit(["click", "double_click", "set_value", "type", "select", "key", "scroll", "open_window", "close_window", "focus_window", "wait"] as const),
   window: Type.Optional(Type.String({ description: "窗口 id（open_window、wait 不用）" })),
   target: Type.Optional(Type.String({ description: "元素 id，来自 computer_observe" })),
   value: Type.Optional(Type.String()), text: Type.Optional(Type.String()), option: Type.Optional(Type.String()),
@@ -86,7 +86,7 @@ function checkAction(a: Action): string | null {
     case "close_window": case "focus_window": return need("window");
     case "scroll": return need("window") ?? need("dy");
     case "key": return need("window") ?? need("chord");
-    case "click": return need("window") ?? need("target");
+    case "click": case "double_click": return need("window") ?? need("target");
     case "set_value": return need("window") ?? need("target") ?? need("value");
     case "type": return need("window") ?? need("target") ?? need("text");
     case "select": return need("window") ?? need("target") ?? need("option");

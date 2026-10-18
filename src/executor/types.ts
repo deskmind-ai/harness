@@ -48,6 +48,7 @@ export interface Observation {
 
 export type Action =
   | { kind: "click"; window: string; target: string }
+  | { kind: "double_click"; window: string; target: string }     // opens a row, plays a song: what a single click only selects
   | { kind: "set_value"; window: string; target: string; value: string }
   | { kind: "type"; window: string; target: string; text: string }
   | { kind: "select"; window: string; target: string; option: string }
