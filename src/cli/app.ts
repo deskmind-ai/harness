@@ -79,7 +79,11 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
   switch (kind) {
     case "tool.call": return body.name === "computer_act" ? { kind: "step", text: s((body.args as any)?.action), purpose: s((body.args as any)?.purpose ?? ""), consequence: (body.args as any)?.consequence } : null;
     case "fs.act": return { kind: "step", text: `${s(body.cap)} ${s(body.args)}`, status: s(body.status), consequence: body.consequence as never };
-    case "executor.act": return body.status === "ok" || body.status === "needs_consent" ? null : { kind: "refused", what: s(body.action), why: `${s(body.status)}${body.why ? ": " + s(body.why) : ""}`, by: "executor" };
+    // an action that went out but could not be read back (hands: "dispatched, unverified") is a step with that status,
+    // not a refusal; the executor's refusals (stale, stopped, environment, blocked, error) are
+    case "executor.act": return body.status === "ok" || body.status === "needs_consent" ? null
+      : body.status === "unverified" ? { kind: "step", text: s(body.action), consequence: body.consequence as never, object: s(body.object), status: "unverified" }
+      : { kind: "refused", what: s(body.action), why: `${s(body.status)}${body.why ? ": " + s(body.why) : ""}`, by: "executor" };
     case "plan": return { kind: "plan", steps: body.steps as never };
     case "consent.asked": return { kind: "consent", object: s(body.object), consequence: body.consequence as never, scope: "action", picked: (body.picked as string | null) ?? null };
     case "plan.confirmed": return null;
