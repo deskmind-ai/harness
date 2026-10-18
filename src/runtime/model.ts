@@ -18,7 +18,8 @@ export function loopModel(spec: string, o: { contextWindow?: number; maxTokens?:
   if (!p.key) throw new Error(`no API key in the environment for provider ${p.name}`);
   const model: Model<"openai-completions"> = {
     id: p.model, name: p.model, api: "openai-completions", provider: p.name, baseUrl: p.url, input: ["text", "image"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: o.contextWindow ?? 128_000, maxTokens: o.maxTokens ?? 8_000,
+    // a local server (mlx_lm, llama.cpp) runs a small model with a small window: the loop's compaction budget follows it
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: o.contextWindow ?? (p.name === "local" ? 32_000 : 128_000), maxTokens: o.maxTokens ?? (p.name === "local" ? 2_000 : 8_000),
   };
   return { model, apiKey: p.key, streamFn: streamCompletions as unknown as StreamFn };
 }

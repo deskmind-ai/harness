@@ -41,6 +41,9 @@ export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: s
   volcengine: { urlEnv: "VOLCENGINE_URL", keyEnv: "VOLCENGINE_API_KEY", url: "https://ark.cn-beijing.volces.com/api/v3", noThinking: { thinking: { type: "disabled" } } },
   // any other OpenAI-compatible service the user names in the app's settings (URL, key, model id)
   custom: { urlEnv: "CUSTOM_URL", keyEnv: "CUSTOM_API_KEY" },
+  // a local OpenAI-compatible server (mlx_lm.server, llama.cpp) as the actor: the loop model needs a provider with a
+  // key variable; the server ignores the key. Used by the localization experiments, not a default.
+  local: { urlEnv: "LOCAL_URL", keyEnv: "LOCAL_API_KEY", url: "http://127.0.0.1:8089" },
 };
 /** A model configuration by name (CONFIGS) or by spec: `openai:<provider>|<model>` — every role on that model. */
 export function configTable(spec: string): RoleTable | null {
@@ -107,6 +110,8 @@ export const CONFIGS: Record<string, RoleTable> = {
   // one is built on — as a config it is the whole table (measurement), as a judge tier see DESKMIND_JUDGE_FIRST
   "ark-evolving": all("openai", "volcengine|doubao-seed-evolving"),
   "ark-lite": all("openai", "volcengine|doubao-seed-2-1-lite-260915"),
+  // the local actor experiment (docs/localization-2026-10-19.md): the bundled Qwen2.5-7B through mlx_lm.server
+  "local-qwen7b": all("openai", "local|mlx-community/Qwen2.5-7B-Instruct-4bit"),
   "yy-mix": { ...all("openai", "yy|gpt-6.1-sol"), choice: { backend: "openai", model: "yy|gpt-6-luna" }, transform: { backend: "openai", model: "yy|gpt-6-luna", timeoutMs: TRANSFORM_TIMEOUT_MS } },
 };
 
