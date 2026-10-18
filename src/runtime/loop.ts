@@ -250,13 +250,28 @@ export class FrontierRuntime {
     if (!got) return this.end("failed", "no answer from the user");
     if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
     if (!got.option) return text(`用户没有同意，而是说：${got.text}。按这个改计划。`);
-    for (const s of need) if (s.consequence === "modify_user") for (const obj of s.objects) {
+    for (const s of need) if (s.consequence === "modify_user") for (const obj of await this.canonObjects(s.objects)) {
       const t = this.o.signer.forObject(obj, "modify_user", this.o.task);
       this.tokens.set(obj, t);
       this.consents.push({ scope: "object", object: obj, consequence: "modify_user" });
     }
     this.emit("plan.confirmed", { objects: [...this.tokens.keys()] });
     return text("用户同意了计划。改用户东西的步骤可以做了；往外发的步骤到时候会再确认一次。");
+  }
+
+  /** The objects a plan names, in the executor's own terms: a model writes 「窗口 editor-1（用户的编辑器）」 or a bare
+   *  path; the consent has to be keyed by `window:<id>` / `tab:<id>` / `path:<p>` or it covers nothing. Matched
+   *  against the ids on screen and the files in the folder, by structure, never by meaning. */
+  private async canonObjects(objects: string[]): Promise<string[]> {
+    const snap = await this.o.executor.snapshot();
+    const ids = snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]);
+    const paths = this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [];
+    const out = new Set<string>();
+    for (const o of objects) {
+      const hits = [...ids, ...paths].filter((k) => o === k || o === k.slice(k.indexOf(":") + 1) || o.includes(k.slice(k.indexOf(":") + 1)));
+      if (hits.length) hits.forEach((h) => out.add(h)); else out.add(o);
+    }
+    return [...out];
   }
 
   /** A file capability as a tool, under the same rule: a path that existed at begin is the user's. */
