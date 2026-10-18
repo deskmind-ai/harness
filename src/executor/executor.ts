@@ -201,6 +201,9 @@ export class Executor {
     const now = await this.driver.snapshot();
     if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
     if (req.action.kind === "file") return done(await this.actFile(req.action, req.consent, consequence, f.object, now.epoch));
+    // the user is at the keyboard: a window action now would fight them for it, whoever owns the window (D20). Read-only
+    // looks are fine; the runtime waits and tries again
+    if (now.user_active && consequence !== "read") return done({ ...base, status: "blocked", why: "the user is using the computer right now; wait a moment and try again", epoch: now.epoch });
     if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
     if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });

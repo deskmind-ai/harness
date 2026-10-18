@@ -334,3 +334,17 @@ describe("executor: the start gate", () => {
     void w;
   });
 });
+
+describe("executor: the user at the keyboard", () => {
+  it("a state-changing action waits while the user is active; a look does not", async () => {
+    const { ex, sim } = setup();
+    await started(ex);
+    const r = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: (await ex.snapshot()).epoch });
+    const mine = r.after!.window.id;
+    sim.user_active = true;
+    expect((await click(ex, mine, "新建文档")).status).toBe("blocked");
+    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: (await ex.snapshot()).epoch })).status).toBe("ok");
+    sim.user_active = false;
+    expect((await click(ex, mine, "新建文档")).status).toBe("ok");
+  });
+});
