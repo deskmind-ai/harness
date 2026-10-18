@@ -264,6 +264,9 @@ export class FrontierRuntime {
     if (a.kind === "file") this.emit("fs.act", { cap: a.capability, args: a.args, status: r.status, consequence: r.consequence, why: r.why ?? "" });
     if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(a.kind === "file" ? describeAction(a, undefined, r.consequence, cap) : `${p.purpose}：${describeAction(a, r.after, r.consequence)}`);
     if (r.status === "needs_plan") { this.count("needs_plan"); return err(`先交计划：${r.why}`); }
+    // the judge's "not what the user asked": the way out is the user's answer, never another guess
+    if (r.status === "refused" && (r.why ?? "").includes("意图核对")) { this.count("refused_by_judge"); return err(`${r.why}
+不确定用户想怎么做的，用 ask_user 问清楚（给出几种做法当选项），不要换一种猜法再试。`); }
     if (r.status === "environment") return this.end("environment", r.why ?? "environment");
     if (r.status === "stopped") return this.end("stopped", r.why ?? "stopped");
     const { after, challenge: _c, ...rest } = r;
