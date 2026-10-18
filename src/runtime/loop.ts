@@ -347,17 +347,19 @@ export class FrontierRuntime {
     // "done" is a claim: the verdict comes from an independent judge reading the final state the executor hands over
     const v = await this.verify(p.summary);
     this.verdicts.push(v);
-    if (v.verdict === "pass") return this.end("succeeded", "verified: " + v.reason.slice(0, 200));
+    // a judge tier that answers without words (DeskMind Brain's system one) still gets named, so the app's history
+    // never shows an empty "verified:"
+    if (v.verdict === "pass") return this.end("succeeded", "verified: " + (v.reason.trim() || `by ${v.by ?? "judge"}`).slice(0, 200));
     this.count("verify_failed");
     if ((this.counters["verify_failed"] ?? 0) > this.budget.verify_retries) return this.end("unconfirmed", `verification did not pass: ${v.reason.slice(0, 200)}`);
     return err(`核对没有通过（${v.verdict}）：${v.reason}\n没做成就接着做；确认不了就 finish unconfirmed 并说明缺什么。不要再直接说 done。`);
   }
 
   /** The independent verdict: the computer and files after, every window the task touched, what it did, its claim. */
-  private async verify(summary: string): Promise<{ verdict: string; reason: string }> {
+  private async verify(summary: string): Promise<{ verdict: string; reason: string; by?: string }> {
     this.count("model_calls");
     const v = await this.o.executor.verdict(summary, { 本任务做过的动作: this.effects, ...(this.answers.length ? { "用户对提问的回答（和原话一样是证据）": this.answers } : {}), ...(this.answer !== null ? { 给用户的答案: this.answer } : {}) });
-    return { verdict: v.verdict, reason: v.reason };
+    return { verdict: v.verdict, reason: v.reason, by: v.by };
   }
 
   // --- the loop --------------------------------------------------------------------------------------------------------

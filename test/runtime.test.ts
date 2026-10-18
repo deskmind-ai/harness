@@ -86,6 +86,16 @@ describe("frontier runtime: consent", () => {
     expect((seen[0]![1] as any).content).toContain('"owner":"user"');
   });
 
+  it("a verdict without words names the judge tier instead of an empty reason", async () => {
+    const { sim } = mail();
+    const steps: Step[] = [{ calls: [{ name: "finish", args: { outcome: "done", summary: "看过了" } }] }];
+    const { rt, gw } = runtime(sim, steps, user(approveAll));
+    gw.script = [() => ({ choice: "pass", reason: "" })];
+    const r = await rt.run();
+    expect(r.status).toBe("succeeded");
+    expect(r.reason).toMatch(/^verified: by \S+/);
+  });
+
   it("the user saying stop in their own words ends the run cancelled, with nothing verified or claimed", async () => {
     const { sim } = mail();
     const steps: Step[] = [{ calls: [{ name: "finish", args: { outcome: "stopped", summary: "用户说取消，不复制了；没有改动任何东西" } }] }];
