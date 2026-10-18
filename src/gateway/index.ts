@@ -35,14 +35,18 @@ export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: s
   // DeepSeek's own API: `deepseek-flash` is DeepSeek-V4.1-Flash-1017 (the API takes the family name, /v1/models lists
   // deepseek-flash and deepseek-v4-pro); it rejects json_schema, so the gateway falls back to json_object
   deepseek: { urlEnv: "DEEPSEEK_URL", keyEnv: "DEEPSEEK_API_KEY", url: "https://api.deepseek.com" },
+  // Volcengine Ark (doubao): the API lives under /api/v3, not /v1 — a provider URL carries its own version segment
+  volcengine: { urlEnv: "VOLCENGINE_URL", keyEnv: "VOLCENGINE_API_KEY", url: "https://ark.cn-beijing.volces.com/api/v3" },
 };
+/** A service base URL with its version segment: `https://host` → `https://host/v1`; `…/api/v3` stays. */
+export const versionedBase = (url: string) => { const u = url.replace(/\/+$/, ""); return /\/v\d+$/.test(u) ? u : u + "/v1"; };
 export function providerOf(model: string): { url: string; key: string | undefined; model: string; name: string } | { error: string } {
   const [name, ...rest] = model.split("|");
   const p = PROVIDERS[name!];
   if (!p || !rest.length) return { error: `openai backend needs <provider>|<model>; providers: ${Object.keys(PROVIDERS).join(", ")}` };
   const url = process.env[p.urlEnv] ?? p.url;
   if (!url) return { error: `${p.urlEnv} not set` };
-  return { url: url.replace(/\/$/, "").replace(/\/v1$/, ""), key: process.env[p.keyEnv], model: rest.join("|"), name: name! };
+  return { url: versionedBase(url), key: process.env[p.keyEnv], model: rest.join("|"), name: name! };
 }
 /** Per role, beyond backend and model: maxOutputTokens, the most it may write in one answer (sent as max_tokens);
  *  contextTokens, how much it can read; timeoutMs, how long one call may take. Unset, the backend's defaults below. */
@@ -82,6 +86,10 @@ export const CONFIGS: Record<string, RoleTable> = {
   "or-luna": all("openai", "openrouter|openai/gpt-6-luna"),
   // DeepSeek V4.1 Flash (10-17 release) through DeepSeek's API: a cheap second frontier for the same comparisons
   "ds-flash": all("openai", "deepseek|deepseek-flash"),
+  // doubao on Volcengine Ark: seed-evolving as the frontier; seed-2.1-lite is the fast model DeskMind Brain's system
+  // one is built on — as a config it is the whole table (measurement), as a judge tier see DESKMIND_JUDGE_FIRST
+  "ark-evolving": all("openai", "volcengine|doubao-seed-evolving"),
+  "ark-lite": all("openai", "volcengine|doubao-seed-2-1-lite-260915"),
   "yy-mix": { ...all("openai", "yy|gpt-6.1-sol"), choice: { backend: "openai", model: "yy|gpt-6-luna" }, transform: { backend: "openai", model: "yy|gpt-6-luna", timeoutMs: TRANSFORM_TIMEOUT_MS } },
 };
 
@@ -367,7 +375,7 @@ export class Gateway {
     const t0 = performance.now();
     let res: Response;
     try {
-      res = await fetch(url.replace(/\/$/, "") + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+      res = await fetch(versionedBase(url) + "/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       return { outcome: msg.includes("Timeout") ? "timeout" : "error", error: msg.slice(0, 300) };

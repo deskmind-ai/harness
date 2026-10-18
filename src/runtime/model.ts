@@ -17,7 +17,7 @@ export function loopModel(spec: string, o: { contextWindow?: number; maxTokens?:
   if ("error" in p) throw new Error(p.error);
   if (!p.key) throw new Error(`no API key in the environment for provider ${p.name}`);
   const model: Model<"openai-completions"> = {
-    id: p.model, name: p.model, api: "openai-completions", provider: p.name, baseUrl: p.url + "/v1", input: ["text", "image"],
+    id: p.model, name: p.model, api: "openai-completions", provider: p.name, baseUrl: p.url, input: ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: o.contextWindow ?? 128_000, maxTokens: o.maxTokens ?? 8_000,
   };
   return { model, apiKey: p.key, streamFn: streamCompletions as unknown as StreamFn };

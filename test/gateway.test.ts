@@ -6,7 +6,7 @@ describe("provider table", () => {
     const saved = process.env.DEEPSEEK_URL; delete process.env.DEEPSEEK_URL;
     const p = providerOf("deepseek|deepseek-flash");
     if (saved !== undefined) process.env.DEEPSEEK_URL = saved;
-    expect(p).toMatchObject({ name: "deepseek", url: "https://api.deepseek.com", model: "deepseek-flash" });
+    expect(p).toMatchObject({ name: "deepseek", url: "https://api.deepseek.com/v1", model: "deepseek-flash" });
     expect(PROVIDERS.deepseek!.keyEnv).toBe("DEEPSEEK_API_KEY");
     expect(CONFIGS["ds-flash"]!.goal).toEqual({ backend: "openai", model: "deepseek|deepseek-flash" });
   });
@@ -19,5 +19,23 @@ describe("provider table", () => {
     expect(Gateway.schemaRejected('HTTP 400: {"error":{"message":"This response_format type is unavailable now"}}')).toBe(true);
     expect(Gateway.schemaRejected("HTTP 429: rate limited")).toBe(false);
     expect(Gateway.schemaRejected("HTTP 503: Service temporarily unavailable")).toBe(false);
+  });
+});
+
+describe("service URLs", () => {
+  it("adds /v1 to a bare host and keeps a service's own version segment", async () => {
+    const { versionedBase } = await import("../src/gateway/index.js");
+    expect(versionedBase("https://api.deepseek.com")).toBe("https://api.deepseek.com/v1");
+    expect(versionedBase("https://api.deepseek.com/v1/")).toBe("https://api.deepseek.com/v1");
+    expect(versionedBase("https://ark.cn-beijing.volces.com/api/v3")).toBe("https://ark.cn-beijing.volces.com/api/v3");
+    const saved = process.env.VOLCENGINE_URL; delete process.env.VOLCENGINE_URL;
+    expect(providerOf("volcengine|doubao-seed-evolving")).toMatchObject({ url: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-seed-evolving" });
+    if (saved !== undefined) process.env.VOLCENGINE_URL = saved;
+  });
+  it("a first judge tier is any backend:model the gateway can reach", async () => {
+    const { firstTier } = await import("../src/executor/judge.js");
+    expect(firstTier("openai:volcengine|doubao-seed-2-1-lite-260915", "0.8")).toEqual({ name: "first:doubao-seed-2-1-lite-260915", backend: "openai", model: "volcengine|doubao-seed-2-1-lite-260915", floor: 0.8 });
+    expect(firstTier(undefined)).toBeNull();
+    expect(firstTier("nonsense")).toBeNull();
   });
 });

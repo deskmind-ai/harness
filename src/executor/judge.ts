@@ -59,19 +59,30 @@ export const INTENT_OPTIONS: JudgeOption[] = [
 ];
 export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取好参数）。这是完成用户要求过程中的一步，不是全部：只判断这一步和用户原话是否一致——对象是不是用户说的那个、内容是不是用户给的、有没有做用户没要求的事。一步只做了一部分不算「不是」。只看给出的材料，不替用户补充意图。";
 
-/** The judge a runtime gets by default: the gateway's intent role; with `DESKMIND_BRAIN_JUDGE=1` (and
- *  `DESKMIND_BRAIN_URL`, token in `DESKMIND_BRAIN_TOKEN`) DeskMind Brain answers first and may approve on its own above
- *  the floor, never refuse alone. Opt-in until Brain is measured on these questions: in the 10-18 probe it was
- *  confidently wrong on 2 of 13 (docs/0.5-decisions.md D24). The floor is a calibration output, not a rule. */
+/** The judge a runtime gets by default: the gateway's intent role, with an optional first tier that answers first and
+ *  may approve on its own above its floor, never refuse alone:
+ *  - `DESKMIND_BRAIN_JUDGE=1` (+ `DESKMIND_BRAIN_URL`, token in `DESKMIND_BRAIN_TOKEN`, floor `DESKMIND_BRAIN_FLOOR`):
+ *    DeskMind Brain's system one, local, calibrated probabilities;
+ *  - `DESKMIND_JUDGE_FIRST=<backend>:<model>` (floor `DESKMIND_JUDGE_FIRST_FLOOR`), e.g.
+ *    `openai:volcengine|doubao-seed-2-1-lite-260915`: any fast model the gateway can reach, same contract.
+ *  Opt-in until measured on these questions: in the 10-18 probe Brain was confidently wrong on 2 of 13
+ *  (docs/0.5-decisions.md D24). The floor is a calibration output, not a rule. */
 export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Record<string, unknown>) => void): Judge {
   const tiers: JudgeTier[] = [];
   const url = process.env.DESKMIND_BRAIN_URL;
-  if (url && process.env.DESKMIND_BRAIN_JUDGE === "1") {
-    const table = Object.fromEntries(R.ROLES.map((r) => [r, { backend: "systemone", model: url }])) as ConstructorParameters<typeof Gateway>[0];
-    tiers.push({ name: "brain", gateway: new Gateway(table), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9) });
-  }
+  const table = (backend: string, model: string) => Object.fromEntries(R.ROLES.map((r) => [r, { backend, model }])) as ConstructorParameters<typeof Gateway>[0];
+  if (url && process.env.DESKMIND_BRAIN_JUDGE === "1") tiers.push({ name: "brain", gateway: new Gateway(table("systemone", url)), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9) });
+  const first = firstTier(process.env.DESKMIND_JUDGE_FIRST, process.env.DESKMIND_JUDGE_FIRST_FLOOR);
+  if (first) tiers.push({ name: first.name, gateway: new Gateway(table(first.backend, first.model)), floor: first.floor });
   tiers.push({ name: "frontier", gateway });
   return new Judge(tiers, { onEvent });
+}
+
+/** `backend:model` → a first judge tier; null when unset or malformed (then the frontier judges alone). */
+export function firstTier(spec: string | undefined, floor?: string): { name: string; backend: string; model: string; floor: number } | null {
+  const m = spec ? /^(\w+):(.+)$/s.exec(spec.trim()) : null;
+  if (!m) return null;
+  return { name: `first:${m[2]!.split("|").pop()}`, backend: m[1]!, model: m[2]!, floor: Number(floor ?? 0.9) };
 }
 
 /** The completion audit, as a choice: Codex's wording (ext/goal/templates/goals/continuation.md) — completion is
