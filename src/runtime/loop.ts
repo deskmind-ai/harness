@@ -365,7 +365,8 @@ export class FrontierRuntime {
     const base = fs.existsSync(BASE_SKILL) ? body(fs.readFileSync(BASE_SKILL, "utf-8")) : "";
     const cands = this.o.skills?.candidates(this.o.raw) ?? [];
     const skills = cands.length ? "\n\n## 可能适用的教程\n" + cands.map((c) => `- ${c.name}：${c.description}`).join("\n") + "\n适用的用 read_skill 读全文。" : "";
-    const ws = this.o.workspace ? `\n\n## 任务目录\n用户选定的文件夹，文件工具的路径都相对它。现在的内容：${J(this.o.workspace.listing())}` : "";
+    // the folder's absolute path too: a save sheet in an app (⌘⇧G) needs it, and the model cannot find it out otherwise
+    const ws = this.o.workspace ? `\n\n## 任务目录\n用户选定的文件夹，文件工具的路径都相对它；它在这台电脑上的完整路径是 ${this.o.workspace.root}（应用的存储对话框里用这个）。现在的内容：${J(this.o.workspace.listing())}` : "";
     return `你是桌面助手 DeskMind。只用工具做事；每一轮要么调用工具，要么用 finish 结束。\n\n${base}${skills}${ws}`;
   }
 
