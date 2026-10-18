@@ -39,3 +39,28 @@ describe("teaching on the runtime path", () => {
     expect(sameTree({ "a.txt": "x\n" }, { "a.txt": "x" })).toBe(true);
   });
 });
+
+describe("revision on the runtime path", () => {
+  it("a counterexample is written down; the next version replaces the old only if every confirmed example still replays", async () => {
+    const { reviseFromCounter } = await import("../src/skills/teach.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "revise-"));
+    const store = new SkillStore(dir);
+    const gw = new Gateway(table);
+    const tutorial = { name: "organize-meeting-minutes", description: "把会议纪要按项目归类，用户说「纪要归一下类」时用", body: "## 用户当时的原话\nx\n\n## 怎么做\nv1\n\n## 不适用\n-", scope: { apps: [], objects: ["docx/*"], family: "f" }, effects: ["move"] };
+    gw.script = [() => tutorial, () => ({ ...tutorial, body: "## 用户当时的原话\nx\n\n## 怎么做\nv2 草稿放草稿箱\n\n## 不适用\n-" }), () => ({ ...tutorial, body: "v3" })];
+    await teachFromRun(gw, store, { raw: "纪要归一下类", before, after, effects: [] });
+    await admit(store, "organize-meeting-minutes", async () => ({ ...after }));
+    const counter = { raw: "纪要归一下类", before: { "草稿.docx": "d" }, after: { "草稿箱/草稿.docx": "d", "草稿箱": null }, why: "草稿被当成正式纪要放进了项目文件夹" };
+    const good = await reviseFromCounter(gw, store, "organize-meeting-minutes", counter, async () => ({ ...after }));
+    expect(good.revised).toBe(true);
+    const s = store.get("organize-meeting-minutes")!;
+    expect(s.meta.version).toBe(2);
+    expect(s.body).toContain("v2");
+    expect(s.counter.length).toBe(1);
+    expect(s.meta.status).toBe("admitted");
+    const bad = await reviseFromCounter(gw, store, "organize-meeting-minutes", counter, async () => ({ ...before }));
+    expect(bad.revised).toBe(false);
+    expect(store.get("organize-meeting-minutes")!.body).toContain("v2");           // the old version stays
+    expect(store.names()).toEqual(["organize-meeting-minutes"]);                   // the probe copy is gone
+  });
+});

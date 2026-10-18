@@ -65,3 +65,37 @@ export async function admit(store: SkillStore, name: string, replay: (raw: strin
   store.write(s);
   return { admitted: ok, why: String((s.state.admission as { why: string }).why) };
 }
+
+/** A use that went wrong (the user undid the result, or the verdict failed) is a counterexample: written down with
+ *  what the user said and what the folder looked like, then the skill role writes the next version from every example
+ *  the skill has. The new version is admitted the same way as the first — every confirmed example replayed must end
+ *  as confirmed — or the old version stays and the counterexample waits for the next revision. */
+export async function reviseFromCounter(gw: Gateway, store: SkillStore, name: string, counter: { raw: string; before: Tree; after: Tree | null; why: string }, replay: (raw: string, before: Tree, skill: string) => Promise<Tree | null>): Promise<{ revised: boolean; why: string }> {
+  const s = store.get(name);
+  if (!s) return { revised: false, why: "no such skill" };
+  s.counter = [...s.counter, { ...counter, t: new Date().toISOString() }];
+  store.write(s);
+  const show = (ex: { raw: string; before: Tree; after: Tree | null }) => `- 原话「${ex.raw}」；做之前：${Object.keys(ex.before).join("、")}；${ex.after ? "正确结果：" + Object.keys(ex.after).join("、") : "没有正确结果"}`;
+  const prompt = [
+    `任务：修订一份教程（第 ${s.meta.version} 版）。它这次用错了；下面是它学过的例子（用户确认过的，新版必须都对）和这次的反例。只改需要改的，用自然语言，不写正则。`,
+    "", "当前教程：", s.body, "", "用户确认过的例子：", ...s.confirmed.map((e) => show(e as never)), "", "反例（这次用错了）：", show(counter), `哪里错了：${counter.why}`,
+    "", "输出完整的新版本（name 保持不变，description 可以改，body 三段照旧，scope、effects 照旧或更准）。",
+  ].join("\n");
+  const rep = await gw.ask("skill", SYSTEM, prompt, TaughtSkill, name);
+  if (rep.outcome !== "answered") return { revised: false, why: `skill role ${rep.outcome}` };
+  const d = rep.data!;
+  // every confirmed example must still end as the user confirmed under the new words
+  const candidate: Skill = { ...s, description: d.description, body: d.body, meta: { ...s.meta, version: s.meta.version + 1, scope: d.scope, effects: d.effects } };
+  const probe = `${name}--v${candidate.meta.version}`;
+  store.write({ ...candidate, name: probe, meta: { ...candidate.meta, status: "draft" } });
+  let ok = true;
+  for (const ex of s.confirmed as { raw: string; before: Tree; after: Tree }[]) {
+    const got = await replay(ex.raw, ex.before, probe);
+    if (!got || !sameTree(got, ex.after)) { ok = false; break; }
+  }
+  store.remove(probe);
+  if (!ok) { s.state = { ...(s.state ?? {}), revisions: [...((s.state?.revisions as unknown[]) ?? []), { ok: false, version: s.meta.version, why: "the new version broke a confirmed example", t: new Date().toISOString() }] }; store.write(s); return { revised: false, why: "the new version broke a confirmed example; the old one stays" }; }
+  candidate.state = { ...(s.state ?? {}), revisions: [...((s.state?.revisions as unknown[]) ?? []), { ok: true, version: candidate.meta.version, t: new Date().toISOString() }] };
+  store.write(candidate);
+  return { revised: true, why: `version ${candidate.meta.version}` };
+}
