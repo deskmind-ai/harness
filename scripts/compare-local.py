@@ -27,6 +27,7 @@ def load(d):
         for l in open(d + "/model_calls.jsonl"):
             e = json.loads(l)
             if e.get("role") in ("intent", "verify", "choice"):
+                if e.get("outcome") != "answered" and "Abort" in (e.get("error") or ""): gw["aborted"] = gw.get("aborted", 0) + 1; continue   # the race: abandoned cloud calls
                 gw["calls"] += 1; gw["tokens_in"] += e.get("tokens_in", 0); gw["tokens_out"] += e.get("tokens_out", 0)
                 gw["latency_ms"] += e.get("latency_ms", 0); gw["user_chars"] += e.get("user_chars", 0) + e.get("system_chars", 0)
     except OSError:
@@ -54,7 +55,7 @@ for name, d in zip("AB", args[:2]):
     s["judge_cloud_calls"] = gw["calls"] / n; s["judge_tokens_in"] = gw["tokens_in"] / n; s["judge_tokens_out"] = gw["tokens_out"] / n
     s["judge_latency_s"] = gw["latency_ms"] / 1000 / n; s["judge_chars_cloud"] = gw["user_chars"] / n
     s["usd_all"] = s["usd"] + (gw["tokens_in"] * price[0] + gw["tokens_out"] * price[1]) / n
-    s["skipped"] = gw["skipped"]; s["shadow"] = gw["shadow"]
+    s["skipped"] = gw["skipped"]; s["shadow"] = gw["shadow"]; s["aborted"] = gw.get("aborted", 0) / n
     out[name] = s
 A, B = out.get("A"), out.get("B")
 def pct(x): return f"{100*x:.0f}%"
@@ -79,6 +80,7 @@ row("  本地占比", A["local_share"], B["local_share"], pct)
 row("  升云端 / unsettled", (A["escalations"], A["unsettled"]), (B["escalations"], B["unsettled"]), lambda v: "/".join(map(str, v)))
 row("  自适应跳过（没问快档）", A["skipped"], B["skipped"], str)
 row("  影子核对 一致/比较", tuple(A["shadow"]), tuple(B["shadow"]), lambda v: "/".join(map(str, v)))
+row("  竞速中放弃的云端调用/题", A["aborted"], B["aborted"])
 print("\n按类正确数:")
 for c in sorted(set(A["by_cat"]) | set(B["by_cat"])):
     print(f"  {c:12} A {pct(A['by_cat'].get(c,0)):>5}  B {pct(B['by_cat'].get(c,0)):>5}")
