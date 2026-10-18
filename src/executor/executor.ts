@@ -26,6 +26,8 @@ import type { KeyObject } from "node:crypto";
 
 export interface ExecutorOptions {
   task: string; publicKey: KeyObject; now?: () => number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
+  /** How long a state-changing action waits for the user to pause before it is blocked, and how often it looks. */
+  userWait?: { ms: number; pollMs: number };
   /** The independent judge (judge.ts): asked before every action that changes the user's things or sends something
    *  out whether it is what the user asked for. Without one, consent alone gates those actions. */
   judge?: Judge;
@@ -281,7 +283,13 @@ export class Executor {
     }
     const object = objectOf(a);
     if (a.kind === "wait" || a.kind === "focus_window" || a.kind === "scroll") return { consequence: "read", object, why: "changes no content" };
-    if (a.kind === "open_window") return { consequence: "create", object, why: "a window of the task's own" };
+    if (a.kind === "open_window") {
+      // a URL handed to a browser the user already has open lands as a tab in their window (deskmind#73): that is
+      // the user's thing and asks first; without a URL, or for an app not running, a new window of the task's own
+      const theirs = a.url ? this.last?.windows.find((w) => w.owner === "user" && (w.app === a.app || w.id.startsWith(a.app + "#"))) : undefined;
+      if (theirs) return { consequence: "modify_user", object: `window:${theirs.id}`, why: `opens ${a.url} in the user's ${a.app} window` };
+      return { consequence: "create", object, why: "a window of the task's own" };
+    }
     const owner = this.ledger.ownerOf(object);
     if (a.kind === "close_window") return owner === "user" ? { consequence: "modify_user", object, why: "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
     const obs = this.lastObs.get(a.window);
@@ -315,13 +323,26 @@ export class Executor {
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
-    const now = await this.driver.snapshot();
+    let now = await this.driver.snapshot(), waited = false;
     if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
     if (req.action.kind === "file") return done(await this.actFile(req.action, req.consent, consequence, f.object, now.epoch));
     // the user is at the keyboard: a window action now would fight them for it, whoever owns the window (D20). Read-only
-    // looks are fine; the runtime waits and tries again
-    if (now.user_active && consequence !== "read") return done({ ...base, status: "blocked", why: "the user is using the computer right now; wait a moment and try again", epoch: now.epoch });
-    if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
+    // looks are fine. The executor itself waits for them to pause (polling, up to a limit) rather than bouncing the
+    // model, which burned a run's whole turn budget on "wait and try again" while the user watched (10-19)
+    if (now.user_active && consequence !== "read") {
+      const wait = this.opts.userWait ?? { ms: 120_000, pollMs: 2_000 };
+      const until = (this.opts.now?.() ?? Date.now()) + wait.ms;
+      this.emit("executor.user_wait", { object: f.object });
+      waited = true;
+      while (now.user_active && (this.opts.now?.() ?? Date.now()) < until && !this.stopped) {
+        await new Promise((r) => setTimeout(r, wait.pollMs));
+        now = await this.driver.snapshot();
+      }
+      if (now.user_active) return done({ ...base, status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later`, epoch: now.epoch });
+      this.emit("executor.user_resumed", {});
+    }
+    // after a wait the computer may have moved on; the request's epoch is what the model saw before it, so it is not held stale
+    if (req.epoch !== now.epoch && !waited) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
     if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
     // an element is addressed only through the window's last observation: a guessed id would skip the structural

@@ -89,6 +89,8 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
     case "fs.act": return { kind: "step", text: `${s(body.cap)} ${s(body.args)}`, status: s(body.status), consequence: body.consequence as never };
     // an action that went out but could not be read back (hands: "dispatched, unverified") is a step with that status,
     // not a refusal; the executor's refusals (stale, stopped, environment, blocked, error) are
+    case "executor.user_wait": return { kind: "waiting" };            // the user is at the keyboard: the app says "paused while you use your Mac"
+    case "executor.user_resumed": return { kind: "resumed" };
     case "executor.act": return body.status === "ok" || body.status === "needs_consent" ? null
       : body.status === "unverified" ? { kind: "step", text: s(body.action), consequence: body.consequence as never, object: s(body.object), status: "unverified" }
       : { kind: "refused", what: s(body.action), why: `${s(body.status)}${body.why ? ": " + s(body.why) : ""}`, by: "executor" };

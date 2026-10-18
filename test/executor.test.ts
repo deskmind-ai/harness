@@ -431,16 +431,37 @@ describe("executor: the start gate", () => {
 });
 
 describe("executor: the user at the keyboard", () => {
-  it("a state-changing action waits while the user is active; a look does not", async () => {
-    const { ex, sim } = setup();
+  it("a state-changing action waits for the user to pause, then goes; past the limit it is blocked; a look never waits", async () => {
+    const app = ConsentSigner.fresh();
+    const { sim, w } = mailSim();
+    const events: string[] = [];
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, userWait: { ms: 300, pollMs: 20 }, onEvent: (k) => events.push(k) });
     await started(ex);
     const r = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: (await ex.snapshot()).epoch });
     const mine = r.after!.window.id;
     sim.user_active = true;
-    expect((await click(ex, mine, "新建文档")).status).toBe("blocked");
-    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: (await ex.snapshot()).epoch })).status).toBe("ok");
-    sim.user_active = false;
+    setTimeout(() => { sim.user_active = false; }, 80);                   // the user pauses while the executor waits
     expect((await click(ex, mine, "新建文档")).status).toBe("ok");
+    expect(events).toContain("executor.user_wait"); expect(events).toContain("executor.user_resumed");
+    sim.user_active = true;
+    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: (await ex.snapshot()).epoch })).status).toBe("ok");   // read-only: no wait
+    const t0 = Date.now();
+    const b = await click(ex, mine, "新建文档");
+    expect(b.status).toBe("blocked"); expect(Date.now() - t0).toBeGreaterThanOrEqual(280);   // waited the limit, then gave up
+    void w;
+  });
+
+  it("a URL handed to a browser the user has open is the user's window: plan and consent first", async () => {
+    const { ex, sim, app } = setup();
+    const b = sim.addBrowser("Safari", [{ title: "首页", url: "https://example.com" }]);
+    await ex.begin();
+    const pre = ex.preview({ action: { kind: "open_window", app: "Safari", url: "https://music.163.com" }, epoch: ex.currentEpoch });
+    expect(pre).toMatchObject({ consequence: "modify_user", object: `window:${b.id}`, needs_consent: true });
+    expect((await ex.act({ action: { kind: "open_window", app: "Safari", url: "https://music.163.com" }, epoch: ex.currentEpoch })).status).toBe("needs_plan");
+    // no URL, or an app the user does not have open: the task's own window
+    expect(ex.preview({ action: { kind: "open_window", app: "Safari" }, epoch: ex.currentEpoch }).consequence).toBe("create");
+    expect(ex.preview({ action: { kind: "open_window", app: "编辑器", url: "x" }, epoch: ex.currentEpoch }).consequence).toBe("create");
+    void app;
   });
 });
 
