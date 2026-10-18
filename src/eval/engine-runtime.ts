@@ -3,7 +3,7 @@
  * user and scorer as the orchestrator path, so the two engines compare on the same 105 tasks with the same model.
  *
  * Not carried over for this engine: the
- * skill library (group 5 teach / learn): the row says `skills: "unsupported"`, and the GUI group runs on the simulated
+ * skill revision (group 5 learn after a use: counterexamples are not written back yet), and the GUI group runs on the simulated
  * editor window (the user's, since it is on screen at begin, so acting in it is consented on a card).
  */
 import * as fs from "node:fs";
@@ -20,6 +20,8 @@ import type { loopModel } from "../runtime/model.js";
 import type { Registry } from "../registry/capability.js";
 import { Workspace, build } from "../registry/workspace.js";
 import { score, type Summary, type Talk, type Task } from "./score.js";
+import { SkillStore } from "../skills/agentskills.js";
+import { admit, teachFromRun, type Tree } from "../skills/teach.js";
 
 const STATUS: Record<RuntimeStatus, Summary["status"]> = { succeeded: "succeeded", unconfirmed: "failed", failed: "failed", environment: "failed", stopped: "failed", cancelled: "cancelled" };
 
@@ -90,7 +92,13 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     },
   };
   const t0 = Date.now(), calls0 = gw.calls, spent0 = gw.spentUsd;
-  const makeRuntime = () => new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, model, workspace: ws, registry, onEvent });
+  // group 5: tutorials taught on this path live in the repetition's skills folder; a use-stage task sees the admitted
+  // ones (chosen by structure: the folder's file types), a teach-stage task teaches after it succeeded
+  const store = task.group === 5 ? new SkillStore(path.join(outDir, `rep${rep}`, "skills")) : null;
+  if (store) fs.mkdirSync(store.dir, { recursive: true });
+  const fileTypes = [...new Set(Object.keys(task.files).map((p) => (p.includes(".") ? p.slice(p.lastIndexOf(".") + 1).toLowerCase() : "")).filter(Boolean))];
+  const skills = store ? store.source({ fileTypes }) : undefined;
+  const makeRuntime = () => new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, model, workspace: ws, registry, onEvent, ...(skills ? { skills } : {}) });
   rt = makeRuntime();
   let crashed = false;
   let r: Awaited<ReturnType<FrontierRuntime["run"]>>;
@@ -102,6 +110,27 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     ex = makeExecutor(false);
     rt = makeRuntime();
     r = await rt.run();
+  }
+  // teach: the run the user confirmed becomes a tutorial, admitted only when doing the example again with it ends the same
+  let taught: unknown = null;
+  if (store && task.stage === "teach" && r.status === "succeeded") {
+    const sk = await teachFromRun(gw, store, { raw: task.raw, answers: user.asked, before: start as Tree, after: ws.tree() as Tree, effects: r.effects, family: task.family, runId: task.id });
+    if (sk) {
+      const replay = async (raw: string, before: Tree, name: string): Promise<Tree | null> => {
+        const root2 = fs.mkdtempSync(path.join(os.tmpdir(), "b0rt-replay-"));
+        build(root2, before);
+        const ws2 = new Workspace(root2), sim2 = new SimComputer(root2), app2 = ConsentSigner.fresh();
+        const ex2 = new Executor(sim2, { task: task.id + "#replay", publicKey: app2.publicKey });
+        const one = store.get(name)!;
+        const rt2 = new FrontierRuntime({ task: task.id + "#replay", raw, executor: ex2, signer: app2, user: { ask: (c) => { const i = c.options.findIndex((o) => o.kind === "approve"); return i >= 0 ? { option: i } : null; } }, gateway: gw, model, workspace: ws2, registry, skills: { candidates: () => [{ name: one.name, description: one.description }], read: (n) => (n === one.name ? one.body : null) } });
+        const r2 = await rt2.run().catch(() => null);
+        const tree = r2?.status === "succeeded" ? ws2.tree() : null;
+        fs.rmSync(root2, { recursive: true, force: true });
+        return tree;
+      };
+      const a = await admit(store, sk.name, replay);
+      taught = { name: sk.name, admitted: a.admitted, why: a.why };
+    } else taught = { admitted: false, why: "the skill role gave no usable tutorial" };
   }
   const firstAsk = seen.find((s) => s.kind === "missing" || s.kind === "ambiguity" || s.kind === "plan")?.at ?? -1;
   const firstWrite = writes[0]?.at ?? -1;
@@ -119,7 +148,7 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: `${gw.name}@runtime`, engine: "runtime", status: summ.status, runtime_status: r.status, reason: r.reason,
     ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0 + (r.counters["model_calls"] ?? 0), loop_calls: r.counters["model_calls"] ?? 0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
     tokens_in: r.counters["tokens_in"] ?? 0, tokens_out: r.counters["tokens_out"] ?? 0,
-    category: task.category, policy: {}, skill: null, skills: task.group === 5 ? "unsupported" : null, taught: null, learned: null, asked: user.asked, approvals: user.approvals, result_response: null, sim: user.sim,
+    category: task.category, policy: {}, skill: null, skills: store ? store.admitted().map((x) => x.name) : null, taught, learned: null, skills_read: r.counters["skills_read"] ?? 0, asked: user.asked, approvals: user.approvals, result_response: null, sim: user.sim,
     ask_decisions: [], consents: r.consents, cards: seen.map((s) => `${s.kind}:${s.picked ?? "-"}`), verdicts: r.verdicts, answer: r.answer, summary: r.summary,
     first_outcome: task.gold.outcomes?.[0]?.name ?? "gold", seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
