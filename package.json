@@ -4,22 +4,31 @@
   "private": true,
   "type": "module",
   "description": "DeskMind orchestration runtime: the 2.0 design's first slice (goal -> plan -> bind -> intent check -> execute -> verify -> skill), TypeScript port of openjev/experiments/harness-b0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22.19"
+  },
   "packageManager": "pnpm@10.26.2",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "eval": "tsx src/eval/run.ts",
-    "schemas": "tsx src/protocol/export.ts"
+    "schemas": "tsx src/protocol/export.ts",
+    "gym": "tsx src/eval/gym.ts",
+    "app": "tsx src/cli/app.ts",
+    "bundle": "node scripts/bundle.mjs",
+    "mcp": "tsx src/cli/mcp.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "esbuild": "0.28.2",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
     "zod": "^3.24.0",
     "zod-to-json-schema": "^3.24.0"
   }

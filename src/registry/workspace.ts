@@ -12,6 +12,16 @@ export const TRASH = ".deskmind-trash";
  *  the task's files and never listed. Nothing a user owns is ever put there (a trashed file goes to TRASH, under its
  *  own name, whatever that name is), so sweeping it can never delete the user's data. */
 export const TMP = ".deskmind-tmp";
+/** A folder's version, from entries (path → file digest | "dir"): its direct members and their digests. One formula
+ *  for the disk (Workspace.version) and for undo's paper folder, so the two cannot drift apart. */
+export function folderVersion(e: Record<string, string>, p: string): string {
+  const members = Object.keys(e).filter((k) => (p ? k.startsWith(p + "/") && !k.slice(p.length + 1).includes("/") : !k.includes("/"))).sort();
+  return "dir:" + sha(members.map((m) => `${m}=${e[m]}`).join("\n"));
+}
+
+/** The hands driver's own folder in the task folder (a new TextEdit document is a file there until it is saved as
+ *  something): the driver's, never the task's or the user's — not listed, not credited (review of #16). */
+export const HANDS = ".hands";
 /** A temporary output older than this is left by a process that died, not one still being checked. */
 const STALE_TEMP_MS = 10 * 60_000;
 
@@ -63,11 +73,15 @@ export class Workspace {
   /** A cheap fingerprint of the tree's shape and mtimes; when it is unchanged the digest snapshot is reused. */
   private stamp(): string {
     const parts: string[] = [];
+    const gone = (e: unknown) => (e as { code?: string }).code === "ENOENT";
     const walk = (dir: string) => {
-      for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
-        if (d.name === TRASH || d.name === TMP || d.name === ".keep") continue;
+      let names: fs.Dirent[];
+      try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && dir !== this.root) return; throw e; }   // vanished meanwhile: not there
+      for (const d of names) {
+        if (d.name === TRASH || d.name === TMP || d.name === HANDS || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
-        const st = fs.lstatSync(full);              // a link (even a dangling one) is not followed
+        let st: fs.Stats;
+        try { st = fs.lstatSync(full); } catch (e) { if (gone(e)) continue; throw e; }   // a link (even a dangling one) is not followed
         parts.push(`${full}:${st.mtimeMs}:${st.size}`);
         if (d.isDirectory()) walk(full);
       }
@@ -79,6 +93,17 @@ export class Workspace {
   abs(p: string): string {
     const full = path.resolve(this.root, p.replace(/^\/+|\/+$/g, ""));
     if (full !== this.root && !full.startsWith(this.root + path.sep)) throw new Error(`path outside the workspace: ${p}`);
+    // nor through a link on the way: a folder swapped for a link to somewhere else takes a write there (review of #16:
+    // destination/ became a link while the judge answered, and a move replaced a file outside). The last part may be a
+    // link itself — the tools look at it (lstat) and never write through it
+    const parts = path.relative(this.root, full).split(path.sep).filter(Boolean);
+    let at = this.root;
+    for (const part of parts.slice(0, -1)) {
+      at = path.join(at, part);
+      let st: fs.Stats;
+      try { st = fs.lstatSync(at); } catch { break; }            // not there yet: nothing further to go through
+      if (st.isSymbolicLink()) throw new Error(`path goes through a link: ${p}`);
+    }
     return full;
   }
 
@@ -87,12 +112,18 @@ export class Workspace {
     const mtimes = this.stamp();
     if (this.cache && this.cache.mtimes === mtimes) return this.cache.entries;
     const out: Record<string, string> = {};
+    // a folder other programs use too (a scope like /tmp): an entry that vanishes between the listing and its read
+    // is simply not there — the listing is of what exists now, not a reason to fail the task (10-18, app-run on /tmp)
+    const gone = (e: unknown) => (e as { code?: string }).code === "ENOENT";
     const walk = (dir: string, rel: string) => {
-      const names = fs.readdirSync(dir, { withFileTypes: true });
-      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP).map((d) => d.name).sort();
+      let names: fs.Dirent[];
+      try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && rel) { delete out[rel]; return; } throw e; }
+      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP && d.name !== HANDS).map((d) => d.name).sort();
       const files = names.filter((d) => d.isFile() && d.name !== ".keep").map((d) => d.name).sort();
       for (const d of dirs) out[rel ? `${rel}/${d}` : d] = "dir";
-      for (const f of files) out[rel ? `${rel}/${f}` : f] = sha(fs.readFileSync(path.join(dir, f)));
+      for (const f of files) {
+        try { out[rel ? `${rel}/${f}` : f] = sha(fs.readFileSync(path.join(dir, f))); } catch (e) { if (!gone(e)) throw e; }
+      }
       for (const d of dirs) walk(path.join(dir, d), rel ? `${rel}/${d}` : d);
     };
     walk(this.root, "");
@@ -102,16 +133,9 @@ export class Workspace {
 
   version(p: string): string {
     const e = this.entries();
-    if (p === "" || p === "/" || p === ".") {
-      const members = Object.keys(e).filter((k) => !k.includes("/")).sort();
-      return "dir:" + sha(members.map((m) => `${m}=${e[m]}`).join("\n"));
-    }
+    if (p === "" || p === "/" || p === ".") return folderVersion(e, "");
     if (!(p in e)) return ABSENT;
-    if (e[p] === "dir") {
-      const members = Object.keys(e).filter((k) => k.startsWith(p + "/") && !k.slice(p.length + 1).includes("/")).sort();
-      return "dir:" + sha(members.map((m) => `${m}=${e[m]}`).join("\n"));
-    }
-    return e[p]!;
+    return e[p] === "dir" ? folderVersion(e, p) : e[p]!;
   }
 
   read(p: string): string {
@@ -139,6 +163,12 @@ export class Workspace {
 
   isDir(p: string): boolean {
     return this.version(p).startsWith("dir:");
+  }
+
+  /** A folder's members as they are on disk (names, hidden ones too): what "this folder holds only ours" is checked
+   *  by. A seam: undo's preflight asks the same of the folder as it will be after the later undos. */
+  members(d: string): string[] {
+    return fs.readdirSync(this.abs(d));
   }
 
   /** path -> text (null for a folder): the scorer's view. */

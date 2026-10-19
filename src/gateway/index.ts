@@ -22,16 +22,62 @@ import { ROLES, type Role } from "../protocol/roles.js";
  * claude_cli   `claude -p`, local development on synthetic data only
  * scripted     tests
  */
-export type Backend = "openrouter" | "local_chat" | "systemone" | "claude_cli" | "scripted";
+export type Backend = "openrouter" | "openai" | "local_chat" | "systemone" | "claude_cli" | "scripted";
+
+/**
+ * openai: any OpenAI-compatible chat-completions service with a key, named by a provider entry: the model string is
+ * `<provider>|<model>` (e.g. `yy|gpt-6-luna`), the provider's URL and key come from the environment and are never
+ * logged. Adding a service is one line here, not a new backend.
+ */
+export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: string; noThinking?: Record<string, unknown> }> = {
+  yy: { urlEnv: "YY_URL", keyEnv: "YY_API_KEY" },
+  openrouter: { urlEnv: "OPENROUTER_URL", keyEnv: "OPENROUTER_API_KEY", url: "https://openrouter.ai/api/v1" },
+  // DeepSeek's own API: `deepseek-flash` is DeepSeek-V4.1-Flash-1017 (the API takes the family name, /v1/models lists
+  // deepseek-flash and deepseek-v4-pro); it rejects json_schema, so the gateway falls back to json_object
+  deepseek: { urlEnv: "DEEPSEEK_URL", keyEnv: "DEEPSEEK_API_KEY", url: "https://api.deepseek.com", noThinking: { thinking: { type: "disabled" } } },
+  // Volcengine Ark (doubao): the API lives under /api/v3, not /v1 — a provider URL carries its own version segment.
+  // `noThinking` is how this service turns reasoning off: a role that wants a fast answer (think: false) sends it —
+  // doubao-seed-2.1-lite answered a judge question in 1.6 s without thinking, 76 s with (10-18)
+  volcengine: { urlEnv: "VOLCENGINE_URL", keyEnv: "VOLCENGINE_API_KEY", url: "https://ark.cn-beijing.volces.com/api/v3", noThinking: { thinking: { type: "disabled" } } },
+  // any other OpenAI-compatible service the user names in the app's settings (URL, key, model id)
+  custom: { urlEnv: "CUSTOM_URL", keyEnv: "CUSTOM_API_KEY" },
+  // a local OpenAI-compatible server (mlx_lm.server, llama.cpp) as the actor: the loop model needs a provider with a
+  // key variable; the server ignores the key. Used by the localization experiments, not a default.
+  local: { urlEnv: "LOCAL_URL", keyEnv: "LOCAL_API_KEY", url: "http://127.0.0.1:8089" },
+};
+/** A model configuration by name (CONFIGS) or by spec: `openai:<provider>|<model>` — every role on that model. */
+export function configTable(spec: string): RoleTable | null {
+  if (CONFIGS[spec]) return CONFIGS[spec]!;
+  const m = /^(\w+):(.+)$/s.exec(spec);
+  return m ? all(m[1] as Backend, m[2]!) : null;
+}
+/** The request fields a role's wish for a fast answer (`think: false`) becomes on this provider; none when the
+ *  service has no switch or the role did not ask. */
+export function extraBodyFor(provider: string, think: boolean | undefined): Record<string, unknown> {
+  return think === false && PROVIDERS[provider]?.noThinking ? { ...PROVIDERS[provider]!.noThinking } : {};
+}
+/** A service base URL with its version segment: `https://host` → `https://host/v1`; `…/api/v3` stays. */
+export const versionedBase = (url: string) => { const u = url.replace(/\/+$/, ""); return /\/v\d+$/.test(u) ? u : u + "/v1"; };
+export function providerOf(model: string): { url: string; key: string | undefined; model: string; name: string } | { error: string } {
+  const [name, ...rest] = model.split("|");
+  const p = PROVIDERS[name!];
+  if (!p || !rest.length) return { error: `openai backend needs <provider>|<model>; providers: ${Object.keys(PROVIDERS).join(", ")}` };
+  const url = process.env[p.urlEnv] ?? p.url;
+  if (!url) return { error: `${p.urlEnv} not set` };
+  return { url: versionedBase(url), key: process.env[p.keyEnv], model: rest.join("|"), name: name! };
+}
 /** Per role, beyond backend and model: maxOutputTokens, the most it may write in one answer (sent as max_tokens);
  *  contextTokens, how much it can read; timeoutMs, how long one call may take. Unset, the backend's defaults below. */
-export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutputTokens?: number; contextTokens?: number; timeoutMs?: number }>;
+export type RoleTable = Record<Role, { backend: Backend; model: string; maxOutputTokens?: number; contextTokens?: number; timeoutMs?: number;
+  /** false: this role wants a fast plain answer (a judge's choice); providers with a reasoning switch turn it off. */
+  think?: boolean }>;
 
 /** What a backend's models can read in one call and how long a call may take, when the table does not say. The
  *  context sizes are those of the models we configure (gpt-6 family 128k, Claude 200k, local MLX models 32k); a choice-only
  *  backend reads a state but writes no text; tests (scripted) are not limited. */
 const BACKEND_DEFAULTS: Record<Backend, { contextTokens: number; timeoutMs: number }> = {
   openrouter: { contextTokens: 128_000, timeoutMs: 120_000 },
+  openai: { contextTokens: 128_000, timeoutMs: 120_000 },
   local_chat: { contextTokens: 32_000, timeoutMs: 300_000 },
   systemone: { contextTokens: 8_000, timeoutMs: 120_000 },
   claude_cli: { contextTokens: 200_000, timeoutMs: 180_000 },
@@ -53,13 +99,28 @@ export const CONFIGS: Record<string, RoleTable> = {
   "B0-luna": all("openrouter", "openai/gpt-6-luna"),
   "B0-mix": { ...all("openrouter", "openai/gpt-6.1-sol"), choice: { backend: "openrouter", model: "openai/gpt-6-luna" } },
   "dev-claude": all("claude_cli", "sonnet"),
+  // YY (an OpenAI-compatible gateway, cheap): the same two models the OpenRouter configs use
+  "yy-luna": all("openai", "yy|gpt-6-luna"),
+  "yy-sol": all("openai", "yy|gpt-6.1-sol"),
+  // the same model through OpenRouter (when YY is down; same provider table, different URL and key)
+  "or-luna": all("openai", "openrouter|openai/gpt-6-luna"),
+  // DeepSeek V4.1 Flash (10-17 release) through DeepSeek's API: a cheap second frontier for the same comparisons
+  "ds-flash": all("openai", "deepseek|deepseek-flash"),
+  // doubao on Volcengine Ark: seed-evolving as the frontier; seed-2.1-lite is the fast model DeskMind Brain's system
+  // one is built on — as a config it is the whole table (measurement), as a judge tier see DESKMIND_JUDGE_FIRST
+  "ark-evolving": all("openai", "volcengine|doubao-seed-evolving"),
+  "ark-lite": all("openai", "volcengine|doubao-seed-2-1-lite-260915"),
+  // the local actor experiment (docs/localization-2026-10-19.md): the bundled Qwen2.5-7B through mlx_lm.server
+  "local-qwen7b": all("openai", "local|mlx-community/Qwen2.5-7B-Instruct-4bit"),
+  "local-qwen30b": all("openai", "local|mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"),
+  "yy-mix": { ...all("openai", "yy|gpt-6.1-sol"), choice: { backend: "openai", model: "yy|gpt-6-luna" }, transform: { backend: "openai", model: "yy|gpt-6-luna", timeoutMs: TRANSFORM_TIMEOUT_MS } },
 };
 
 /** `--role goal=openrouter:openai/gpt-6-luna --role choice=systemone:http://127.0.0.1:18852` on top of a config. */
 export function withOverrides(base: RoleTable, overrides: string[]): RoleTable {
   const t: RoleTable = { ...base };
   for (const o of overrides) {
-    const m = /^(\w+)=(\w+):(.+)$/.exec(o);
+    const m = /^(\w+)=(\w+):(.+)$/s.exec(o);
     if (!m) throw new Error(`bad --role ${o}; expected role=backend:model`);
     const [, role, backend, model] = m;
     if (!(role! in t)) throw new Error(`unknown role ${role}`);
@@ -81,6 +142,10 @@ const PRICES: Record<string, [number, number]> = {
   "openai/gpt-6-sol": [2e-6, 10e-6],
   "anthropic/claude-sonnet-5.5": [2e-6, 10e-6],
   "anthropic/claude-opus-5.5": [4e-6, 20e-6],
+  // the keyed services, by their `<provider>|<model>` names: DeepSeek V4.1 Flash list price (standard hours, 10-2026);
+  // doubao-seed-evolving as third-party price pages list the Ark price (no official USD page found)
+  "deepseek|deepseek-flash": [0.30e-6, 1.20e-6],
+  "volcengine|doubao-seed-evolving": [0.89e-6, 4.45e-6],
 };
 
 export type Outcome = "answered" | "refusal" | "invalid" | "error" | "timeout";
@@ -186,15 +251,17 @@ export class Gateway {
    *  process decoding greedily, so the same prompt gives the same bad JSON again. A cut-off answer would be cut again.
    *  Both attempts are logged; the second says it is a retry. A retry is not counted against the run's model-call
    *  budget (the orchestrator sees one reply). */
-  async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = ""): Promise<Reply<z.infer<S>>> {
-    const first = await this.askOnce(role, system, user, schema, runId, null);
+  /** `signal`: the caller may abort the call (the judge's race: the cloud answer is no longer needed once the local
+   *  tier settled); an aborted call is an error that is never retried. */
+  async ask<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId = "", signal?: AbortSignal): Promise<Reply<z.infer<S>>> {
+    const first = await this.askOnce(role, system, user, schema, runId, null, signal);
     const { backend } = this.table[role];
-    const again = (first.outcome === "timeout" && backend === "claude_cli")
-      || (first.outcome === "invalid" && first.error !== TRUNCATED && (backend === "claude_cli" || backend === "openrouter"));
-    return again ? this.askOnce(role, system, user, schema, runId, first.outcome) : first;
+    const again = !signal?.aborted && ((first.outcome === "timeout" && backend === "claude_cli")
+      || (first.outcome === "invalid" && first.error !== TRUNCATED && (backend === "claude_cli" || backend === "openrouter" || backend === "openai")));
+    return again ? this.askOnce(role, system, user, schema, runId, first.outcome, signal) : first;
   }
 
-  private async askOnce<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId: string, retryOf: Outcome | null): Promise<Reply<z.infer<S>>> {
+  private async askOnce<S extends z.ZodTypeAny>(role: Role, system: string, user: string, schema: S, runId: string, retryOf: Outcome | null, signal?: AbortSignal): Promise<Reply<z.infer<S>>> {
     const { backend, model } = this.table[role];
     const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" });
     const sys = `${system}\n\n只输出一个 JSON 对象，不要别的文字。字段名必须和这个 JSON Schema 完全一致（例如判别字段叫 kind 就写 kind）：\n${JSON.stringify(jsonSchema)}`;
@@ -204,15 +271,19 @@ export class Gateway {
       rep = { ...base, outcome: "error", error: "budget: gateway cost cap reached" };
     } else {
       const t0 = performance.now();
-      const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens;
-      let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens)
+      const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens, think = this.table[role].think;
+      let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens, signal)
+        : backend === "openai" ? await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think, signal)
         : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? (role === "transform" ? LOCAL_TRANSFORM_MAX_TOKENS : LOCAL_MAX_TOKENS))
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
         : backend === "claude_cli" ? this.claudeCli(model, sys, user, timeoutMs)
         : this.scripted(role, sys, user);
-      for (let i = 0; i < 2 && backend === "openrouter" && (partial.outcome === "error" || partial.outcome === "timeout") && !/HTTP 4/.test(partial.error ?? ""); i++) {
-        await new Promise((r) => setTimeout(r, 2000));                 // transient network failure: retry, then report
-        partial = await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens);
+      // a transient failure (network, a 5xx, or a 429 rate limit when several runs share one key) is asked again
+      // with a growing pause; any other 4xx is final
+      const transient = (p: Partial<Reply>) => p.outcome === "timeout" || (p.outcome === "error" && /HTTP 5|HTTP 429|fetch failed|ECONN|socket|network|EAI_AGAIN/i.test(p.error ?? ""));
+      for (let i = 0; i < 4 && (backend === "openrouter" || backend === "openai") && transient(partial) && !signal?.aborted; i++) {
+        await new Promise((r) => setTimeout(r, /HTTP 429/.test(partial.error ?? "") ? 5000 * (i + 1) * (i + 1) : 2000));
+        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens, signal) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think, signal);
       }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;
       rep.latencyMs ||= performance.now() - t0;
@@ -225,8 +296,9 @@ export class Gateway {
           rep.data = undefined;
         }
       }
-      if (!rep.costUsd && PRICES[model]) {
-        const [pi, po] = PRICES[model]!;
+      const priced = PRICES[model] ?? PRICES["openai/" + model.split("|").pop()!];
+      if (!rep.costUsd && priced) {
+        const [pi, po] = priced;
         rep.costUsd = rep.tokensIn * pi + rep.tokensOut * po;
       }
     }
@@ -255,7 +327,7 @@ export class Gateway {
     return { config: this.name, calls: this.calls, spent_usd: Number(this.spentUsd.toFixed(4)), roles };
   }
 
-  private async openrouter(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
+  private async openrouter(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, signal?: AbortSignal): Promise<Partial<Reply>> {
     const key = process.env.OPENROUTER_API_KEY;
     if (!key) return { outcome: "error", error: "OPENROUTER_API_KEY not set" };
     const body = {
@@ -272,13 +344,18 @@ export class Gateway {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}`, "HTTP-Referer": "https://github.com/deskmind-ai", "X-Title": "DeskMind harness" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      if (signal?.aborted) return { outcome: "error", error: msg.slice(0, 300) };   // the caller let go (the judge's race)
       return { outcome: msg.includes("Timeout") || msg.includes("abort") ? "timeout" : "error", error: msg.slice(0, 300) };
     }
-    const raw = await res.text();
+    let raw: string;
+    try { raw = await res.text(); } catch (e) {        // aborted while the body was arriving (the judge's race)
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return { outcome: "error", error: msg.slice(0, 300), latencyMs: performance.now() - t0 };
+    }
     const latencyMs = performance.now() - t0;
     if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
     try {
@@ -296,26 +373,62 @@ export class Gateway {
   }
 
   /** An OpenAI-compatible local server (mlx_lm.server): same shape as OpenRouter, no key, no cost. */
-  private async localChat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens: number): Promise<Partial<Reply>> {
-    const body = { model: localModelName(model), temperature: 0, max_tokens: maxTokens,
+  private localChat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens: number): Promise<Partial<Reply>> {
+    return this.chatCompletions(localUrl(model), undefined, localModelName(model), system, user, jsonSchema, timeoutMs, maxTokens);
+  }
+
+  /** A keyed OpenAI-compatible service (PROVIDERS): the model string names the provider. */
+  private openaiCompat(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, think?: boolean, signal?: AbortSignal): Promise<Partial<Reply>> {
+    const p = providerOf(model);
+    if ("error" in p) return Promise.resolve({ outcome: "error", error: p.error });
+    if (!p.key) return Promise.resolve({ outcome: "error", error: `${PROVIDERS[p.name]!.keyEnv} not set` });
+    return this.chatCompletions(p.url, p.key, p.model, system, user, jsonSchema, timeoutMs, maxTokens, extraBodyFor(p.name, think), signal);
+  }
+
+  /** Models whose service rejects our (non-strict) JSON Schema: asked for a JSON object instead, the schema stays in
+   *  the system prompt and zod still validates the answer (gpt-6.1-sol behind a Responses-API proxy insists on
+   *  strict schemas with every property required, which our optional fields and records are not; DeepSeek's API
+   *  does not offer json_schema at all). */
+  private readonly jsonObjectOnly = new Set<string>();
+  static schemaRejected(error: string): boolean { return /Invalid schema|response_format|json_schema/i.test(error); }
+
+  private async chatCompletions(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}, signal?: AbortSignal): Promise<Partial<Reply>> {
+    const k = `${url}|${model}`;
+    const r = await this.chatCompletionsOnce(url, key, model, system, user, this.jsonObjectOnly.has(k) ? null : jsonSchema, timeoutMs, maxTokens, extra, signal);
+    if (r.outcome === "error" && r.error && Gateway.schemaRejected(r.error) && !this.jsonObjectOnly.has(k)) {
+      this.jsonObjectOnly.add(k);
+      return this.chatCompletionsOnce(url, key, model, system, user, null, timeoutMs, maxTokens, extra, signal);
+    }
+    return r;
+  }
+
+  private async chatCompletionsOnce(url: string, key: string | undefined, model: string, system: string, user: string, jsonSchema: unknown | null, timeoutMs: number, maxTokens?: number, extra: Record<string, unknown> = {}, signal?: AbortSignal): Promise<Partial<Reply>> {
+    const body = { model, temperature: 0, ...extra, ...(maxTokens ? { max_tokens: maxTokens } : {}),
       messages: [{ role: "system", content: system }, { role: "user", content: user }],
-      response_format: { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } };
+      response_format: jsonSchema ? { type: "json_schema", json_schema: { name: "answer", schema: jsonSchema } } : { type: "json_object" } };
     const t0 = performance.now();
     let res: Response;
     try {
-      res = await fetch(localUrl(model).replace(/\/$/, "") + "/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+      res = await fetch(versionedBase(url) + "/chat/completions", { method: "POST", headers: { "Content-Type": "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(body), signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs) });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       return { outcome: msg.includes("Timeout") ? "timeout" : "error", error: msg.slice(0, 300) };
     }
-    const raw = await res.text(), latencyMs = performance.now() - t0;
+    let raw: string;
+    try { raw = await res.text(); } catch (e) {        // aborted while the body was arriving (the judge's race)
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return { outcome: "error", error: msg.slice(0, 300), latencyMs: performance.now() - t0 };
+    }
+    const latencyMs = performance.now() - t0;
     if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
     try {
       const out = JSON.parse(raw);
       const usage = out.usage ?? {};
-      const counts = { tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, latencyMs };
-      if (out.choices[0].finish_reason === "length") return { outcome: "invalid", error: TRUNCATED, ...counts };
-      return { outcome: "answered", data: extractJson(out.choices[0].message.content ?? ""), ...counts };
+      const counts = { tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, costUsd: Number(usage.cost ?? 0), latencyMs };
+      const ch = out.choices[0];
+      if (ch.message?.refusal || ch.finish_reason === "content_filter") return { ...counts, outcome: "refusal", error: String(ch.message?.refusal ?? "content_filter").slice(0, 300) };
+      if (ch.finish_reason === "length") return { outcome: "invalid", error: TRUNCATED, ...counts };
+      return { outcome: "answered", data: extractJson(ch.message.content ?? ""), ...counts };
     } catch (e) {
       return { outcome: "invalid", error: `bad reply: ${e instanceof Error ? e.message : e}: ${raw.slice(0, 300)}`, latencyMs };
     }
@@ -331,7 +444,9 @@ export class Gateway {
     const field = Object.entries(sch.properties ?? {}).find(([, v]) => Array.isArray(v.enum));
     if (!field) return { outcome: "error", error: "systemone backend needs a role whose answer is one enum field" };
     const [name, { enum: options }] = field;
-    const body = { state: user, questions: { [name]: { type: "choice", instructions: { goal: system, question: name }, criteria: options!.map((o) => ({ key: o, description: o })) } } };
+    // criteria is a map (Brain ≥ the app's 0.3 build and pi-ai's typesafe-system-one agree; the list form was refused
+    // on 10-18 with "choice criteria must be a map")
+    const body = { state: user, questions: { [name]: { type: "choice", instructions: { goal: system, question: name }, criteria: Object.fromEntries(options!.map((o) => [o, o])) } } };
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (process.env.DESKMIND_BRAIN_TOKEN) headers.Authorization = `Bearer ${process.env.DESKMIND_BRAIN_TOKEN}`;
     const t0 = performance.now();
@@ -341,7 +456,12 @@ export class Gateway {
     } catch (e) {
       return { outcome: "error", error: (e instanceof Error ? e.message : String(e)).slice(0, 300) };
     }
-    const raw = await res.text(), latencyMs = performance.now() - t0;
+    let raw: string;
+    try { raw = await res.text(); } catch (e) {        // aborted while the body was arriving (the judge's race)
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return { outcome: "error", error: msg.slice(0, 300), latencyMs: performance.now() - t0 };
+    }
+    const latencyMs = performance.now() - t0;
     if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
     try {
       const a = JSON.parse(raw).answers[name];

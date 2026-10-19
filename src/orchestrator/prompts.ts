@@ -33,11 +33,17 @@ const CHECKS_DOC = `可用的确定性检查（由代码执行，expected 里的
 能用这些检查表达的都用 deterministic；semantic 只用于「看起来对不对」这类代码判断不了的要求。
 path 是相对任务目录的路径；用户没说清楚的值不要编造，写进 missing。`;
 
-export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string, decided: { point: string; reading: string }[] = [], notMeant: { point: string; readings: string[]; text: string }[] = []): string {
+/** A skill chosen for the request: the way the user confirmed before, shown as evidence (skills-layer design: what
+ *  the skill settles is not asked; this time's words win over it). */
+export interface SkillEvidence { title: string; applies_when: string; examples: string[] }
+
+export function goalPrompt(raw: string, answers: string[], workspace: Listing, caps: CapView[], scope: string, decided: { point: string; reading: string }[] = [], notMeant: { point: string; readings: string[]; text: string }[] = [], skill: SkillEvidence | null = null): string {
   return [
     "任务：把用户的要求整理成可逐项验收的需求。保留用户的原话；不要替用户决定没说的事。",
     "", `用户原文：${J(raw)}`,
     ...(answers.length ? [`用户后来补充：${J(answers)}`] : []),
+    ...(skill ? ["用户以前确认过的做法（教材，可以当作用户说过的话；教材说清楚了的不要再问；这次原文和教材不一样时以原文为准）：",
+      `- ${skill.title}。适用：${skill.applies_when}`, ...skill.examples.map((e) => `- 例子：${e}`)] : []),
     ...(decided.length ? ["用户已经选定的理解（必须照用；assumptions 里同一处的 reading 原样写用户选的这一项）：", ...decided.map((d) => `- 「${d.point}」：${d.reading}`)] : []),
     ...(notMeant.length ? ["用户的回答说的不是这些理解（按回答重新理解这一处，不要再用它们）：", ...notMeant.map((d) => `- 「${d.point}」：不是 ${d.readings.join(" / ")}；用户回答：${d.text}`)] : []),
     `任务目录（用户选定，相对路径的根；用户说的「这个目录」「当前目录」「下载」等指的就是它）：${scope}`, "目录现在的内容：", J(workspace),

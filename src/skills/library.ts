@@ -6,7 +6,7 @@
  * A skill instantiates into plan nodes (fs.mkdir / fs.move) whose arguments the rules computed; the orchestrator still
  * runs the intent check and every execution guard on them. Files the rules cannot place are handed back to the planner.
  *
- * Revision (openjev docs/design/skill-revision-2026-10-12.md, after Sakana MASS): a skill carries checks of its own
+ * Revision (design notes docs/design/skill-revision-2026-10-12.md, after Sakana MASS): a skill carries checks of its own
  * (expect), every use is recorded, and a use that went wrong but ended right becomes a counterexample. The skill role
  * writes a revised version; code replays both on every example the skill has (teaching, variants, past correct uses,
  * the counterexample) and the new version replaces the old only if it gets the counterexample right and breaks
@@ -20,6 +20,49 @@ import { SkillAnswer, SkillRevision, type SkillExpect, type SkillRule } from "..
 import type { PlanNode } from "../protocol/schemas.js";
 import type { Workspace } from "../registry/workspace.js";
 import { DSL_HELP, SkillError, checkExpect, coversSomething, failed, ofKind, runSkill, type ExpectReport } from "./rules.js";
+import { SkillStore, type Skill } from "./agentskills.js";
+
+/** The misuse signals that are the skill's own doing (recordUse). */
+const OWN_FAULT: ReadonlySet<Signal> = new Set(["uncovered", "misnamed", "touched", "undone"]);
+
+// --- the Agent Skills folder as the Library's storage -------------------------------------------------------------
+const STATUS_OUT: Record<SkillStatus, Skill["meta"]["status"]> = { draft: "draft", validated: "draft", probation: "admitted", active: "admitted", disabled: "retired", rejected: "retired" };
+const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+
+/** A stored skill as a folder: the standard part (name, description, body) for any runtime, the rules and examples
+ *  for ours, and in state.json everything else, so nothing the Library knows is lost. */
+export function toSkill(sk: StoredSkill): Skill {
+  const family = slug(sk.family);
+  const name = `${sk.id.toLowerCase()}${family ? "-" + family : ""}`.slice(0, 64);
+  const exts = (sk.expect?.covers.ext === undefined ? [] : typeof sk.expect.covers.ext === "string" ? [sk.expect.covers.ext] : sk.expect.covers.ext).map((e) => `*.${e.replace(/^\./, "")}`);
+  const examples = sk.examples ?? [];
+  const confirmed = examples.filter((e) => e.confirmed && e.source !== "correction"), counter = examples.filter((e) => e.source === "correction");
+  const rest = examples.filter((e) => !confirmed.includes(e) && !counter.includes(e));
+  const { rules, expect, also, variants, examples: _ex, title, applies_when, family: _f, status, version, ...state } = sk;
+  const body = [
+    `## 用户当时的原话`, examples.find((e) => e.source === "teach")?.files.length ? `（教学时的例子见 examples/confirmed.jsonl）` : "",
+    "", "## 怎么做", `- ${title ?? sk.id}：${applies_when ?? ""}`, "- 具体规则在 rules.json 里由程序执行；例子见 examples/。",
+    "", "## 不适用", "- 用户这次说的做法和上面不同时，以这次为准。",
+  ].join("\n");
+  return {
+    name, description: `${title ?? sk.id}。适用：${applies_when ?? ""}`,
+    meta: { source: "taught", status: STATUS_OUT[status], version: version ?? 1, scope: { apps: [], objects: exts, family: sk.family }, effects: ["create", "move"], taught_on: sk.created.slice(0, 10) },
+    body, rules: rules ? { rules, ...(expect ? { expect } : {}), ...(also ? { also } : {}), ...(variants ? { variants } : {}) } : null,
+    confirmed: confirmed as unknown as Record<string, unknown>[], counter: counter as unknown as Record<string, unknown>[],
+    state: { ...state, status, title, applies_when, order: examples.map((e) => e.id), other_examples: rest },
+  };
+}
+
+export function fromSkill(s: Skill): StoredSkill | null {
+  const st = (s.state ?? {}) as Record<string, unknown> & { order?: string[]; other_examples?: Example[]; status?: SkillStatus };
+  if (!st.id || !st.status) return null;                      // a shipped skill (no Library state) is not the Library's
+  const { order, other_examples, ...rest } = st;
+  const all = [...(s.confirmed as unknown as Example[]), ...(s.counter as unknown as Example[]), ...(other_examples ?? [])];
+  const byId = new Map(all.map((e) => [e.id, e]));
+  const examples = [...(order ?? []).map((id) => byId.get(id)).filter((e): e is Example => !!e), ...all.filter((e) => !(order ?? []).includes(e.id))];
+  const r = (s.rules ?? {}) as { rules?: SkillRule[]; expect?: SkillExpect; also?: SkillExpect[]; variants?: StoredSkill["variants"] };
+  return { ...(rest as unknown as StoredSkill), family: s.meta.scope.family, version: s.meta.version, ...(r.rules ? { rules: r.rules } : {}), ...(r.expect ? { expect: r.expect } : {}), ...(r.also ? { also: r.also } : {}), ...(r.variants ? { variants: r.variants } : {}), examples };
+}
 
 export type SkillStatus = "draft" | "validated" | "probation" | "active" | "disabled" | "rejected";
 
@@ -67,7 +110,7 @@ export interface StoredSkill {
   also?: SkillExpect[];                          // earlier versions' checks a revision kept: every one must hold too
   examples?: Example[];
   admission: Record<string, unknown>;
-  uses?: { ok: boolean; teacher_calls: number; t: string; signals?: Signal[] }[];
+  uses?: { ok: boolean; teacher_calls: number; t: string; signals?: Signal[]; counted?: boolean }[];
   revisions?: { ok: boolean; version: number; change?: string; why?: string; counter: string; counted?: boolean; asked?: boolean; retired?: string[]; dropped?: string[]; t: string }[];
   failed_revisions?: number;                     // in a row, of versions written and lost on the replay; two disable the skill
   notice?: string | null;                        // what the last revision changed, said once with the next result
@@ -165,12 +208,19 @@ export class Library implements SkillLibrary {
   skills: StoredSkill[] = [];
   private planned = new Map<string, Planned>();  // the last instantiation of each skill, for recording its use
 
+  /** A folder of Agent Skills (one folder per skill; skills/agentskills.ts), or the older single JSON file. */
+  private readonly store: SkillStore | null;
+
   constructor(readonly path: string) {
-    if (fs.existsSync(path)) this.skills = JSON.parse(fs.readFileSync(path, "utf-8"));
+    this.store = path.endsWith(".json") ? null : new SkillStore(path);
+    if (this.store) this.skills = this.store.list().map(fromSkill).filter((s): s is StoredSkill => s !== null);
+    else if (fs.existsSync(path)) this.skills = JSON.parse(fs.readFileSync(path, "utf-8"));
   }
 
   save() {
-    fs.writeFileSync(this.path, JSON.stringify(this.skills, null, 1));
+    if (!this.store) { fs.writeFileSync(this.path, JSON.stringify(this.skills, null, 1)); return; }
+    fs.mkdirSync(this.path, { recursive: true });
+    for (const sk of this.skills) this.store.write(toSkill(sk));
   }
 
   usable() {
@@ -180,6 +230,15 @@ export class Library implements SkillLibrary {
   /** Every usable skill is a candidate; the choice role decides (retrieval is trivial at this library size). */
   candidates(_raw: string, _ws: Workspace) {
     return this.usable().map((s) => ({ id: s.id, title: s.title!, applies_when: s.applies_when! }));
+  }
+
+  /** The chosen skill as the goal role sees it: its description and the examples the user confirmed, in words. */
+  evidence(skillId: string): { title: string; applies_when: string; examples: string[] } | null {
+    const s = this.skills.find((x) => x.id === skillId);
+    if (!s?.title) return null;
+    const examples = (s.examples ?? []).filter((e) => e.confirmed).slice(-3)
+      .map((e) => e.files.filter((f) => e.want[f] && e.want[f] !== f).map((f) => `${f} → ${e.want[f]}`).join("；")).filter(Boolean);
+    return { title: s.title, applies_when: s.applies_when ?? "", examples };
   }
 
   /** Where the rules put each file. A file the skill's own checks object to is handed back to the planner, not moved:
@@ -360,13 +419,19 @@ export class Library implements SkillLibrary {
     return rec;
   }
 
+  /** A use that went wrong counts toward disabling only when the signals show the skill's own error (its checks: a
+   *  file of its kind it missed, placed under the wrong name, or another kind moved; the user taking the result
+   *  back). A guard stopping a step, the user declining one or answering differently this time, the goal not met:
+   *  not the skill's fault, so not counted (skills-layer design: 停用按归因来算). A use that ended right is a revision's
+   *  business (revise counts its own failures). Two counted misuses still disable. */
   recordUse(skillId: string, ok: boolean, teacherCalls: number, signals: Signal[] = []) {
     const s = this.skills.find((x) => x.id === skillId);
     if (!s) return;
-    s.uses = [...(s.uses ?? []), { ok, teacher_calls: teacherCalls, t: now(), ...(signals.length ? { signals } : {}) }];
+    const counted = !ok && signals.some((x) => OWN_FAULT.has(x));
+    s.uses = [...(s.uses ?? []), { ok, teacher_calls: teacherCalls, t: now(), ...(signals.length ? { signals } : {}), ...(counted ? { counted } : {}) }];
     const clean = (u: { ok: boolean; signals?: Signal[] }) => u.ok && !u.signals?.length;
     if (s.status === "probation" && s.uses.length >= 2 && s.uses.slice(-2).every(clean)) s.status = "active";
-    if (!ok && s.uses.filter((u) => !u.ok).length >= 2) s.status = "disabled";
+    if (counted && s.uses.filter((u) => u.counted).length >= 2) s.status = "disabled";
     this.save();
   }
 

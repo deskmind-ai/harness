@@ -28,7 +28,7 @@ import * as P from "./prompts.js";
 /** A user's answer: a picked option (index into the options shown) or free text. */
 export type Answer = { option: number } | { text: string };
 
-/** What an option means. The runtime acts on this, never on the option's words (openjev
+/** What an option means. The runtime acts on this, never on the option's words (design notes
  *  docs/design/interaction-cards-2026-10-09.md). */
 export type OptionKind = "approve" | "reading" | "value" | "proposal" | "skip_step" | "delegate" | "undo" | "undo_and_reading" | "other" | "cancel" | "never_ask_this";
 export interface CardOption {
@@ -79,6 +79,9 @@ export function cardUser(u: User): CardUser {
 export interface SkillLibrary {
   candidates(raw: string, ws: Workspace): { id: string; title: string; applies_when: string }[];
   instantiate(skillId: string, ws: Workspace): { nodes: PlanNode[]; unsure: string[]; notice?: string | null };
+  /** What the goal role is told about a chosen skill: the way the user confirmed before, as evidence beside their
+   *  words (skills-layer design §与理解要求的配合). */
+  evidence?(skillId: string): { title: string; applies_when: string; examples: string[] } | null;
 }
 
 export interface GuiApp {
@@ -235,9 +238,12 @@ export class Orchestrator {
       }
       if (ready.length) {
         const boundNow: NodeState[] = [];
+        const planRev = st.revs.plan_rev;
         for (const n of ready) {
           if (await this.doBind(n, "", true)) boundNow.push(n);
-          if ((st.status !== "running" && st.status !== "received") || st.nodes.size === 0) break;
+          // a bind can replace the plan (missing observation → read-only steps first): the rest of this batch belongs
+          // to the old plan and is not bound (10-18: a stale node's node.bound crashed State.apply)
+          if ((st.status !== "running" && st.status !== "received") || st.nodes.size === 0 || st.revs.plan_rev !== planRev) break;
         }
         if (boundNow.length && boundNow.every((n) => st.nodes.has(n.node.id))) await this.intentCheck(boundNow);
         continue;
@@ -273,7 +279,11 @@ export class Orchestrator {
   private async doGoal() {
     const st = this.st;
     const caps = this.registry.list().map((c) => ({ id: c.id, description: c.description }));
-    const rep = await this.askModel("goal", P.goalPrompt(st.raw, st.answersText(), this.ws.listing(), caps, st.scope, this.decided(), st.notMeant), R.GoalAnswer);
+    // the skill is looked up before the request is understood: a way the user confirmed before counts as something
+    // they said, so what it settles is not asked again (10-17: 35 of 36 reuse tasks asked)
+    if (this.opts.skills && st.skillChosen === undefined) await this.chooseSkill();
+    const skill = st.skillChosen ? this.opts.skills?.evidence?.(st.skillChosen) ?? null : null;
+    const rep = await this.askModel("goal", P.goalPrompt(st.raw, st.answersText(), this.ws.listing(), caps, st.scope, this.decided(), st.notMeant, skill), R.GoalAnswer);
     if (rep.outcome !== "answered") return this.modelFailed(rep);
     const g = rep.data!;
     if (g.feasible === "needs_capability_we_lack") return this.cannot(g.infeasible_reason ?? "需要没有注册的能力");
@@ -394,7 +404,7 @@ export class Orchestrator {
     const st = this.st;
     if (this.opts.skills && previous === null && st.get("skill_tried") === 0) {
       st.count("skill_tried");
-      if (await this.trySkill()) return;
+      if (this.trySkill()) return;
     }
     if (previous !== null && st.get("replans") >= this.budget.replans) return this.finish("failed", "budget: replans");
     const caps = this.registry.list().map(describeCapability);
@@ -440,18 +450,27 @@ export class Orchestrator {
     return null;
   }
 
-  private async trySkill(): Promise<boolean> {
+  /** Which skill, if any, this request is for: asked once per run (the choice replays from the log) before the
+   *  goal, so the goal reads the skill as evidence and the plan instantiates it without asking again. */
+  private async chooseSkill() {
     const st = this.st, lib = this.opts.skills!;
     const cands = lib.candidates(st.raw, this.ws);
-    if (!cands.length) return false;
+    if (!cands.length) { this.emit("skill.chosen", { skill: null, candidates: [] }); return; }
     const options = [...cands.map((s) => ({ id: s.id, text: `${s.title}。适用：${s.applies_when}` })), { id: "none", text: "都不适用，另外规划" }];
     const ids = options.map((o) => o.id) as [string, ...string[]];
     const rep = await this.askModel("choice", P.choicePrompt("哪份已有的教材适用于这个任务？", { 用户原文: st.raw, 目录: this.ws.listing() }, options), R.choiceAnswer(ids));
-    if (rep.outcome !== "answered" || rep.data!.choice === "none") return false;
-    const { nodes, unsure, notice } = lib.instantiate(rep.data!.choice, this.ws);
-    if (unsure.length) this.emit("note", { text: `教材 ${rep.data!.choice} 处理不了：${JSON.stringify(unsure)}` });
-    if (!nodes.length) { this.emit("note", { text: `教材 ${rep.data!.choice} 选中但没有产生任何动作` }); return false; }
-    this.emit("plan.accepted", { plan: { nodes, source: "skill", skill: rep.data!.choice, unsure, ...(notice ? { notice } : {}) } });
+    const chosen = rep.outcome === "answered" && rep.data!.choice !== "none" ? rep.data!.choice : null;
+    this.emit("skill.chosen", { skill: chosen, candidates: cands.map((c) => c.id) });
+  }
+
+  /** The chosen skill's executable rules as the plan; files they cannot place go to the planner. */
+  private trySkill(): boolean {
+    const st = this.st, lib = this.opts.skills!, id = st.skillChosen;
+    if (!id) return false;
+    const { nodes, unsure, notice } = lib.instantiate(id, this.ws);
+    if (unsure.length) this.emit("note", { text: `教材 ${id} 处理不了：${JSON.stringify(unsure)}` });
+    if (!nodes.length) { this.emit("note", { text: `教材 ${id} 选中但没有产生任何动作` }); return false; }
+    this.emit("plan.accepted", { plan: { nodes, source: "skill", skill: id, unsure, ...(notice ? { notice } : {}) } });
     return true;
   }
 

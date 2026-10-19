@@ -72,7 +72,7 @@ const madeBy = (ws: Workspace, q: string) => { const made: string[] = []; for (l
 function mkdirBusy(ws: Workspace, r: ExecResult, ours: ReadonlySet<string>): string | null {
   if (!Array.isArray(r.undo?.made)) return "no record of which folders were created";
   const made = r.undo!.made as string[];
-  const busy = made.filter((d) => ws.isDir(d) && fs.readdirSync(ws.abs(d)).some((x) => { const q = d ? `${d}/${x}` : x; return !made.includes(q) && !ours.has(q); }));
+  const busy = made.filter((d) => ws.isDir(d) && ws.members(d).some((x) => { const q = d ? `${d}/${x}` : x; return !made.includes(q) && !ours.has(q); }));
   return busy.length ? `folders not empty: ${busy.join(", ")}` : null;
 }
 

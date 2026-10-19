@@ -1,8 +1,8 @@
 /**
- * Run the B0 evaluation set through the TS runtime. The task file (gold included) stays in openjev and is passed by
+ * Run the B0 evaluation set through the TS runtime. The task file (gold included) stays in the design-notes repository and is passed by
  * path, so both implementations are scored against the same tasks by the same rule.
  *
- *   pnpm eval -- --tasks ../../gxcsoccer/openjev/experiments/harness-b0/evalset/tasks.json --config dev-claude --split dev --groups 1 --limit 2 -v
+ *   pnpm eval -- --tasks <design-notes repo>/experiments/harness-b0/evalset/tasks.json --config dev-claude --split dev --groups 1 --limit 2 -v
  *   OPENROUTER_API_KEY=... pnpm eval -- --tasks <path> --config B0-luna --split dev --max-cost 3
  *   pnpm eval -- --report runs/B0-luna-dev/results.jsonl
  *
@@ -24,6 +24,8 @@ import { EditorSim } from "../gui/sim.js";
 import { Library, movesBetween, useConfirmation, useOutcome, useSignals } from "../skills/library.js";
 import { spawnSync } from "node:child_process";
 import { score, talkOf, type Task } from "./score.js";
+import { runTaskRuntime } from "./engine-runtime.js";
+import { loopModel } from "../runtime/model.js";
 
 const loose = (t: string) => t.replace(/\s+/g, "").toLowerCase();
 
@@ -59,7 +61,7 @@ function simJudge(prompt: string, stats: { calls: number; cached: number; fallba
   return merged[key]!;
 }
 
-class SimUser implements CardUser {
+export class SimUser implements CardUser {
   asked: string[] = [];
   clarifies = 0;                                             // blocking questions (missing, ambiguity; can't-do under policy.cannot "ask")
   authorizes = 0;                                            // blocking confirmations (plan, action, result)
@@ -321,6 +323,8 @@ async function main() {
     role: { type: "string", multiple: true, default: [] },
     repeat: { type: "string", default: "1" },
     policy: { type: "string", multiple: true, default: [] },     // e.g. --policy cannot=report --policy evidence=v1
+    engine: { type: "string", default: "orchestrator" },         // orchestrator (the role loop) or runtime (the frontier loop, engine-runtime.ts)
+    loop: { type: "string" },                                    // --engine runtime: the loop's model as <provider>|<model>; default the config's goal model
   } });
   // `--report a b c` reads all three: a file after the first used to be taken as a stray argument and dropped unseen
   if (a.report?.length) return report([...a.report, ...positionals], a.supersede);
@@ -337,11 +341,14 @@ async function main() {
   tasks = tasks.filter((t) => groups.has(t.group) && t.split === a.split && (!only || only.has(t.id)));
   if (a.limit) tasks = tasks.slice(0, Number(a.limit));
   const policy = parsePolicy(a.policy!);
-  const out = path.resolve("runs", a.out ?? `${a.config}${a.role!.length ? "+" + a.role!.map((r) => r.split("=")[0]).join("+") : ""}${Object.entries(policy).map(([k, v]) => `+${k}-${v}`).join("")}-${a.split}`);
+  if (!["orchestrator", "runtime"].includes(a.engine!)) throw new Error(`--engine ${a.engine}: expected orchestrator or runtime`);
+  const out = path.resolve("runs", a.out ?? `${a.config}${a.engine === "runtime" ? "@runtime" : ""}${a.role!.length ? "+" + a.role!.map((r) => r.split("=")[0]).join("+") : ""}${Object.entries(policy).map(([k, v]) => `+${k}-${v}`).join("")}-${a.split}`);
   fs.mkdirSync(out, { recursive: true });
   const callsLog = fs.openSync(path.join(out, "model_calls.jsonl"), "a");
   const table = a.role!.length ? withOverrides(CONFIGS[a.config!]!, a.role!) : a.config!;
   const gw = new Gateway(table, { log: (r) => fs.writeSync(callsLog, JSON.stringify(r) + "\n"), maxCostUsd: Number(a["max-cost"]) });
+  const roleTable = typeof table === "string" ? CONFIGS[table]! : table;
+  const model = a.engine === "runtime" ? loopModel(a.loop ?? roleTable.goal.model) : null;
   const resPath = path.join(out, "results.jsonl");
   const done = new Set(fs.existsSync(resPath) ? fs.readFileSync(resPath, "utf-8").split("\n").filter(Boolean).map((l) => { const r = JSON.parse(l); return `${r.task}#${r.rep ?? 0}`; }) : []);
   const repeats = Number(a.repeat);
@@ -351,7 +358,7 @@ async function main() {
     for (const t of tasks) {
       if (done.has(`${t.id}#${rep}`)) continue;
       if (a.v) console.log(`\n=== ${t.id} (${t.split}, rep ${rep}): ${t.raw}`);
-      const r = { ...(await runTask(t, gw, out, a.v!, library, rep, policy)), rep };
+      const r = { ...(model ? await runTaskRuntime(t, gw, model, capsFor(t), new SimUser(t), out, a.v!, rep) : await runTask(t, gw, out, a.v!, library, rep, policy)), rep };
       fs.appendFileSync(resPath, JSON.stringify(r) + "\n");
       console.log(`${r.correct ? "✓" : "✗"} ${t.id}#${rep} ${r.status} (${(r.reason ?? "").slice(0, 60)}) calls=${r.model_calls} $${r.cost_usd.toFixed(4)} ${r.seconds}s ${r.correct ? "" : r.why.slice(0, 80)}`);
       if (gw.spentUsd >= Number(a["max-cost"])) { console.log("cost cap reached, stopping"); break outer; }

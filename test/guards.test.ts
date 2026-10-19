@@ -1,6 +1,6 @@
 /**
  * The protections of the execution path, driven by a scripted (adversarial) model against real files in a temp dir.
- * Port of openjev experiments/protocol-demo-2026-10-07/test_guards.py onto the 2.0 slice.
+ * Port of design notes experiments/protocol-demo-2026-10-07/test_guards.py onto the 2.0 slice.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";

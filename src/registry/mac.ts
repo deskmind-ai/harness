@@ -49,10 +49,23 @@ function works(bin: string): boolean {
   return false;
 }
 
+/** A helper built ahead of time (the app ships one: `DESKMIND_MACTOOLS=<path>`): used as it is, never compiled. A
+ *  path that is set but does not answer is reported, not silently replaced by a build on the user's machine. */
+function prebuilt(): string | null {
+  const p = process.env.DESKMIND_MACTOOLS;
+  if (!p) return null;
+  if (!fs.existsSync(p)) { state = { unavailable: `DESKMIND_MACTOOLS points at ${p}, which does not exist` }; return null; }
+  const r = run(p, ["ping", "-"], { timeoutMs: 10_000 });
+  if (r.ok && r.stdout.toString().includes('"ok"')) { state = { ready: p }; return p; }
+  state = { unavailable: `DESKMIND_MACTOOLS ${p} does not answer ping: ${r.stderr.slice(0, 120)}` };
+  return null;
+}
+
 /** The helper, if it is ready now. Never builds and never waits: see prepareHelper. */
 export function helperBin(): string | null {
   if (state && "ready" in state) return state.ready;
   if (state) return null;
+  if (process.env.DESKMIND_MACTOOLS) return prebuilt();
   const bin = binPath();
   if (IS_MAC && bin && fs.existsSync(bin) && works(bin)) { state = { ready: bin }; return bin; }
   return null;
@@ -74,6 +87,7 @@ export function prepareHelper(): Promise<void> {
     if (helperBin()) return Promise.resolve();
     if (state && "building" in state) return state.building;
     if (state && "unavailable" in state) return Promise.resolve();
+    if (process.env.DESKMIND_MACTOOLS) return Promise.resolve();       // prebuilt() has said why it is unavailable
     if (!IS_MAC) { fail("needs macOS"); return Promise.resolve(); }
     const bin = binPath();
     if (!bin) { fail(`the helper's source is missing (${HELPER.source})`); return Promise.resolve(); }

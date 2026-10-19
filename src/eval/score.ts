@@ -1,6 +1,6 @@
 /**
  * Independent scoring: the gold trees and the allowed paths from the task file, never the orchestrator's verdict.
- * Port of openjev experiments/harness-b0/evalset/score.py, extended for evalset v2 (openjev experiments/evalset-v2):
+ * Port of design notes experiments/harness-b0/evalset/score.py, extended for evalset v2 (design notes experiments/evalset-v2):
  *  - gold.outcomes: every final tree that counts as correct (the first match is reported);
  *  - gold.asked_ok: stopping to ask the user, with nothing changed, is also correct;
  *  - task.must_ask: nothing in the directory settles the ambiguity, so writing before any question is a wrong action;
@@ -33,7 +33,9 @@ export interface Task {
 }
 export interface Summary { status: string; reason?: string | null; counters: Record<string, number>; ops: Record<string, string> }
 /** What the user saw, from the run: questions and confirmations, and whether any came before the first write. */
-export interface Talk { clarify: number; authorize: number; askedBeforeFirstWrite: boolean; wrote: boolean; clarified?: boolean; declinedPlan?: boolean; cancelled?: boolean }
+/** plans: plan cards shown. The owner's rule (10-18, D20): on a task that needs no interaction, one plan card is the
+ *  price of touching the user's things and is not counted as unnecessary. */
+export interface Talk { clarify: number; authorize: number; askedBeforeFirstWrite: boolean; wrote: boolean; clarified?: boolean; declinedPlan?: boolean; cancelled?: boolean; plans?: number }
 
 type Tree = Record<string, string | null>;
 const norm = (t: Tree): Tree => Object.fromEntries(Object.entries(t).filter(([k]) => !k.startsWith(".deskmind-trash")).map(([k, v]) => [k, v === null ? null : v.replace(/\n+$/, "")]));
@@ -174,7 +176,7 @@ export function score(task: Task, start: Tree, end: Tree, summ: Summary, guiLog:
     false_success: succeeded && (gold.lack ? !lackDone : gold.expect === "succeeded" ? outcome === null : diffOf(e, norm(gold.tree)).length > 0),
     gap: lack === "gap", lack_outcome: lack,
     unconfirmed_write: unconfirmed, errored, changed: ours, why, outcome, guessed, interruptions,
-    unnecessary: task.interaction === "none" ? interruptions : 0, declined_plan: outcome === "declined_plan",
+    unnecessary: task.interaction === "none" ? Math.max(0, interruptions - Math.min(1, talk?.plans ?? 0)) : 0, declined_plan: outcome === "declined_plan",
   };
 }
 
@@ -189,6 +191,7 @@ export function talkOf(events: readonly Record<string, any>[], user: { clarifies
   const last = replies.at(-1);
   const declinedPlan = last?.body?.kind === "authorize" && last?.body?.purpose === "plan" && last?.body?.approved === false && !["cancel", "skip_step"].includes(last?.body?.picked);
   const cancelled = last?.body?.picked === "cancel";
-  return { clarify: user.clarifies, authorize: user.authorizes, wrote: firstWrite >= 0, askedBeforeFirstWrite: firstAsk >= 0 && (firstWrite < 0 || firstAsk < firstWrite),
+  const plans = events.filter((e) => e.kind === "interaction.request" && e.body?.purpose === "plan").length;
+  return { clarify: user.clarifies, authorize: user.authorizes, wrote: firstWrite >= 0, askedBeforeFirstWrite: firstAsk >= 0 && (firstWrite < 0 || firstAsk < firstWrite), plans,
     clarified: replies.at(-1)?.body?.kind === "clarify", declinedPlan, cancelled };       // what the run stopped on: the last exchange
 }
