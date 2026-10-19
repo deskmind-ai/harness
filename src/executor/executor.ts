@@ -77,7 +77,7 @@ export class Executor {
   /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
   private planAccepted: PlanProposal | null = null;
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
-  private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
+  private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; madeParents: string[]; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
   /** Paths the task has seen listed in a folder (fs.list): known to be there, though not read. */
   private listed = new Set<string>();
   /** The window each open_window really made (by receipt seq): what its undo closes. */
@@ -570,6 +570,11 @@ export class Executor {
     const undo_prep = cap.prepareUndo?.(ws, a.args);
     const versions_before: Record<string, string> = {};
     for (const p of [...fp.reads, ...fp.writes]) versions_before[p] = ws.version(p);
+    // the folders on the way to a written path that are not there yet: the step makes them (mkdir -p, a save into a
+    // new folder) and its undo takes them away, though they are not among its writes — undo's paper needs them
+    // (review of #16: parent/child made by "mkdir parent/child/grandchild"). Kept for undo only, not journaled: a
+    // restart compares the journal's versions with the disk, and a folder's version moves with what is in it
+    const madeParents = [...new Set(fp.writes.flatMap((p) => { const out: string[] = []; for (let a = parentOf(p); a; a = parentOf(a)) if (!ws.exists(a)) out.push(a); return out; }))];
     if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {} });
     let r: ReturnType<Capability["execute"]>;
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
@@ -577,7 +582,7 @@ export class Executor {
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && cap.effect !== "observe") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {} });
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
-    if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, writes: fp.writes, versions_before, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
+    if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, writes: fp.writes, versions_before, madeParents, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));
     for (const p of fp.writes) {
       const v = ws.version(p);
@@ -671,7 +676,7 @@ export class Executor {
       const moved = f.writes.find((p) => left(p) !== undefined && left(p) !== paper!.version(p));
       const why = moved !== undefined ? `changed since the action: ${moved}` : f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
       if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
-      paper!.takeBack(f.writes, before, left);
+      paper!.takeBack(f.writes, before, left, f.madeParents);
     }
     let undone = 0;
     for (const step of plan.steps) {
@@ -733,15 +738,24 @@ function reach(ws: Workspace, paths: string[]): string[] {
 
 /** What a send in this window would send, for the card and the consent. `fields`: every element that holds content —
  *  a value (typed, picked, or only shown) or, with nothing to do on it, a text of its own (a confirmation page's
- *  "Recipient: Alice" may be only a label); `shown`: every line of the window's text those do not already carry. The
- *  card shows both, whole. `bound` is what the consent binds: those, and every element as it is (role, label, value),
- *  so a send whose window changed in any way since the card is asked again, text or no text. Review of #16, four
- *  rounds of "Alice approved, Bob sent": a typed field, a pop-up, a read-only value, a label. */
+ *  "Recipient: Alice" may be only a label) — and what is selected (the recipient's row); `shown`: every line of the
+ *  window's text those do not already carry. The card shows both, whole, under the window's title. `bound` is what
+ *  the consent binds: the whole observation as it is — the title, the dialog, the text, and every element's role,
+ *  label, value, focus, state and options — so a send whose window changed in any way since the card is asked
+ *  again. Not a list of which parts count as "content": that list was short of one part in each of five rounds of
+ *  "Alice approved, Bob sent" (a typed field, a pop-up, a read-only value, a label, the title or a selection). */
 export function outgoing(obs: Observation | undefined): { fields: string[]; shown: string[]; bound: unknown } {
   const els = obs?.elements ?? [];
-  const fields = els.filter((e) => e.value || (!e.actions.length && e.label)).map((e) => (e.value ? `${e.label}：${e.value}` : e.label));
+  const fields = [
+    ...els.filter((e) => e.value || (!e.actions.length && e.label)).map((e) => (e.value ? `${e.label}：${e.value}` : e.label)),
+    ...els.filter((e) => e.focused && !e.value && e.actions.length && !e.sends).map((e) => `✓ ${e.label}`),
+  ];
   const shown = (obs?.text ?? "").split("\n").map((l) => l.trim()).filter((l) => l && !fields.some((f) => f.includes(l)));
-  return { fields, shown, bound: { fields, shown, elements: els.map((e) => [e.role, e.label, e.value ?? null]) } };
+  const bound = obs ? {
+    window: { app: obs.window.app, title: obs.window.title }, modal: obs.modal, text: obs.text ?? "",
+    elements: els.map((e) => ({ role: e.role, label: e.label, value: e.value ?? null, focused: !!e.focused, enabled: e.enabled !== false, options: e.options ?? null, in_modal: !!e.in_modal, sends: !!e.sends })),
+  } : null;
+  return { fields, shown, bound };
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */

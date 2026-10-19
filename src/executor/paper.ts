@@ -41,8 +41,8 @@ export class PaperFolder {
 
   /** Take one step back on paper: each path it wrote returns to its version before; a folder it renamed takes
    *  everything under it back along (draft/ → final/: final/note.txt is draft/note.txt again), and a folder it made
-   *  goes with everything still under it. */
-  takeBack(writes: string[], before: (p: string) => string, left: (p: string) => string | undefined) {
+   *  goes with everything still under it — the ones it made on the way to a written path too (`madeParents`). */
+  takeBack(writes: string[], before: (p: string) => string, left: (p: string) => string | undefined, madeParents: string[] = []) {
     const src = writes.find((p) => before(p).startsWith("dir:") && left(p) === ABSENT);
     const dst = writes.find((p) => before(p) === ABSENT && left(p)?.startsWith("dir:"));
     if (src && dst) this.relocate(dst, src);
@@ -51,6 +51,7 @@ export class PaperFolder {
       const b = before(p);
       if (b === ABSENT) { delete this.e[p]; this.other.delete(p); } else this.e[p] = b.startsWith("dir:") ? "dir" : b;
     }
+    for (const d of madeParents) { this.drop(d); delete this.e[d]; }
   }
 
   private inside(d: string, x: string) { return x.startsWith(d + "/"); }
