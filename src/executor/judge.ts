@@ -24,7 +24,7 @@ export interface JudgeAnswer { choice: string; by: string; confidence?: number; 
  *  the evidence questions share a prefix), kept across tasks when a path is given: a tier that never settles a kind
  *  is not asked it any more, except for an occasional probe, so its latency is not paid for nothing. */
 export class TierStats {
-  private readonly data: Record<string, Record<string, { asked: number; settled: number; compared?: number; agreed?: number }>> = {};
+  private readonly data: Record<string, Record<string, { asked: number; settled: number; compared?: number; agreed?: number; turns?: number }>> = {};
   constructor(private readonly path?: string) {
     if (path) { try { Object.assign(this.data, JSON.parse(readFileSync(path, "utf-8"))); } catch { /* fresh */ } }
   }
@@ -37,6 +37,10 @@ export class TierStats {
   }
   private save() { if (this.path) { try { mkdirSync(dirname(this.path), { recursive: true }); writeFileSync(this.path, JSON.stringify(this.data)); } catch { /* best effort */ } } }
   private at(tier: string, kind: string) { const t = (this.data[tier] ??= {}); return (t[kind] ??= { asked: 0, settled: 0 }); }
+  /** One routing decision for this tier on this kind: counts the turn, whether the tier is then asked or skipped, and
+   *  decides. The probe cycle runs on turns — `asked` stops growing once a kind is skipped, so a cycle on it froze and
+   *  a skipped kind was never probed again (deskmind#86 review). Called once per tier per question. */
+  route(tier: string, kind: string): boolean { const k = this.at(tier, kind); k.turns = (k.turns ?? k.asked) + 1; const s = this.skip(tier, kind); this.save(); return s; }
   note(tier: string, kind: string, settled: boolean) { const k = this.at(tier, kind); k.asked += 1; if (settled) k.settled += 1; this.save(); }
   /** A shadow comparison: did the slow tier agree with what the fast tier settled? */
   noteAgreement(tier: string, kind: string, agree: boolean) { const k = this.at(tier, kind); k.compared = (k.compared ?? 0) + 1; k.agreed = (k.agreed ?? 0) + (agree ? 1 : 0); this.save(); }
@@ -47,7 +51,8 @@ export class TierStats {
   skip(tier: string, kind: string, min = 8, floor = 0.2, probeEvery = 20, minCompared = 10, agreeFloor = 0.9): boolean {
     const k = this.data[tier]?.[kind];
     if (!k) return false;
-    if (k.asked > 0 && k.asked % probeEvery === 0) return false;
+    const turns = k.turns ?? k.asked;
+    if (turns > 0 && turns % probeEvery === 0) return false;
     if (k.asked >= min && k.settled / k.asked < floor) return true;
     if ((k.compared ?? 0) >= minCompared && (k.agreed ?? 0) / k.compared! < agreeFloor) return true;
     return false;
@@ -81,14 +86,18 @@ export class Judge {
     const prompt = P.choicePrompt(question, context, options);
     const sample = (top: string | null) => { if (this.opts.samples && lower && top) this.opts.onEvent?.("judge.sample", { question_kind: kind, prompt, options, lower, top }); };
     const topTier = this.tiers[this.tiers.length - 1]!;
-    const lowerAsked = this.tiers.slice(0, -1).some((t) => !this.opts.stats?.skip(t.name, kind));
+    const skipped = new Set(this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)));
+    const lowerAsked = this.tiers.length - 1 > skipped.size;
+    // shadow is drawn before the race: a sampled question keeps the raced top answer for the comparison instead of
+    // abandoning it (with both on, aborting first left the agreement routing with no samples — deskmind#86 review)
+    const shadowNow = this.opts.shadow === true || (typeof this.opts.shadow === "number" && Math.random() < this.opts.shadow);
     // the race: the top tier starts now, alongside the lower tiers; abortable
     type Answer = Reply<z.infer<ReturnType<typeof R.choiceAnswer>>>;
     const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
     if (raced) raced.promise = topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids), "", raced.controller.signal);
     for (const tier of this.tiers) {
       const final = tier === topTier;
-      if (!final && this.opts.stats?.skip(tier.name, kind)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
+      if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
       const rep = final && raced?.promise ? await raced.promise : await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids));
       if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
@@ -101,14 +110,12 @@ export class Judge {
       // "no" blocked right actions in the 10-18 probe), and "not enough evidence" is never final below the top
       const canSettle = last.choice === options[0]?.id && confidence !== undefined && confidence >= (tier.floor ?? 0);
       this.opts.stats?.note(tier.name, kind, canSettle);
-      if (canSettle) { settled = true; settledBy = tier; if (raced) { raced.promise?.catch(() => undefined); raced.controller.abort(); this.opts.onEvent?.("judge.raced", { won: tier.name }); } break; }
+      if (canSettle) { settled = true; settledBy = tier; if (raced && !shadowNow) { raced.promise?.catch(() => undefined); raced.controller.abort(); this.opts.onEvent?.("judge.raced", { won: tier.name }); } break; }
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
-    const shadowNow = !raced && (this.opts.shadow === true || (typeof this.opts.shadow === "number" && Math.random() < this.opts.shadow));
     if (settled && settledBy && shadowNow) {
-      const top = this.tiers[this.tiers.length - 1]!;
-      const rep = await top.gateway.ask(role ?? top.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
+      const rep = raced?.promise ? await raced.promise : await topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids));
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
       if (agree !== null) this.opts.stats?.noteAgreement(settledBy.name, kind, agree);
       if (rep.outcome === "answered") sample(rep.data!.choice);

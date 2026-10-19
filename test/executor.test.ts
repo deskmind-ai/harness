@@ -408,7 +408,7 @@ describe("judge: adaptive routing and shadow", () => {
     const a = await judge.choose("任务做成了没有？", {}, opts);
     expect(a?.by).toBe("low");
     expect(events.find((e) => e.k === "judge.shadow")).toMatchObject({ tier: "low", choice: "matches", top: "matches", agree: true });
-    expect(stats.snapshot().low!["程序即将执行这个动作？"]).toEqual({ asked: 8, settled: 0 });
+    expect(stats.snapshot().low!["程序即将执行这个动作？"]).toMatchObject({ asked: 8, settled: 0, turns: 9 });
     // agreement routing: a kind the slow tier keeps disagreeing on (measured by shadow) is taken away from the fast tier
     const stats2 = new TierStats();
     const low2 = new Gateway(table), top2 = new Gateway(table);
@@ -447,6 +447,55 @@ describe("judge: adaptive routing and shadow", () => {
     expect(samples[0]).toMatchObject({ lower: { choice: "mismatch", by: "low" }, top: "matches" });
     expect(samples[1]).toMatchObject({ lower: { choice: "matches", by: "low" }, top: "mismatch" });
     expect(typeof samples[0]!.prompt).toBe("string");
+  });
+
+  it("a skipped kind is still probed on schedule: the cycle counts skipped turns, not only asked ones (deskmind#86 review)", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge, TierStats } = await import("../src/executor/judge.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const low = new Gateway(table), top = new Gateway(table);
+    const opts = [{ id: "matches", text: "yes" }, { id: "mismatch", text: "no" }];
+    const judge = new Judge([{ name: "low", gateway: low, floor: 0.9 }, { name: "top", gateway: top }], { stats: new TierStats(), budget: 1000 });
+    low.script = Array(100).fill(() => ({ choice: "mismatch", scores: { mismatch: 1 } }));
+    top.script = Array(100).fill(() => ({ choice: "matches" }));
+    for (let i = 0; i < 48; i++) await judge.choose("程序即将执行这个动作？", { i }, opts);
+    expect(100 - low.script.length).toBe(10);                                                  // 8 to learn, probes at turns 20 and 40
+  });
+
+  it("race + shadow: a sampled question keeps the raced top answer for the comparison instead of abandoning it", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { Judge, TierStats } = await import("../src/executor/judge.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const low = new Gateway(table), top = new Gateway(table);
+    const opts = [{ id: "matches", text: "yes" }, { id: "mismatch", text: "no" }];
+    const ev: Record<string, unknown>[] = [];
+    const stats = new TierStats();
+    const judge = new Judge([{ name: "low", gateway: low, floor: 0.9 }, { name: "top", gateway: top }], { stats, race: true, shadow: true, budget: 1000, onEvent: (k, b) => ev.push({ k, ...b }) });
+    low.script = Array(20).fill(() => ({ choice: "matches", scores: { matches: 0.99 } }));
+    top.script = Array(20).fill(() => ({ choice: "matches" }));
+    for (let i = 0; i < 20; i++) expect((await judge.choose("q", { i }, opts))?.by).toBe("low");
+    expect(top.script.length).toBe(0);                                                         // one top call each, no second one
+    expect(ev.filter((e) => e.k === "judge.shadow").length).toBe(20);
+    expect(ev.some((e) => e.k === "judge.raced")).toBe(false);
+    expect(stats.snapshot().low!.q).toMatchObject({ compared: 20, agreed: 20 });
+  });
+
+  it("an OpenRouter call is cancelled when its caller aborts (the judge's race)", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "openrouter", model: "x/y" }])) as any;
+    const prevKey = process.env.OPENROUTER_API_KEY, prevFetch = globalThis.fetch;
+    process.env.OPENROUTER_API_KEY = "test";
+    let seen: AbortSignal | undefined;
+    globalThis.fetch = ((_u: unknown, init?: RequestInit) => { seen = init?.signal ?? undefined; return new Promise((_r, reject) => seen!.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")))); }) as typeof fetch;
+    try {
+      const { z } = await import("zod");
+      const ctl = new AbortController();
+      const p = new Gateway(table).ask("intent", "s", "u", z.object({ choice: z.string() }), "", ctl.signal);
+      ctl.abort();
+      const rep = await p;
+      expect(seen?.aborted).toBe(true);
+      expect(rep.outcome).toBe("error");                                                      // not retried as a timeout
+    } finally { globalThis.fetch = prevFetch; if (prevKey === undefined) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prevKey; }
   });
 });
 

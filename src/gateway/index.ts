@@ -272,7 +272,7 @@ export class Gateway {
     } else {
       const t0 = performance.now();
       const timeoutMs = this.timeoutFor(role), maxTokens = this.table[role].maxOutputTokens, think = this.table[role].think;
-      let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens)
+      let partial: Partial<Reply> = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens, signal)
         : backend === "openai" ? await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think, signal)
         : backend === "local_chat" ? await this.localChat(model, sys, user, jsonSchema, timeoutMs, maxTokens ?? (role === "transform" ? LOCAL_TRANSFORM_MAX_TOKENS : LOCAL_MAX_TOKENS))
         : backend === "systemone" ? await this.systemone(model, system, user, jsonSchema, timeoutMs)
@@ -283,7 +283,7 @@ export class Gateway {
       const transient = (p: Partial<Reply>) => p.outcome === "timeout" || (p.outcome === "error" && /HTTP 5|HTTP 429|fetch failed|ECONN|socket|network|EAI_AGAIN/i.test(p.error ?? ""));
       for (let i = 0; i < 4 && (backend === "openrouter" || backend === "openai") && transient(partial) && !signal?.aborted; i++) {
         await new Promise((r) => setTimeout(r, /HTTP 429/.test(partial.error ?? "") ? 5000 * (i + 1) * (i + 1) : 2000));
-        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think, signal);
+        partial = backend === "openrouter" ? await this.openrouter(model, sys, user, jsonSchema, timeoutMs, maxTokens, signal) : await this.openaiCompat(model, sys, user, jsonSchema, timeoutMs, maxTokens, think, signal);
       }
       rep = { ...base, outcome: "error", ...partial, role, model } as Reply<z.infer<S>>;
       rep.latencyMs ||= performance.now() - t0;
@@ -327,7 +327,7 @@ export class Gateway {
     return { config: this.name, calls: this.calls, spent_usd: Number(this.spentUsd.toFixed(4)), roles };
   }
 
-  private async openrouter(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number): Promise<Partial<Reply>> {
+  private async openrouter(model: string, system: string, user: string, jsonSchema: unknown, timeoutMs: number, maxTokens?: number, signal?: AbortSignal): Promise<Partial<Reply>> {
     const key = process.env.OPENROUTER_API_KEY;
     if (!key) return { outcome: "error", error: "OPENROUTER_API_KEY not set" };
     const body = {
@@ -344,13 +344,18 @@ export class Gateway {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}`, "HTTP-Referer": "https://github.com/deskmind-ai", "X-Title": "DeskMind harness" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
       });
     } catch (e) {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      if (signal?.aborted) return { outcome: "error", error: msg.slice(0, 300) };   // the caller let go (the judge's race)
       return { outcome: msg.includes("Timeout") || msg.includes("abort") ? "timeout" : "error", error: msg.slice(0, 300) };
     }
-    const raw = await res.text();
+    let raw: string;
+    try { raw = await res.text(); } catch (e) {        // aborted while the body was arriving (the judge's race)
+      const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      return { outcome: "error", error: msg.slice(0, 300), latencyMs: performance.now() - t0 };
+    }
     const latencyMs = performance.now() - t0;
     if (!res.ok) return { outcome: "error", error: `HTTP ${res.status}: ${raw.slice(0, 300)}`, latencyMs };
     try {
