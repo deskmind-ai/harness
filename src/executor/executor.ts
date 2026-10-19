@@ -562,6 +562,11 @@ export class Executor {
       const judgedOn: Record<string, string> = {};
       for (const p of new Set([...fp.reads, ...reach(ws, fp.writes)])) if (!ws.isDir(p)) judgedOn[p] = ws.version(p);
       const judged = await this.judgeIntent(a, consequence, object, evidence, text);
+      // the screen first: locked meanwhile, the task stops, a file action as much as a window one. It is the last
+      // wait: from the versions read below to the write there is none, or another program's edit made during it
+      // would be overwritten unchecked (review of #16: the lock look, put after the checks, opened just that gap)
+      const screen = await this.driver.snapshot();
+      if (screen.locked) return { ...base, status: "environment", why: "the screen is locked", epoch: screen.epoch };
       // the judge answers over the network: a file the user changed meanwhile is not the one it judged, and writing
       // now would overwrite their edit (review of #16) — read the versions again, as at the top
       ws.invalidate();
@@ -577,9 +582,6 @@ export class Executor {
       let still: string | null;
       try { still = cap.preconditions(ws, a.args); } catch (e) { still = e instanceof Error ? e.message : String(e); }
       if (still) return { ...base, status: "stale", why: `changed while this step was being checked: ${still}. Look again and decide anew.` };
-      // and the screen: locked meanwhile, the task stops, a file action as much as a window one (review of #16)
-      const screen = await this.driver.snapshot();
-      if (screen.locked) return { ...base, status: "environment", why: "the screen is locked", epoch: screen.epoch };
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {

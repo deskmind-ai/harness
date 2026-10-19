@@ -121,8 +121,11 @@ export interface PerformResult {
    *  not one: a sync client editing it meanwhile looks the same (review of #16). `sha256` (hex, of the file's bytes)
    *  is what was written: the executor credits a file only while it still holds exactly that — a sync client that
    *  wrote the same file again before the action returned is not the task (review of #16, tenth round) — and a bare
-   *  path, or a digest that no longer matches, leaves the file unconfirmed. `[]` says nothing was written; no field,
-   *  that the driver does not know. */
+   *  path, or a digest that no longer matches, leaves the file unconfirmed. The digest has to come from what was
+   *  written itself (the bytes the driver wrote, the document's content as the app holds it), never from reading the
+   *  file back: read after another program wrote it, it matches that program's content, which would then be credited
+   *  (eleventh round). No such source, no digest — the file stays unconfirmed. `[]` says nothing was written; no
+   *  field, that the driver does not know. */
   files?: (string | { path: string; sha256: string })[];
   /** The file the window points to after the action (AXDocument, or the app's scripting), when the app says. What it
    *  shows, not what the action did: never credits a file. */
