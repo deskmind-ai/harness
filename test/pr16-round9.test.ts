@@ -7,6 +7,8 @@ import { SimComputer } from '../src/executor/sim.js';
 import { Workspace, build } from '../src/registry/workspace.js';
 import { fileRegistry } from '../src/registry/fs.js';
 import type { Driver } from '../src/executor/types.js';
+import { createHash } from 'node:crypto';
+const sha=(t:string)=>createHash('sha256').update(t).digest('hex');
 
 describe('PR16 ninth review probes',()=>{
   it('invalidates send consent when a webview switches the destination URL',async()=>{
@@ -33,7 +35,7 @@ describe('PR16 ninth review probes',()=>{
       epoch++;
       fs.writeFileSync(path.join(root,'hello.txt'),'你好 DeskMind');              // the app's save, which the driver vouches for
       fs.writeFileSync(path.join(root,'synced.txt'),'from a sync client');      // at the same moment, not in the receipt
-      return {status:'ok',window:'w',files:[path.join(fs.realpathSync(root),'hello.txt')],document:path.join(root,'hello.txt')};
+      return {status:'ok',window:'w',files:[{path:path.join(fs.realpathSync(root),'hello.txt'),sha256:sha('你好 DeskMind')}],document:path.join(root,'hello.txt')};
     }};
     const ex=new Executor(driver,{task:'t',publicKey:signer.publicKey,files:{workspace:ws,registry:fileRegistry()}});
     await ex.begin();await ex.plan({steps:[]});const obs=await ex.observe('w');
@@ -45,7 +47,7 @@ describe('PR16 ninth review probes',()=>{
     const real=fs.mkdtempSync('/private/tmp/pr16-round9-real-'),linked=real+'-link';fs.symlinkSync(real,linked);
     const ws=new Workspace(linked),signer=ConsentSigner.fresh();let epoch=1;const w={id:'w',app:'TextEdit',title:'hello.txt'};
     const driver:Driver={snapshot:()=>({epoch,locked:false,front_app:w.app,windows:[w]}),observe:()=>({epoch,window:w,modal:null,elements:[{id:'save',role:'menuItem',label:'Save',actions:['click']}]}),perform:()=>{
-      epoch++;fs.writeFileSync(path.join(real,'hello.txt'),'你好 DeskMind');return {status:'ok',window:'w',files:[path.join(real,'hello.txt')]};
+      epoch++;fs.writeFileSync(path.join(real,'hello.txt'),'你好 DeskMind');return {status:'ok',window:'w',files:[{path:path.join(real,'hello.txt'),sha256:sha('你好 DeskMind')}]};
     }};
     const ex=new Executor(driver,{task:'t',publicKey:signer.publicKey,files:{workspace:ws,registry:fileRegistry()}});
     await ex.begin();await ex.plan({steps:[]});const obs=await ex.observe('w');

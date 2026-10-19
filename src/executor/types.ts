@@ -118,10 +118,12 @@ export interface PerformResult {
   /** The files this action wrote, as far as the driver can vouch for it: relative to the task folder, or absolute. Only
    *  writes it is sure of — one it made itself (a save-as it carried out), or the app's own save, seen as the window's
    *  document going from unsaved to saved during the action. A document that merely changed while the action ran is
-   *  not one: a sync client editing it meanwhile looks the same (review of #16). The receipt the executor credits
-   *  files by (only those whose version did change); `[]` says nothing was written, no field that the driver does not
-   *  know. */
-  files?: string[];
+   *  not one: a sync client editing it meanwhile looks the same (review of #16). `sha256` (hex, of the file's bytes)
+   *  is what was written: the executor credits a file only while it still holds exactly that — a sync client that
+   *  wrote the same file again before the action returned is not the task (review of #16, tenth round) — and a bare
+   *  path, or a digest that no longer matches, leaves the file unconfirmed. `[]` says nothing was written; no field,
+   *  that the driver does not know. */
+  files?: (string | { path: string; sha256: string })[];
   /** The file the window points to after the action (AXDocument, or the app's scripting), when the app says. What it
    *  shows, not what the action did: never credits a file. */
   document?: string;

@@ -19,6 +19,7 @@ import { parentOf } from "../registry/spec.js";
 import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
@@ -188,15 +189,20 @@ export class Executor {
    *  unconfirmed, protected like the user's (a write on it needs a read, discarding it needs consent), and shown to the
    *  verdict as such. A credited file is seen, the task's content, and when new the task's object. Returns the
    *  credited paths (files only). */
-  private creditFiles(changes: { path: string; was: string; now: string }[], receipt: string[] | undefined): string[] {
+  private creditFiles(changes: { path: string; was: string; now: string }[], receipt: PerformResult["files"]): string[] {
     if (!changes.length) return [];
-    const reported = receipt?.map((f) => this.inFolder(f)).filter((p): p is string => p !== null);
+    const ws = this.opts.files!.workspace;
+    const reported = receipt?.map((f) => (typeof f === "string" ? { path: this.inFolder(f), sha256: null } : { path: this.inFolder(f.path), sha256: f.sha256 })).filter((f) => f.path !== null);
+    // the receipt vouches for a file only while it holds what the driver wrote: the file's own bytes, hashed in full
+    const holds = (p: string, sha256: string | null) => !!sha256 && ws.exists(p) && !ws.isDir(p) && createHash("sha256").update(ws.readBytes(p)).digest("hex") === sha256.toLowerCase();
+    const unconfirmed = (c: { path: string; was: string; now: string }) => { if (!this.unconfirmed.some((u) => u.path === c.path && u.now === c.now)) this.unconfirmed.push({ path: c.path, seen: c.was, now: c.now, at: this.opts.now?.() ?? Date.now() }); };
     const wrote: string[] = [], other: string[] = [];
     for (const c of changes) {
       if (c.was.startsWith("dir:") || c.now.startsWith("dir:")) { if (c.now === "absent") delete this.seen[c.path]; else this.seen[c.path] = c.now; continue; }
-      if (!reported?.includes(c.path)) {
-        if (reported) this.noteExternal(c.path, c.was, c.now);
-        else if (!this.unconfirmed.some((u) => u.path === c.path && u.now === c.now)) this.unconfirmed.push({ path: c.path, seen: c.was, now: c.now, at: this.opts.now?.() ?? Date.now() });
+      const entry = reported?.find((f) => f.path === c.path);
+      if (!entry || !holds(c.path, entry.sha256)) {
+        // in the receipt but no longer (or never said to be) what was written: whose the content is now is not known
+        if (reported && !entry) this.noteExternal(c.path, c.was, c.now); else unconfirmed(c);
         other.push(c.path);
         continue;
       }
@@ -207,7 +213,7 @@ export class Executor {
       if (c.was === "absent") this.ledger.created(`path:${c.path}`);
     }
     if (wrote.length) this.emit("executor.files_written", { paths: wrote });
-    if (other.length) this.emit(reported ? "executor.external_change" : "executor.files_unconfirmed", { paths: other, while: "screen action" });
+    if (other.length) this.emit("executor.files_not_credited", { paths: other, while: "screen action" });
     return wrote;
   }
 
@@ -571,6 +577,9 @@ export class Executor {
       let still: string | null;
       try { still = cap.preconditions(ws, a.args); } catch (e) { still = e instanceof Error ? e.message : String(e); }
       if (still) return { ...base, status: "stale", why: `changed while this step was being checked: ${still}. Look again and decide anew.` };
+      // and the screen: locked meanwhile, the task stops, a file action as much as a window one (review of #16)
+      const screen = await this.driver.snapshot();
+      if (screen.locked) return { ...base, status: "environment", why: "the screen is locked", epoch: screen.epoch };
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {

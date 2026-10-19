@@ -14,6 +14,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { Action, Driver, Element, Observation, PerformResult, Snapshot, WindowInfo } from "./types.js";
 
 export interface MailMessage { id: string; from: string; subject: string; body: string[]; time: string; date?: string }
@@ -146,7 +147,7 @@ export class SimComputer implements Driver {
     return { ...r, files: this.wrote };                       // the sim knows what it wrote: [] says nothing
   }
   /** What the action being performed saved: its receipt (PerformResult.files), [] when it saved nothing. */
-  private wrote: string[] = [];
+  private wrote: { path: string; sha256: string }[] = [];
 
   private performOne(a: Action): ReturnType<Driver["perform"]> {
     if (a.kind === "wait") return { status: "ok" };
@@ -225,7 +226,7 @@ export class SimComputer implements Driver {
     const full = path.join(this.wsRoot, p);
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, w.state.doc.text, "utf-8");
-    this.wrote.push(p);
+    this.wrote.push({ path: p, sha256: createHash("sha256").update(w.state.doc.text, "utf-8").digest("hex") });
     w.state.doc.path = p; w.state.doc.title = path.basename(p); w.title = w.state.doc.title;
   }
 
