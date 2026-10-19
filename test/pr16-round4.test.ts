@@ -58,7 +58,9 @@ describe('PR16 fourth review probes',()=>{
     await act('click','menu_save');await act('set_value','sheet_name',{value:'report.txt'});await act('select','sheet_folder',{option:'output'});
     const saved=await act('click','sheet_save');
     const removed=await file(ex,'fs.trash',{target:'incoming/output/report.txt'});
-    expect({credited:saved.files,owner:ex.ledger.ownerOf('path:incoming/output/report.txt'),status:removed.status,exists:ws.exists('incoming/output/report.txt')}).toEqual({credited:['output/report.txt'],owner:'user',status:'stale',exists:true});
+    // without a driver receipt nothing is credited, not even the task's own save: it is unconfirmed (crediting by receipts
+    // only, after hands' PerformResult.files); what this probe guards still holds — the other file is not adopted
+    expect({credited:saved.files,owner:ex.ledger.ownerOf('path:incoming/output/report.txt'),status:removed.status,exists:ws.exists('incoming/output/report.txt')}).toEqual({credited:undefined,owner:'user',status:'stale',exists:true});
   });
 
   it('says stopped, not blocked, when the stop comes as the action finds the user at the keyboard',async()=>{

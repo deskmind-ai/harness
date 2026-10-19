@@ -17,9 +17,7 @@ const setup=()=>{
 };
 
 describe('PR16 sixth review probes',()=>{
-  // open (review of #16, round 6, item 2): without a driver receipt a file is still credited by what the window shows;
-  // this passes once crediting goes by receipts only — after hands reports PerformResult.files (harness-executor)
-  it.skip('does not adopt an external file when cancelling the save dialog',async()=>{
+  it('does not adopt an external file when cancelling the save dialog',async()=>{
     const root=dir(),ws=new Workspace(root),signer=ConsentSigner.fresh(),sim=new SimComputer(root);
     const driver:Driver={snapshot:()=>sim.snapshot(),observe:id=>sim.observe(id),perform:action=>{
       if(action.kind==='click'&&action.target.endsWith(':sheet_cancel'))fs.writeFileSync(path.join(root,'report.txt'),'external user document');
@@ -66,7 +64,7 @@ describe('PR16 sixth review probes',()=>{
     const ex=new Executor(driver,{task:'t',publicKey:signer.publicKey,files:{workspace:ws,registry:fileRegistry()}});
     await ex.begin();
     const opened=await ex.act({action:{kind:'open_window',app:'Editor'},epoch:ex.currentEpoch});
-    expect({files:opened.files,entries:ws.entries(),external:ex.externalChanges,changes:ex.changes()}).toEqual({files:undefined,entries:{},external:[],changes:{created:[],modified:[],deleted:[],external:[]}});
+    expect({files:opened.files,entries:ws.entries(),external:ex.externalChanges,changes:ex.changes()}).toEqual({files:undefined,entries:{},external:[],changes:{created:[],modified:[],deleted:[],external:[],unconfirmed:[]}});
   });
 
   it('can undo a file rename followed by its parent directory rename',async()=>{

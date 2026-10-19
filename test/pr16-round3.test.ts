@@ -55,7 +55,7 @@ describe('PR16 third review probes',()=>{
     expect({credited:saved.files,owner:ex.ledger.ownerOf('path:incoming/report.txt'),status:removed.status,exists:ws.exists('incoming/report.txt')}).toEqual({credited:['output/report.txt'],owner:'user',status:'stale',exists:true});
   });
 
-  it('without a driver receipt, credits only the file whose name and folder the window shows',async()=>{
+  it('without a driver receipt, credits nothing: both changes are of unconfirmed origin',async()=>{
     const root=dir();build(root,{'output':null,'incoming':null});
     const ws=new Workspace(root),signer=ConsentSigner.fresh(),sim=new SimComputer(root);
     const driver:Driver={snapshot:()=>sim.snapshot(),observe:id=>sim.observe(id),perform:action=>{
@@ -71,7 +71,9 @@ describe('PR16 third review probes',()=>{
     await act('click','menu_new');await act('set_value','textarea',{value:'task report'});
     await act('click','menu_save');await act('set_value','sheet_name',{value:'report.txt'});await act('select','sheet_folder',{option:'output'});
     const saved=await act('click','sheet_save');
-    expect({credited:saved.files,mine:ex.ledger.ownerOf('path:output/report.txt'),theirs:ex.ledger.ownerOf('path:incoming/report.txt'),external:ex.externalChanges.map(c=>c.path)}).toEqual({credited:['output/report.txt'],mine:'task',theirs:'user',external:['incoming/report.txt']});
+    // nothing on screen proves a write (the save sheet named output/report.txt, a sync client wrote incoming/report.txt at
+    // the same moment): neither is the task's, neither is called another program's — both are unconfirmed
+    expect({credited:saved.files,mine:ex.ledger.ownerOf('path:output/report.txt'),theirs:ex.ledger.ownerOf('path:incoming/report.txt'),external:ex.externalChanges.map(c=>c.path),unconfirmed:ex.changes().unconfirmed.sort()}).toEqual({credited:undefined,mine:'user',theirs:'user',external:[],unconfirmed:['incoming/report.txt','output/report.txt']});
   });
 
   it('rejects directory deletion if a child changes while the intent judge is answering',async()=>{

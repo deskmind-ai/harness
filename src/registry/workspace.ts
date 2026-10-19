@@ -93,6 +93,17 @@ export class Workspace {
   abs(p: string): string {
     const full = path.resolve(this.root, p.replace(/^\/+|\/+$/g, ""));
     if (full !== this.root && !full.startsWith(this.root + path.sep)) throw new Error(`path outside the workspace: ${p}`);
+    // nor through a link on the way: a folder swapped for a link to somewhere else takes a write there (review of #16:
+    // destination/ became a link while the judge answered, and a move replaced a file outside). The last part may be a
+    // link itself — the tools look at it (lstat) and never write through it
+    const parts = path.relative(this.root, full).split(path.sep).filter(Boolean);
+    let at = this.root;
+    for (const part of parts.slice(0, -1)) {
+      at = path.join(at, part);
+      let st: fs.Stats;
+      try { st = fs.lstatSync(at); } catch { break; }            // not there yet: nothing further to go through
+      if (st.isSymbolicLink()) throw new Error(`path goes through a link: ${p}`);
+    }
     return full;
   }
 

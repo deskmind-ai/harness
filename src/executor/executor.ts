@@ -74,6 +74,9 @@ export class Executor {
   /** The folder as the task found it (small files with their text): what "unchanged" and "renamed from" are proved against. */
   private startTree: { versions: Record<string, string>; contents: Record<string, string> } | null = null;
   readonly externalChanges: ExternalChange[] = [];
+  /** Files that changed while a screen action ran, with no driver receipt to say whose doing it was: neither the
+   *  task's nor called another program's (creditFiles). */
+  readonly unconfirmed: ExternalChange[] = [];
   /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
   private planAccepted: PlanProposal | null = null;
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
@@ -150,7 +153,8 @@ export class Executor {
    *  same change is one fact). */
   private noted = new Set<string>();
   private noteExternal(path: string, seen: string, now: string) {
-    if (this.noted.has(`${path}@${now}`)) return;
+    // a change of unknown origin found again by a later write is still of unknown origin, not another program's
+    if (this.noted.has(`${path}@${now}`) || this.unconfirmed.some((u) => u.path === path && u.now === now)) return;
     this.noted.add(`${path}@${now}`);
     this.externalChanges.push({ path, seen, now, at: this.opts.now?.() ?? Date.now() });
   }
@@ -175,33 +179,27 @@ export class Executor {
     return out;
   }
 
-  /** After a screen action: which of the files that changed while it ran are its doing. The driver's receipt says so
-   *  when it has one (the paths a save it carried out wrote). Without one, the window it acted in has to name the file
-   *  and its whole folder — the save sheet's name, and a location field reading exactly that folder — before or after
-   *  the action: a name alone is not enough (output/report.txt saved, a sync client's incoming/report.txt is not the
-   *  task's), nor a folder's last part (incoming/output is not output), nor a part of a name, and being at the same
-   *  time is no evidence at all (review of #16). A nested folder a location field shows only by its last name is not credited: the file is
-   *  then another program's, and the task reads it before writing it — safe, one step more. A credited file is seen, the task's content, and when new the
-   *  task's object; any other is another program's change, recorded, and a later write on it is found as never read
-   *  or changed. Returns the credited paths (files only). */
-  private creditFiles(changes: { path: string; was: string; now: string }[], receipt: string[] | undefined, evidence: (Observation | null | undefined)[]): string[] {
+  /** After a screen action: which of the files that changed while it ran are its doing — only what the driver's
+   *  receipt (PerformResult.files) vouches for, and only where the version did change. Nothing on screen is evidence of
+   *  a write: eight rounds of review found a counter-example to every reading of the window (a sync client's file of
+   *  the same name, of the same folder name, a cancelled save sheet, a document that merely changed meanwhile). With a
+   *  receipt, any other change is another program's (the driver said what this action wrote; `[]`: it cannot write).
+   *  Without one, a change is of unknown origin: not credited and not called another program's either — recorded as
+   *  unconfirmed, protected like the user's (a write on it needs a read, discarding it needs consent), and shown to the
+   *  verdict as such. A credited file is seen, the task's content, and when new the task's object. Returns the
+   *  credited paths (files only). */
+  private creditFiles(changes: { path: string; was: string; now: string }[], receipt: string[] | undefined): string[] {
     if (!changes.length) return [];
-    const root = this.opts.files!.workspace.root;
-    const reported = receipt?.map((f) => (path.isAbsolute(f) ? path.relative(root, f) : path.normalize(f)).split(path.sep).join("/"));
-    const texts = evidence.flatMap((o) => (o ? [o.window.title, ...o.elements.flatMap((e) => [e.label, e.value ?? ""])] : []));
-    const named = (p: string) => {
-      const base = p.slice(p.lastIndexOf("/") + 1), dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
-      // the whole name, as a field or what a title starts with ("report.txt — Edited"): not a part of one (a.txt is in
-      // data.txt) nor the name without its extension (report.csv is not report.txt) (review of #16)
-      const file = texts.some((t) => t === base || t.startsWith(base + " ") || t.startsWith(base + "（"));
-      // the folder, as a whole field: its path in the task folder, or for the top the task folder's name or "."
-      const folder = dir ? texts.includes(dir) : texts.includes(".") || texts.includes(path.basename(root));
-      return file && folder;
-    };
-    const wrote: string[] = [], external: string[] = [];
+    const reported = receipt?.map((f) => this.inFolder(f)).filter((p): p is string => p !== null);
+    const wrote: string[] = [], other: string[] = [];
     for (const c of changes) {
       if (c.was.startsWith("dir:") || c.now.startsWith("dir:")) { if (c.now === "absent") delete this.seen[c.path]; else this.seen[c.path] = c.now; continue; }
-      if (!(reported ? reported.includes(c.path) : named(c.path))) { this.noteExternal(c.path, c.was, c.now); external.push(c.path); continue; }
+      if (!reported?.includes(c.path)) {
+        if (reported) this.noteExternal(c.path, c.was, c.now);
+        else if (!this.unconfirmed.some((u) => u.path === c.path && u.now === c.now)) this.unconfirmed.push({ path: c.path, seen: c.was, now: c.now, at: this.opts.now?.() ?? Date.now() });
+        other.push(c.path);
+        continue;
+      }
       wrote.push(c.path);
       if (c.now === "absent") { delete this.seen[c.path]; continue; }
       this.seen[c.path] = c.now;
@@ -209,8 +207,22 @@ export class Executor {
       if (c.was === "absent") this.ledger.created(`path:${c.path}`);
     }
     if (wrote.length) this.emit("executor.files_written", { paths: wrote });
-    if (external.length) this.emit("executor.external_change", { paths: external, while: "screen action" });
+    if (other.length) this.emit(reported ? "executor.external_change" : "executor.files_unconfirmed", { paths: other, while: "screen action" });
     return wrote;
+  }
+
+  /** A path a driver reported, as a path in the task folder (null when outside it). A driver reports what the app says,
+   *  links resolved (/private/tmp/… for a task folder given as /tmp/…, as rc.1's /tmp/dm-real was), so both sides are
+   *  compared resolved. */
+  private inFolder(f: string): string | null {
+    const root = this.opts.files!.workspace.root;
+    if (!path.isAbsolute(f)) return path.normalize(f).split(path.sep).join("/");
+    const real = (p: string) => { try { return fs.realpathSync(p); } catch { try { return path.join(fs.realpathSync(path.dirname(p)), path.basename(p)); } catch { return p; } } };
+    for (const [base, file] of [[root, f], [real(root), real(f)]] as const) {
+      const r = path.relative(base, file);
+      if (r && !r.startsWith("..") && !path.isAbsolute(r)) return r.split(path.sep).join("/");
+    }
+    return null;
   }
 
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
@@ -457,14 +469,13 @@ export class Executor {
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
     // credited to it once the window is read back (its name there is the evidence), not found later as "changed by
     // another program" (rc.1 end-to-end: hello.txt, 10-18)
-    const fileChanges = r.status === "ok" && consequence !== "read" ? this.fileChanges(filesBefore) : [];
-    const credit = (o?: Observation) => this.creditFiles(fileChanges, r.files, [before, o]);
+    const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles(this.fileChanges(filesBefore), r.files) : [];
     let after: Snapshot;
-    try { after = await this.driver.snapshot(); } catch (e) { credit(); return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
+    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
     this.epoch = after.epoch;
-    if (after.locked) { credit(); return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch }); }
+    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch });
     const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
-    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch };
+    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}) };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
       try {
@@ -476,8 +487,6 @@ export class Executor {
         out.why = `${out.why ?? ""}; the window could not be read back: ${e instanceof Error ? e.message : e}`.replace(/^; /, "");
       }
     }
-    const wrote = credit(out.after);
-    if (wrote.length) out.files = wrote;
     return done(out);
   }
 
@@ -557,6 +566,11 @@ export class Executor {
         this.emit("executor.external_change", { paths: moved });
         return { ...base, status: "stale", why: `changed while this step was being checked (by another program): ${moved.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
       }
+      // and what the action needs of the folder still holds (the folder it writes into is still a folder, not a link
+      // put there meanwhile to somewhere outside: review of #16)
+      let still: string | null;
+      try { still = cap.preconditions(ws, a.args); } catch (e) { still = e instanceof Error ? e.message : String(e); }
+      if (still) return { ...base, status: "stale", why: `changed while this step was being checked: ${still}. Look again and decide anew.` };
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
@@ -628,6 +642,7 @@ export class Executor {
       // what the task read (file reads, listings): the content it decided on is evidence the judge can quote
       "任务读到过的内容（文件读取的输出，每条最多 1500 字）": ev.receipts.filter((r) => r.request.action.kind === "file" && r.result.output && Object.keys(r.result.output).length).slice(-8).map((r) => ({ action: r.request.action, output: JSON.stringify(r.result.output).slice(0, 1500) })),
       ...(ev.external_changes.length ? { "任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）": ev.external_changes.map((c) => c.path) } : {}),
+      ...(this.unconfirmed.length ? { "任务做界面操作期间出现或变化、来源未确认的文件（驱动没有说是这次动作写的：可能是任务在应用里的保存，也可能是别的程序；做没做成看它们现在的内容，来源未确认不算没做成）": this.unconfirmed.map((c) => c.path) } : {}),
       ...(ws ? { 任务目录现在的内容: ws.listing(), "任务目录现在的版本（路径 → 版本，和开始时逐条比就知道哪些没动过；文件夹的版本随内容变）": Object.fromEntries(Object.keys(ws.entries()).map((p) => [p, ws.version(p)])) } : {}),
       ...(this.startTree ? { "任务开始时的目录（路径 → 版本；小文件带内容）": this.startTree } : {}),
       ...extra,
@@ -702,16 +717,20 @@ export class Executor {
 
   /** What changed in the task folder since begin, for the result: paths made, changed and gone (external changes
    *  are listed apart, as what another program did). */
-  changes(): { created: string[]; modified: string[]; deleted: string[]; external: string[] } {
+  changes(): { created: string[]; modified: string[]; deleted: string[]; external: string[]; unconfirmed: string[] } {
     const ws = this.opts.files?.workspace, start = this.startTree?.versions ?? {};
-    if (!ws) return { created: [], modified: [], deleted: [], external: this.externalChanges.map((c) => c.path) };
+    const unconfirmed = new Set(this.unconfirmed.map((c) => c.path));
+    if (!ws) return { created: [], modified: [], deleted: [], external: this.externalChanges.map((c) => c.path), unconfirmed: [...unconfirmed] };
     const now = ws.entries();
     const external = new Set(this.externalChanges.map((c) => c.path));
+    // a change of unknown origin (unconfirmed) is listed apart, like another program's: not under created / modified
+    const apart = (p: string) => external.has(p) || unconfirmed.has(p);
     return {
-      created: Object.keys(now).filter((p) => !(p in start) && !external.has(p)),
-      modified: Object.keys(now).filter((p) => p in start && start[p] !== (now[p] === "dir" ? ws.version(p) : now[p]) && now[p] !== "dir" && !external.has(p)),
+      created: Object.keys(now).filter((p) => !(p in start) && !apart(p)),
+      modified: Object.keys(now).filter((p) => p in start && start[p] !== (now[p] === "dir" ? ws.version(p) : now[p]) && now[p] !== "dir" && !apart(p)),
       deleted: Object.keys(start).filter((p) => !(p in now)),
       external: [...external],
+      unconfirmed: [...unconfirmed].filter((p) => !external.has(p)),
     };
   }
 
@@ -751,8 +770,10 @@ export function outgoing(obs: Observation | undefined): { fields: string[]; show
     ...els.filter((e) => e.focused && !e.value && e.actions.length && !e.sends).map((e) => `✓ ${e.label}`),
   ];
   const shown = (obs?.text ?? "").split("\n").map((l) => l.trim()).filter((l) => l && !fields.some((f) => f.includes(l)));
+  // where it goes: a page's address may be only in the window's metadata (review of #16: a webview switched sites)
+  if (obs?.window.url) fields.unshift(`URL：${obs.window.url}`);
   const bound = obs ? {
-    window: { app: obs.window.app, title: obs.window.title }, modal: obs.modal, text: obs.text ?? "",
+    window: { app: obs.window.app, title: obs.window.title, url: obs.window.url ?? null, tabs: (obs.window.tabs ?? []).map((t) => ({ title: t.title, url: t.url, active: !!t.active })) }, modal: obs.modal, text: obs.text ?? "",
     elements: els.map((e) => ({ role: e.role, label: e.label, value: e.value ?? null, focused: !!e.focused, enabled: e.enabled !== false, options: e.options ?? null, in_modal: !!e.in_modal, sends: !!e.sends })),
   } : null;
   return { fields, shown, bound };

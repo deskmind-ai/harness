@@ -46,7 +46,9 @@ describe('PR16 fifth review probes',()=>{
     await act('click','menu_save');await act('set_value','sheet_name',{value:own});
     const saved=await act('click','sheet_save');
     const removed=await file(ex,'fs.trash',{target:external});
-    expect({credited:saved.files,owner:ex.ledger.ownerOf('path:'+external),status:removed.status,exists:ws.exists(external)}).toEqual({credited:[own],owner:'user',status:'stale',exists:true});
+    // without a driver receipt nothing is credited, not even the task's own save: it is unconfirmed (crediting by receipts
+    // only, after hands' PerformResult.files); what this probe guards still holds — the other file is not adopted
+    expect({credited:saved.files,owner:ex.ledger.ownerOf('path:'+external),status:removed.status,exists:ws.exists(external)}).toEqual({credited:undefined,owner:'user',status:'stale',exists:true});
   });
 
   it('can undo mkdir, create child, and rename directory when nothing external changed',async()=>{

@@ -143,9 +143,9 @@ export class SimComputer implements Driver {
   perform(a: Action): ReturnType<Driver["perform"]> {
     this.wrote = [];
     const r = this.performOne(a) as PerformResult;
-    return this.wrote.length ? { ...r, files: this.wrote } : r;
+    return { ...r, files: this.wrote };                       // the sim knows what it wrote: [] says nothing
   }
-  /** What the action being performed saved: its receipt (PerformResult.files). */
+  /** What the action being performed saved: its receipt (PerformResult.files), [] when it saved nothing. */
   private wrote: string[] = [];
 
   private performOne(a: Action): ReturnType<Driver["perform"]> {
