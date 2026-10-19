@@ -435,6 +435,18 @@ describe("judge: adaptive routing and shadow", () => {
     expect(top3.script.length).toBe(1);                                                        // started once, abandoned
     expect((await j3.choose("q", { a: 2 }, opts))).toMatchObject({ by: "top", choice: "matches" });
     expect(top3.script.length).toBe(0);
+    // samples: a question both tiers answered becomes training material with both answers
+    const low4 = new Gateway(table), top4 = new Gateway(table);
+    const ev4: Record<string, unknown>[] = [];
+    const j4 = new Judge([{ name: "low", gateway: low4, floor: 0.9 }, { name: "top", gateway: top4 }], { samples: true, shadow: true, budget: 1000, onEvent: (k, b) => ev4.push({ k, ...b }) });
+    low4.script = [() => ({ choice: "mismatch", scores: { mismatch: 0.8 } }), () => ({ choice: "matches", scores: { matches: 0.99 } })];
+    top4.script = [() => ({ choice: "matches" }), () => ({ choice: "mismatch" })];
+    await j4.choose("q", { a: 3 }, opts); await j4.choose("q", { a: 4 }, opts);
+    const samples = ev4.filter((e) => e.k === "judge.sample");
+    expect(samples.length).toBe(2);
+    expect(samples[0]).toMatchObject({ lower: { choice: "mismatch", by: "low" }, top: "matches" });
+    expect(samples[1]).toMatchObject({ lower: { choice: "matches", by: "low" }, top: "mismatch" });
+    expect(typeof samples[0]!.prompt).toBe("string");
   });
 });
 

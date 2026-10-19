@@ -65,7 +65,9 @@ export class Judge {
      *  keeps the agreement routing learning in production at a tenth of the cost */ shadow?: boolean | number;
     /** the top tier is asked at the same time as the lower ones; when a lower tier settles, the top call is aborted
      *  (its cost saved when the service honours the abort), otherwise its answer is already on its way — a refusing
-     *  fast tier costs no time (10-19: Brain refuses most file-task questions, which made those runs no faster) */ race?: boolean } = {}) {}
+     *  fast tier costs no time (10-19: Brain refuses most file-task questions, which made those runs no faster) */ race?: boolean;
+    /** training material for the fast tier: every question both tiers answered (an escalation, or a shadow
+     *  comparison) is emitted as a `judge.sample` with the prompt, the options and both answers */ samples?: boolean } = {}) {}
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. */
   async choose(question: string, context: unknown, options: JudgeOption[], role?: Role): Promise<JudgeAnswer | null> {
@@ -75,8 +77,9 @@ export class Judge {
     if (this.calls >= (this.opts.budget ?? 40)) { this.opts.onEvent?.("judge.budget", {}); return null; }
     const ids = options.map((o) => o.id) as [string, ...string[]];
     const kind = TierStats.kindOf(question, context);
-    let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null;
+    let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null, lower: JudgeAnswer | null = null;
     const prompt = P.choicePrompt(question, context, options);
+    const sample = (top: string | null) => { if (this.opts.samples && lower && top) this.opts.onEvent?.("judge.sample", { question_kind: kind, prompt, options, lower, top }); };
     const topTier = this.tiers[this.tiers.length - 1]!;
     const lowerAsked = this.tiers.slice(0, -1).some((t) => !this.opts.stats?.skip(t.name, kind));
     // the race: the top tier starts now, alongside the lower tiers; abortable
@@ -92,7 +95,8 @@ export class Judge {
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
       last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason };
-      if (final) { settled = true; break; }
+      if (final) { settled = true; sample(last.choice); break; }
+      lower = last;
       // a lower tier may approve on its own when confident; refusing is the top tier's call (a cheap model's confident
       // "no" blocked right actions in the 10-18 probe), and "not enough evidence" is never final below the top
       const canSettle = last.choice === options[0]?.id && confidence !== undefined && confidence >= (tier.floor ?? 0);
@@ -107,6 +111,7 @@ export class Judge {
       const rep = await top.gateway.ask(role ?? top.role ?? "intent", P.SYSTEM, P.choicePrompt(question, context, options), R.choiceAnswer(ids));
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
       if (agree !== null) this.opts.stats?.noteAgreement(settledBy.name, kind, agree);
+      if (rep.outcome === "answered") sample(rep.data!.choice);
       this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, question_kind: kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree });
     }
     // every tier above a lower tier's refusal failed: that refusal does not become final by default — the caller takes
@@ -146,7 +151,7 @@ export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Re
   const stats = new TierStats(process.env.DESKMIND_JUDGE_STATS || undefined);
   const shadowEnv = process.env.DESKMIND_JUDGE_SHADOW;
   const shadow = shadowEnv === "1" ? true : shadowEnv && Number(shadowEnv) > 0 && Number(shadowEnv) < 1 ? Number(shadowEnv) : false;
-  return new Judge(tiers, { onEvent, stats, shadow, race: process.env.DESKMIND_JUDGE_RACE === "1" });
+  return new Judge(tiers, { onEvent, stats, shadow, race: process.env.DESKMIND_JUDGE_RACE === "1", samples: process.env.DESKMIND_JUDGE_SAMPLES === "1" });
 }
 
 /** `backend:model` → a first judge tier; null when unset or malformed (then the frontier judges alone). */
