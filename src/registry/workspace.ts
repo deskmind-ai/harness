@@ -12,6 +12,9 @@ export const TRASH = ".deskmind-trash";
  *  the task's files and never listed. Nothing a user owns is ever put there (a trashed file goes to TRASH, under its
  *  own name, whatever that name is), so sweeping it can never delete the user's data. */
 export const TMP = ".deskmind-tmp";
+/** The hands driver's own folder in the task folder (a new TextEdit document is a file there until it is saved as
+ *  something): the driver's, never the task's or the user's — not listed, not credited (review of #16). */
+export const HANDS = ".hands";
 /** A temporary output older than this is left by a process that died, not one still being checked. */
 const STALE_TEMP_MS = 10 * 60_000;
 
@@ -68,7 +71,7 @@ export class Workspace {
       let names: fs.Dirent[];
       try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && dir !== this.root) return; throw e; }   // vanished meanwhile: not there
       for (const d of names) {
-        if (d.name === TRASH || d.name === TMP || d.name === ".keep") continue;
+        if (d.name === TRASH || d.name === TMP || d.name === HANDS || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
         let st: fs.Stats;
         try { st = fs.lstatSync(full); } catch (e) { if (gone(e)) continue; throw e; }   // a link (even a dangling one) is not followed
@@ -97,7 +100,7 @@ export class Workspace {
     const walk = (dir: string, rel: string) => {
       let names: fs.Dirent[];
       try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && rel) { delete out[rel]; return; } throw e; }
-      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP).map((d) => d.name).sort();
+      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP && d.name !== HANDS).map((d) => d.name).sort();
       const files = names.filter((d) => d.isFile() && d.name !== ".keep").map((d) => d.name).sort();
       for (const d of dirs) out[rel ? `${rel}/${d}` : d] = "dir";
       for (const f of files) {
@@ -149,6 +152,12 @@ export class Workspace {
 
   isDir(p: string): boolean {
     return this.version(p).startsWith("dir:");
+  }
+
+  /** A folder's members as they are on disk (names, hidden ones too): what "this folder holds only ours" is checked
+   *  by. A seam: undo's preflight asks the same of the folder as it will be after the later undos. */
+  members(d: string): string[] {
+    return fs.readdirSync(this.abs(d));
   }
 
   /** path -> text (null for a folder): the scorer's view. */

@@ -661,11 +661,21 @@ export class Executor {
     // folder is played backwards on paper: from its versions now, newest step first, each path a step wrote must be as
     // it left it, then that step is taken back on the paper folder — what it wrote returns to its version before, and
     // a folder it renamed takes its contents back with it (draft/ → final/: final/note.txt is draft/note.txt again
-    // for the step that wrote it; review of #16) — and the capability's own check (a folder holding only ours) passes
+    // for the step that wrote it; review of #16) — and the capability's own check (a folder holding only ours, the
+    // folder a moved file goes back to) passes on the paper folder as it will be when that step's undo runs, not on
+    // the disk as it is now (review of #16: "folder draft is gone" for a draft/ renamed later; a user's file put into
+    // final/inner/ found only after two steps were undone)
     const files = plan.steps.map((st) => this.fileReceipts.get(st.seq)).filter((f) => !!f);
     const ours = new Set(files.flatMap((f) => f.writes));
     const paper: Record<string, string> = files.length ? Object.fromEntries(Object.keys(ws!.entries()).map((p) => [p, ws!.version(p)])) : {};
     const under = (d: string) => Object.keys(paper).filter((x) => x.startsWith(d + "/"));
+    const onPaper = {
+      version: (p: string) => (p === "" ? "dir:" : paper[p] ?? "absent"),
+      exists: (p: string) => p === "" || p in paper,
+      isDir: (p: string) => p === "" || (paper[p] ?? "").startsWith("dir:"),
+      entries: () => Object.fromEntries(Object.entries(paper).map(([p, v]) => [p, v.startsWith("dir:") ? "dir" : v])),
+      members: (d: string) => Object.keys(paper).filter((x) => parentOf(x) === d).map((x) => x.slice(d ? d.length + 1 : 0)),
+    } as unknown as Workspace;
     for (const f of files) {
       let why: string | null = null;
       const before = (p: string) => f.versions_before[p] ?? "absent", left = (p: string) => f.exec.versions_after[p];
@@ -674,15 +684,13 @@ export class Executor {
         const l = left(p);
         if (l !== undefined && !l.startsWith("dir:") && l !== (paper[p] ?? "absent")) { why = `changed since the action: ${p}`; break; }
       }
-      if (!why) {
-        const src = f.writes.find((p) => before(p).startsWith("dir:") && left(p) === "absent");
-        const dst = f.writes.find((p) => before(p) === "absent" && left(p)?.startsWith("dir:"));
-        if (src && dst) for (const x of under(dst)) { paper[src + x.slice(dst.length)] = paper[x]!; delete paper[x]; }
-        else for (const p of f.writes) if (before(p) === "absent") for (const x of under(p)) delete paper[x];
-        for (const p of f.writes) { if (before(p) === "absent") delete paper[p]; else paper[p] = before(p); }
-      }
-      why ??= f.cap.undoCheck?.(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      why ??= f.cap.undoCheck?.(onPaper, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
       if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
+      const src = f.writes.find((p) => before(p).startsWith("dir:") && left(p) === "absent");
+      const dst = f.writes.find((p) => before(p) === "absent" && left(p)?.startsWith("dir:"));
+      if (src && dst) for (const x of under(dst)) { paper[src + x.slice(dst.length)] = paper[x]!; delete paper[x]; }
+      else for (const p of f.writes) if (before(p) === "absent") for (const x of under(p)) delete paper[x];
+      for (const p of f.writes) { if (before(p) === "absent") delete paper[p]; else paper[p] = before(p); }
     }
     let undone = 0;
     for (const step of plan.steps) {
@@ -742,13 +750,14 @@ function reach(ws: Workspace, paths: string[]): string[] {
   return [...new Set(paths.flatMap((p) => (ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
 }
 
-/** What a send in this window would send: every field set in it — typed (subject, body) or picked from a list (a
- *  recipient pop-up; review of #16: Alice approved, Bob sent) — whole, a commitment after the 300th character goes out
- *  too, and the first line it shows (the message replied to, the page). Read from the observation the action was
- *  decided on. */
-export function outgoing(obs: Observation | undefined): { fields: string[]; context: string } {
-  const fields = (obs?.elements ?? []).filter((e) => e.value && e.actions.some((x) => x === "set_value" || x === "type" || x === "select")).map((e) => `${e.label}：${e.value!}`);
-  return { fields, context: (obs?.text ?? "").split("\n")[0]!.slice(0, 120) };
+/** What a send in this window would send: every element that shows a value — typed (subject, body), picked from a
+ *  list (a recipient pop-up) or only shown (a confirmation page's recipient) — whole, and the first line it shows (the
+ *  message replied to, the page); `text` is all the window says, which the consent binds too. Whether a field can be
+ *  edited is not what makes it part of the send: Alice approved, Bob sent, three times over (review of #16). Read from
+ *  the observation the action was decided on. */
+export function outgoing(obs: Observation | undefined): { fields: string[]; context: string; text: string } {
+  const fields = (obs?.elements ?? []).filter((e) => e.value).map((e) => `${e.label}：${e.value!}`);
+  return { fields, context: (obs?.text ?? "").split("\n")[0]!.slice(0, 120), text: obs?.text ?? "" };
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
