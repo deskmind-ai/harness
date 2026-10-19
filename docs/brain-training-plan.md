@@ -11,7 +11,7 @@
 - 来源：判官的 `judge.sample` 事件（`DESKMIND_JUDGE_SAMPLES=1` + `DESKMIND_JUDGE_SHADOW=1`）：每道两档都答过的题，带完整提示词（`P.choicePrompt` 的输出：材料 + 问题 + 选项）、选项 id、Brain 的答案与置信度、云端的答案。
 - 汇总脚本：`scripts/judge-samples.py <run dirs> > samples.jsonl`（按提示词去重）。
 - 已有：练习场 40 题 → **204 条**（意图 99、计划依据 65、核对 40；不一致 78：意图题 Brain 放行而云端「证据不够」40 / 「不一致」4、Brain 否决而云端放行 13、核对题 Brain fail 云端 pass 13、依据题 8）。文件 `runs/judge-samples-gym.jsonl`（不进仓库，已交负责人）。
-- 在跑：检查集 105 题同开关 → 预计 ~400 条，合并为 `runs/judge-samples-all.jsonl`。
+- 已有（合并）：练习场 40 + 检查集 105 → **626 条**（意图 241、计划依据 244、核对 141；两档不一致 295 条）。文件 `runs/judge-samples-all.jsonl`（2.5 MB，不进仓库，已交负责人）。
 - 再要更多：任何带 Brain 快档的运行开这两个开关即可；app 侧 `DESKMIND_JUDGE_SHADOW=0.1` 抽样后也会产出（量少、来自真实任务——隐私上这些材料是用户的窗口 / 文件内容，**只在本机用，不上传**）。
 
 ## 标签口径
