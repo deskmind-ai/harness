@@ -43,7 +43,12 @@ export class EventLog {
 
   constructor(readonly file: string, readonly runId: string, private readonly sink?: (ev: AppEvent) => void) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    if (fs.existsSync(file)) this.events = fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as AppEvent);
+    if (!fs.existsSync(file)) return;
+    // an event cut off mid-write (the process died inside writeSync) was never sent: it is skipped, kept on a line of
+    // its own (the next event must not be glued to it), and its seq is used again (review of #16)
+    const raw = fs.readFileSync(file, "utf-8");
+    if (raw && !raw.endsWith("\n")) fs.appendFileSync(file, "\n");
+    this.events = raw.split("\n").filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l) as AppEvent]; } catch { return []; } });
   }
 
   emit(body: EventBody): AppEvent {

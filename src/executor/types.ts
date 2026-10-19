@@ -113,7 +113,12 @@ export interface ActResult {
   output?: Record<string, unknown>;  // a file capability's output (a read's text, a listing)
 }
 
-export interface PerformResult { status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo }
+export interface PerformResult {
+  status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo;
+  /** The files the action wrote, when the driver knows (a save it carried out): relative to the task folder, or
+   *  absolute. The receipt the executor credits files by; without it, only a window that names a file and its folder. */
+  files?: string[];
+}
 type Maybe<T> = T | Promise<T>;
 /** The raw driver: sees and moves, decides nothing. The simulated one answers at once; a real one talks to a process. */
 export interface Driver {

@@ -104,14 +104,22 @@ async function main() {
   const ws = a.scope ? new Workspace(a.scope) : undefined;
   const server = new McpExecutorServer({ driver: () => (a.driver === "hands" ? new HandsDriver(ws ? { workspace: ws.root } : {}) : new SimComputer(ws?.root)), gateway: gw, workspace: ws, consent: a.consent === "auto" ? "auto" : "none", log: (l) => process.stderr.write(l + "\n") });
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  const answer = (res: Json | null) => { if (res) process.stdout.write(JSON.stringify(res) + "\n"); };
+  // requests run one after another, in order — except stop, which is the stop switch: it is handled the moment it
+  // arrives, so an act waiting for the user (or the judge) sees it before its effect (review of #16)
+  let queue: Promise<void> = Promise.resolve();
   for await (const line of rl) {
     if (!line.trim()) continue;
     let msg: Json;
     try { msg = JSON.parse(line); } catch { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }) + "\n"); continue; }
-    const res = await server.handle(msg);
-    if (res) process.stdout.write(JSON.stringify(res) + "\n");
+    if (isStop(msg)) { answer(await server.handle(msg)); continue; }
+    queue = queue.then(() => server.handle(msg).then(answer)).catch((e) => { process.stderr.write(String(e) + "\n"); });
   }
+  await queue;
 }
+
+/** A tools/call of `stop`. */
+export const isStop = (msg: Json) => msg.method === "tools/call" && (msg.params as Json | undefined)?.name === "stop";
 
 const entry = process.argv[1] ?? "";
 if (entry.endsWith("mcp.ts") || entry.endsWith("mcp.js")) main().catch((e) => { process.stderr.write(String(e) + "\n"); process.exit(1); });

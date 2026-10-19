@@ -16,6 +16,7 @@ import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher } from "./types.js";
 import { ConsentVerifier } from "./consent.js";
@@ -170,20 +171,30 @@ export class Executor {
     return out;
   }
 
-  /** After a screen action: a file that changed while it ran is the action's doing only when the window it acted in
-   *  names it — the save sheet's name field, the title the document takes after a save, a row in a file list — before
-   *  or after the action. Being at the same time is no evidence: a sync client writing meanwhile is not the task (review
-   *  of #16). A credited file is seen, the task's content, and when new the task's object; any other is another
-   *  program's change, recorded, and a later write on it is found as never read or changed. Returns the credited
-   *  paths (files only). */
-  private creditFiles(changes: { path: string; was: string; now: string }[], evidence: (Observation | null | undefined)[]): string[] {
+  /** After a screen action: which of the files that changed while it ran are its doing. The driver's receipt says so
+   *  when it has one (the paths a save it carried out wrote). Without one, the window it acted in has to name the file
+   *  and its folder — the save sheet's name and location, a row in a file list — before or after the action: a name
+   *  alone is not enough (output/report.txt saved, a sync client's incoming/report.txt is not the task's), and being at
+   *  the same time is no evidence at all (review of #16). A credited file is seen, the task's content, and when new the
+   *  task's object; any other is another program's change, recorded, and a later write on it is found as never read
+   *  or changed. Returns the credited paths (files only). */
+  private creditFiles(changes: { path: string; was: string; now: string }[], receipt: string[] | undefined, evidence: (Observation | null | undefined)[]): string[] {
     if (!changes.length) return [];
-    const names = evidence.flatMap((o) => (o ? [o.window.title, ...o.elements.flatMap((e) => [e.label, e.value ?? ""])] : [])).join("\n");
-    const named = (p: string) => { const base = p.slice(p.lastIndexOf("/") + 1), stem = base.replace(/\.[^.]+$/, ""); return names.includes(base) || (stem.length >= 3 && names.includes(stem)); };
+    const root = this.opts.files!.workspace.root;
+    const reported = receipt?.map((f) => (path.isAbsolute(f) ? path.relative(root, f) : path.normalize(f)).split(path.sep).join("/"));
+    const texts = evidence.flatMap((o) => (o ? [o.window.title, ...o.elements.flatMap((e) => [e.label, e.value ?? ""])] : []));
+    const names = texts.join("\n");
+    const named = (p: string) => {
+      const base = p.slice(p.lastIndexOf("/") + 1), stem = base.replace(/\.[^.]+$/, ""), dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+      const file = names.includes(base) || (stem.length >= 3 && names.includes(stem));
+      // the folder: its own name for a subfolder; the task folder's name (or a location field saying ".") for the top
+      const folder = dir ? names.includes(dir.slice(dir.lastIndexOf("/") + 1)) : texts.includes(".") || names.includes(path.basename(root));
+      return file && folder;
+    };
     const wrote: string[] = [], external: string[] = [];
     for (const c of changes) {
       if (c.was.startsWith("dir:") || c.now.startsWith("dir:")) { if (c.now === "absent") delete this.seen[c.path]; else this.seen[c.path] = c.now; continue; }
-      if (!named(c.path)) { this.noteExternal(c.path, c.was, c.now); external.push(c.path); continue; }
+      if (!(reported ? reported.includes(c.path) : named(c.path))) { this.noteExternal(c.path, c.was, c.now); external.push(c.path); continue; }
       wrote.push(c.path);
       if (c.now === "absent") { delete this.seen[c.path]; continue; }
       this.seen[c.path] = c.now;
@@ -314,9 +325,8 @@ export class Executor {
       if (f.cap.effect === "observe") return { consequence: "read", object, why: "reads only" };
       if (f.cap.effect === "external") return { consequence: "external", object, why: "sends something out" };
       // a folder carries what is in it: the task's output/ with the user's file put inside is the user's file moved or
-      // trashed along with it (review of #16), so what a write reaches is the path and everything under it
-      const all = Object.keys(f.ws.entries());
-      const reached = [...new Set(f.fp.writes.flatMap((p) => (f.ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
+      // trashed along with it (review of #16)
+      const reached = reach(f.ws, f.fp.writes);
       const userPaths = reached.filter((p) => f.ws.exists(p) && this.ledger.ownerOf(`path:${p}`) === "user");
       if (userPaths.length) return { consequence: "modify_user", object, why: `changes the user's ${userPaths.join(", ")}` };
       // discarding content the task did not write (replace, trash) is the user's loss even on a path the task made
@@ -373,17 +383,9 @@ export class Executor {
     // looks are fine. The executor itself waits for them to pause (polling, up to a limit) rather than bouncing the
     // model, which burned a run's whole turn budget on "wait and try again" while the user watched (10-19)
     if (now.user_active && consequence !== "read") {
-      const wait = this.opts.userWait ?? { ms: 120_000, pollMs: 2_000 };
-      const until = (this.opts.now?.() ?? Date.now()) + wait.ms;
-      this.emit("executor.user_wait", { object: f.object });
-      while (now.user_active && (this.opts.now?.() ?? Date.now()) < until && !this.stopped) {
-        await new Promise((r) => setTimeout(r, wait.pollMs));
-        now = await this.driver.snapshot();
-      }
-      // every wait ends with a resumed, whichever way it ends: the app clears its "paused" state on it (deskmind#85)
-      if (now.user_active) { this.emit("executor.user_resumed", { timed_out: true }); return done({ ...base, status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later`, epoch: now.epoch }); }
-      if (this.stopped) { this.emit("executor.user_resumed", { stopped: true }); return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: now.epoch }); }
-      this.emit("executor.user_resumed", {});
+      const w = await this.waitForUser(now, f.object);
+      now = w.now;
+      if (w.end) return done({ ...base, ...w.end, epoch: now.epoch });
     }
     // after a wait too: what the user did meanwhile (selected another row) is not what the model decided on, so the
     // action would land on something else (review of #16: "delete selected" deleted B, decided on A)
@@ -397,6 +399,9 @@ export class Executor {
     if (target && (req.action.kind === "key" || req.action.kind === "type") && !obs) return done({ ...base, status: "stale", why: `window ${target} was never observed; observe it first`, epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
+      // the card and the consent are made from the window's last observation: one older than the computer (a snapshot
+      // since gave the model a newer epoch) would show draft A and send B (review of #16) — look at the window again
+      if (obs && obs.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
       // a send shows what goes out (the filled-in fields, what the window is about): the user checks it on the card
       // and the judge reads it, not only the Send button (review of #16)
       const sending = consequence === "external" ? outgoing(obs) : null;
@@ -408,6 +413,12 @@ export class Executor {
       // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
       now = await this.driver.snapshot();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+      // the user came back to the keyboard meanwhile, before anything on screen moved: wait for them, as at the top
+      if (now.user_active) {
+        const w = await this.waitForUser(now, f.object);
+        now = w.now;
+        if (w.end) return done({ ...base, ...w.end, epoch: now.epoch });
+      }
       if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
       // a send's consent is for what it sends: the draft changed since the card is another send, asked again
@@ -437,7 +448,7 @@ export class Executor {
     // credited to it once the window is read back (its name there is the evidence), not found later as "changed by
     // another program" (rc.1 end-to-end: hello.txt, 10-18)
     const fileChanges = r.status === "ok" && consequence !== "read" ? this.fileChanges(filesBefore) : [];
-    const credit = (o?: Observation) => this.creditFiles(fileChanges, [before, o]);
+    const credit = (o?: Observation) => this.creditFiles(fileChanges, r.files, [before, o]);
     let after: Snapshot;
     try { after = await this.driver.snapshot(); } catch (e) { credit(); return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
     this.epoch = after.epoch;
@@ -460,6 +471,23 @@ export class Executor {
     return done(out);
   }
 
+  /** The user is at the keyboard: wait for them to pause (polling, up to a limit). Returns the computer as it is after,
+   *  and why the action ends instead when they did not pause or the app stopped the task. */
+  private async waitForUser(now: Snapshot, object: string): Promise<{ now: Snapshot; end?: { status: "blocked" | "stopped"; why: string } }> {
+    const wait = this.opts.userWait ?? { ms: 120_000, pollMs: 2_000 };
+    const until = (this.opts.now?.() ?? Date.now()) + wait.ms;
+    this.emit("executor.user_wait", { object });
+    while (now.user_active && (this.opts.now?.() ?? Date.now()) < until && !this.stopped) {
+      await new Promise((r) => setTimeout(r, wait.pollMs));
+      now = await this.driver.snapshot();
+    }
+    // every wait ends with a resumed, whichever way it ends: the app clears its "paused" state on it (deskmind#85)
+    if (now.user_active) { this.emit("executor.user_resumed", { timed_out: true }); return { now, end: { status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later` } }; }
+    if (this.stopped) { this.emit("executor.user_resumed", { stopped: true }); return { now, end: { status: "stopped", why: "the app stopped the task" } }; }
+    this.emit("executor.user_resumed", {});
+    return { now };
+  }
+
   /** A file capability under the same guard as a window action. Versions stand in for the observation epoch: every
    *  path the action reads or writes must be as the task last saw it (at begin, in a read, or by its own write); one
    *  that changed since was changed by someone else — recorded as a fact, and the action is refused until the task
@@ -474,8 +502,11 @@ export class Executor {
     // a read is that reading, so it goes ahead (refusing a read with "read it first" went in circles in rc.1). Only
     // the read moves what the task has seen: a refusal does not, or the same write retried unread went through
     // (review of #16).
+    // a written folder is checked by the files in it: trashing folder/ while the user edits folder/note.txt is a write
+    // on their edit (review of #16)
     const touched = [...new Set([...fp.reads, ...fp.writes])].filter((p) => ws.exists(p) && !ws.isDir(p));
-    const changed = touched.filter((p) => p in this.seen && this.seen[p] !== ws.version(p));
+    const checked = [...new Set([...touched, ...reach(ws, fp.writes)])].filter((p) => ws.exists(p) && !ws.isDir(p));
+    const changed = checked.filter((p) => p in this.seen && this.seen[p] !== ws.version(p));
     if (changed.length) {
       for (const p of changed) this.noteExternal(p, this.seen[p] ?? "absent", ws.version(p));
       this.emit("executor.external_change", { paths: changed });
@@ -491,7 +522,7 @@ export class Executor {
       const evidence: Record<string, unknown> = {};
       for (const p of touched) if (!ws.isDir(p)) evidence[`文件 ${p} 现在的内容（前 600 字）`] = ws.readForModel(p, 600);
       const judgedOn: Record<string, string> = {};
-      for (const p of new Set([...fp.reads, ...fp.writes])) if (!ws.isDir(p)) judgedOn[p] = ws.version(p);
+      for (const p of new Set([...fp.reads, ...reach(ws, fp.writes)])) if (!ws.isDir(p)) judgedOn[p] = ws.version(p);
       const judged = await this.judgeIntent(a, consequence, object, evidence, text);
       // the judge answers over the network: a file the user changed meanwhile is not the one it judged, and writing
       // now would overwrite their edit (review of #16) — read the versions again, as at the top
@@ -648,6 +679,12 @@ function diffObs(before: Observation | null, after: Observation, newWindows: str
   const bs = new Set(b.map(key));
   const changed = after.elements.filter((e) => !bs.has(key(e))).length + b.filter((e) => !after.elements.some((x) => key(x) === key(e))).length;
   return { elements: changed, focus: after.elements.find((e) => e.focused)?.label, modal: after.modal?.title ?? null, ...(newWindows.length ? { new_windows: newWindows } : {}) };
+}
+
+/** What a write on these paths reaches: each path, and everything under the ones that are folders. */
+function reach(ws: Workspace, paths: string[]): string[] {
+  const all = Object.keys(ws.entries());
+  return [...new Set(paths.flatMap((p) => (ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
 }
 
 /** What a send in this window would send: its filled-in fields (to, subject, body), whole — a commitment after the

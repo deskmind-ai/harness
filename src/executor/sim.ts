@@ -14,7 +14,7 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Action, Driver, Element, Observation, Snapshot, WindowInfo } from "./types.js";
+import type { Action, Driver, Element, Observation, PerformResult, Snapshot, WindowInfo } from "./types.js";
 
 export interface MailMessage { id: string; from: string; subject: string; body: string[]; time: string; date?: string }
 export interface MailState { app: string; inbox: MailMessage[]; flagged: string[]; deleted: string[]; replies: { to: string; body: string }[]; selected: string | null; composing: { to: string; body: string } | null; dialog: { kind: "delete"; id: string } | null; texts: Record<string, string> }
@@ -141,6 +141,14 @@ export class SimComputer implements Driver {
   }
 
   perform(a: Action): ReturnType<Driver["perform"]> {
+    this.wrote = [];
+    const r = this.performOne(a) as PerformResult;
+    return this.wrote.length ? { ...r, files: this.wrote } : r;
+  }
+  /** What the action being performed saved: its receipt (PerformResult.files). */
+  private wrote: string[] = [];
+
+  private performOne(a: Action): ReturnType<Driver["perform"]> {
     if (a.kind === "wait") return { status: "ok" };
     if (a.kind === "file") return { status: "unsupported", why: "files are the executor's, not the desktop driver's" };
     if (a.kind === "double_click") a = { ...a, kind: "click" };     // the fake apps open on a click; a real one may need two
@@ -217,6 +225,7 @@ export class SimComputer implements Driver {
     const full = path.join(this.wsRoot, p);
     fs.mkdirSync(path.dirname(full), { recursive: true });
     fs.writeFileSync(full, w.state.doc.text, "utf-8");
+    this.wrote.push(p);
     w.state.doc.path = p; w.state.doc.title = path.basename(p); w.title = w.state.doc.title;
   }
 
