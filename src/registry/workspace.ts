@@ -12,6 +12,13 @@ export const TRASH = ".deskmind-trash";
  *  the task's files and never listed. Nothing a user owns is ever put there (a trashed file goes to TRASH, under its
  *  own name, whatever that name is), so sweeping it can never delete the user's data. */
 export const TMP = ".deskmind-tmp";
+/** A folder's version, from entries (path → file digest | "dir"): its direct members and their digests. One formula
+ *  for the disk (Workspace.version) and for undo's paper folder, so the two cannot drift apart. */
+export function folderVersion(e: Record<string, string>, p: string): string {
+  const members = Object.keys(e).filter((k) => (p ? k.startsWith(p + "/") && !k.slice(p.length + 1).includes("/") : !k.includes("/"))).sort();
+  return "dir:" + sha(members.map((m) => `${m}=${e[m]}`).join("\n"));
+}
+
 /** The hands driver's own folder in the task folder (a new TextEdit document is a file there until it is saved as
  *  something): the driver's, never the task's or the user's — not listed, not credited (review of #16). */
 export const HANDS = ".hands";
@@ -115,16 +122,9 @@ export class Workspace {
 
   version(p: string): string {
     const e = this.entries();
-    if (p === "" || p === "/" || p === ".") {
-      const members = Object.keys(e).filter((k) => !k.includes("/")).sort();
-      return "dir:" + sha(members.map((m) => `${m}=${e[m]}`).join("\n"));
-    }
+    if (p === "" || p === "/" || p === ".") return folderVersion(e, "");
     if (!(p in e)) return ABSENT;
-    if (e[p] === "dir") {
-      const members = Object.keys(e).filter((k) => k.startsWith(p + "/") && !k.slice(p.length + 1).includes("/")).sort();
-      return "dir:" + sha(members.map((m) => `${m}=${e[m]}`).join("\n"));
-    }
-    return e[p]!;
+    return e[p] === "dir" ? folderVersion(e, p) : e[p]!;
   }
 
   read(p: string): string {

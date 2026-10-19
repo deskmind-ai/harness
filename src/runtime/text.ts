@@ -13,7 +13,7 @@ const ZH = {
   select: (l: string, o: string) => `把「${l}」选成「${o}」`, key: (c: string) => `按 ${c}`, closeWindow: "关闭窗口", openWindow: (a: string) => `打开 ${a}`, focusWindow: "切到窗口", scroll: "滚动", wait: "等待",
   sends: "这会把内容发出去", modifies: "这会改动你的东西", modifiesFile: "这会改动你的文件", undoable: "界面上的操作撤不回", noUndoFor: (cap: string) => `${cap} 没有撤回的办法`,
   openedInYours: "在你已开着的窗口里打开的页面撤不回",
-  outgoing: (fields: string[], context: string) => `\n要发出去的：${fields.length ? fields.map((f) => `\n· ${f}`).join("") : "窗口里看不到要发出的内容"}${context ? `\n窗口里显示的：${context}` : ""}`,
+  outgoing: (fields: string[], shown: string[]) => `\n要发出去的：${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : "窗口里看不到要发出的内容"}`,
   byRule: (rules: string[]) => `按你以前定的规则做的：${rules.join("、")}`,
 };
 const EN: typeof ZH = {
@@ -25,7 +25,7 @@ const EN: typeof ZH = {
   select: (l: string, o: string) => `choose "${o}" in "${l}"`, key: (c: string) => `press ${c}`, closeWindow: "close the window", openWindow: (a: string) => `open ${a}`, focusWindow: "switch to the window", scroll: "scroll", wait: "wait",
   sends: "this sends something out", modifies: "this changes your things", modifiesFile: "this changes your file", undoable: "an action on screen cannot be undone", noUndoFor: (cap: string) => `${cap} cannot be undone`,
   openedInYours: "a page opened in a window of yours cannot be undone",
-  outgoing: (fields: string[], context: string) => `\nWhat goes out:${fields.length ? fields.map((f) => `\n· ${f}`).join("") : " not visible in the window"}${context ? `\nThe window shows: ${context}` : ""}`,
+  outgoing: (fields: string[], shown: string[]) => `\nWhat goes out:${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : " not visible in the window"}`,
   byRule: (rules: string[]) => `Under your standing rule: ${rules.join(", ")}`,
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);

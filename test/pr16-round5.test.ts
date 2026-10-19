@@ -70,7 +70,7 @@ describe('PR16 fifth review probes',()=>{
     expect((await file(ex,'fs.move',{source:'draft',destination:'final'})).status).toBe('ok');
     fs.appendFileSync(path.join(root,'final/note.txt'),' user edit');ws.invalidate();
     const result=await ex.undo();
-    expect({undone:result.undone,refused:result.refused,final:ws.exists('final/note.txt'),draft:ws.exists('draft')}).toEqual({undone:0,refused:'changed since the action: draft/note.txt',final:true,draft:false});
+    expect({undone:result.undone,refused:result.refused,final:ws.exists('final/note.txt'),draft:ws.exists('draft')}).toEqual({undone:0,refused:'changed since the action: final',final:true,draft:false});
   });
 
   it('does not mark entries omitted by a bounded listing as observed',async()=>{

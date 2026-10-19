@@ -16,6 +16,7 @@ import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
 import { parentOf } from "../registry/spec.js";
+import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Workspace } from "../registry/workspace.js";
@@ -414,9 +415,9 @@ export class Executor {
       // a send shows what goes out (the filled-in fields, what the window is about): the user checks it on the card
       // and the judge reads it, not only the Send button (review of #16)
       const sending = consequence === "external" ? outgoing(obs) : null;
-      const text = describeAction(req.action, obs, consequence, undefined, this.opts.lang) + (sending ? T(this.opts.lang).outgoing(sending.fields, sending.context) : "");
+      const text = describeAction(req.action, obs, consequence, undefined, this.opts.lang) + (sending ? T(this.opts.lang).outgoing(sending.fields, sending.shown) : "");
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
-      const judged = await this.judgeIntent(req.action, consequence, f.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: sending } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      const judged = await this.judgeIntent(req.action, consequence, f.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
       if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
       // the judge answers over the network: the user may have selected another row meanwhile, and the action would land
       // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
@@ -431,9 +432,9 @@ export class Executor {
       if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
       // a send's consent is for what it sends: the draft changed since the card is another send, asked again
-      const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent, sending ?? undefined);
+      const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent, sending?.bound);
       if (why) {
-        const challenge = this.consent.challenge(req.action, f.object, consequence, text, undefined, sending ?? undefined);
+        const challenge = this.consent.challenge(req.action, f.object, consequence, text, undefined, sending?.bound);
         this.emit("executor.consent_needed", { why, consequence, object: f.object });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
@@ -658,39 +659,19 @@ export class Executor {
     const ws = this.opts.files?.workspace;
     // check every file step first, as the orchestrator's undoRun does: nothing is touched unless all of them can be
     // taken back (review of #16: second.txt was deleted, then the user's edit to first.txt stopped the undo). The
-    // folder is played backwards on paper: from its versions now, newest step first, each path a step wrote must be as
-    // it left it, then that step is taken back on the paper folder — what it wrote returns to its version before, and
-    // a folder it renamed takes its contents back with it (draft/ → final/: final/note.txt is draft/note.txt again
-    // for the step that wrote it; review of #16) — and the capability's own check (a folder holding only ours, the
-    // folder a moved file goes back to) passes on the paper folder as it will be when that step's undo runs, not on
-    // the disk as it is now (review of #16: "folder draft is gone" for a draft/ renamed later; a user's file put into
-    // final/inner/ found only after two steps were undone)
+    // folder is played backwards on paper (paper.ts): newest step first, each path the step wrote — a folder too, its
+    // version worked out from what is in it on paper — must be as the step left it, and the capability's own check (a
+    // folder holding only ours, the folder a moved file goes back to) must pass on the paper folder as it will be when
+    // that step's undo runs; then the step is taken back on paper
     const files = plan.steps.map((st) => this.fileReceipts.get(st.seq)).filter((f) => !!f);
     const ours = new Set(files.flatMap((f) => f.writes));
-    const paper: Record<string, string> = files.length ? Object.fromEntries(Object.keys(ws!.entries()).map((p) => [p, ws!.version(p)])) : {};
-    const under = (d: string) => Object.keys(paper).filter((x) => x.startsWith(d + "/"));
-    const onPaper = {
-      version: (p: string) => (p === "" ? "dir:" : paper[p] ?? "absent"),
-      exists: (p: string) => p === "" || p in paper,
-      isDir: (p: string) => p === "" || (paper[p] ?? "").startsWith("dir:"),
-      entries: () => Object.fromEntries(Object.entries(paper).map(([p, v]) => [p, v.startsWith("dir:") ? "dir" : v])),
-      members: (d: string) => Object.keys(paper).filter((x) => parentOf(x) === d).map((x) => x.slice(d ? d.length + 1 : 0)),
-    } as unknown as Workspace;
+    const paper = files.length ? new PaperFolder(ws!) : null;
     for (const f of files) {
-      let why: string | null = null;
       const before = (p: string) => f.versions_before[p] ?? "absent", left = (p: string) => f.exec.versions_after[p];
-      for (const p of f.writes) {
-        // a folder's version follows its contents, which later undos change: folders are the capability's to check
-        const l = left(p);
-        if (l !== undefined && !l.startsWith("dir:") && l !== (paper[p] ?? "absent")) { why = `changed since the action: ${p}`; break; }
-      }
-      why ??= f.cap.undoCheck?.(onPaper, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      const moved = f.writes.find((p) => left(p) !== undefined && left(p) !== paper!.version(p));
+      const why = moved !== undefined ? `changed since the action: ${moved}` : f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
       if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
-      const src = f.writes.find((p) => before(p).startsWith("dir:") && left(p) === "absent");
-      const dst = f.writes.find((p) => before(p) === "absent" && left(p)?.startsWith("dir:"));
-      if (src && dst) for (const x of under(dst)) { paper[src + x.slice(dst.length)] = paper[x]!; delete paper[x]; }
-      else for (const p of f.writes) if (before(p) === "absent") for (const x of under(p)) delete paper[x];
-      for (const p of f.writes) { if (before(p) === "absent") delete paper[p]; else paper[p] = before(p); }
+      paper!.takeBack(f.writes, before, left);
     }
     let undone = 0;
     for (const step of plan.steps) {
@@ -750,14 +731,17 @@ function reach(ws: Workspace, paths: string[]): string[] {
   return [...new Set(paths.flatMap((p) => (ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
 }
 
-/** What a send in this window would send: every element that shows a value — typed (subject, body), picked from a
- *  list (a recipient pop-up) or only shown (a confirmation page's recipient) — whole, and the first line it shows (the
- *  message replied to, the page); `text` is all the window says, which the consent binds too. Whether a field can be
- *  edited is not what makes it part of the send: Alice approved, Bob sent, three times over (review of #16). Read from
- *  the observation the action was decided on. */
-export function outgoing(obs: Observation | undefined): { fields: string[]; context: string; text: string } {
-  const fields = (obs?.elements ?? []).filter((e) => e.value).map((e) => `${e.label}：${e.value!}`);
-  return { fields, context: (obs?.text ?? "").split("\n")[0]!.slice(0, 120), text: obs?.text ?? "" };
+/** What a send in this window would send, for the card and the consent. `fields`: every element that holds content —
+ *  a value (typed, picked, or only shown) or, with nothing to do on it, a text of its own (a confirmation page's
+ *  "Recipient: Alice" may be only a label); `shown`: every line of the window's text those do not already carry. The
+ *  card shows both, whole. `bound` is what the consent binds: those, and every element as it is (role, label, value),
+ *  so a send whose window changed in any way since the card is asked again, text or no text. Review of #16, four
+ *  rounds of "Alice approved, Bob sent": a typed field, a pop-up, a read-only value, a label. */
+export function outgoing(obs: Observation | undefined): { fields: string[]; shown: string[]; bound: unknown } {
+  const els = obs?.elements ?? [];
+  const fields = els.filter((e) => e.value || (!e.actions.length && e.label)).map((e) => (e.value ? `${e.label}：${e.value}` : e.label));
+  const shown = (obs?.text ?? "").split("\n").map((l) => l.trim()).filter((l) => l && !fields.some((f) => f.includes(l)));
+  return { fields, shown, bound: { fields, shown, elements: els.map((e) => [e.role, e.label, e.value ?? null]) } };
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
