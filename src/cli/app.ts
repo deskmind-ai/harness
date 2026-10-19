@@ -47,13 +47,15 @@ export class LineReader {
     rl.on("line", (l) => {
       if (!l.trim()) return;
       // the app's stop can arrive at any moment, card or no card: it never waits in the answer queue
-      try { const j = JSON.parse(l); if (j && j.stop === true) { this.onStop?.(); return; } } catch { /* an answer line */ }
+      // it also lets go of a card waiting for its answer: that card is answered with nothing (review of #16)
+      try { const j = JSON.parse(l); if (j && j.stop === true) { this.stopped = true; this.onStop?.(); for (const w of this.waiting.splice(0)) w(""); return; } } catch { /* an answer line */ }
       const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l);
     });
     // the app went away (stdin closed): every open card is answered with nothing, so the run ends instead of hanging
     rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); });
   }
   closed = false;
+  stopped = false;
   onStop: (() => void) | null = null;
   next(): Promise<string> { const q = this.queued.shift(); return q !== undefined ? Promise.resolve(q) : this.closed ? Promise.resolve("") : new Promise((r) => this.waiting.push(r)); }
 }
@@ -69,7 +71,7 @@ export class StdioUser implements RuntimeUser {
     for (;;) {
       let a: Record<string, unknown>;
       const line = await this.input.next();
-      if (!line && this.input.closed) return null;           // the app is gone: no answer, the run ends honestly
+      if (!line && (this.input.closed || this.input.stopped)) return null;     // the app is gone or stopped the task: no answer, the run ends honestly
       try { a = JSON.parse(line); } catch { continue; }
       if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
       this.log.emit({ kind: "resumed", ask_id });

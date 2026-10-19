@@ -18,7 +18,9 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Gateway } from "../gateway/index.js";
 import type { Answer, Card, CardOption } from "../orchestrator/index.js";
-import type { Registry } from "../registry/capability.js";
+import type { Capability, Registry } from "../registry/capability.js";
+import * as P from "../orchestrator/prompts.js";
+import * as R from "../protocol/roles.js";
 import type { Workspace } from "../registry/workspace.js";
 import { canon } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
@@ -144,7 +146,8 @@ export class FrontierRuntime {
   stop(why = "stopped") { this.o.executor.stop(); if (!this.status) { this.status = "stopped"; this.reason = why; } this.abort.abort(); }
 
   private end(status: RuntimeStatus, reason: string): AgentToolResult {
-    this.status = status; this.reason = reason;
+    // a stop is final: the card it cancelled comes back unanswered, and that is not a failure of its own
+    if (this.status !== "stopped") { this.status = status; this.reason = reason; }
     return { ...text(`结束：${status}（${reason}）`), terminate: true };
   }
 
@@ -152,7 +155,9 @@ export class FrontierRuntime {
   private async askCard(card: Card): Promise<{ option: CardOption | null; text: string } | null> {
     this.count("cards"); this.count(`cards:${card.kind}`);
     this.emit("card", { kind: card.kind, text: card.text, options: card.options.map((o) => o.kind) });
-    const a = await this.o.user.ask(card);
+    // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16)
+    const stop = this.abort.signal;
+    const a = stop.aborted ? null : await Promise.race([this.o.user.ask(card), new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
     if (a === null) return null;
     if ("option" in a) { const o = card.options[a.option]; return o ? { option: o, text: o.text } : null; }
     return { option: null, text: a.text };
@@ -237,10 +242,32 @@ export class FrontierRuntime {
       for (const [k, f] of Object.entries(cap.schema.properties)) props[k] = Type.String({ description: f.description });
       tools.push(tool({
         name: "fs_" + cap.id.split(".").slice(1).join("_"), label: cap.id, description: `${cap.description} 路径相对任务目录。`,
-        parameters: Type.Object(props), execute: async (_id, args) => this.act({ action: { kind: "file", capability: cap.id, args: args as Record<string, string> }, epoch: ex.currentEpoch, consequence: "read", purpose: cap.description.split("；")[0]! }),
+        parameters: Type.Object(props), execute: async (_id, args) => {
+          const full = await this.derive(cap, args as Record<string, string>);
+          if (typeof full === "string") return err(full);
+          return this.act({ action: { kind: "file", capability: cap.id, args: full }, epoch: ex.currentEpoch, consequence: "read", purpose: cap.description.split("；")[0]! });
+        },
       }));
     }
     return tools;
+  }
+
+  /** A value the capability needs that a model makes from the arguments (fs.transform_text: the rewritten text), asked
+   *  of the `transform` role once, as the orchestrator does, and stored in the arguments with the source version it
+   *  was made from — so the intent check reads it and a source changed before the write fails the precondition. */
+  private async derive(cap: Capability, args: Record<string, string>): Promise<Record<string, string> | string> {
+    if (!cap.derive || !this.o.workspace) return args;
+    const ws = this.o.workspace;
+    const bad = cap.typecheck(args) ?? cap.preconditions(ws, args);
+    if (bad) return bad;
+    const d = cap.derive(ws, args);
+    const ctx = this.o.gateway.contextBudget("transform");
+    if ([...d.source].length > ctx) return `the source is ${[...d.source].length} characters; the rewriting model reads at most about ${ctx} tokens`;
+    this.count("model_calls");
+    const rep = await this.o.gateway.ask("transform", P.SYSTEM, P.transformPrompt(this.raw, d.instruction, d.source), R.TransformAnswer, this.o.task);
+    this.emit("transform", { cap: cap.id, outcome: rep.outcome, error: rep.error.slice(0, 200) });
+    if (rep.outcome !== "answered") return `the rewrite could not be made (${rep.outcome}: ${rep.error.slice(0, 200)})`;
+    return { ...args, ...(d.also ?? {}), [d.field]: rep.data!.text };
   }
 
   private async act(p: { action: Static<typeof ActionSchema> | Extract<Action, { kind: "file" }>; epoch: number; consequence: Consequence; purpose: string }): Promise<AgentToolResult> {
@@ -329,9 +356,17 @@ export class FrontierRuntime {
     const ids = snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]);
     const paths = this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [];
     const out = new Set<string>();
+    const bare = (k: string) => k.slice(k.indexOf(":") + 1);
     for (const o of objects) {
-      const hits = [...ids, ...paths].filter((k) => o === k || o === k.slice(k.indexOf(":") + 1) || o.includes(k.slice(k.indexOf(":") + 1)));
-      if (hits.length) hits.forEach((h) => out.add(h)); else out.add(o);
+      const keys = [...ids, ...paths];
+      // an exact name is the object; a name inside the model's words counts only when it is the one name there (a
+      // name inside another hit's name is that hit: "a.txt" in "data.txt"). Several names are ambiguous and sign
+      // nothing — the step asks on its own when it comes (review of #16: path:data.txt also signed a.txt)
+      const exact = keys.filter((k) => o === k || o === bare(k));
+      const within = keys.filter((k) => o.includes(bare(k)));
+      const hits = exact.length ? exact : within.filter((k) => !within.some((x) => x !== k && bare(x).includes(bare(k))));
+      if (hits.length === 1 || (exact.length && hits.length)) hits.forEach((h) => out.add(h));
+      else { if (hits.length > 1) this.emit("plan.ambiguous_object", { object: o, matches: hits }); out.add(o); }
     }
     return [...out];
   }

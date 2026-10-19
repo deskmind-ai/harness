@@ -75,6 +75,8 @@ export class Executor {
   private planAccepted: PlanProposal | null = null;
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
+  /** The window each open_window really made (by receipt seq): what its undo closes. */
+  private openedWindows = new Map<number, string>();
 
   /** What a restart found: an action the previous process started and never receipted, what became of it, and the
    *  files other programs changed while no process was watching (from the journal's versions, so they are facts of
@@ -134,24 +136,35 @@ export class Executor {
     this.emit("executor.recovered", { action, finding, external });
   }
 
-  /** After a screen action: what changed in the task folder is the action's doing — versions noted as seen, new
-   *  files as the task's objects, contents as the task's. Returns the paths (files only). */
-  private creditFiles(): string[] {
+  /** The task folder right before a screen action: what `creditFiles` compares against afterwards. */
+  private fileVersions(): Record<string, string> | null {
     const ws = this.opts.files?.workspace;
-    if (!ws) return [];
+    if (!ws) return null;
+    ws.invalidate();
+    return Object.fromEntries(Object.keys(ws.entries()).map((p) => [p, ws.version(p)]));
+  }
+
+  /** After a screen action: what changed in the task folder while it ran is the action's doing — versions noted as
+   *  seen, new files as the task's objects, contents as the task's. What changed before it (since the task last
+   *  looked) is not: a file the user made meanwhile stays theirs, and a later write on it is found as never read or
+   *  changed by another program (review of #16: user.txt adopted by an "open editor", then trashed without consent).
+   *  Returns the paths (files only). */
+  private creditFiles(before: Record<string, string> | null): string[] {
+    const ws = this.opts.files?.workspace;
+    if (!ws || !before) return [];
     ws.invalidate();
     const now = ws.entries(), wrote: string[] = [];
     for (const p of Object.keys(now)) {
       const v = ws.version(p);
-      if (this.seen[p] === v) continue;
-      const isNew = !(p in this.seen);
+      if (before[p] === v) continue;
+      const isNew = !(p in before);
       this.seen[p] = v;
       if (now[p] === "dir") continue;
       wrote.push(p);
       this.taskContent.add(`${p}@${v}`);
       if (isNew) this.ledger.created(`path:${p}`);
     }
-    for (const p of Object.keys(this.seen)) if (!(p in now)) { delete this.seen[p]; wrote.push(p); }
+    for (const p of Object.keys(before)) if (!(p in now)) { delete this.seen[p]; wrote.push(p); }
     if (wrote.length) this.emit("executor.files_written", { paths: wrote });
     return wrote;
   }
@@ -323,7 +336,7 @@ export class Executor {
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
-    let now = await this.driver.snapshot(), waited = false;
+    let now = await this.driver.snapshot();
     if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
     if (req.action.kind === "file") return done(await this.actFile(req.action, req.consent, consequence, f.object, now.epoch));
     // the user is at the keyboard: a window action now would fight them for it, whoever owns the window (D20). Read-only
@@ -333,7 +346,6 @@ export class Executor {
       const wait = this.opts.userWait ?? { ms: 120_000, pollMs: 2_000 };
       const until = (this.opts.now?.() ?? Date.now()) + wait.ms;
       this.emit("executor.user_wait", { object: f.object });
-      waited = true;
       while (now.user_active && (this.opts.now?.() ?? Date.now()) < until && !this.stopped) {
         await new Promise((r) => setTimeout(r, wait.pollMs));
         now = await this.driver.snapshot();
@@ -343,8 +355,9 @@ export class Executor {
       if (this.stopped) { this.emit("executor.user_resumed", { stopped: true }); return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: now.epoch }); }
       this.emit("executor.user_resumed", {});
     }
-    // after a wait the computer may have moved on; the request's epoch is what the model saw before it, so it is not held stale
-    if (req.epoch !== now.epoch && !waited) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
+    // after a wait too: what the user did meanwhile (selected another row) is not what the model decided on, so the
+    // action would land on something else (review of #16: "delete selected" deleted B, decided on A)
+    if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
     if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
     // an element is addressed only through the window's last observation: a guessed id would skip the structural
@@ -354,10 +367,19 @@ export class Executor {
     if (target && (req.action.kind === "key" || req.action.kind === "type") && !obs) return done({ ...base, status: "stale", why: `window ${target} was never observed; observe it first`, epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
-      const text = describeAction(req.action, this.lastObs.get("window" in req.action ? req.action.window : ""), consequence, undefined, this.opts.lang);
+      // a send shows what goes out (the filled-in fields, what the window is about): the user checks it on the card
+      // and the judge reads it, not only the Send button (review of #16)
+      const sending = consequence === "external" ? outgoing(obs) : null;
+      const text = describeAction(req.action, obs, consequence, undefined, this.opts.lang) + (sending ? T(this.opts.lang).outgoing(sending.fields, sending.context) : "");
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
-      const judged = await this.judgeIntent(req.action, consequence, f.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      const judged = await this.judgeIntent(req.action, consequence, f.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: sending } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
       if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
+      // the judge answers over the network: the user may have selected another row meanwhile, and the action would land
+      // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
+      now = await this.driver.snapshot();
+      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+      if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
       const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent);
       if (why) {
         const challenge = this.consent.challenge(req.action, f.object, consequence, text);
@@ -372,13 +394,17 @@ export class Executor {
     // meanwhile must not be followed by the effect (review of deskmind#80, 10-18)
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
     if (consequence !== "read") this.journal("intent", { action: req.action, object: f.object, consequence, text: describeAction(req.action, obs, consequence) });
+    const filesBefore = consequence !== "read" ? this.fileVersions() : null;
     try { r = await this.driver.perform(req.action); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
-    if (r.new_window) this.ledger.created(`window:${r.new_window.id}`);
+    // a window is the task's (and closing it takes the opening back) only when it was not on screen before: a driver
+    // that put a tab into the user's browser window returns that window, which stays theirs (review of #16)
+    const openedId = r.new_window?.id ?? (req.action.kind === "open_window" ? r.window : undefined);
+    if (openedId && !now.windows.some((w) => w.id === openedId)) { this.ledger.created(`window:${openedId}`); this.openedWindows.set(this.receipts.length + 1, openedId); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
     // credited to it here, not found later as "changed by another program" (rc.1 end-to-end: hello.txt, 10-18)
-    const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles() : [];
+    const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles(filesBefore) : [];
     let after: Snapshot;
     try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
     this.epoch = after.epoch;
@@ -427,7 +453,18 @@ export class Executor {
       const text = describeAction(a, undefined, consequence, cap, this.opts.lang);
       const evidence: Record<string, unknown> = {};
       for (const p of touched) if (!ws.isDir(p)) evidence[`文件 ${p} 现在的内容（前 600 字）`] = ws.readForModel(p, 600);
+      const judgedOn: Record<string, string> = {};
+      for (const p of new Set([...fp.reads, ...fp.writes])) if (!ws.isDir(p)) judgedOn[p] = ws.version(p);
       const judged = await this.judgeIntent(a, consequence, object, evidence, text);
+      // the judge answers over the network: a file the user changed meanwhile is not the one it judged, and writing
+      // now would overwrite their edit (review of #16) — read the versions again, as at the top
+      ws.invalidate();
+      const moved = Object.keys(judgedOn).filter((p) => ws.version(p) !== judgedOn[p]);
+      if (moved.length) {
+        for (const p of moved) { this.externalChanges.push({ path: p, seen: judgedOn[p]!, now: ws.version(p), at: this.opts.now?.() ?? Date.now() }); if (p in this.seen) this.seen[p] = ws.version(p); }
+        this.emit("executor.external_change", { paths: moved });
+        return { ...base, status: "stale", why: `changed while this step was being checked (by another program): ${moved.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
+      }
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
@@ -512,7 +549,7 @@ export class Executor {
       const a = r.request.action;
       const t = T(this.opts.lang);
       if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap, this.opts.lang), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap, this.opts.lang), can: false, why: t.noUndoFor(a.capability) }); continue; }
-      if (a.kind === "open_window") { steps.push({ seq: r.seq, text: t.openWindow(a.app), can: true }); continue; }
+      if (a.kind === "open_window") { steps.push(this.openedWindows.has(r.seq) ? { seq: r.seq, text: t.openWindow(a.app), can: true } : { seq: r.seq, text: t.openWindow(a.app), can: false, why: t.openedInYours }); continue; }
       steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, undefined, this.opts.lang), can: false, why: t.undoable });
     }
     return { reversible: steps.every((s) => s.can), steps };
@@ -535,7 +572,7 @@ export class Executor {
         ws!.invalidate();
         if (!err) for (const p of f.cap.footprint(ws!, f.args).writes) this.seen[p] = ws!.version(p);
       } else if (a.kind === "open_window") {
-        const id = r.result.after?.window.id;
+        const id = this.openedWindows.get(r.seq);
         const snap = await this.driver.snapshot();
         if (id && snap.windows.some((w) => w.id === id)) { const pr = await this.driver.perform({ kind: "close_window", window: id }); if (pr.status !== "ok") err = pr.why ?? pr.status; }
       }
@@ -574,6 +611,13 @@ function diffObs(before: Observation | null, after: Observation, newWindows: str
   const bs = new Set(b.map(key));
   const changed = after.elements.filter((e) => !bs.has(key(e))).length + b.filter((e) => !after.elements.some((x) => key(x) === key(e))).length;
   return { elements: changed, focus: after.elements.find((e) => e.focused)?.label, modal: after.modal?.title ?? null, ...(newWindows.length ? { new_windows: newWindows } : {}) };
+}
+
+/** What a send in this window would send: its filled-in fields (to, subject, body) and the first line it shows (the
+ *  message replied to, the page). Read from the observation the action was decided on. */
+export function outgoing(obs: Observation | undefined): { fields: string[]; context: string } {
+  const fields = (obs?.elements ?? []).filter((e) => e.value && (e.actions.includes("set_value") || e.actions.includes("type"))).map((e) => `${e.label}：${e.value!.slice(0, 300)}`);
+  return { fields, context: (obs?.text ?? "").split("\n")[0]!.slice(0, 120) };
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
