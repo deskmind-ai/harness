@@ -625,16 +625,21 @@ export class Executor {
 
   /** The evidence for a final judgement: the computer now, and every window the task touched or created, observed
    *  again. Who judges is the runtime's `verify` role; what it judges on is this. */
-  async verify(): Promise<{ snapshot: Snapshot; windows: Observation[]; receipts: Receipt[]; external_changes: ExternalChange[] }> {
+  async verify(): Promise<{ snapshot: Snapshot; windows: Observation[]; unreadable: { window: string; why: string }[]; receipts: Receipt[]; external_changes: ExternalChange[] }> {
     const s = await this.snapshot();
     // every window the task looked at or made, not only the ones it changed: a judge has to see the state of a
     // window a refused action never reached, too
     const touched = new Set<string>(this.lastObs.keys());
     for (const r of this.receipts) if ("window" in r.request.action && (r.result.status === "ok" || r.result.status === "unverified")) touched.add(r.request.action.window);
     for (const o of this.ledger.taskObjects()) if (o.startsWith("window:")) touched.add(o.slice(7));
-    const windows: Observation[] = [];
-    for (const id of touched) if (s.windows.some((w) => w.id === id)) windows.push(await this.observe(id));
-    return { snapshot: s, windows, receipts: this.receipts, external_changes: this.externalChanges };
+    const windows: Observation[] = [], unreadable: { window: string; why: string }[] = [];
+    // a window that cannot be read is said so, not a reason to throw the verdict away: a driver that reads only the
+    // window it was asked for (hands f4c4621: it no longer passes another window's content off under this one's id)
+    // fails such a look outright, and the judge decides on the rest
+    for (const id of touched) if (s.windows.some((w) => w.id === id)) {
+      try { windows.push(await this.observe(id)); } catch (e) { unreadable.push({ window: id, why: e instanceof Error ? e.message : String(e) }); }
+    }
+    return { snapshot: s, windows, unreadable, receipts: this.receipts, external_changes: this.externalChanges };
   }
 
   /** The finish gate's verdict: the independent judge reads the computer and the folder as they are now, every window
@@ -649,6 +654,7 @@ export class Executor {
       任务结束时整台电脑: ev.snapshot,
       任务看过的窗口现在的样子: ev.windows.map(brief),
       "任务第一次看到这些窗口时的样子（和现在逐条比：少了的行就是被删或移走的，多了的就是新建的；元素 id 在两边是同一个）": ev.windows.map((o) => this.firstObs.get(o.window.id)).filter((o): o is Observation => !!o).map(brief),
+      ...(ev.unreadable.length ? { "任务看过、现在读不出来的窗口（只知道读不出来，不知道它现在的样子）": ev.unreadable } : {}),
       执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
       // what the task read (file reads, listings): the content it decided on is evidence the judge can quote
       "任务读到过的内容（文件读取的输出，每条最多 1500 字）": ev.receipts.filter((r) => r.request.action.kind === "file" && r.result.output && Object.keys(r.result.output).length).slice(-8).map((r) => ({ action: r.request.action, output: JSON.stringify(r.result.output).slice(0, 1500) })),

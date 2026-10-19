@@ -22,3 +22,17 @@ describe('PR16 eleventh review probes',()=>{
     expect({status:r.status,text:ws.read('note.txt')}).toEqual({status:'stale',text:'edited while the screen was looked at'});
   });
 });
+
+describe('hands f4c4621: an observation that fails is an error, not another window',()=>{
+  it('the verdict still runs when a window cannot be read at the end, and says which',async()=>{
+    let readable=true;const w={id:'w',app:'Editor',title:'Doc'};
+    const driver:Driver={snapshot:()=>({epoch:1,locked:false,front_app:w.app,windows:[w]}),observe:()=>{if(!readable)throw new Error('window w could not be read; the driver read v instead');return {epoch:1,window:w,modal:null,elements:[]};},perform:()=>({status:'ok',window:'w'})};
+    let asked:any=null;
+    const judge={choose:async(_q:string,ctx:any)=>{asked=ctx;return {choice:'unknown',by:'test'};}} as any;
+    const ex=new Executor(driver,{task:'t',raw:'look',publicKey:ConsentSigner.fresh().publicKey,judge});
+    await ex.begin();await ex.observe('w');readable=false;
+    const v=await ex.verdict('done');
+    expect(v.verdict).toBe('unknown');
+    expect(JSON.stringify(asked)).toContain('window w could not be read');
+  });
+});
