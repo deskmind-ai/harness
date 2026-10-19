@@ -468,9 +468,12 @@ export class Executor {
     try { r = await this.driver.perform(req.action); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
-    // a window is the task's (and closing it takes the opening back) only when it was not on screen before: a driver
-    // that put a tab into the user's browser window returns that window, which stays theirs (review of #16)
-    const openedId = r.new_window?.id ?? (req.action.kind === "open_window" ? r.window : undefined);
+    // a window is the task's (and closing it takes the opening back) only on the driver's proof that the action made
+    // it (`new_window`) and when it was not on screen before. The window an action merely lands in is not proof: a URL
+    // put into the user's browser window returns that window (review of #16), and an app launched by open_window comes
+    // back with the windows it restores from its last session, which are the user's (hands PR #48, fourth review: the
+    // driver reports `new_window` only for a window it can prove it made)
+    const openedId = r.new_window?.id;
     if (openedId && !now.windows.some((w) => w.id === openedId)) { this.ledger.created(`window:${openedId}`); this.openedWindows.set(this.receipts.length + 1, openedId); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
     // credited to it once the window is read back (its name there is the evidence), not found later as "changed by
