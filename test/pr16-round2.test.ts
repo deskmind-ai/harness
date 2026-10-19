@@ -51,6 +51,10 @@ describe('PR16 second review probes', () => {
     await ex.begin();await ex.plan({steps:[]});
     expect((await file(ex,'fs.mkdir',{path:'output'})).status).toBe('ok');
     fs.writeFileSync(path.join(root,'output','user.txt'),'user-owned document');ws.invalidate();
+    // the file put in since the task last looked: first look again, then the user's consent
+    const unseen=await file(ex,'fs.trash',{target:'output'});
+    expect({status:unseen.status,exists:ws.exists('output/user.txt')}).toEqual({status:'stale',exists:true});
+    expect((await file(ex,'fs.list',{path:'output'})).status).toBe('ok');
     const result=await file(ex,'fs.trash',{target:'output'});
     expect({status:result.status,exists:ws.exists('output/user.txt')}).toEqual({status:'needs_consent',exists:true});
   });

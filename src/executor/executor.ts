@@ -15,6 +15,7 @@ import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, 
 import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
+import { parentOf } from "../registry/spec.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Workspace } from "../registry/workspace.js";
@@ -75,7 +76,9 @@ export class Executor {
   /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
   private planAccepted: PlanProposal | null = null;
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
-  private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
+  private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
+  /** Paths the task has seen listed in a folder (fs.list): known to be there, though not read. */
+  private listed = new Set<string>();
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
 
@@ -173,9 +176,11 @@ export class Executor {
 
   /** After a screen action: which of the files that changed while it ran are its doing. The driver's receipt says so
    *  when it has one (the paths a save it carried out wrote). Without one, the window it acted in has to name the file
-   *  and its folder — the save sheet's name and location, a row in a file list — before or after the action: a name
-   *  alone is not enough (output/report.txt saved, a sync client's incoming/report.txt is not the task's), and being at
-   *  the same time is no evidence at all (review of #16). A credited file is seen, the task's content, and when new the
+   *  and its whole folder — the save sheet's name, and a location field reading exactly that folder — before or after
+   *  the action: a name alone is not enough (output/report.txt saved, a sync client's incoming/report.txt is not the
+   *  task's), nor a folder's last part (incoming/output is not output), and being at the same time is no evidence at
+   *  all (review of #16). A nested folder a location field shows only by its last name is not credited: the file is
+   *  then another program's, and the task reads it before writing it — safe, one step more. A credited file is seen, the task's content, and when new the
    *  task's object; any other is another program's change, recorded, and a later write on it is found as never read
    *  or changed. Returns the credited paths (files only). */
   private creditFiles(changes: { path: string; was: string; now: string }[], receipt: string[] | undefined, evidence: (Observation | null | undefined)[]): string[] {
@@ -187,8 +192,8 @@ export class Executor {
     const named = (p: string) => {
       const base = p.slice(p.lastIndexOf("/") + 1), stem = base.replace(/\.[^.]+$/, ""), dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
       const file = names.includes(base) || (stem.length >= 3 && names.includes(stem));
-      // the folder: its own name for a subfolder; the task folder's name (or a location field saying ".") for the top
-      const folder = dir ? names.includes(dir.slice(dir.lastIndexOf("/") + 1)) : texts.includes(".") || names.includes(path.basename(root));
+      // the folder, as a whole field: its path in the task folder, or for the top the task folder's name or "."
+      const folder = dir ? texts.includes(dir) : texts.includes(".") || texts.includes(path.basename(root));
       return file && folder;
     };
     const wrote: string[] = [], external: string[] = [];
@@ -397,11 +402,14 @@ export class Executor {
     const obs = target ? this.lastObs.get(target) : undefined;
     if ("target" in req.action && req.action.target && !obs?.elements.some((e) => e.id === (req.action as { target: string }).target)) return done({ ...base, status: "stale", why: `element ${req.action.target} is not in the last observation of ${target}; observe the window first`, epoch: now.epoch });
     if (target && (req.action.kind === "key" || req.action.kind === "type") && !obs) return done({ ...base, status: "stale", why: `window ${target} was never observed; observe it first`, epoch: now.epoch });
+    // the class above was read off that observation (a `sends` button, a compose form Return submits), and so are the
+    // card and the consent: one older than the computer (a snapshot since gave the model a newer epoch) may show
+    // "Preview" where the button now says "Send" — sent without asking — or draft A where B goes out (review of #16).
+    // Any action that reads the observation, or needs consent, waits for the window to be looked at again
+    const readsObs = ("target" in req.action && !!req.action.target) || req.action.kind === "key" || req.action.kind === "type";
+    if (obs && obs.epoch !== now.epoch && (readsObs || NEEDS_CONSENT.has(consequence))) return done({ ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
-      // the card and the consent are made from the window's last observation: one older than the computer (a snapshot
-      // since gave the model a newer epoch) would show draft A and send B (review of #16) — look at the window again
-      if (obs && obs.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
       // a send shows what goes out (the filled-in fields, what the window is about): the user checks it on the card
       // and the judge reads it, not only the Send button (review of #16)
       const sending = consequence === "external" ? outgoing(obs) : null;
@@ -481,9 +489,11 @@ export class Executor {
       await new Promise((r) => setTimeout(r, wait.pollMs));
       now = await this.driver.snapshot();
     }
-    // every wait ends with a resumed, whichever way it ends: the app clears its "paused" state on it (deskmind#85)
-    if (now.user_active) { this.emit("executor.user_resumed", { timed_out: true }); return { now, end: { status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later` } }; }
+    // every wait ends with a resumed, whichever way it ends: the app clears its "paused" state on it (deskmind#85). A
+    // stop is said as a stop even when the user is still at the keyboard — it ended the wait, not they (a stop that
+    // came before the first look used to be reported "blocked: try again later")
     if (this.stopped) { this.emit("executor.user_resumed", { stopped: true }); return { now, end: { status: "stopped", why: "the app stopped the task" } }; }
+    if (now.user_active) { this.emit("executor.user_resumed", { timed_out: true }); return { now, end: { status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later` } }; }
     this.emit("executor.user_resumed", {});
     return { now };
   }
@@ -514,6 +524,15 @@ export class Executor {
     }
     const unseen = fp.writes.filter((p) => ws.exists(p) && !ws.isDir(p) && !(p in this.seen));
     if (unseen.length && cap.effect !== "observe") return { ...base, status: "stale", why: `never read: ${unseen.join(", ")}. Read it first, then decide.` };
+    // a written folder holds only what the task knows is there: something put in since it last looked (and not listed)
+    // goes with the folder unseen — look again first (review of #16)
+    const dirs = fp.writes.filter((p) => ws.exists(p) && ws.isDir(p));
+    const appeared = reach(ws, dirs).filter((p) => !dirs.includes(p) && !(p in this.seen) && !this.listed.has(p));
+    if (appeared.length && cap.effect !== "observe") {
+      for (const p of appeared) if (!ws.isDir(p)) this.noteExternal(p, "absent", ws.version(p));
+      this.emit("executor.external_change", { paths: appeared });
+      return { ...base, status: "stale", why: `new in ${dirs.join(", ")} since you last looked (by another program): ${appeared.join(", ")}. List it again and decide anew.` };
+    }
     const pre = cap.preconditions(ws, a.args);
     if (pre) return { ...base, status: "error", why: `precondition: ${pre}` };
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return { ...base, status: "needs_plan", why: "changing the user's files or sending something out needs a plan first: call plan with the paths, your readings and their evidence" };
@@ -521,15 +540,18 @@ export class Executor {
       const text = describeAction(a, undefined, consequence, cap, this.opts.lang);
       const evidence: Record<string, unknown> = {};
       for (const p of touched) if (!ws.isDir(p)) evidence[`文件 ${p} 现在的内容（前 600 字）`] = ws.readForModel(p, 600);
+      for (const d of dirs) evidence[`文件夹 ${d} 里的东西（会一起受影响）`] = reach(ws, [d]).filter((p) => p !== d).slice(0, 100);
+      const members = new Set(reach(ws, fp.writes));
       const judgedOn: Record<string, string> = {};
       for (const p of new Set([...fp.reads, ...reach(ws, fp.writes)])) if (!ws.isDir(p)) judgedOn[p] = ws.version(p);
       const judged = await this.judgeIntent(a, consequence, object, evidence, text);
       // the judge answers over the network: a file the user changed meanwhile is not the one it judged, and writing
       // now would overwrite their edit (review of #16) — read the versions again, as at the top
       ws.invalidate();
-      const moved = Object.keys(judgedOn).filter((p) => ws.version(p) !== judgedOn[p]);
+      // and what a written folder holds: a file put into it meanwhile is not in the versions above (review of #16)
+      const moved = [...Object.keys(judgedOn).filter((p) => ws.version(p) !== judgedOn[p]), ...reach(ws, fp.writes).filter((p) => !members.has(p))];
       if (moved.length) {
-        for (const p of moved) this.noteExternal(p, judgedOn[p]!, ws.version(p));
+        for (const p of moved) if (!ws.isDir(p)) this.noteExternal(p, judgedOn[p] ?? "absent", ws.version(p));
         this.emit("executor.external_change", { paths: moved });
         return { ...base, status: "stale", why: `changed while this step was being checked (by another program): ${moved.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
       }
@@ -553,7 +575,7 @@ export class Executor {
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && cap.effect !== "observe") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {} });
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
-    if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
+    if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, writes: fp.writes, versions_before, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));
     for (const p of fp.writes) {
       const v = ws.version(p);
@@ -562,6 +584,8 @@ export class Executor {
       if (!existed.includes(p) && ws.exists(p)) { if (gone.length) this.ledger.inherits(`path:${p}`, `path:${gone[0]}`); else this.ledger.created(`path:${p}`); }
     }
     for (const p of fp.reads) this.seen[p] = ws.version(p);        // a read is an observation
+    // a listed folder's members are known to be there (their content is not read: a write on one still needs a read)
+    for (const p of fp.reads) if (ws.isDir(p)) for (const x of Object.keys(ws.entries())) if (parentOf(x) === p) this.listed.add(x);
     return { ...base, status: "ok", output: r.output ?? {} };
   }
 
@@ -629,6 +653,26 @@ export class Executor {
     const plan = this.undoable();
     if (!plan.reversible) return { undone: 0, total: plan.steps.length, refused: plan.steps.find((s) => !s.can)?.why ?? "cannot undo" };
     const ws = this.opts.files?.workspace;
+    // check every file step first, as the orchestrator's undoRun does: nothing is touched unless all of them can be
+    // taken back (review of #16: second.txt was deleted, then the user's edit to first.txt stopped the undo). From the
+    // newest step back, each path a step wrote must be as it left it, given that the later steps' undos have run —
+    // expected[p] starts at the version now and becomes the version before each step — and the capability's own
+    // check (a folder holding only our files) must pass
+    const files = plan.steps.map((st) => this.fileReceipts.get(st.seq)).filter((f) => !!f);
+    const ours = new Set(files.flatMap((f) => f.writes));
+    const expected: Record<string, string> = {};
+    for (const f of files) {
+      let why: string | null = null;
+      for (const p of f.writes) {
+        const now = p in expected ? expected[p]! : ws!.version(p);
+        // a folder's version follows its contents, which later undos change: folders are the capability's to check
+        const left = f.exec.versions_after[p];
+        if (left !== undefined && !left.startsWith("dir:") && left !== now) { why = `changed since the action: ${p}`; break; }
+        expected[p] = f.versions_before[p] ?? "absent";
+      }
+      why ??= f.cap.undoCheck?.(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
+    }
     let undone = 0;
     for (const step of plan.steps) {
       const r = this.receipts.find((x) => x.seq === step.seq)!;
