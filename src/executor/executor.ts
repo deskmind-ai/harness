@@ -100,7 +100,12 @@ export class Executor {
   private recover() {
     const p = this.opts.journal;
     if (!p || !fs.existsSync(p)) return;
-    const lines = fs.readFileSync(p, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
+    // a record cut off mid-write (the process died inside writeSync) is no record: recovery goes on from the last whole
+    // one (review of #16). The fragment is kept — it shows the process got as far as writing — and closed with a
+    // newline, so the next record starts on its own line instead of being glued to it and lost
+    const raw = fs.readFileSync(p, "utf-8");
+    if (raw && !raw.endsWith("\n")) { fs.appendFileSync(p, "\n"); this.emit("executor.journal_torn_tail", { bytes: Buffer.byteLength(raw) - Buffer.byteLength(raw.slice(0, raw.lastIndexOf("\n") + 1)) }); }
+    const lines = raw.split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
     const last = lines.at(-1);
     if (!last || last.kind !== "intent") return;
     const action = last.action as Action;
@@ -136,6 +141,15 @@ export class Executor {
     this.emit("executor.recovered", { action, finding, external });
   }
 
+  /** Another program's change to a file, recorded once per version it made (a write refused again and again on the
+   *  same change is one fact). */
+  private noted = new Set<string>();
+  private noteExternal(path: string, seen: string, now: string) {
+    if (this.noted.has(`${path}@${now}`)) return;
+    this.noted.add(`${path}@${now}`);
+    this.externalChanges.push({ path, seen, now, at: this.opts.now?.() ?? Date.now() });
+  }
+
   /** The task folder right before a screen action: what `creditFiles` compares against afterwards. */
   private fileVersions(): Record<string, string> | null {
     const ws = this.opts.files?.workspace;
@@ -144,28 +158,40 @@ export class Executor {
     return Object.fromEntries(Object.keys(ws.entries()).map((p) => [p, ws.version(p)]));
   }
 
-  /** After a screen action: what changed in the task folder while it ran is the action's doing — versions noted as
-   *  seen, new files as the task's objects, contents as the task's. What changed before it (since the task last
-   *  looked) is not: a file the user made meanwhile stays theirs, and a later write on it is found as never read or
-   *  changed by another program (review of #16: user.txt adopted by an "open editor", then trashed without consent).
-   *  Returns the paths (files only). */
-  private creditFiles(before: Record<string, string> | null): string[] {
+  /** What changed in the task folder since `before`, read right after a screen action (path → version, "absent" when
+   *  gone): the candidates `creditFiles` decides on. */
+  private fileChanges(before: Record<string, string> | null): { path: string; was: string; now: string }[] {
     const ws = this.opts.files?.workspace;
     if (!ws || !before) return [];
     ws.invalidate();
-    const now = ws.entries(), wrote: string[] = [];
-    for (const p of Object.keys(now)) {
-      const v = ws.version(p);
-      if (before[p] === v) continue;
-      const isNew = !(p in before);
-      this.seen[p] = v;
-      if (now[p] === "dir") continue;
-      wrote.push(p);
-      this.taskContent.add(`${p}@${v}`);
-      if (isNew) this.ledger.created(`path:${p}`);
+    const out: { path: string; was: string; now: string }[] = [];
+    for (const p of Object.keys(ws.entries())) { const v = ws.version(p); if (before[p] !== v) out.push({ path: p, was: before[p] ?? "absent", now: v }); }
+    for (const p of Object.keys(before)) if (!ws.exists(p)) out.push({ path: p, was: before[p]!, now: "absent" });
+    return out;
+  }
+
+  /** After a screen action: a file that changed while it ran is the action's doing only when the window it acted in
+   *  names it — the save sheet's name field, the title the document takes after a save, a row in a file list — before
+   *  or after the action. Being at the same time is no evidence: a sync client writing meanwhile is not the task (review
+   *  of #16). A credited file is seen, the task's content, and when new the task's object; any other is another
+   *  program's change, recorded, and a later write on it is found as never read or changed. Returns the credited
+   *  paths (files only). */
+  private creditFiles(changes: { path: string; was: string; now: string }[], evidence: (Observation | null | undefined)[]): string[] {
+    if (!changes.length) return [];
+    const names = evidence.flatMap((o) => (o ? [o.window.title, ...o.elements.flatMap((e) => [e.label, e.value ?? ""])] : [])).join("\n");
+    const named = (p: string) => { const base = p.slice(p.lastIndexOf("/") + 1), stem = base.replace(/\.[^.]+$/, ""); return names.includes(base) || (stem.length >= 3 && names.includes(stem)); };
+    const wrote: string[] = [], external: string[] = [];
+    for (const c of changes) {
+      if (c.was.startsWith("dir:") || c.now.startsWith("dir:")) { if (c.now === "absent") delete this.seen[c.path]; else this.seen[c.path] = c.now; continue; }
+      if (!named(c.path)) { this.noteExternal(c.path, c.was, c.now); external.push(c.path); continue; }
+      wrote.push(c.path);
+      if (c.now === "absent") { delete this.seen[c.path]; continue; }
+      this.seen[c.path] = c.now;
+      this.taskContent.add(`${c.path}@${c.now}`);
+      if (c.was === "absent") this.ledger.created(`path:${c.path}`);
     }
-    for (const p of Object.keys(before)) if (!(p in now)) { delete this.seen[p]; wrote.push(p); }
     if (wrote.length) this.emit("executor.files_written", { paths: wrote });
+    if (external.length) this.emit("executor.external_change", { paths: external, while: "screen action" });
     return wrote;
   }
 
@@ -287,10 +313,14 @@ export class Executor {
       const object = objectOf(a, f.fp, f.cap);
       if (f.cap.effect === "observe") return { consequence: "read", object, why: "reads only" };
       if (f.cap.effect === "external") return { consequence: "external", object, why: "sends something out" };
-      const userPaths = f.fp.writes.filter((p) => f.ws.exists(p) && this.ledger.ownerOf(`path:${p}`) === "user");
+      // a folder carries what is in it: the task's output/ with the user's file put inside is the user's file moved or
+      // trashed along with it (review of #16), so what a write reaches is the path and everything under it
+      const all = Object.keys(f.ws.entries());
+      const reached = [...new Set(f.fp.writes.flatMap((p) => (f.ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
+      const userPaths = reached.filter((p) => f.ws.exists(p) && this.ledger.ownerOf(`path:${p}`) === "user");
       if (userPaths.length) return { consequence: "modify_user", object, why: `changes the user's ${userPaths.join(", ")}` };
       // discarding content the task did not write (replace, trash) is the user's loss even on a path the task made
-      const foreign = f.cap.discards ? f.fp.writes.filter((p) => f.ws.exists(p) && !f.ws.isDir(p) && !this.taskContent.has(`${p}@${f.ws.version(p)}`)) : [];
+      const foreign = f.cap.discards ? reached.filter((p) => f.ws.exists(p) && !f.ws.isDir(p) && !this.taskContent.has(`${p}@${f.ws.version(p)}`)) : [];
       if (foreign.length) return { consequence: "modify_user", object, why: `discards content the task did not write: ${foreign.join(", ")}` };
       return { consequence: "create", object, why: "creates, or changes the task's own files" };
     }
@@ -380,9 +410,10 @@ export class Executor {
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
       if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
-      const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent);
+      // a send's consent is for what it sends: the draft changed since the card is another send, asked again
+      const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent, sending ?? undefined);
       if (why) {
-        const challenge = this.consent.challenge(req.action, f.object, consequence, text);
+        const challenge = this.consent.challenge(req.action, f.object, consequence, text, undefined, sending ?? undefined);
         this.emit("executor.consent_needed", { why, consequence, object: f.object });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
@@ -403,14 +434,16 @@ export class Executor {
     const openedId = r.new_window?.id ?? (req.action.kind === "open_window" ? r.window : undefined);
     if (openedId && !now.windows.some((w) => w.id === openedId)) { this.ledger.created(`window:${openedId}`); this.openedWindows.set(this.receipts.length + 1, openedId); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
-    // credited to it here, not found later as "changed by another program" (rc.1 end-to-end: hello.txt, 10-18)
-    const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles(filesBefore) : [];
+    // credited to it once the window is read back (its name there is the evidence), not found later as "changed by
+    // another program" (rc.1 end-to-end: hello.txt, 10-18)
+    const fileChanges = r.status === "ok" && consequence !== "read" ? this.fileChanges(filesBefore) : [];
+    const credit = (o?: Observation) => this.creditFiles(fileChanges, [before, o]);
     let after: Snapshot;
-    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
+    try { after = await this.driver.snapshot(); } catch (e) { credit(); return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
     this.epoch = after.epoch;
-    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch });
+    if (after.locked) { credit(); return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch }); }
     const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
-    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}) };
+    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
       try {
@@ -422,6 +455,8 @@ export class Executor {
         out.why = `${out.why ?? ""}; the window could not be read back: ${e instanceof Error ? e.message : e}`.replace(/^; /, "");
       }
     }
+    const wrote = credit(out.after);
+    if (wrote.length) out.files = wrote;
     return done(out);
   }
 
@@ -436,11 +471,13 @@ export class Executor {
     const { cap, fp, ws } = f;
     // Files (not folders: a folder's version moves with its children) that changed since the task last saw them were
     // changed by someone else — a fact, recorded. A write on such a file is refused until the task has read it again;
-    // a read is that reading, so it goes ahead (refusing a read with "read it first" went in circles in rc.1).
+    // a read is that reading, so it goes ahead (refusing a read with "read it first" went in circles in rc.1). Only
+    // the read moves what the task has seen: a refusal does not, or the same write retried unread went through
+    // (review of #16).
     const touched = [...new Set([...fp.reads, ...fp.writes])].filter((p) => ws.exists(p) && !ws.isDir(p));
     const changed = touched.filter((p) => p in this.seen && this.seen[p] !== ws.version(p));
     if (changed.length) {
-      for (const p of changed) { this.externalChanges.push({ path: p, seen: this.seen[p] ?? "absent", now: ws.version(p), at: this.opts.now?.() ?? Date.now() }); this.seen[p] = ws.version(p); }
+      for (const p of changed) this.noteExternal(p, this.seen[p] ?? "absent", ws.version(p));
       this.emit("executor.external_change", { paths: changed });
       if (cap.effect !== "observe") return { ...base, status: "stale", why: `changed since you last saw it (by another program): ${changed.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
     }
@@ -461,7 +498,7 @@ export class Executor {
       ws.invalidate();
       const moved = Object.keys(judgedOn).filter((p) => ws.version(p) !== judgedOn[p]);
       if (moved.length) {
-        for (const p of moved) { this.externalChanges.push({ path: p, seen: judgedOn[p]!, now: ws.version(p), at: this.opts.now?.() ?? Date.now() }); if (p in this.seen) this.seen[p] = ws.version(p); }
+        for (const p of moved) this.noteExternal(p, judgedOn[p]!, ws.version(p));
         this.emit("executor.external_change", { paths: moved });
         return { ...base, status: "stale", why: `changed while this step was being checked (by another program): ${moved.join(", ")}. Read it again and decide anew; its content is not yours to undo.` };
       }
@@ -613,10 +650,11 @@ function diffObs(before: Observation | null, after: Observation, newWindows: str
   return { elements: changed, focus: after.elements.find((e) => e.focused)?.label, modal: after.modal?.title ?? null, ...(newWindows.length ? { new_windows: newWindows } : {}) };
 }
 
-/** What a send in this window would send: its filled-in fields (to, subject, body) and the first line it shows (the
- *  message replied to, the page). Read from the observation the action was decided on. */
+/** What a send in this window would send: its filled-in fields (to, subject, body), whole — a commitment after the
+ *  300th character goes out too (review of #16) — and the first line it shows (the message replied to, the page).
+ *  Read from the observation the action was decided on. */
 export function outgoing(obs: Observation | undefined): { fields: string[]; context: string } {
-  const fields = (obs?.elements ?? []).filter((e) => e.value && (e.actions.includes("set_value") || e.actions.includes("type"))).map((e) => `${e.label}：${e.value!.slice(0, 300)}`);
+  const fields = (obs?.elements ?? []).filter((e) => e.value && (e.actions.includes("set_value") || e.actions.includes("type"))).map((e) => `${e.label}：${e.value!}`);
   return { fields, context: (obs?.text ?? "").split("\n")[0]!.slice(0, 120) };
 }
 

@@ -1,7 +1,8 @@
 /**
  * Consent tokens: the app signs, the executor verifies. Ed25519 (node:crypto): the executor holds the public key
  * only, so a runtime between the two cannot forge a token; a challenge binds an action-scoped token to the exact
- * action, object and class, and every token expires and (action scope) is spent on use.
+ * action, object and class — and, for a send, to what goes out — and every token expires and (action scope) is spent
+ * on use.
  *
  * Three scopes (docs/0.5-decisions.md D4, D5): action (this one action), object (this object, this task, up to the
  * class signed), rule (a durable permission the executor keeps).
@@ -11,7 +12,9 @@ import type { Action, Challenge, Consequence, ConsentToken } from "./types.js";
 import { rank } from "./types.js";
 
 export const canon = (x: unknown): string => JSON.stringify(x, (_, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v as object).sort()) : v));
-export const digestOf = (action: Action, object: string, consequence: Consequence) => "sha256:" + createHash("sha256").update(canon({ action, object, consequence })).digest("hex").slice(0, 32);
+/** `content`: what a send sends (the window's filled-in fields), so a "yes" to body A does not send body B — a click on
+ *  Send is the same action whatever the draft says (review of #16). Left out of the digest when there is none. */
+export const digestOf = (action: Action, object: string, consequence: Consequence, content?: unknown) => "sha256:" + createHash("sha256").update(canon({ action, object, consequence, ...(content !== undefined ? { content } : {}) })).digest("hex").slice(0, 32);
 
 const unsigned = (t: ConsentToken) => { const { sig: _s, ...rest } = t; return canon(rest); };
 
@@ -70,10 +73,10 @@ export class ConsentVerifier {
 
   constructor(private readonly publicKey: KeyObject, private readonly now: () => number = Date.now) {}
 
-  challenge(action: Action, object: string, consequence: Consequence, text: string, ttlMs = 5 * 60_000): Challenge {
+  challenge(action: Action, object: string, consequence: Consequence, text: string, ttlMs = 5 * 60_000, content?: unknown): Challenge {
     const nonce = randomBytes(16).toString("hex");
     this.issued.add(nonce);
-    return { nonce, digest: digestOf(action, object, consequence), object, consequence, text, expires_at: this.now() + ttlMs };
+    return { nonce, digest: digestOf(action, object, consequence, content), object, consequence, text, expires_at: this.now() + ttlMs };
   }
 
   private valid(t: ConsentToken): string | null {
@@ -86,14 +89,14 @@ export class ConsentVerifier {
 
   /** Does this token (or a stored rule) cover the action? Spends an action-scoped token. Returns the reason it does
    *  not, or null. */
-  check(action: Action, object: string, consequence: Consequence, task: string, token?: ConsentToken): string | null {
+  check(action: Action, object: string, consequence: Consequence, task: string, token?: ConsentToken, content?: unknown): string | null {
     const covers = (t: ConsentToken): string | null => {
       const bad = this.valid(t);
       if (bad) return bad;
       if (rank(t.consequence) < rank(consequence)) return `consent covers ${t.consequence}, the action is ${consequence}`;
       if (t.scope === "action") {
         if (!this.issued.has(t.nonce)) return "consent answers a challenge this executor did not issue";
-        if (t.digest !== digestOf(action, object, consequence)) return "consent is for another action";
+        if (t.digest !== digestOf(action, object, consequence, content)) return "consent is for another action";
         if (this.spent.has(t.nonce)) return "consent already used";
         return null;
       }
