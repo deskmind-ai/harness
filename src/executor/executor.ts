@@ -178,8 +178,8 @@ export class Executor {
    *  when it has one (the paths a save it carried out wrote). Without one, the window it acted in has to name the file
    *  and its whole folder — the save sheet's name, and a location field reading exactly that folder — before or after
    *  the action: a name alone is not enough (output/report.txt saved, a sync client's incoming/report.txt is not the
-   *  task's), nor a folder's last part (incoming/output is not output), and being at the same time is no evidence at
-   *  all (review of #16). A nested folder a location field shows only by its last name is not credited: the file is
+   *  task's), nor a folder's last part (incoming/output is not output), nor a part of a name, and being at the same
+   *  time is no evidence at all (review of #16). A nested folder a location field shows only by its last name is not credited: the file is
    *  then another program's, and the task reads it before writing it — safe, one step more. A credited file is seen, the task's content, and when new the
    *  task's object; any other is another program's change, recorded, and a later write on it is found as never read
    *  or changed. Returns the credited paths (files only). */
@@ -188,10 +188,11 @@ export class Executor {
     const root = this.opts.files!.workspace.root;
     const reported = receipt?.map((f) => (path.isAbsolute(f) ? path.relative(root, f) : path.normalize(f)).split(path.sep).join("/"));
     const texts = evidence.flatMap((o) => (o ? [o.window.title, ...o.elements.flatMap((e) => [e.label, e.value ?? ""])] : []));
-    const names = texts.join("\n");
     const named = (p: string) => {
-      const base = p.slice(p.lastIndexOf("/") + 1), stem = base.replace(/\.[^.]+$/, ""), dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
-      const file = names.includes(base) || (stem.length >= 3 && names.includes(stem));
+      const base = p.slice(p.lastIndexOf("/") + 1), dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+      // the whole name, as a field or what a title starts with ("report.txt — Edited"): not a part of one (a.txt is in
+      // data.txt) nor the name without its extension (report.csv is not report.txt) (review of #16)
+      const file = texts.some((t) => t === base || t.startsWith(base + " ") || t.startsWith(base + "（"));
       // the folder, as a whole field: its path in the task folder, or for the top the task folder's name or "."
       const folder = dir ? texts.includes(dir) : texts.includes(".") || texts.includes(path.basename(root));
       return file && folder;
@@ -584,8 +585,10 @@ export class Executor {
       if (!existed.includes(p) && ws.exists(p)) { if (gone.length) this.ledger.inherits(`path:${p}`, `path:${gone[0]}`); else this.ledger.created(`path:${p}`); }
     }
     for (const p of fp.reads) this.seen[p] = ws.version(p);        // a read is an observation
-    // a listed folder's members are known to be there (their content is not read: a write on one still needs a read)
-    for (const p of fp.reads) if (ws.isDir(p)) for (const x of Object.keys(ws.entries())) if (parentOf(x) === p) this.listed.add(x);
+    // a listed folder's members are known to be there — the ones the listing returned, not the ones a bounded listing
+    // left out (review of #16: the 201st file) — their content is not read: a write on one still needs a read
+    const shown = Array.isArray(r.output?.entries) ? (r.output.entries as { path?: unknown }[]).map((e) => e.path).filter((x): x is string => typeof x === "string") : [];
+    for (const p of fp.reads) if (ws.isDir(p)) for (const x of shown) if (parentOf(x) === p) this.listed.add(x);
     return { ...base, status: "ok", output: r.output ?? {} };
   }
 
@@ -654,21 +657,29 @@ export class Executor {
     if (!plan.reversible) return { undone: 0, total: plan.steps.length, refused: plan.steps.find((s) => !s.can)?.why ?? "cannot undo" };
     const ws = this.opts.files?.workspace;
     // check every file step first, as the orchestrator's undoRun does: nothing is touched unless all of them can be
-    // taken back (review of #16: second.txt was deleted, then the user's edit to first.txt stopped the undo). From the
-    // newest step back, each path a step wrote must be as it left it, given that the later steps' undos have run —
-    // expected[p] starts at the version now and becomes the version before each step — and the capability's own
-    // check (a folder holding only our files) must pass
+    // taken back (review of #16: second.txt was deleted, then the user's edit to first.txt stopped the undo). The
+    // folder is played backwards on paper: from its versions now, newest step first, each path a step wrote must be as
+    // it left it, then that step is taken back on the paper folder — what it wrote returns to its version before, and
+    // a folder it renamed takes its contents back with it (draft/ → final/: final/note.txt is draft/note.txt again
+    // for the step that wrote it; review of #16) — and the capability's own check (a folder holding only ours) passes
     const files = plan.steps.map((st) => this.fileReceipts.get(st.seq)).filter((f) => !!f);
     const ours = new Set(files.flatMap((f) => f.writes));
-    const expected: Record<string, string> = {};
+    const paper: Record<string, string> = files.length ? Object.fromEntries(Object.keys(ws!.entries()).map((p) => [p, ws!.version(p)])) : {};
+    const under = (d: string) => Object.keys(paper).filter((x) => x.startsWith(d + "/"));
     for (const f of files) {
       let why: string | null = null;
+      const before = (p: string) => f.versions_before[p] ?? "absent", left = (p: string) => f.exec.versions_after[p];
       for (const p of f.writes) {
-        const now = p in expected ? expected[p]! : ws!.version(p);
         // a folder's version follows its contents, which later undos change: folders are the capability's to check
-        const left = f.exec.versions_after[p];
-        if (left !== undefined && !left.startsWith("dir:") && left !== now) { why = `changed since the action: ${p}`; break; }
-        expected[p] = f.versions_before[p] ?? "absent";
+        const l = left(p);
+        if (l !== undefined && !l.startsWith("dir:") && l !== (paper[p] ?? "absent")) { why = `changed since the action: ${p}`; break; }
+      }
+      if (!why) {
+        const src = f.writes.find((p) => before(p).startsWith("dir:") && left(p) === "absent");
+        const dst = f.writes.find((p) => before(p) === "absent" && left(p)?.startsWith("dir:"));
+        if (src && dst) for (const x of under(dst)) { paper[src + x.slice(dst.length)] = paper[x]!; delete paper[x]; }
+        else for (const p of f.writes) if (before(p) === "absent") for (const x of under(p)) delete paper[x];
+        for (const p of f.writes) { if (before(p) === "absent") delete paper[p]; else paper[p] = before(p); }
       }
       why ??= f.cap.undoCheck?.(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
       if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
@@ -731,11 +742,12 @@ function reach(ws: Workspace, paths: string[]): string[] {
   return [...new Set(paths.flatMap((p) => (ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
 }
 
-/** What a send in this window would send: its filled-in fields (to, subject, body), whole — a commitment after the
- *  300th character goes out too (review of #16) — and the first line it shows (the message replied to, the page).
- *  Read from the observation the action was decided on. */
+/** What a send in this window would send: every field set in it — typed (subject, body) or picked from a list (a
+ *  recipient pop-up; review of #16: Alice approved, Bob sent) — whole, a commitment after the 300th character goes out
+ *  too, and the first line it shows (the message replied to, the page). Read from the observation the action was
+ *  decided on. */
 export function outgoing(obs: Observation | undefined): { fields: string[]; context: string } {
-  const fields = (obs?.elements ?? []).filter((e) => e.value && (e.actions.includes("set_value") || e.actions.includes("type"))).map((e) => `${e.label}：${e.value!}`);
+  const fields = (obs?.elements ?? []).filter((e) => e.value && e.actions.some((x) => x === "set_value" || x === "type" || x === "select")).map((e) => `${e.label}：${e.value!}`);
   return { fields, context: (obs?.text ?? "").split("\n")[0]!.slice(0, 120) };
 }
 
