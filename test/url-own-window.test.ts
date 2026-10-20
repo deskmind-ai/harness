@@ -17,7 +17,7 @@ import { Workspace, build } from "../src/registry/workspace.js";
 import { fileRegistry } from "../src/registry/fs.js";
 
 /** The sim desktop with hands' promise: a url opens in a window of the task's own (the sim always opens a new one). */
-class OwnWindowSim extends SimComputer { readonly capabilities = { urlInOwnWindow: true }; }
+class OwnWindowSim extends SimComputer { readonly capabilities = { urlInOwnBrowserWindow: true }; }
 
 const google = (q: string) => "https://www.google.com/search?q=" + encodeURIComponent(q);
 
@@ -50,6 +50,13 @@ describe("A: a url opens in the task's own window when the driver promises so", 
     expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: google("今天北京天气") })).toMatchObject({ consequence: "modify_user", object: `window:${theirs}` });
   });
 
+  it("only in a browser: with the promise, a url handed to another app the user has open still lands in their window", async () => {
+    const { ex, sim } = await setup();
+    const editor = sim.addEditor("编辑器").id;                          // the user's own, not a browser (no browser flag)
+    await ex.snapshot();
+    expect(ex.floor({ kind: "open_window", app: "编辑器", url: "x-editor://doc/1" })).toMatchObject({ consequence: "modify_user", object: `window:${editor}` });
+  });
+
   it("the per-site rule is untouched: after a file read, an unapproved host is still a send", async () => {
     const { ex, open } = await setup();
     await ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "合同.txt" } }, epoch: ex.currentEpoch });
@@ -58,7 +65,20 @@ describe("A: a url opens in the task's own window when the driver promises so", 
   });
 });
 
-describe("C: only an action that reads the observation goes stale on an epoch change", () => {
+describe("C: only an action that reads the observation, or needs consent, goes stale on an epoch change", () => {
+  it("closing the user's window with their consent, decided before the epoch moved, is stale: the window stays", async () => {
+    const sim = new SimComputer(), app = ConsentSigner.fresh();
+    const theirs = sim.addEditor("编辑器").id;
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey });
+    const s = await ex.begin(); await ex.plan({ steps: [] });
+    const consent = app.forObject(`window:${theirs}`, "modify_user", "t1");
+    sim.epoch += 3;                                                   // the user edited the window since the card
+    const r = await ex.act({ action: { kind: "close_window", window: theirs }, epoch: s.epoch, consent });
+    expect([r.status, r.consequence]).toEqual(["stale", "modify_user"]);
+    expect(sim.snapshot().windows.some((w) => w.id === theirs)).toBe(true);
+  });
+
+
   it("open_window, focus_window and wait decided before the epoch moved still go; a click on the old look is refused", async () => {
     const { ex, sim, open } = await setup();
     const first = await open();
