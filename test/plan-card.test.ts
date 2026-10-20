@@ -116,7 +116,7 @@ describe("the plan card by the executor's view", () => {
     const { rt, cards, events } = run(sim, steps, "回复林晓：收到");
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("1. 回复并发送（窗口 " + w + "）——改你的东西，也会往外发");
+    expect(cards[0]!.text).toContain("1. 回复并发送（信鸽「收件箱」）——改你的东西，也会往外发");
     expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["external"], objects: [`window:${w}`] });
   });
 
@@ -169,5 +169,51 @@ describe("the plan card by the executor's view", () => {
     ], "开一个新文档");
     await rt.run();
     expect(cards).toEqual([]);
+  });
+});
+
+describe("the plan card names the objects as the user knows them (review of #31)", () => {
+  it("a window by its app and title, an untitled window as the app's main window, a tab by title and site, a file by its path; unresolved as written", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "plancard-"));
+    build(root, { "notes/todo.txt": "交房租\n" });
+    const ws = new Workspace(root);
+    const sim = new SimComputer(root);
+    const mailW = sim.addMail({ app: "信鸽", texts: ZH_MAIL_TEXTS, flagged: [], inbox: [] }).id;
+    const ed = sim.addEditor("编辑器"); ed.title = "";
+    const br = sim.addBrowser("Safari", [{ title: "合同续签 - Mailora", url: "http://127.0.0.1:8977/apps/mail.html" }]);
+    const tab = br.state.tabs[0].id as string;
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
+    const gw = new Gateway(table);
+    gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));
+    const cards: Card[] = [];
+    const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "整理", objects: [`窗口 ${mailW}`, `window:${ed.id}`, `tab:${tab}`, "notes/todo.txt", "那个不存在的东西"], consequence: "create" }] } }] }, finish];
+    const rt = new FrontierRuntime({ task: "t1", raw: "整理一下", executor: ex, signer: app, user: { ask: (c: Card): Answer => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) }, workspace: ws, registry: fileRegistry() });
+    await rt.run();
+    expect(cards[0]!.text).toContain("1. 整理（信鸽「收件箱」、编辑器 的主窗口、「合同续签 - Mailora」（127.0.0.1:8977）、notes/todo.txt、那个不存在的东西）——改你的东西");
+    expect(cards[0]!.text).not.toContain(mailW);
+  });
+
+  it("one look for the whole plan; none for a plan of looks only", async () => {
+    for (const [consequence, want] of [["create", 1], ["read", 0]] as const) {
+      const { sim, w } = mailSim();
+      const app = ConsentSigner.fresh();
+      const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey });
+      const gw = new Gateway(table);
+      gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));
+      const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [1, 2, 3].map((n) => ({ purpose: `第 ${n} 步`, objects: [`窗口 ${w}`], consequence })) } }] }, finish];
+      let looks = 0, inPlan = false;
+      const rt = new FrontierRuntime({ task: "t1", raw: "看看", executor: ex, signer: app, user: { ask: (c: Card): Answer => ({ option: c.options.findIndex((o) => o.kind === "approve") }) }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) },
+        onEvent: (k, b) => { if (k === "tool.result" && b.name === "plan") inPlan = false; } });
+      const snap = ex.snapshot.bind(ex);
+      ex.snapshot = async () => { if (inPlan) looks += 1; return snap(); };
+      const plan = ex.plan.bind(ex);
+      ex.plan = async (p) => { const v = await plan(p); inPlan = true; return v; };      // count from the executor's plan to the card
+      await rt.run();
+      expect([consequence, looks]).toEqual([consequence, want]);
+    }
   });
 });

@@ -27,7 +27,7 @@ import type { ConsentSigner } from "../executor/consent.js";
 import { Executor, describeAction } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
 import { defaultJudge } from "../executor/judge.js";
-import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading } from "../executor/types.js";
+import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "../executor/types.js";
 
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
 /** What signs consent: the app (keychain) in production, a ConsentSigner in tests and the CLI. */
@@ -365,8 +365,10 @@ export class FrontierRuntime {
     // file that is the user's changes the user's things, whatever the model declared (a real run wrote "create" for the
     // music app's window the executor counted as the user's, so no plan card was shown and every step asked on its own
     // card — 「打开网易云播放安溥的宝贝」, 10-20). A declared external stays external; sending still asks per action
-    const snap = await this.o.executor.snapshot();
-    const objectsOf = await Promise.all(steps.map((s) => this.canonObjects(s.objects)));
+    // only looks: nothing to ask, nothing to resolve
+    if (steps.every((s) => s.consequence === "read")) return text("计划记下了；这些步骤不需要用户同意，直接做。");
+    const snap = await this.o.executor.snapshot();           // one look for the whole plan
+    const objectsOf = await Promise.all(steps.map((s) => this.canonObjects(s.objects, snap)));
     // only what is there: a window or tab on screen, a file in the task folder (a raw "window:…" the model wrote that names
     // nothing would otherwise be called the user's by the ledger and signed — review of #31)
     const there = new Set([...snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]), ...(this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [])]);
@@ -388,7 +390,17 @@ export class FrontierRuntime {
     // opened, the body filled): the card says both, and only what the card says changes the user's things is signed
     // (review of #31: 「回复并发送」 signed the mail window under a line that said only 「会发出去」)
     const mine = (i: number) => objectsOf[i]!.some(theirs);
-    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
+    // the objects as the user knows them, from the snapshot — the app and its window's title, a tab's title and site, a
+    // file's path in the task folder — not the model's words (「窗口 com.netease.163music#30144」 told the user nothing,
+    // review of #31); what did not resolve is shown as the model wrote it, and is not signed
+    const shown = (o: string): string => {
+      const id = o.slice(o.indexOf(":") + 1);
+      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return w.title.trim() ? `${w.app}「${w.title}」` : this.t.mainWindow(w.app); }
+      if (o.startsWith("tab:")) for (const w of snap.windows) { const t = w.tabs?.find((x) => x.id === id); if (t) { let site = ""; try { site = new URL(t.url).host; } catch { /* no site */ } return `「${t.title}」${site ? `（${site}）` : ""}`; } }
+      if (o.startsWith("path:") && there.has(o)) return id;
+      return o;
+    };
+    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${objectsOf[i]!.length ? "（" + objectsOf[i]!.map(shown).join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
     const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     if (!got) return this.end("failed", "no answer from the user");
@@ -408,8 +420,8 @@ export class FrontierRuntime {
   /** The objects a plan names, in the executor's own terms: a model writes 「窗口 editor-1（用户的编辑器）」 or a bare
    *  path; the consent has to be keyed by `window:<id>` / `tab:<id>` / `path:<p>` or it covers nothing. Matched
    *  against the ids on screen and the files in the folder, by structure, never by meaning. */
-  private async canonObjects(objects: string[]): Promise<string[]> {
-    const snap = await this.o.executor.snapshot();
+  private async canonObjects(objects: string[], given?: Snapshot): Promise<string[]> {
+    const snap = given ?? await this.o.executor.snapshot();
     const ids = snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]);
     const paths = this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [];
     const out = new Set<string>();
