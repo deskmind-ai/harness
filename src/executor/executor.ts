@@ -676,18 +676,23 @@ export class Executor {
       const onScreen = app.windows.length > 0;
       const own = !!a.url && !!this.driver.capabilities?.urlInOwnBrowserWindow && app.browser;
       const theirs = a.url && !own ? app.windows.find((w) => w.owner === "user") : undefined;
-      const mine = own ? app.windows.find((w) => w.owner === "task") : undefined;
+      // the object is a window only when it is the one the driver will use: the user's window of the one app the name
+      // means (names that match two apps may be opened in either, so the card names the app), and the task's window
+      // when it has just one there (with several, which the driver picks is its own) — otherwise the app
+      const theirsObject = theirs && app.oneApp ? `window:${theirs.id}` : object;
+      const mine = app.windows.filter((w) => w.owner === "task");
+      const mineObject = mine.length === 1 ? `window:${mine[0]!.id}` : object;
       // once the task has taken in content (read a file, typed what the user did not write), a URL can carry it out:
       // a host not approved yet in this task is a send, asked once per host; a URL that is not http(s) every time
       // (owner 10-21: per-site consent, replacing the text matching of #33)
       const s = this.siteRule(a);
-      if (s) return { consequence: "external", object: theirs ? `window:${theirs.id}` : object, why: s.host ? `the task has ${s.by === "read" ? "read the user's files" : "typed text the user did not write"}; opening ${s.host} may carry what it took in` : `the task has taken in content; ${a.url} is not an http(s) page and may carry it` };
-      if (theirs) return { consequence: "modify_user", object: `window:${theirs.id}`, why: `opens ${a.url} in the user's ${a.app} window` };
+      if (s) return { consequence: "external", object: theirsObject, why: s.host ? `the task has ${s.by === "read" ? "read the user's files" : "typed text the user did not write"}; opening ${s.host} may carry what it took in` : `the task has taken in content; ${a.url} is not an http(s) page and may carry it` };
+      if (theirs) return { consequence: "modify_user", object: theirsObject, why: app.oneApp ? `opens ${a.url} in the user's ${a.app} window` : `opens ${a.url} in ${a.app}, a name more than one app on screen goes by: it may land in a window of the user's` };
       // a url for an app with no window on screen that is not a known browser — an alias of an app the user has open,
       // or one not running that may bring back the user's last session on launch: where it lands is not known, taken
       // to be the user's (a browser not running, on a driver that does not list browsers, costs one card: the safe side)
       if (a.url && !onScreen && !own) return { consequence: "modify_user", object, why: `opens ${a.url} in ${a.app}, which has no window on screen and is not a known browser: it may land in a window of the user's` };
-      if (own) return { consequence: "create", object: mine ? `window:${mine.id}` : object, why: `opens ${a.url} in a ${a.app} window of the task's own` };
+      if (own) return { consequence: "create", object: mineObject, why: `opens ${a.url} in a ${a.app} window of the task's own` };
       return { consequence: "create", object, why: "a window of the task's own" };
     }
     const owner = this.ledger.ownerOf(object);
@@ -702,17 +707,19 @@ export class Executor {
    *  — resolved by hands all the same — landed in their window with no card (review of #34). `bundle` is set only when
    *  every match is one app, and `browser` only when that app is beyond doubt a browser: two apps both called "Foo",
    *  one of them a browser, are neither (review of #36: hands might pick the other). */
-  private appNamed(name: string): { windows: WindowInfo[]; bundle?: string; browser: boolean } {
+  private appNamed(name: string): { windows: WindowInfo[]; bundle?: string; browser: boolean; oneApp: boolean } {
     const want = name.trim().toLowerCase();
     const named = (n?: string) => !!n && n.trim().toLowerCase() === want;
     const windows = (this.last?.windows ?? []).filter((w) => [w.app, w.app_name, w.bundle, w.id.includes("#") ? w.id.slice(0, w.id.lastIndexOf("#")) : ""].some(named));
     if (windows.length) {
       const bundles = new Set(windows.map((w) => w.bundle?.toLowerCase()));
       const bundle = bundles.size === 1 && windows[0]!.bundle ? windows[0]!.bundle : undefined;
-      return { windows, bundle, browser: !!bundle && windows.every((w) => w.browser === true) };
+      // one app: one bundle, or (a driver that gives none) one name
+      const oneApp = new Set(windows.map((w) => (w.bundle ?? w.app).toLowerCase())).size === 1;
+      return { windows, bundle, browser: !!bundle && windows.every((w) => w.browser === true), oneApp };
     }
     const listed = (this.last?.browsers ?? []).filter((b) => named(b.bundle) || b.names.some(named));
-    return listed.length === 1 ? { windows, bundle: listed[0]!.bundle, browser: true } : { windows, browser: false };
+    return listed.length === 1 ? { windows, bundle: listed[0]!.bundle, browser: true, oneApp: true } : { windows, browser: false, oneApp: listed.length < 2 };
   }
 
   /** The action as the driver is handed it: an open_window names the app by the bundle settled here, when there is
