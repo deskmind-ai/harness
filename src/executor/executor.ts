@@ -80,17 +80,22 @@ const RETURN = /\b(return|enter)\b/i;
 
 /** How far (px, on each axis) an element read again may have moved and still be the same one: text recognition's boxes
  *  jitter by a few pixels, while two lines of a chat or two controls are at least a line apart (~20 px and more at
- *  default sizes). A fixed grid would split elements sitting on a cell edge; a distance does not. The window's frame is
- *  not in an observation, so it is screen pixels: a window moved as a whole asks again (the safe side). */
+ *  default sizes). A fixed grid would split elements sitting on a cell edge; a distance does not. hands gives rects in
+ *  the window's own coordinates (fractions of the window's screenshot), so moving the whole window changes nothing
+ *  here; content moving inside the window (a scroll) does. */
 const NEAR_PX = 16;
 
-/** One element as the binding knows it: its content (role, label, value, focus, and where it was read from), and its
- *  identity — the id for an accessibility element (stable between looks), its position for one read from the screen
- *  (text recognition renumbers its ids every look). */
-interface Ident { c: string; id?: string; at: [number, number] | null }
+/** One element as the binding knows it: its content (role, label, value, focus, and where it was read from), its
+ *  identity — the id for an accessibility element, its position for one read from the screen (text recognition
+ *  renumbers its ids every look) — and whether it can be acted on (`act`). Peekaboo's accessibility ids (elem_N) are
+ *  not stable either: they are numbered per look. Pairing by id is safe only because every element of the window is
+ *  bound: the same id with another label is a change, and a renumbering that pairs nothing asks again (more cards,
+ *  never fewer). */
+interface Ident { c: string; id?: string; at: [number, number] | null; act?: true }
 const identOf = (e: Element, withFocus = true): Ident => ({
   c: canon([e.role, e.label, e.value ?? null, fromScreen(e) ? "pixels" : "ax", ...(withFocus ? [!!e.focused] : [])]),
   ...(fromScreen(e) ? {} : { id: e.id }),
+  ...(e.actions.length ? { act: true as const } : {}),
   at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null,
 });
 /** The same element: same content, and the same id (accessibility) or roughly the same place (screen; without a
@@ -124,10 +129,12 @@ interface SendBinding { window: { app: string; title: string; url: string | null
  *  moved or gone is another send. */
 function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding): boolean {
   if (canon([bound.window, bound.modal, bound.typed]) !== canon([now.window, now.modal, now.typed])) return false;
-  // strict, for a window read from the screen: nothing may have changed at all
-  if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return sameScreen(bound.whole, now.whole);
+  // the same target and focus under every policy: a screen the same as before, renumbered, can put the caller's id on
+  // the other pane's「发送」 (review of #25)
   const one = (a: Ident | null, b: Ident | null) => (a === null || b === null ? a === b : sameEl(a, b));
   if (!one(bound.target, now.target) || !one(bound.focused, now.focused)) return false;
+  // strict, for a window read from the screen: nothing may have changed at all
+  if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return sameScreen(bound.whole, now.whole);
   const used = new Set<number>();
   for (const b of bound.elements) {
     let best = -1;
@@ -135,6 +142,11 @@ function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding):
     if (best < 0) return false;
     used.add(best);
   }
+  // what came since: in a window read from the accessibility tree, only what cannot be acted on (an incoming message,
+  // a "typing…" line); a new button, tag, link or field may be a new recipient (review of #25: 「b@evil.com」 added).
+  // Text recognition offers every row as clickable, so in a screen-read window under `match` nothing tells them apart:
+  // additions stay allowed there (the owner's trade-off; `strict` is the default)
+  if (now.elements.some((n, i) => !used.has(i) && n.act && n.id !== undefined)) return false;
   return true;
 }
 

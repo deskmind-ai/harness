@@ -621,8 +621,8 @@ describe("outgoing check: the loop after a stale", () => {
     let looks = 0;
     const { r, cards, desk } = await run((desk) => {
       const observe = desk.observe.bind(desk);
-      // the second look (the last look of the approved send) finds a new name-list control: stale; it stays after that
-      desk.observe = (id: string) => { looks += 1; if (looks === 2) w.elements = [...w.elements, { id: "sf", role: "button", label: "发送文件", actions: ["click"], sends: true }]; return observe(id); };
+      // the second look (the last look of the approved send) finds the computer moved on (another app's input): stale
+      desk.observe = (id: string) => { looks += 1; if (looks === 2) desk.epoch += 1; return observe(id); };
       return [plan, look, click("b7"), look, click("b7"), { calls: [{ name: "finish", args: { outcome: "done", summary: "发了" } }] }];
     }, w);
     expect(cards.map((c) => c.kind)).toEqual(["plan", "action"]);
@@ -852,5 +852,50 @@ describe("outgoing check: the pixel send-binding policy (owner 10-20)", () => {
       expect((await setup([chat()])).ex.pixelPolicy).toBe("match");
       expect((await setup([chat()], undefined, undefined, { pixelSendBinding: "strict" })).ex.pixelPolicy).toBe("strict");   // the option wins
     } finally { if (prev === undefined) delete process.env.DESKMIND_PIXEL_SEND_BINDING; else process.env.DESKMIND_PIXEL_SEND_BINDING = prev; }
+  });
+});
+
+describe("outgoing check: review of #25", () => {
+  it("both policies: the same screen renumbered between the caller's looks does not send from the other pane", async () => {
+    for (const p of ["strict", "match"] as const) {
+      const { judge } = judged(() => ({ choice: "sends" }));
+      let flip = false;
+      const w: FakeWin = { info: { id: "w", app: "微信", title: "微信" }, elements: [], text: "" };
+      const fill = () => {
+        const a: Omit<Element, "id">[] = [{ role: "statictext", label: "张三", actions: [], rect: [0, 0, 10, 10] }, { role: "button", label: "发送", actions: ["click"], rect: [0, 100, 10, 10] }];
+        const b: Omit<Element, "id">[] = [{ role: "statictext", label: "李四", actions: [], rect: [500, 0, 10, 10] }, { role: "button", label: "发送", actions: ["click"], rect: [500, 100, 10, 10] }];
+        w.elements = (flip ? [...b, ...a] : [...a, ...b]).map((e, i) => ({ id: `ocr:${i}`, ...e }));
+      };
+      fill();
+      const { ex, desk, app } = await setup([w], judge, undefined, { pixelSendBinding: p });
+      let o = await ex.observe("w");
+      const a: Action = { kind: "click", window: "w", target: "ocr:1" };
+      const r1 = await ex.act({ action: a, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+      flip = true; fill();
+      o = await ex.observe("w");                                                            // ocr:1 is now 李四's 发送
+      const r2 = await ex.act({ action: a, epoch: o.epoch, consent: app.forAction(r1.challenge!) });
+      expect([p, r2.status, desk.log.length]).toEqual([p, "needs_consent", 0]);
+      expect(r2.challenge!.text).toContain("李四");
+    }
+  });
+
+  it("windows read from the accessibility tree: a recipient tag added before sending asks again; an incoming message does not", async () => {
+    for (const p of ["strict", "match"] as const) {
+      for (const [added, want] of [[{ id: "elem_4", role: "button", label: "b@evil.com", actions: ["click"], rect: [200, 10, 80, 20] }, "needs_consent"], [{ id: "elem_5", role: "statictext", label: "a@x.com：好的", actions: [], rect: [10, 400, 200, 20] }, "ok"]] as const) {
+        const { judge } = judged(() => ({ choice: "sends" }));
+        const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: [
+          { id: "elem_1", role: "textfield", label: "收件人", value: "a@x.com", actions: ["type"], rect: [10, 10, 300, 20] },
+          { id: "elem_2", role: "textarea", label: "正文", value: "报价单", actions: ["type"], rect: [10, 100, 300, 200] },
+          { id: "elem_3", role: "button", label: "发送", actions: ["click"], rect: [320, 10, 40, 20] },
+        ], text: "" };
+        const { ex, desk, app } = await setup([w], judge, undefined, { pixelSendBinding: p });
+        const o = await ex.observe("w");
+        const a: Action = { kind: "click", window: "w", target: "elem_3" };
+        const r1 = await ex.act({ action: a, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+        w.elements = [...w.elements, { ...added, actions: [...added.actions], rect: [...added.rect] as [number, number, number, number] }];
+        const r2 = await ex.act({ action: a, epoch: o.epoch, consent: app.forAction(r1.challenge!) });
+        expect([p, added.label, r2.status, desk.log.length]).toEqual([p, added.label, want, want === "ok" ? 1 : 0]);
+      }
+    }
   });
 });
