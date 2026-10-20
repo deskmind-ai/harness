@@ -6,7 +6,8 @@
  *   begin     inventory: everything on screen now is the user's
  *   snapshot  the whole computer, owners stamped
  *   observe   one window close up
- *   act       floor (structure) ⊔ the model's class → guard → driver → re-observe → receipt
+ *   classify  structure ⊔ the model's class ⊔ the judge's "will this send something out?" (only raises)
+ *   act       classify → guard → driver → re-observe → receipt
  *   verify    the evidence a final judgement needs (every window of interest, after)
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
@@ -21,10 +22,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
-import { NEEDS_CONSENT, higher } from "./types.js";
-import { ConsentVerifier } from "./consent.js";
+import { NEEDS_CONSENT, higher, rank } from "./types.js";
+import { ConsentVerifier, canon } from "./consent.js";
 import { Ledger } from "./ledger.js";
-import { INTENT_OPTIONS, INTENT_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
+import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import { T, type Lang } from "../runtime/text.js";
 import type { KeyObject } from "node:crypto";
 
@@ -47,6 +48,19 @@ export interface ExecutorOptions {
   /** The task folder and the file capabilities: files are objects like windows (owner, version, last seen). */
   files?: { workspace: Workspace; registry: Registry };
 }
+
+/** An action's class, as `classify` settles it, and who settled it: structure (ownership, a capability's declared
+ *  effect, or — with no judge attached — the old send hints), the model's own class, a judge tier (its name: "brain",
+ *  "frontier"…) answering "will this send something out?", or no answer (then external). */
+export interface Classification { consequence: Consequence; object: string; why: string; by: string }
+
+/** An element read from the screen's pixels rather than the accessibility tree: hands' `source` when it sends one,
+ *  otherwise its id prefix (text recognition, controls hands made up, Eyes). */
+export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pixels" : /^(ocr|gen|icon|desc):/.test(e.id));
+
+/** The screen actions the outgoing question is asked of: those that change something and could send — a click, a
+ *  double-click, a key, a typed newline. set_value / select / scroll / typing without a newline are not. */
+const mightSend = (a: Action): boolean => a.kind === "click" || a.kind === "double_click" || a.kind === "key" || (a.kind === "type" && a.text.includes("\n"));
 
 /** What an action touches: the object the guard and the consent are about. */
 export function objectOf(a: Action, fp?: { reads: string[]; writes: string[] }, cap?: Capability): string {
@@ -84,6 +98,12 @@ export class Executor {
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; madeParents: string[]; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
   /** Paths the task has seen listed in a folder (fs.list): known to be there, though not read. */
   private listed = new Set<string>();
+  /** What the task typed into each window (type / set_value that went through), in order: evidence for the outgoing
+   *  question, and on a window read from the screen what the card shows goes out (text recognition may not read an
+   *  input box back). Cleared when a send in that window went through: that text is gone. */
+  private typed = new Map<string, string[]>();
+  /** classify's answers, per (action, epoch, the model's class): the judge is asked once per action per screen. */
+  private classified = new Map<string, Classification>();
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
 
@@ -341,8 +361,8 @@ export class Executor {
     try { return { cap, fp: cap.footprint(f.workspace, a.args), ws: f.workspace }; } catch (e) { return { error: e instanceof Error ? e.message : String(e) }; }
   }
 
-  /** The minimum class an action can have, from structure alone. */
-  floor(a: Action): { consequence: Consequence; object: string; why: string } {
+  /** The minimum class an action can have, from structure alone: ownership and what a capability declares. */
+  structure(a: Action): { consequence: Consequence; object: string; why: string } {
     if (a.kind === "file") {
       const f = this.fileOf(a);
       if ("error" in f) return { consequence: "read", object: `cap:${a.capability}`, why: f.error };
@@ -370,30 +390,99 @@ export class Executor {
     }
     const owner = this.ledger.ownerOf(object);
     if (a.kind === "close_window") return owner === "user" ? { consequence: "modify_user", object, why: "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
-    const obs = this.lastObs.get(a.window);
-    const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
-    if (el?.sends) return { consequence: "external", object, why: `「${el.label}」 sends something out` };
-    // Return (any chord with it) or a typed newline in a window that has a sending control: in every compose form the
-    // focus is on the text, the default button sends, so this is the same as pressing it (review 10-18, T3)
-    const submits = (a.kind === "key" && /\b(return|enter)\b/i.test(a.chord)) || (a.kind === "type" && a.text.includes("\n"));
-    const sender = obs?.elements.find((e) => e.sends);
-    if (submits && sender) return { consequence: "external", object, why: `Return in a window where 「${sender.label}」 sends` };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
   }
 
-  /** What `act` would decide before doing anything: the class and whether consent is needed (for a runtime that
-   *  wants to ask first). */
-  preview(req: Omit<ActRequest, "consent">): { consequence: Consequence; object: string; needs_consent: boolean; floor_why: string } {
-    const f = this.floor(req.action);
-    const consequence = higher(f.consequence, req.consequence ?? "read");
+  /** The old structural send hints for a screen action: the target is marked `sends` (hands' name list), and Return or
+   *  a typed newline in a window that has such a control — in every compose form the focus is on the text and the
+   *  default button sends (review 10-18, T3). With a judge they are evidence for the outgoing question, not a class. */
+  private hints(a: Action): { obs?: Observation; el?: Element; submits: boolean; sender?: Element } {
+    if (!("window" in a)) return { submits: false };
+    const obs = this.lastObs.get(a.window);
+    const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
+    const submits = (a.kind === "key" && /\b(return|enter)\b/i.test(a.chord)) || (a.kind === "type" && a.text.includes("\n"));
+    return { obs, el, submits, sender: obs?.elements.find((e) => e.sends) };
+  }
+
+  /** The minimum class from structure alone, the send hints included: what decides when no judge is attached (tests,
+   *  the practice ground without a model). With a judge, `classify` uses `structure` and asks instead. */
+  floor(a: Action): { consequence: Consequence; object: string; why: string } {
+    const s = this.structure(a);
+    if (s.consequence === "external" || a.kind === "file" || a.kind === "close_window" || a.kind === "open_window") return s;
+    const h = this.hints(a);
+    if (h.el?.sends) return { consequence: "external", object: s.object, why: `「${h.el.label}」 sends something out` };
+    if (h.submits && h.sender) return { consequence: "external", object: s.object, why: `Return in a window where 「${h.sender.label}」 sends` };
+    return s;
+  }
+
+  /** The text the task typed into the action's window so far, and what this action types. */
+  private typedIn(a: Action): string[] {
+    if (!("window" in a)) return [];
+    return [...(this.typed.get(a.window) ?? []), ...(a.kind === "type" ? [a.text] : a.kind === "set_value" ? [a.value] : [])];
+  }
+
+  /** An action's class and who settled it (docs/outgoing-check-2026-10-20.md §4), from structured facts only — never
+   *  the user's words: structure first (ownership; a capability that declares it sends), then the model's own class,
+   *  then, for a screen action that changes something and is still below external, the judge's "will this send
+   *  something out?" — which only raises: 会 / 拿不准 / no answer → external, 不会 → unchanged. Without a judge the old
+   *  send hints decide (floor). Answered once per action per screen (epoch); `act` always calls it itself. */
+  async classify(a: Action, epoch: number, declared?: Consequence): Promise<Classification> {
+    const key = canon({ a, epoch, declared: declared ?? null });
+    const hit = this.classified.get(key);
+    if (hit) return hit;
+    const s = this.structure(a);
+    const model = declared && rank(declared) > rank(s.consequence);
+    const settle = (c: Classification) => { this.classified.set(key, c); this.emit("executor.classify", { action: a, epoch, ...c }); return c; };
+    const mine = (): Classification => ({ consequence: higher(s.consequence, declared ?? "read"), object: s.object, why: model ? `the model's class (${declared}); structure: ${s.why}` : s.why, by: model ? "model" : "structure" });
+    if (s.consequence === "external") return settle({ ...s, by: "structure" });
+    if (declared === "external") return settle(mine());
+    const judge = this.opts.judge;
+    if (!judge || !mightSend(a)) {
+      // not a question for the judge (or none attached): the old hints still raise, as before
+      const f = this.floor(a);
+      if (f.consequence === "external") return settle({ ...f, by: "structure" });
+      return settle(mine());
+    }
+    const h = this.hints(a);
+    const els = h.obs?.elements ?? [];
+    const screen = (e: Element) => (fromScreen(e) ? "画面（文字识别或补出来的控件，不是辅助功能树）" : "辅助功能树");
+    const typed = this.typedIn(a);
+    const ctx: Record<string, unknown> = {
+      对象: s.object,
+      动作: describeAction(a, h.obs, "read"),
+      ...(a.kind === "key" ? { 按的键: a.chord } : {}),
+      ...(a.kind === "type" ? { 输入的文字: a.text } : {}),
+      目标元素: h.el ? { 角色: h.el.role, 名字: h.el.label, ...(h.el.value ? { 值: h.el.value } : {}), 来源: screen(h.el), 名字命中发送词表: !!h.el.sends } : null,
+      窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
+      窗口里标了会发出的其他元素: els.filter((e) => e.sends && e !== h.el).map((e) => ({ 角色: e.role, 名字: e.label, 来源: screen(e) })),
+      窗口里的其他控件: els.filter((e) => e !== h.el && e.actions.length).slice(0, 60).map((e) => ({ 角色: e.role, 名字: e.label, ...(e.value ? { 值: e.value.slice(0, 80) } : {}), 来源: screen(e) })),
+      ...(h.obs?.text ? { "窗口里的文字（前 800 字）": h.obs.text.slice(0, 800) } : {}),
+      本次任务在这个窗口里打过的字: typed,
+      结构线索: { 目标名字命中发送词表: !!h.el?.sends, 回车或换行: h.submits, 窗口里有名字命中发送词表的控件: !!h.sender },
+    };
+    const ans = await judge.choose(OUTGOING_QUESTION, ctx, OUTGOING_OPTIONS, undefined, { settle: "sends", route: false });
+    if (!ans) return settle({ consequence: "external", object: s.object, why: "the outgoing check got no answer: treated as sending", by: "no_answer" });
+    if (ans.choice !== "stays") return settle({ consequence: "external", object: s.object, why: `判官（${ans.by}）：${ans.choice === "sends" ? "会发出去" : "拿不准"}${ans.reason ? "。" + ans.reason : ""}`, by: ans.by });
+    const m = mine();
+    return settle({ ...m, why: `判官（${ans.by}）：不会发出去${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by });
+  }
+
+  /** What `act` would decide before doing anything, without waiting on a judge: `classify`'s answer when it has been
+   *  given for this action on this screen (`by` says who settled it), otherwise structure with the send hints and the
+   *  model's class — what `act` decides with no judge attached. Synchronous; `classify` is the full answer. */
+  preview(req: Omit<ActRequest, "consent">): { consequence: Consequence; object: string; needs_consent: boolean; floor_why: string; by?: string } {
+    const hit = this.classified.get(canon({ a: req.action, epoch: req.epoch, declared: req.consequence ?? null }));
+    const f = hit ?? this.floor(req.action);
+    const consequence = hit ? hit.consequence : higher(f.consequence, req.consequence ?? "read");
     const needs = NEEDS_CONSENT.has(consequence) && this.consent.check(req.action, f.object, consequence, this.opts.task) !== null;
-    return { consequence, object: f.object, needs_consent: needs, floor_why: f.why };
+    return { consequence, object: f.object, needs_consent: needs, floor_why: f.why, ...(hit ? { by: hit.by } : {}) };
   }
 
   async act(req: ActRequest): Promise<ActResult> {
+    // until the action is classified below (after the checks that it is current), the structural floor stands in
     const f = this.floor(req.action);
-    const consequence = higher(f.consequence, req.consequence ?? "read");
-    const base = { consequence, object: f.object };
+    let consequence = higher(f.consequence, req.consequence ?? "read");
+    let base = { consequence, object: f.object };
     const done = (r: ActResult): ActResult => {
       const { consent, ...rest } = req;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: r });
@@ -428,14 +517,34 @@ export class Executor {
     // Any action that reads the observation, or needs consent, waits for the window to be looked at again
     const readsObs = ("target" in req.action && !!req.action.target) || req.action.kind === "key" || req.action.kind === "type";
     if (obs && obs.epoch !== now.epoch && (readsObs || NEEDS_CONSENT.has(consequence))) return done({ ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
+    // the class, settled here and never taken from the caller: structure, the model's class, and the judge's "will this
+    // send something out?" (only raises; cached, so a preview's or a classify call's answer is the same one)
+    const asked = this.classified.size;
+    const c = await this.classify(req.action, req.epoch, req.consequence);
+    consequence = c.consequence; base = { consequence, object: c.object };
+    if (this.classified.size !== asked && c.by !== "structure" && c.by !== "model" && !NEEDS_CONSENT.has(consequence)) {
+      // a judge answered over the network and nothing below waits again: the computer is looked at once more, as after
+      // the intent check (an action with consent is looked at again there)
+      now = await this.driver.snapshot();
+      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+      if (now.user_active) { const w = await this.waitForUser(now, c.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
+      if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
+    }
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
     if (NEEDS_CONSENT.has(consequence)) {
       // a send shows what goes out (the filled-in fields, what the window is about): the user checks it on the card
       // and the judge reads it, not only the Send button (review of #16)
+      // what the task typed into this window goes on the card when the window does not show it (a window read from the
+      // screen: text recognition may not read the input box), and is bound with the consent in every case — changed
+      // text is another send, asked again
       const sending = consequence === "external" ? outgoing(obs) : null;
-      const text = describeAction(req.action, obs, consequence, undefined, this.opts.lang) + (sending ? T(this.opts.lang).outgoing(sending.fields, sending.shown) : "");
+      const typed = sending ? this.typedIn(req.action).filter((t) => t.trim()) : [];
+      const typedLines = typed.filter((t) => ![...sending!.fields, ...sending!.shown].some((l) => l.includes(t.trim())));
+      const content = sending ? (typed.length ? { ...(sending.bound as object), typed } : sending.bound) : undefined;
+      const text = describeAction(req.action, obs, consequence, undefined, this.opts.lang) + (sending ? T(this.opts.lang).outgoing([...sending.fields, ...typedLines.map((t) => T(this.opts.lang).typed(t.trim()))], sending.shown) : "");
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
-      const judged = await this.judgeIntent(req.action, consequence, f.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      const judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
       if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
       // the judge answers over the network: the user may have selected another row meanwhile, and the action would land
       // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
@@ -443,17 +552,17 @@ export class Executor {
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
       // the user came back to the keyboard meanwhile, before anything on screen moved: wait for them, as at the top
       if (now.user_active) {
-        const w = await this.waitForUser(now, f.object);
+        const w = await this.waitForUser(now, base.object);
         now = w.now;
         if (w.end) return done({ ...base, ...w.end, epoch: now.epoch });
       }
       if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
       // a send's consent is for what it sends: the draft changed since the card is another send, asked again
-      const why = this.consent.check(req.action, f.object, consequence, this.opts.task, req.consent, sending?.bound);
+      const why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, content);
       if (why) {
-        const challenge = this.consent.challenge(req.action, f.object, consequence, text, undefined, sending?.bound);
-        this.emit("executor.consent_needed", { why, consequence, object: f.object });
+        const challenge = this.consent.challenge(req.action, base.object, consequence, text, undefined, content);
+        this.emit("executor.consent_needed", { why, consequence, object: base.object });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
     }
@@ -463,11 +572,17 @@ export class Executor {
     // the stop switch is read again here, after the waits above (the judge, the user's consent): a stop that arrived
     // meanwhile must not be followed by the effect (review of deskmind#80, 10-18)
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
-    if (consequence !== "read") this.journal("intent", { action: req.action, object: f.object, consequence, text: describeAction(req.action, obs, consequence) });
+    if (consequence !== "read") this.journal("intent", { action: req.action, object: base.object, consequence, text: describeAction(req.action, obs, consequence) });
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
     try { r = await this.driver.perform(req.action); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
+    // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
+    // send that went through took it with it
+    if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
+      if (consequence === "external") this.typed.delete(req.action.window);
+      else if (req.action.kind === "type" || req.action.kind === "set_value") this.typed.set(req.action.window, this.typedIn(req.action));
+    }
     // a window is the task's (and closing it takes the opening back) only on the driver's proof that the action made
     // it (`new_window`) and when it was not on screen before. The window an action merely lands in is not proof: a URL
     // put into the user's browser window returns that window (review of #16), and an app launched by open_window comes

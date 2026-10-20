@@ -1,5 +1,5 @@
 /**
- * The execution layer as an MCP service (stdio, JSON-RPC 2.0): eight tools over the Executor, so any runtime (Codex,
+ * The execution layer as an MCP service (stdio, JSON-RPC 2.0): nine tools over the Executor, so any runtime (Codex,
  * Claude Code, our own) gets the same ownership, consequence floor, consent, start gate, intent check and completion
  * verdict. The judge and the verdict use the gateway config; the runtime above only sees refusals and reasons.
  *
@@ -20,7 +20,7 @@ import { Executor } from "../executor/executor.js";
 import { defaultJudge } from "../executor/judge.js";
 import { SimComputer } from "../executor/sim.js";
 import { HandsDriver } from "../executor/hands.js";
-import type { Action, Consequence, Driver, PlanProposal } from "../executor/types.js";
+import { NEEDS_CONSENT, type Action, type Consequence, type Driver, type PlanProposal } from "../executor/types.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
 
@@ -32,6 +32,7 @@ export const TOOLS = [
   { name: "snapshot", description: "整台电脑的状态：锁屏、最前面的应用、所有窗口（id、应用、标题、归谁）。只读。", inputSchema: schema({}) },
   { name: "observe", description: "一个窗口的元素、弹窗、文字。动作要用这里的元素 id 和 epoch。只读。", inputSchema: schema({ window: { type: "string" } }, ["window"]) },
   { name: "plan", description: "动手前的计划：步骤（目的、对象、后果类别）和有歧义处的理解与依据。碰用户的东西、往外发之前必须有。依据不够的理解会被退回，先问用户。", inputSchema: schema({ steps: { type: "array" }, readings: { type: "array" } }, ["steps"]) },
+  { name: "classify", description: "只读：一个动作的后果类别（read / create / modify_user / external）和谁定的（结构、模型报的、判官的哪一档、没有结论）。界面上会改东西的动作，判官会判断「会不会把内容发出去」，只往上调。act 动手时自己再算一次，不采信这里的结果；同一个动作在同一个 epoch 上只算一次。", inputSchema: schema({ action: { type: "object" }, epoch: { type: "number" }, consequence: { type: "string" } }, ["action"]) },
   { name: "act", description: "做一个动作（界面动作带 window/target/epoch；文件动作 kind=file 带 capability 和 args）。改用户的东西、往外发要先有计划和同意。", inputSchema: schema({ action: { type: "object" }, epoch: { type: "number" }, consequence: { type: "string" }, purpose: { type: "string" }, consent: { type: "object" } }, ["action"]) },
   { name: "verify", description: "结束前的独立核对：判官读现在的状态，回答 pass / fail / unknown。unknown 不算做成。", inputSchema: schema({ summary: { type: "string" } }, ["summary"]) },
   { name: "stop", description: "停止开关：之后的动作一律拒绝。", inputSchema: schema({}) },
@@ -54,6 +55,11 @@ export class McpExecutorServer {
     switch (name) {
       case "snapshot": return (await ex.snapshot()) as unknown as Json;
       case "observe": return (await ex.observe(String(args.window))) as unknown as Json;
+      case "classify": {
+        const c = await ex.classify(args.action as Action, typeof args.epoch === "number" ? args.epoch : ex.currentEpoch, args.consequence as Consequence | undefined);
+        const needs_consent = NEEDS_CONSENT.has(c.consequence);
+        return { ...c, needs_consent } as unknown as Json;
+      }
       case "plan": return (await ex.plan(args as unknown as PlanProposal)) as unknown as Json;
       case "act": {
         const req = { action: args.action as Action, epoch: typeof args.epoch === "number" ? args.epoch : ex.currentEpoch, consequence: args.consequence as Consequence | undefined, purpose: args.purpose as string | undefined, consent: args.consent as never };

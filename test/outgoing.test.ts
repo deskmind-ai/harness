@@ -1,0 +1,291 @@
+/**
+ * "Will this send something out?" (docs/outgoing-check-2026-10-20.md): the judge decides for screen actions that change
+ * something, the name list and Return are only evidence, the judge only raises, no answer is external, a lower tier
+ * settles only「会发出去」alone and its「不会」is compared with the top's answer every time. Scripted gateways, fake
+ * drivers: no model is called.
+ */
+import { describe, expect, it } from "vitest";
+import { Gateway } from "../src/gateway/index.js";
+import { ConsentSigner } from "../src/executor/consent.js";
+import { Executor } from "../src/executor/executor.js";
+import { INTENT_QUESTION, Judge, OUTGOING_QUESTION, TierStats, type JudgeTier } from "../src/executor/judge.js";
+import { McpExecutorServer } from "../src/cli/mcp.js";
+import type { Action, Driver, Element, WindowInfo } from "../src/executor/types.js";
+
+const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+const isOutgoing = (u: string) => u.includes(OUTGOING_QUESTION.slice(0, 12));
+
+interface FakeWin { info: WindowInfo; elements: Element[]; text: string }
+/** A desktop of fixed windows: actions are logged and move the epoch, the windows' contents never change — as a window
+ *  read by text recognition, which does not read the input box back. `open_window` opens `opens` as the task's. */
+class FakeDesk implements Driver {
+  epoch = 1;
+  log: Action[] = [];
+  constructor(public wins: FakeWin[], private readonly opens?: FakeWin) {}
+  snapshot() { return { epoch: this.epoch, locked: false, front_app: this.wins[0]?.info.app ?? "", windows: this.wins.map((w) => w.info) }; }
+  observe(id: string) { const w = this.wins.find((x) => x.info.id === id)!; return { epoch: this.epoch, window: w.info, modal: null, elements: w.elements, text: w.text }; }
+  perform(a: Action) {
+    this.log.push(a); this.epoch += 1;
+    if (a.kind === "open_window" && this.opens) { this.wins.push(this.opens); return { status: "ok" as const, window: this.opens.info.id, new_window: this.opens.info }; }
+    return { status: "ok" as const, window: "window" in a ? a.window : undefined };
+  }
+}
+
+/** A chat app hands reads from the screen: text recognition's rows (the「发送」 among them, a listitem hands' name list
+ *  does not mark) and the search box hands always offers. */
+const chat = (): FakeWin => ({
+  info: { id: "chat", app: "聊天", title: "张三" },
+  elements: [
+    { id: "ocr:0", role: "listitem", label: "张三：明天开会吗？", actions: ["click"] },
+    { id: "ocr:1", role: "listitem", label: "输入消息…", actions: ["click", "type"] },
+    { id: "ocr:2", role: "listitem", label: "发送", actions: ["click"] },
+    { id: "gen:search", role: "textField", label: "搜索", actions: ["click", "type"] },
+  ],
+  text: "张三：明天开会吗？\n输入消息…\n发送",
+});
+
+/** One judge tier (or two) over scripted gateways; `outgoing` answers the outgoing question, the intent check matches. */
+function judged(outgoing: (u: string) => unknown, extra: Partial<{ lower: (u: string) => unknown; stats: TierStats; events: Record<string, unknown>[] }> = {}) {
+  const top = new Gateway(table), prompts: string[] = [];
+  top.script = Array(80).fill((_r: string, _s: string, u: string) => { prompts.push(u); return isOutgoing(u) ? outgoing(u) : { choice: "matches" }; });
+  const tiers: JudgeTier[] = [];
+  let low: Gateway | null = null;
+  if (extra.lower) { low = new Gateway(table); low.script = Array(80).fill((_r: string, _s: string, u: string) => extra.lower!(u)); tiers.push({ name: "brain", gateway: low, floor: 0.9 }); }
+  tiers.push({ name: "frontier", gateway: top });
+  return { judge: new Judge(tiers, { stats: extra.stats, onEvent: (k, b) => extra.events?.push({ k, ...b }) }), top, low, prompts };
+}
+
+async function setup(wins: FakeWin[], judge?: Judge, opens?: FakeWin) {
+  const desk = new FakeDesk(wins, opens), app = ConsentSigner.fresh();
+  const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, judge, raw: "回张三：明天见" });
+  await ex.begin();
+  await ex.plan({ steps: [] });
+  return { desk, app, ex };
+}
+
+describe("outgoing check: a window read from the screen", () => {
+  it("typing then Return asks for a send, with the typed text on the card; changed text asks again", async () => {
+    const { judge, prompts } = judged(() => ({ choice: "sends", reason: "聊天窗口里打了字再回车，就是发消息" }));
+    const { desk, app, ex } = await setup([chat()], judge);
+    const mine = app.forObject("window:chat", "modify_user", "t1");
+    let o = await ex.observe("chat");
+    // typing (no newline) is not a send question: the user's window, consented by the plan's object token
+    expect((await ex.act({ action: { kind: "type", window: "chat", target: "ocr:1", text: "明天见" }, epoch: o.epoch, consent: mine })).status).toBe("ok");
+    o = await ex.observe("chat");
+    const ret: Action = { kind: "key", window: "chat", chord: "return" };
+    const r = await ex.act({ action: ret, epoch: o.epoch, consent: mine });
+    expect(r).toMatchObject({ status: "needs_consent", consequence: "external" });
+    expect(r.challenge!.text).toContain("明天见");                       // the screen did not show it; the card does
+    expect(desk.log.filter((a) => a.kind === "key")).toEqual([]);
+    // the judge saw the evidence: the typed text, the key, where the elements came from, the old hint as a hint
+    const asked = prompts.filter(isOutgoing).at(-1)!;
+    expect(asked).toContain("明天见");
+    expect(asked).toContain("return");
+    expect(asked).toContain("画面");
+    expect(asked).toContain("回车或换行");
+    expect(asked).not.toContain("回张三");                                // facts only, not the user's words
+    // the user approves that card; the task then types more before pressing Return: another send, asked again
+    const token = app.forAction(r.challenge!);
+    expect((await ex.act({ action: { kind: "type", window: "chat", target: "ocr:1", text: "，不见不散" }, epoch: r.epoch, consent: mine })).status).toBe("ok");
+    o = await ex.observe("chat");
+    const again = await ex.act({ action: ret, epoch: o.epoch, consent: token });
+    expect(again.status).toBe("needs_consent");
+    expect(again.challenge!.text).toContain("不见不散");
+    expect(desk.log.filter((a) => a.kind === "key")).toEqual([]);
+    const ok = await ex.act({ action: ret, epoch: o.epoch, consent: app.forAction(again.challenge!) });
+    expect(ok.status).toBe("ok");
+    expect(desk.log.at(-1)).toEqual(ret);
+  });
+
+  it("a click on the「发送」text recognition read is a send (a listitem the name list does not mark)", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const { ex, app } = await setup([chat()], judge);
+    const o = await ex.observe("chat");
+    const r = await ex.act({ action: { kind: "click", window: "chat", target: "ocr:2" }, epoch: o.epoch, consent: app.forObject("window:chat", "modify_user", "t1") });
+    expect(r).toMatchObject({ status: "needs_consent", consequence: "external" });
+    // without a judge the old floor has nothing to go on here: the gap the judge closes
+    const { ex: bare } = await setup([chat()]);
+    await bare.observe("chat");
+    expect(bare.floor({ kind: "click", window: "chat", target: "ocr:2" }).consequence).toBe("modify_user");
+  });
+
+  it("hands' `source` is taken when present: an element with an ax-looking id but source pixels is from the screen", async () => {
+    const { judge, prompts } = judged(() => ({ choice: "stays" }));
+    const w = chat(); w.elements = [{ id: "e1", role: "button", label: "确定", actions: ["click"], source: "pixels" }];
+    const { ex } = await setup([w], judge);
+    const o = await ex.observe("chat");
+    await ex.classify({ kind: "click", window: "chat", target: "e1" }, o.epoch);
+    expect(prompts.filter(isOutgoing).at(-1)).toContain("画面");
+  });
+});
+
+describe("outgoing check: accessibility windows", () => {
+  const compose = (owner: "user" | "task"): FakeWin => ({
+    info: { id: owner === "user" ? "mailw" : "mine", app: "邮件", title: "新邮件" },
+    elements: [
+      { id: "to", role: "textField", label: "收件人", value: "zhang@example.com", actions: ["set_value"] },
+      { id: "body", role: "textArea", label: "正文", value: "附件是合同", actions: ["set_value", "type"] },
+      { id: "b7", role: "button", label: "", actions: ["click"] },                       // an icon-only send button
+    ],
+    text: "",
+  });
+
+  it("an unlabelled button the judge says sends is external", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const { ex, app } = await setup([compose("user")], judge);
+    const o = await ex.observe("mailw");
+    const r = await ex.act({ action: { kind: "click", window: "mailw", target: "b7" }, epoch: o.epoch, consent: app.forObject("window:mailw", "modify_user", "t1") });
+    expect(r).toMatchObject({ status: "needs_consent", consequence: "external" });
+    expect(r.challenge!.text).toContain("附件是合同");                    // the filled-in fields, as before
+  });
+
+  it("a judge with no answer is a send", async () => {
+    const { judge } = judged(() => ({ outcome: "error", error: "down" }));
+    const { ex, app } = await setup([compose("user")], judge);
+    const o = await ex.observe("mailw");
+    const action: Action = { kind: "click", window: "mailw", target: "b7" };
+    expect(await ex.classify(action, o.epoch)).toMatchObject({ consequence: "external", by: "no_answer" });
+    expect((await ex.act({ action, epoch: o.epoch, consent: app.forObject("window:mailw", "modify_user", "t1") })).status).toBe("needs_consent");
+  });
+
+  it("a site search's Return the judge says stays is not a send: no card, though the window has a「提交」the name list marks", async () => {
+    const site: FakeWin = {
+      info: { id: "site", app: "浏览器", title: "帮助中心" },
+      elements: [
+        { id: "q", role: "textField", label: "搜索本站", actions: ["set_value", "type"] },
+        { id: "submit", role: "button", label: "提交", actions: ["click"], sends: true },
+      ],
+      text: "帮助中心",
+    };
+    const { judge, prompts } = judged(() => ({ choice: "stays", reason: "站内搜索" }));
+    const { ex, desk } = await setup([], judge, site);
+    const opened = await ex.act({ action: { kind: "open_window", app: "浏览器" }, epoch: (await ex.snapshot()).epoch });
+    expect(opened.status).toBe("ok");
+    let o = await ex.observe("site");
+    expect((await ex.act({ action: { kind: "type", window: "site", target: "q", text: "退款" }, epoch: o.epoch })).status).toBe("ok");
+    o = await ex.observe("site");
+    const ret: Action = { kind: "key", window: "site", chord: "return" };
+    expect(ex.floor(ret).consequence).toBe("external");                       // the old rule would have asked
+    const r = await ex.act({ action: ret, epoch: o.epoch });
+    expect(r).toMatchObject({ status: "ok", consequence: "create" });
+    expect(desk.log.at(-1)).toEqual(ret);
+    const asked = prompts.filter(isOutgoing).at(-1)!;
+    expect(asked).toContain("退款");                                        // the typed text is evidence
+    expect(asked).toMatch(/"窗口里有名字命中发送词表的控件": true/);           // and so is the name list
+  });
+
+  it("the judge only raises: a model that said external stays external, and is not asked about", async () => {
+    const { judge, top } = judged(() => ({ choice: "stays" }));
+    const { ex } = await setup([compose("task")], judge);
+    const o = await ex.observe("mine");
+    const before = top.script.length;
+    expect(await ex.classify({ kind: "click", window: "mine", target: "b7" }, o.epoch, "external")).toMatchObject({ consequence: "external", by: "model" });
+    expect(top.script.length).toBe(before);
+  });
+});
+
+describe("outgoing check: tiers", () => {
+  const button = (n: number): FakeWin => ({ info: { id: "w", app: "应用", title: "窗口" }, elements: Array.from({ length: n }, (_, i) => ({ id: `b${i}`, role: "button", label: `按钮${i}`, actions: ["click"] })), text: "" });
+
+  it("Brain's「不会」is not final: it goes up, the top decides, and the agreement is counted per Brain answer", async () => {
+    const stats = new TierStats();
+    const answers = ["stays", "sends"];
+    const { judge } = judged(() => ({ choice: answers.shift() }), { lower: () => ({ choice: "stays", scores: { stays: 0.97, sends: 0.03 } }), stats });
+    const { ex } = await setup([button(2)], judge);
+    const o = await ex.observe("w");
+    expect(await ex.classify({ kind: "click", window: "w", target: "b0" }, o.epoch)).toMatchObject({ consequence: "modify_user", by: "frontier" });
+    expect(await ex.classify({ kind: "click", window: "w", target: "b1" }, o.epoch)).toMatchObject({ consequence: "external", by: "frontier" });
+    const kind = TierStats.kindOf(OUTGOING_QUESTION, { 对象: "window:w" });
+    expect(stats.snapshot().brain![kind]).toMatchObject({ asked: 2, settled: 0, escalated: { stays: { compared: 2, agreed: 1 } } });
+  });
+
+  it("Brain's「会发出去」above its floor settles alone", async () => {
+    const { judge, top } = judged(() => ({ choice: "stays" }), { lower: () => ({ choice: "sends", scores: { sends: 0.95, stays: 0.05 } }) });
+    const { ex } = await setup([button(1)], judge);
+    const o = await ex.observe("w");
+    const before = top.script.length;
+    expect(await ex.classify({ kind: "click", window: "w", target: "b0" }, o.epoch)).toMatchObject({ consequence: "external", by: "brain" });
+    expect(top.script.length).toBe(before);
+  });
+
+  it("the routing rule does not take this question away from Brain, however rarely it settles", async () => {
+    const events: Record<string, unknown>[] = [];
+    const { judge, low } = judged(() => ({ choice: "stays" }), { lower: () => ({ choice: "stays", scores: { stays: 0.99 } }), stats: new TierStats(), events });
+    const { ex } = await setup([button(12)], judge);
+    const o = await ex.observe("w");
+    for (let i = 0; i < 12; i++) await ex.classify({ kind: "click", window: "w", target: `b${i}` }, o.epoch);
+    expect(80 - low!.script.length).toBe(12);
+    expect(events.some((e) => e.k === "judge.skipped")).toBe(false);
+  });
+
+  it("its kind differs from the intent check's (the routing table groups by the first 12 characters)", () => {
+    expect(TierStats.kindOf(OUTGOING_QUESTION)).not.toBe(TierStats.kindOf(INTENT_QUESTION));
+  });
+
+  it("an existing question keeps its old rule: a lower tier settles only the first option, and is skipped when it rarely does", async () => {
+    const stats = new TierStats();
+    const low = new Gateway(table), top = new Gateway(table);
+    low.script = Array(20).fill(() => ({ choice: "b", scores: { b: 0.99 } }));
+    top.script = Array(20).fill(() => ({ choice: "b" }));
+    const judge = new Judge([{ name: "low", gateway: low, floor: 0.9 }, { name: "top", gateway: top }], { stats });
+    for (let i = 0; i < 9; i++) expect((await judge.choose("某个老问题", { i }, [{ id: "a", text: "a" }, { id: "b", text: "b" }]))?.by).toBe("top");
+    expect(20 - low.script.length).toBe(8);                                     // the 9th skipped the lower tier
+    expect(stats.snapshot().low!["某个老问题"]!.escalated).toEqual({ b: { compared: 8, agreed: 8 } });
+  });
+});
+
+describe("outgoing check: classify over MCP", () => {
+  it("the read-only classify tool answers what act then decides, and act does not ask the judge again", async () => {
+    const gw = new Gateway(table);
+    let outgoingAsked = 0;
+    gw.script = Array(20).fill((role: string, _s: string, u: string) => (isOutgoing(u) ? (outgoingAsked += 1, { choice: "sends" }) : role === "verify" ? { choice: "pass" } : { choice: "matches" }));
+    const desk = new FakeDesk([{ info: { id: "w", app: "邮件", title: "新邮件" }, elements: [{ id: "b7", role: "button", label: "", actions: ["click"] }], text: "" }]);
+    const s = new McpExecutorServer({ driver: () => desk, gateway: gw, consent: "none" });
+    let n = 0;
+    const call = async (name: string, args: unknown = {}) => ((await s.handle({ jsonrpc: "2.0", id: ++n, method: "tools/call", params: { name, arguments: args } as never })) as any).result.structuredContent;
+    await call("begin", { raw: "把合同发给张三" });
+    await call("plan", { steps: [] });
+    const o = await call("observe", { window: "w" });
+    const action = { kind: "click", window: "w", target: "b7" };
+    const c = await call("classify", { action, epoch: o.epoch });
+    expect(c).toMatchObject({ consequence: "external", object: "window:w", by: "frontier", needs_consent: true });
+    const r = await call("act", { action, epoch: o.epoch, consequence: "read" });          // a caller's low class changes nothing
+    expect(r).toMatchObject({ status: "needs_consent", consequence: c.consequence, object: c.object });
+    expect(outgoingAsked).toBe(1);
+    expect(desk.log).toEqual([]);
+  });
+});
+
+describe("outgoing check: in the agent loop", () => {
+  it("a site search's Return in the user's window, cleared by the judge, goes under the plan's object consent: no extra card", async () => {
+    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { scriptedStream } = await import("../src/runtime/scripted.js");
+    const site: FakeWin = {
+      info: { id: "site", app: "浏览器", title: "帮助中心" },
+      elements: [{ id: "q", role: "textField", label: "搜索本站", actions: ["set_value", "type"] }, { id: "submit", role: "button", label: "提交", actions: ["click"], sends: true }],
+      text: "帮助中心",
+    };
+    const desk = new FakeDesk([site]), app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });
+    const gw = new Gateway(table);
+    gw.script = Array(40).fill((role: string, _s: string, u: string) => (role === "verify" ? { choice: "pass", reason: "ok" } : isOutgoing(u) ? { choice: "stays" } : { choice: "matches" }));
+    const lastEpoch = (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role === "toolResult"); const j = JSON.parse(m.content[0].text.split("\n")[0]); return j.after?.epoch ?? j.epoch; };
+    const act = (action: Record<string, unknown>) => (ms: any[]) => ({ calls: [{ name: "computer_act", args: { action, epoch: lastEpoch(ms), consequence: "modify_user", purpose: "搜索" } }] });
+    const steps: any[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "在帮助中心搜索退款", objects: ["window:site"], consequence: "modify_user" }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: "site" } }] },
+      act({ kind: "type", window: "site", target: "q", text: "退款" }),
+      { calls: [{ name: "computer_observe", args: { window: "site" } }] },
+      act({ kind: "key", window: "site", chord: "return" }),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "搜了退款" } }] },
+    ];
+    const cards: { kind: string }[] = [];
+    const user = { ask: (c: any) => { cards.push(c); return { option: c.options.findIndex((o: any) => o.kind === "approve") }; } };
+    const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as any };
+    const rt = new FrontierRuntime({ task: "t1", raw: "在帮助中心搜一下退款", executor: ex, signer: app, user, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
+    const r = await rt.run();
+    expect(cards.map((c) => c.kind)).toEqual(["plan"]);
+    expect(desk.log.at(-1)).toEqual({ kind: "key", window: "site", chord: "return" });
+    expect(r.status).toBe("succeeded");
+  });
+});

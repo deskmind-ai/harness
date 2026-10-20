@@ -8,6 +8,13 @@ import { ConsentSigner, digestOf } from "../src/executor/consent.js";
 import { Executor, describeAction } from "../src/executor/executor.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import type { Action } from "../src/executor/types.js";
+import { OUTGOING_QUESTION } from "../src/executor/judge.js";
+
+/** The outgoing check (OUTGOING_QUESTION) is asked of screen actions too: answered here as a plain judge would — a
+ *  control hands' name list marks as sending sends, anything else stays — so a test about another question sees only
+ *  its own. */
+const outgoingOr = (f: (role: string, s: string, u: string) => unknown) => (role: string, s: string, u: string) =>
+  u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: /"目标名字命中发送词表":\s*true/.test(u) ? "sends" : "stays" } : f(role, s, u);
 
 function mailSim() {
   const sim = new SimComputer();
@@ -230,7 +237,7 @@ describe("executor: the judge before a consequential action", () => {
     const { Gateway } = await import("../src/gateway/index.js");
     const { Judge } = await import("../src/executor/judge.js");
     const gw = new Gateway(Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any);
-    gw.script = Array(20).fill((role: string, _s: string, u: string) => answer(role, u));
+    gw.script = Array(20).fill(outgoingOr((role: string, _s: string, u: string) => answer(role, u)));
     const app = ConsentSigner.fresh();
     const { sim, w } = mailSim();
     const events: Record<string, unknown>[] = [];
@@ -365,7 +372,7 @@ describe("executor: a stop that arrives while an action waits", () => {
     const gw2 = new Gateway(table);
     ex2.opts.judge = new Judge([{ name: "t", gateway: gw2 }]); ex2.setRequest("给林晓那封邮件加旗标");
     await started(ex2);
-    gw2.script = [() => { ex2.stop(); return { choice: "matches" }; }];
+    gw2.script = [outgoingOr(() => ({ choice: "matches" })), outgoingOr(() => { ex2.stop(); return { choice: "matches" }; })];   // the outgoing check, then the intent check
     const c = await click(ex2, w.id, "林晓 · Q3 预算", { consent: app2.forObject(`window:${w.id}`, "modify_user", "t1") });
     expect(c.status).toBe("stopped");
     const o = await ex2.observe(w.id);
@@ -522,7 +529,7 @@ describe("executor: the user's answers reach the judge", () => {
     const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
     const gw = new Gateway(table);
     const prompts: string[] = [];
-    gw.script = Array(6).fill((role: string, _s: string, user: string) => { prompts.push(user); return role === "verify" ? { choice: "pass" } : { choice: "matches" }; });
+    gw.script = Array(6).fill(outgoingOr((role: string, _s: string, user: string) => { prompts.push(user); return role === "verify" ? { choice: "pass" } : { choice: "matches" }; }));   // the outgoing check reads facts only, not the user's words
     const { sim, w } = mailSim();
     const app = ConsentSigner.fresh();
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, judge: new Judge([{ name: "t", gateway: gw }]), raw: "给那封邮件加旗标" });

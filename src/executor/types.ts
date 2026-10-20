@@ -37,6 +37,10 @@ export interface Element {
    *  message, pays): the executor's floor for its consequence is then `external`. From the app profile or the page's
    *  own semantics, never from a model. */
   sends?: boolean;
+  /** Where the element was read from: the accessibility tree (`ax`), or the screen's pixels (`pixels`: text
+   *  recognition, controls hands made up, Eyes). Until hands sends it, the executor infers it from the id prefix
+   *  (`ocr:`, `gen:`, `icon:`, `desc:` are read from the screen). */
+  source?: "ax" | "pixels";
   rect?: [number, number, number, number];
 }
 

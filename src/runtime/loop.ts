@@ -274,7 +274,10 @@ export class FrontierRuntime {
     const a = p.action as unknown as Action;
     const bad = checkAction(a);
     if (bad) return err(bad);
-    const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
+    // which consent token to bring: by the class act will settle on (classify, cached — act asks it again and gets the
+    // same answer). A preview without the judge would take the old send hints for a class and leave the plan's object
+    // token behind for a site search the judge clears, asking the user a card the plan already covered
+    const pre = await this.o.executor.classify(a, p.epoch, p.consequence);
     let consent = this.tokens.get(pre.object);
     if (consent && rank(consent.consequence) < rank(pre.consequence)) consent = undefined;
     let r: ActResult;
