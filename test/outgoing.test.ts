@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import { Gateway } from "../src/gateway/index.js";
 import { ConsentSigner } from "../src/executor/consent.js";
-import { Executor, pixelSendBindingFrom, type ExecutorOptions } from "../src/executor/executor.js";
+import { Executor, pixelSendBindingFrom, sameScreen, type ExecutorOptions } from "../src/executor/executor.js";
 import { INTENT_QUESTION, Judge, OUTGOING_QUESTION, TierStats, type JudgeTier } from "../src/executor/judge.js";
 import { McpExecutorServer } from "../src/cli/mcp.js";
 import type { Action, Driver, Element, WindowInfo } from "../src/executor/types.js";
@@ -785,6 +785,27 @@ describe("outgoing check: the pixel send-binding policy (owner 10-20)", () => {
     expect(r2.status).toBe("needs_consent");
     expect(r2.challenge!.text).toContain("张三：在吗");
     expect(sent).toBe(0);
+  });
+
+  it("strict: the same screen read again with a few pixels of jitter does not ask again; a 20 px shift does", async () => {
+    const move = (d: number, keepTarget = false) => (w: FakeWin) => { w.elements = w.elements.map((e, i) => (keepTarget && e.label === "发送" ? e : { ...e, rect: [e.rect![0] + (i % 2 ? d : -d), e.rect![1] + d, e.rect![2], e.rect![3]] as [number, number, number, number] })); };
+    for (const d of [2, 3]) {
+      const { r2, sent } = await pixelSend("strict", move(d));
+      expect([d, r2.status, sent]).toEqual([d, "ok", 1]);
+    }
+    // the conversation scrolled 20 px (the Send button where it was): asked again with what is there now
+    const { r2, sent } = await pixelSend("strict", move(20, true));
+    expect([r2.status, sent]).toEqual(["needs_consent", 0]);
+    // everything 20 px away, the Send button too: it is not found where it was decided, nothing is done
+    const all = await pixelSend("strict", move(20));
+    expect([all.r2.status, all.sent]).toEqual(["stale", 0]);
+  });
+
+  it("strict: an element with two candidates within the jitter cannot be told apart, which counts as changed", () => {
+    const el = (c: string, x: number, y: number) => ({ c, at: [x, y] as [number, number] });
+    expect(sameScreen([el("a", 10, 10), el("b", 50, 50)], [el("b", 52, 49), el("a", 11, 9)])).toBe(true);
+    expect(sameScreen([el("a", 10, 10), el("a", 13, 10)], [el("a", 11, 10), el("a", 14, 10)])).toBe(false);
+    expect(sameScreen([el("a", 10, 10)], [el("a", 10, 10), el("b", 0, 0)])).toBe(false);          // nothing added
   });
 
   it("match: the same incoming message does not ask again", async () => {

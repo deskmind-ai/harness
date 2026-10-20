@@ -115,9 +115,8 @@ function resolve(decided: Observation, id: string, look: Observation): Element |
  *  row or a recipient tag with actions of its own; the same name elsewhere — a group's history line「张三」 — is not
  *  the header that said 张三, by id or by place). */
 interface SendBinding { window: { app: string; title: string; url: string | null; tab: string | null }; modal: string | null; typed: string[]; target: Ident | null; focused: Ident | null; elements: Ident[];
-  /** A window read from the screen: the whole observation (every element's role, label, value, position and focus;
-   *  sorted, as text recognition's order is not identity), for the strict policy */
-  whole?: string }
+  /** A window read from the screen: every element (role, label, value, focus, and its centre), for the strict policy */
+  whole?: { c: string; at: [number, number] | null }[] }
 
 /** Is what the user consented to still there: the window, the dialog and the typed text unchanged, the same target and
  *  focused element, and every bound element matched one to one by an element of the new look with the same content and
@@ -126,7 +125,7 @@ interface SendBinding { window: { app: string; title: string; url: string | null
 function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding): boolean {
   if (canon([bound.window, bound.modal, bound.typed]) !== canon([now.window, now.modal, now.typed])) return false;
   // strict, for a window read from the screen: nothing may have changed at all
-  if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return bound.whole === now.whole;
+  if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return sameScreen(bound.whole, now.whole);
   const one = (a: Ident | null, b: Ident | null) => (a === null || b === null ? a === b : sameEl(a, b));
   if (!one(bound.target, now.target) || !one(bound.focused, now.focused)) return false;
   const used = new Set<number>();
@@ -135,6 +134,25 @@ function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding):
     now.elements.forEach((n, i) => { if (!used.has(i) && sameEl(b, n) && (best < 0 || dist(b, n) < dist(b, now.elements[best]!))) best = i; });
     if (best < 0) return false;
     used.add(best);
+  }
+  return true;
+}
+
+/** How far (px, on each axis) text recognition's box for an unchanged element may move between two reads of the same
+ *  screen: its jitter is a pixel or two. More is a change (strict policy). */
+const JITTER_PX = 4;
+
+/** The strict policy's "nothing changed" for a window read from the screen: the same elements, none added or gone, each
+ *  paired one to one with an element of the same role, label, value and focus whose centre is within JITTER_PX on both
+ *  axes. An element with two such candidates cannot be told apart, which counts as changed. */
+export function sameScreen(a: { c: string; at: [number, number] | null }[] | undefined, b: { c: string; at: [number, number] | null }[] | undefined): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (!x.at || !y.at ? !x.at && !y.at : Math.abs(x.at[0] - y.at[0]) <= JITTER_PX && Math.abs(x.at[1] - y.at[1]) <= JITTER_PX);
+  const used = new Set<number>();
+  for (const e of a) {
+    const fit = b.map((n, i) => (!used.has(i) && n.c === e.c && near(e, n) ? i : -1)).filter((i) => i >= 0);
+    if (fit.length !== 1) return false;
+    used.add(fit[0]!);
   }
   return true;
 }
@@ -606,7 +624,7 @@ export class Executor {
     const typedLines = typed.filter((t) => !sending!.fields.some((l) => l.includes(t.trim())));
     const focused = look?.elements.find((e) => e.focused);
     const pixels = !!look?.elements.some(fromScreen);
-    const whole = pixels && look ? canon(look.elements.map((e) => canon([e.role, e.label, e.value ?? null, e.rect ?? null, !!e.focused])).sort()) : undefined;
+    const whole = pixels && look ? look.elements.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, !!e.focused]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
     const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
