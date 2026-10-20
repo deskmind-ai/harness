@@ -10,7 +10,7 @@ import { PassThrough } from "node:stream";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { EventLog, type AppEvent } from "../src/protocol/events.js";
-import { LineReader, StdioUser, selftest, toProtocol } from "../src/cli/app.js";
+import { LineReader, StdioUser, selftest, toProtocol, traceWriter } from "../src/cli/app.js";
 import { helperBin, helperProblem, prepareHelper, resetHelper } from "../src/registry/mac.js";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "app-"));
@@ -34,6 +34,29 @@ describe("event log", () => {
     const log = new EventLog(path.join(tmp(), "e.jsonl"), "r1");
     expect(() => log.emit({ kind: "nope" } as never)).toThrow();
     expect(log.events.length).toBe(0);
+  });
+});
+
+describe("run trace", () => {
+  it("keeps every executor event as emitted -- what the protocol leaves out, why included -- with long strings cut", () => {
+    const file = path.join(tmp(), "trace.jsonl");
+    const trace = traceWriter(file);
+    trace("executor.act", { action: { kind: "click", target: "elem_9" }, status: "ok", why: "" });
+    trace("executor.consent_needed", { why: "what goes out changed right before sending", consequence: "external", object: "window:x#1" });
+    trace("judge.sample", { prompt: "p".repeat(5000), options: ["a", "b"] });
+    const lines = fs.readFileSync(file, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.kind)).toEqual(["executor.act", "executor.consent_needed", "judge.sample"]);
+    expect(lines[0].status).toBe("ok");                       // an ok act the protocol drops is in the trace
+    expect(toProtocol("executor.act", { status: "ok" })).toBeNull();
+    expect(lines[1].why).toBe("what goes out changed right before sending");
+    expect(lines[2].prompt.length).toBeLessThan(4100);
+    expect(lines[2].prompt).toContain("…(+1000)");
+    expect(typeof lines[0].t).toBe("number");
+  });
+
+  it("never stops a run when the file cannot be written", () => {
+    const trace = traceWriter(path.join(tmp(), "no-such-dir", "trace.jsonl"));
+    expect(() => trace("executor.act", { status: "ok" })).not.toThrow();
   });
 });
 

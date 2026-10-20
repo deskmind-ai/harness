@@ -123,6 +123,19 @@ function driverFor(name: Request["driver"], scope?: string): Driver {
   return new SimComputer(scope);
 }
 
+/** Every executor and runtime event as it was emitted, beside the run's protocol events: the app shows only the
+ *  protocol (steps, cards, refusals), and a problem on a real Mac -- why a consent was asked again, what an action's
+ *  `why` was -- could not be read from the run afterwards (rc.8, 10-20). Local, like the run's other files; long
+ *  strings are cut so a prompt or an observation does not make the file huge. */
+export function traceWriter(file: string): (kind: string, body: Record<string, unknown>) => void {
+  const cut = (v: unknown): unknown => typeof v === "string" ? (v.length > 4000 ? v.slice(0, 4000) + `…(+${v.length - 4000})` : v)
+    : Array.isArray(v) ? v.slice(0, 200).map(cut)
+    : v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, cut(x)])) : v;
+  return (kind, body) => {
+    try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(cut(body ?? {}) as Record<string, unknown>) }) + "\n"); } catch { /* the trace never stops a run */ }
+  };
+}
+
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
@@ -132,10 +145,11 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   if (!table) { log.emit({ kind: "task_done", status: "failed", reason: `unknown config ${config}`, summary: "", result_card: null }); return; }
   const gw = new Gateway(table, { log: (r) => fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n") });
   const signer = ConsentSigner.fresh();
+  const trace = traceWriter(path.join(o.runs, runId, "trace.jsonl"));
   const ws = req.scope ? new Workspace(req.scope) : undefined;
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
   // process did without a receipt and tells the model (D10)
-  const executor = new Executor(driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); } });
+  const executor = new Executor(driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: (k, b) => { trace(k, b); const e = toProtocol(k, b); if (e) log.emit(e); } });
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
@@ -144,7 +158,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     // a real desktop takes more looks than the check set's folders: a pixel-mode app needs an observation per step
     // and the old engine used ~20 actions on the music sample; the evaluation keeps the default budget
     budget: req.driver === "hands" ? { tool_calls: 90, turns: 60 } : {},
-    onEvent: (k, b) => { const e = toProtocol(k, b); if (e) log.emit(e); },
+    onEvent: (k, b) => { trace(k, b); const e = toProtocol(k, b); if (e) log.emit(e); },
   });
   o.input.onStop = () => { log.emit({ kind: "refused", what: "the task", why: "stopped by the app", by: "user" }); rt.stop("stopped by the app"); };
   const r = await rt.run();
