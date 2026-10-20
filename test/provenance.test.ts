@@ -208,7 +208,8 @@ describe("the plan declares the sites it visits", () => {
   const runLoop = (steps: Step[], judge: Judge, o: { chrome?: boolean; files?: Record<string, string | null> } = {}) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "prov-rt-")); build(root, o.files ?? { "合同.txt": "合同金额 98000 元\n" });
     const ws = new Workspace(root), sim = new SimComputer(root), app = ConsentSigner.fresh();
-    if (o.chrome) sim.addBrowser("Google Chrome", [{ title: "收件箱 - Gmail", url: "https://mail.google.com" }]);
+    // the user's-window case needs a driver without #34's promise (a url into the user's Chrome); the sim may declare it
+    if (o.chrome) { Object.assign(sim, { capabilities: { urlInOwnBrowserWindow: false } }); sim.addBrowser("Google Chrome", [{ title: "收件箱 - Gmail", url: "https://mail.google.com" }]); }
     const cards: Card[] = [], events: { k: string; b: Record<string, unknown> }[] = [];
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, judge, onEvent: (k, b) => events.push({ k, b }) });
     const gw = new Gateway(table);
