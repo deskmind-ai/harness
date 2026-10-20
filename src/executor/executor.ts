@@ -47,7 +47,21 @@ export interface ExecutorOptions {
   crashAfterFirstEffect?: boolean;
   /** The task folder and the file capabilities: files are objects like windows (owner, version, last seen). */
   files?: { workspace: Workspace; registry: Registry };
+  /** A judgement policy (owner 10-20; the app's settings panel will show it, deskmind#90 item 3): how a consent to a
+   *  send is held against a window read from the screen. Unset: `DESKMIND_PIXEL_SEND_BINDING`, else strict. */
+  pixelSendBinding?: PixelSendBinding;
 }
+
+/** How a consent to a send is held, in a window whose elements were read from the screen, against what is there right
+ *  before the effect (windows read from the accessibility tree always use containment by id):
+ *  - `strict` (default): any change of that window — any element's role, label, value, position or focus, the title,
+ *    the dialog — asks again with what is there now. Text recognition has no stable identity, and an incoming message
+ *    scrolls everything anyway, so matching is a guess (docs/0.5-decisions.md, fourth review of #23).
+ *  - `match`: each bound element paired one to one by content and position (within 16 px); new ones allowed. */
+export type PixelSendBinding = "strict" | "match";
+/** The policy from the environment (the app passes `DESKMIND_PIXEL_SEND_BINDING`): only "match" chooses match; anything
+ *  else, unset or unknown, is strict. */
+export const pixelSendBindingFrom = (v: string | undefined): PixelSendBinding => (v?.trim() === "match" ? "match" : "strict");
 
 /** An action's class, as `classify` settles it, and who settled it: structure (ownership, a capability's declared
  *  effect, or — with no judge attached — the old send hints), the model's own class, a judge tier (its name: "brain",
@@ -64,24 +78,94 @@ export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pix
 
 const RETURN = /\b(return|enter)\b/i;
 
-/** One element as content, for the send binding: what it is and says, not its id (text recognition's ids shift). */
-const sigOf = (e: Element) => canon([e.role, e.label, e.value ?? null, !!e.focused]);
-/** The target as content: role, label, value, and where it was read from. */
-const targetOf = (e: Element | undefined) => (e ? { role: e.role, label: e.label, value: e.value ?? null, source: fromScreen(e) ? "pixels" : "ax" } : null);
+/** How far (px, on each axis) an element read again may have moved and still be the same one: text recognition's boxes
+ *  jitter by a few pixels, while two lines of a chat or two controls are at least a line apart (~20 px and more at
+ *  default sizes). A fixed grid would split elements sitting on a cell edge; a distance does not. hands gives rects in
+ *  the window's own coordinates (fractions of the window's screenshot), so moving the whole window changes nothing
+ *  here; content moving inside the window (a scroll) does. */
+const NEAR_PX = 16;
 
-/** What a consent to a send is bound to. `elements` is every element of the window as content (a multiset, sorted):
- *  who it goes to may be only a text-recognition row or a recipient tag with actions of its own (review of #23: the
- *  conversation switched from 张三 to 李四 in a window whose title stays「微信」). */
-interface SendBinding { window: { app: string; title: string; url: string | null; tab: string | null }; modal: string | null; typed: string[]; target: unknown; focused: unknown; elements: string[] }
+/** One element as the binding knows it: its content (role, label, value, focus, and where it was read from), its
+ *  identity — the id for an accessibility element, its position for one read from the screen (text recognition
+ *  renumbers its ids every look) — and whether it can be acted on (`act`). Peekaboo's accessibility ids (elem_N) are
+ *  not stable either: they are numbered per look. Pairing by id is safe only because every element of the window is
+ *  bound: the same id with another label is a change, and a renumbering that pairs nothing asks again (more cards,
+ *  never fewer). */
+interface Ident { c: string; id?: string; at: [number, number] | null; act?: true }
+const identOf = (e: Element, withFocus = true): Ident => ({
+  c: canon([e.role, e.label, e.value ?? null, fromScreen(e) ? "pixels" : "ax", ...(withFocus ? [!!e.focused] : [])]),
+  ...(fromScreen(e) ? {} : { id: e.id }),
+  ...(e.actions.length ? { act: true as const } : {}),
+  at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null,
+});
+/** The same element: same content, and the same id (accessibility) or roughly the same place (screen; without a
+ *  position on either side, content alone). */
+const sameEl = (a: Ident, b: Ident): boolean => a.c === b.c && (a.id !== undefined || b.id !== undefined ? a.id === b.id : !a.at || !b.at || (Math.abs(a.at[0] - b.at[0]) <= NEAR_PX && Math.abs(a.at[1] - b.at[1]) <= NEAR_PX));
+const dist = (a: Ident, b: Ident) => (a.at && b.at ? Math.abs(a.at[0] - b.at[0]) + Math.abs(a.at[1] - b.at[1]) : 0);
 
-/** Is what the user consented to still there: the window, the dialog, the typed text, the target and the focus
- *  unchanged, and every element bound still present unchanged (new ones may have come: an incoming message, a
- *  "typing…" line)? Any bound item changed or gone is another send. */
-function within(bound: SendBinding, now: SendBinding): boolean {
-  if (canon([bound.window, bound.modal, bound.typed, bound.target, bound.focused]) !== canon([now.window, now.modal, now.typed, now.target, now.focused])) return false;
-  const left = new Map<string, number>();
-  for (const e of now.elements) left.set(e, (left.get(e) ?? 0) + 1);
-  for (const e of bound.elements) { const n = left.get(e) ?? 0; if (!n) return false; left.set(e, n - 1); }
+/** The element an action decided on (`id` in the observation it was decided on), found in another look of the window
+ *  by identity: the driver acts on ids of its latest look, and text recognition's ids shift between looks. Null when
+ *  it is gone, or not one of a kind — already where it was decided (two「发送」 in one place) or in the look. */
+function resolve(decided: Observation, id: string, look: Observation): Element | null {
+  const was = decided.elements.find((e) => e.id === id);
+  if (!was) return null;
+  const w = identOf(was, false);
+  if (decided.elements.some((e) => e !== was && sameEl(identOf(e, false), w))) return null;
+  const like = look.elements.filter((e) => sameEl(identOf(e, false), w));
+  return like.length === 1 ? like[0]! : null;
+}
+
+/** What a consent to a send is bound to: the window, the dialog's title, the typed text, the target and the focused
+ *  element, and every element of the window by identity (review of #23: who it goes to may be only a text-recognition
+ *  row or a recipient tag with actions of its own; the same name elsewhere — a group's history line「张三」 — is not
+ *  the header that said 张三, by id or by place). */
+interface SendBinding { window: { app: string; title: string; url: string | null; tab: string | null }; modal: string | null; typed: string[]; target: Ident | null; focused: Ident | null; elements: Ident[];
+  /** A window read from the screen: every element (role, label, value, focus, and its centre), for the strict policy */
+  whole?: { c: string; at: [number, number] | null }[] }
+
+/** Is what the user consented to still there: the window, the dialog and the typed text unchanged, the same target and
+ *  focused element, and every bound element matched one to one by an element of the new look with the same content and
+ *  identity (id, or place)? New elements may have come (an incoming message, a "typing…" line); any bound one changed,
+ *  moved or gone is another send. */
+function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding): boolean {
+  if (canon([bound.window, bound.modal, bound.typed]) !== canon([now.window, now.modal, now.typed])) return false;
+  // the same target and focus under every policy: a screen the same as before, renumbered, can put the caller's id on
+  // the other pane's「发送」 (review of #25)
+  const one = (a: Ident | null, b: Ident | null) => (a === null || b === null ? a === b : sameEl(a, b));
+  if (!one(bound.target, now.target) || !one(bound.focused, now.focused)) return false;
+  // strict, for a window read from the screen: nothing may have changed at all
+  if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return sameScreen(bound.whole, now.whole);
+  const used = new Set<number>();
+  for (const b of bound.elements) {
+    let best = -1;
+    now.elements.forEach((n, i) => { if (!used.has(i) && sameEl(b, n) && (best < 0 || dist(b, n) < dist(b, now.elements[best]!))) best = i; });
+    if (best < 0) return false;
+    used.add(best);
+  }
+  // what came since: in a window read from the accessibility tree, only what cannot be acted on (an incoming message,
+  // a "typing…" line); a new button, tag, link or field may be a new recipient (review of #25: 「b@evil.com」 added).
+  // Text recognition offers every row as clickable, so in a screen-read window under `match` nothing tells them apart:
+  // additions stay allowed there (the owner's trade-off; `strict` is the default)
+  if (now.elements.some((n, i) => !used.has(i) && n.act && n.id !== undefined)) return false;
+  return true;
+}
+
+/** How far (px, on each axis) text recognition's box for an unchanged element may move between two reads of the same
+ *  screen: its jitter is a pixel or two. More is a change (strict policy). */
+const JITTER_PX = 4;
+
+/** The strict policy's "nothing changed" for a window read from the screen: the same elements, none added or gone, each
+ *  paired one to one with an element of the same role, label, value and focus whose centre is within JITTER_PX on both
+ *  axes. An element with two such candidates cannot be told apart, which counts as changed. */
+export function sameScreen(a: { c: string; at: [number, number] | null }[] | undefined, b: { c: string; at: [number, number] | null }[] | undefined): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (!x.at || !y.at ? !x.at && !y.at : Math.abs(x.at[0] - y.at[0]) <= JITTER_PX && Math.abs(x.at[1] - y.at[1]) <= JITTER_PX);
+  const used = new Set<number>();
+  for (const e of a) {
+    const fit = b.map((n, i) => (!used.has(i) && n.c === e.c && near(e, n) ? i : -1)).filter((i) => i >= 0);
+    if (fit.length !== 1) return false;
+    used.add(fit[0]!);
+  }
   return true;
 }
 
@@ -131,6 +215,9 @@ export class Executor {
    *  without input to the task's apps, which hands#49 no longer counts), so classify's answers are kept per
    *  observation, not per epoch (review of #23). */
   private obsSeq = new Map<string, number>();
+  /** The latest look at each window, the executor's own last looks included. The caller's ids refer to `lastObs` (what
+   *  it was shown); what is on screen now is here. */
+  private looks = new Map<string, Observation>();
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
 
@@ -140,8 +227,12 @@ export class Executor {
   recovered: { action: Action; finding: "happened" | "not_happened" | "unknown"; text: string; external: string[] } | null = null;
   private crashed = false;
 
+  /** The pixel send-binding policy in force (ExecutorOptions.pixelSendBinding, else the environment). */
+  readonly pixelPolicy: PixelSendBinding;
+
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
+    this.pixelPolicy = opts.pixelSendBinding ?? pixelSendBindingFrom(process.env.DESKMIND_PIXEL_SEND_BINDING);
   }
 
   private journal(kind: "begin" | "intent" | "receipt", body: Record<string, unknown>) {
@@ -371,8 +462,18 @@ export class Executor {
     const stamped: Observation = { ...o, window: { ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) } };
     this.epoch = o.epoch;
     this.lastObs.set(windowId, stamped);
+    this.looks.set(windowId, stamped);
     this.obsSeq.set(windowId, (this.obsSeq.get(windowId) ?? 0) + 1);
     if (!this.firstObs.has(windowId)) this.firstObs.set(windowId, stamped);
+    return stamped;
+  }
+
+  /** The executor's own look at a window (right before an effect): kept as what is on screen now, not as what the
+   *  caller was shown — the caller's ids stay those of its own observation. */
+  private async look(windowId: string): Promise<Observation> {
+    const o = await this.driver.observe(windowId);
+    const stamped: Observation = { ...o, window: { ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) } };
+    this.looks.set(windowId, stamped);
     return stamped;
   }
 
@@ -525,15 +626,21 @@ export class Executor {
    *  window read from the screen: text recognition may not read the input box back; a chat's history holding the same
    *  words says nothing of the draft, so only the fields count), bound with the consent in every case: changed text is
    *  another send. Nothing for a class below external. */
-  private card(a: Action, obs: Observation | undefined, consequence: Consequence): { sending: ReturnType<typeof outgoing> | null; typed: string[]; content: SendBinding | undefined; text: string } {
-    const sending = consequence === "external" ? outgoing(obs) : null;
+  private card(a: Action, decided: Observation | undefined, consequence: Consequence, look: Observation | undefined = decided): { sending: ReturnType<typeof outgoing> | null; typed: string[]; content: SendBinding | undefined; text: string; act: Action; lost: boolean } {
+    // the target as the caller decided it (its ids are those of `decided`), found in `look` — what is there now
+    const id = "target" in a && a.target ? a.target : null;
+    const el = id && decided && look ? resolve(decided, id, look) : undefined;
+    const act = el && el.id !== id ? ({ ...a, target: el.id } as Action) : a;
+    const sending = consequence === "external" ? outgoing(look) : null;
     const typed = sending ? this.typedIn(a).filter((t) => t.trim()) : [];
     const typedLines = typed.filter((t) => !sending!.fields.some((l) => l.includes(t.trim())));
-    const target = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
-    const content: SendBinding | undefined = sending && obs ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), typed, target: targetOf(target), focused: targetOf(obs.elements.find((e) => e.focused)) } : undefined;
+    const focused = look?.elements.find((e) => e.focused);
+    const pixels = !!look?.elements.some(fromScreen);
+    const whole = pixels && look ? look.elements.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, !!e.focused]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
+    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
-    const text = describeAction(a, obs, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
-    return { sending, typed, content, text };
+    const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
+    return { sending, typed, content, text, act, lost: !!id && !el };
   }
 
   /** classify's cache key: the action, the screen it is decided on — the epoch and which observation of the window —
@@ -615,7 +722,10 @@ export class Executor {
       // what the task typed into this window goes on the card when the window does not show it (a window read from the
       // screen: text recognition may not read the input box), and is bound with the consent in every case — changed
       // text is another send, asked again
-      const { sending, typed, content, text } = this.card(req.action, obs, consequence);
+      // the card is of what is there now (the latest look, the executor's own included), the target found by what it is;
+      // consent is asked and checked for the action as the caller sent it, so a retry of that action is covered
+      const { sending, typed, content, text, lost } = this.card(req.action, obs, consequence, (target ? this.looks.get(target) : undefined) ?? obs);
+      if (lost) return done({ ...base, status: "stale", why: `the target is gone from ${target}, or no longer one of a kind; observe it again and decide anew`, epoch: now.epoch });
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
       const judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
       if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
@@ -636,7 +746,7 @@ export class Executor {
       // a send's token stands while what the user saw is still there (every bound item present unchanged; new ones may
       // have come): it is checked against the binding it was issued for
       const stored = req.consent?.scope === "action" ? this.consent.contentOf(req.consent.nonce) as SendBinding | undefined : undefined;
-      accepted = stored && content && within(stored, content) ? stored : content;
+      accepted = stored && content && within(stored, content, this.pixelPolicy) ? stored : content;
       const why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
       if (why) {
         const challenge = this.consent.challenge(req.action, base.object, consequence, text, undefined, content);
@@ -653,25 +763,18 @@ export class Executor {
     let act: Action = req.action;
     if (target && obs && (this.mightSend(req.action) || consequence === "external")) {
       let fresh: Observation;
-      try { fresh = await this.observe(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
+      try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
       if (fresh.epoch !== req.epoch) return done({ ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
       const changed = (what: string) => done({ ...base, status: "stale", why: `${target} changed right before acting (${what}); observe it again and decide anew`, epoch: fresh.epoch });
-      // the target by content: the driver acts on an id of its latest look, and text recognition's ids shift between
-      // looks, so the element decided on is found again by what it is; gone, or no longer one of a kind, the model looks
-      if ("target" in act && act.target) {
-        const was = obs.elements.find((e) => e.id === (act as { target: string }).target);
-        const same = fresh.elements.find((e) => e.id === (act as { target: string }).target);
-        if (canon(targetOf(same)) !== canon(targetOf(was))) {
-          const like = fresh.elements.filter((e) => canon(targetOf(e)) === canon(targetOf(was)));
-          if (like.length !== 1) return changed("the target");
-          act = { ...act, target: like[0]!.id } as Action;
-        }
-      }
-      if (this.mightSend(req.action) && canon(sendFacts(req.action, obs)) !== canon(sendFacts(req.action, fresh))) return changed("the focus, or which controls send");
+      // the target, always found again by identity (content, and id or place) and required one of a kind: the driver acts
+      // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
+      const again = this.card(req.action, obs, consequence, fresh);
+      if (again.lost) return changed("the target is gone or no longer one of a kind");
+      act = again.act;
+      if (this.mightSend(req.action) && !sameSendFacts(req.action, obs, fresh)) return changed("the focus, or which controls send");
       if (consequence === "external") {
-        const again = this.card(act, fresh, consequence);
-        if (!accepted || !again.content || !within(accepted, again.content)) {
-          const challenge = this.consent.challenge(act, base.object, consequence, again.text, undefined, again.content);
+        if (!accepted || !again.content || !within(accepted, again.content, this.pixelPolicy)) {
+          const challenge = this.consent.challenge(req.action, base.object, consequence, again.text, undefined, again.content);
           this.emit("executor.consent_needed", { why: "what goes out changed right before sending", consequence, object: base.object });
           return done({ ...base, status: "needs_consent", why: "what goes out changed right before sending; asked again with what is there now", challenge, epoch: fresh.epoch });
         }
@@ -694,7 +797,7 @@ export class Executor {
       const challenge = this.consent.challenge(req.action, base.object, consequence, card.text, undefined, card.content);
       return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
     }
-    if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, this.lastObs.get(target ?? "") ?? obs, consequence) });
+    if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence) });
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
     try { r = await this.driver.perform(act); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
@@ -1010,9 +1113,13 @@ function diffObs(before: Observation | null, after: Observation, newWindows: str
  *  observation: where a key or typed text goes (the focused element: a focus moved from a search box to a message box
  *  before Return), and which controls in the window are on hands' name list (by content: ids shift). Compared right
  *  before the effect. */
-function sendFacts(a: Action, obs: Observation): unknown {
-  const focused = a.kind === "key" || a.kind === "type" ? targetOf(obs.elements.find((e) => e.focused)) : null;
-  return { focused, senders: obs.elements.filter((e) => e.sends).map((e) => `${e.role}|${e.label}`).sort() };
+function sameSendFacts(a: Action, decided: Observation, look: Observation): boolean {
+  if (a.kind === "key" || a.kind === "type") {
+    const f1 = decided.elements.find((e) => e.focused), f2 = look.elements.find((e) => e.focused);
+    if (!f1 !== !f2 || (f1 && f2 && !sameEl(identOf(f1, false), identOf(f2, false)))) return false;
+  }
+  const senders = (o: Observation) => canon(o.elements.filter((e) => e.sends).map((e) => `${e.role}|${e.label}`).sort());
+  return senders(decided) === senders(look);
 }
 
 /** What a write on these paths reaches: each path, and everything under the ones that are folders. */
@@ -1042,7 +1149,7 @@ export function outgoing(obs: Observation | undefined): { fields: string[]; show
   if (obs?.window.url) fields.unshift(`URL：${obs.window.url}`);
   const bound = obs ? {
     window: { app: obs.window.app, title: obs.window.title, url: obs.window.url ?? null, tab: (obs.window.tabs ?? []).find((t) => t.active)?.url ?? null }, modal: obs.modal?.title ?? null,
-    elements: els.map(sigOf).sort(),
+    elements: els.map((e) => identOf(e)),
   } : null;
   return { fields, shown, bound };
 }
