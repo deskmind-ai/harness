@@ -27,7 +27,7 @@ import { SkillStore } from "../skills/agentskills.js";
 import type { SkillSource } from "../runtime/loop.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
-import type { ConsentToken, Driver } from "../executor/types.js";
+import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
 import { FrontierRuntime, type RuntimeUser } from "../runtime/loop.js";
 import { loopModel } from "../runtime/model.js";
 import { scriptedStream } from "../runtime/scripted.js";
@@ -105,16 +105,24 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
 }
 
 /** The tutorials the model may read: the shipped ones beside this code and the user's (`skills` in the request, or
- *  ~/.deskmind/skills), filtered by structure (the request's apps, the folder's file types) — never by the words of
- *  the request (skills-layer-2026-10-18.md §检索). The base skill is the system prompt already, so it is not a candidate. */
-function skillsFor(req: Request, ws?: Workspace): SkillSource {
-  const dirs = [path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "skills"), req.skills ?? path.join(os.homedir(), ".deskmind", "skills")].filter((d) => fs.existsSync(d));
+ *  ~/.deskmind/skills), filtered by structure (the apps, the folder's file types) — never by the words of the request
+ *  (skills-layer-2026-10-18.md §检索). The apps are the request's when it names them; the app no longer guesses them
+ *  (rc.10), so otherwise they are facts of the computer as the task began: the frontmost app and every app with a
+ *  window, by every name the driver gives (bundle id, localized name). Read when the candidates are asked for, after
+ *  begin. The base skill is the system prompt already, so it is not a candidate. */
+export function skillsFor(req: Request, ws?: Workspace, computer?: () => Snapshot | null, dirsOverride?: string[]): SkillSource {
+  const dirs = (dirsOverride ?? [path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "skills"), req.skills ?? path.join(os.homedir(), ".deskmind", "skills")]).filter((d) => fs.existsSync(d));
   const fileTypes = ws ? [...new Set(Object.keys(ws.entries()).map((p) => p.includes(".") ? p.slice(p.lastIndexOf(".") + 1).toLowerCase() : "").filter(Boolean))] : [];
-  const facts = { apps: req.apps ?? [], fileTypes, objects: req.scope ? [req.scope] : [] };
-  const sources = dirs.map((d) => new SkillStore(d).source(facts));
+  const appsNow = (): string[] => {
+    if (req.apps?.length) return req.apps;
+    const s = computer?.();
+    if (!s) return [];
+    return [...new Set([s.front_app, ...s.windows.flatMap((w) => [w.app, w.app_name, w.bundle])].filter((x): x is string => !!x))];
+  };
+  const sources = () => { const facts = { apps: appsNow(), fileTypes, objects: req.scope ? [req.scope] : [] }; return dirs.map((d) => new SkillStore(d).source(facts)); };
   return {
-    candidates: (raw) => sources.flatMap((s) => s.candidates(raw)).filter((c) => c.name !== "deskmind-computer-use"),
-    read: (name) => sources.map((s) => s.read(name)).find((t) => t !== null) ?? null,
+    candidates: (raw) => sources().flatMap((s) => s.candidates(raw)).filter((c) => c.name !== "deskmind-computer-use"),
+    read: (name) => sources().map((s) => s.read(name)).find((t) => t !== null) ?? null,
   };
 }
 
@@ -158,7 +166,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
     ...(ws ? { workspace: ws, registry: fileRegistry() } : {}),
-    skills: skillsFor(req, ws), lang: req.lang ?? "zh", ...(req.rules ? { rules: req.rules } : {}),
+    skills: skillsFor(req, ws, () => executor.beginSnapshot), lang: req.lang ?? "zh", ...(req.rules ? { rules: req.rules } : {}),
     // a real desktop takes more looks than the check set's folders: a pixel-mode app needs an observation per step
     // and the old engine used ~20 actions on the music sample; the evaluation keeps the default budget
     budget: req.driver === "hands" ? { tool_calls: 90, turns: 60 } : {},

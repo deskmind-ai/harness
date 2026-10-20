@@ -25,6 +25,10 @@ export interface WindowInfo {
   owner?: Owner;                      // filled by the executor from its ledger; a driver never says
   focused?: boolean; minimized?: boolean;
   url?: string; tabs?: TabInfo[];     // a browser window
+  /** The app's localized name (hands; falls back to the bundle id there), for what the user reads; and its bundle id. */
+  app_name?: string; bundle?: string;
+  /** Brought up by the task's launch of the app (hands#54 `opened_window`), filled by the executor: still the user's. */
+  opened?: boolean;
   /** The driver can operate this window only with its app in front (hands): the plan card says so. */
   needs_foreground?: boolean;
 }
@@ -129,6 +133,8 @@ export interface ActResult {
 
 export interface PerformResult {
   status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo;
+  /** A window that appeared when the task launched an app, without proof the task made it (hands#54): the user's. */
+  opened_window?: WindowInfo;
   /** The files this action wrote, as far as the driver can vouch for it: relative to the task folder, or absolute. Only
    *  writes it is sure of — one it made itself (a save-as it carried out), or the app's own save, seen as the window's
    *  document going from unsaved to saved during the action. A document that merely changed while the action ran is
@@ -150,7 +156,9 @@ type Maybe<T> = T | Promise<T>;
 export interface Driver {
   snapshot(): Maybe<Snapshot>;
   observe(windowId: string, opts?: { screenshot?: boolean }): Maybe<Observation>;
-  perform(action: Action): Maybe<PerformResult>;
+  /** `foreground_ok`: the executor allows this one step to bring its app to the front (the task's own window, or one
+   *  the user consented to); a driver that can act in the background may ignore it. */
+  perform(action: Action, opts?: { foreground_ok?: boolean }): Maybe<PerformResult>;
   end?(): Maybe<void>;
 }
 
