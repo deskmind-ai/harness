@@ -157,16 +157,17 @@ describe("executor: consent tokens", () => {
 });
 
 describe("executor: stop, lock, stale", () => {
-  it("after stop every action is refused; a locked screen is an environment stop; a stale epoch is refused", async () => {
+  it("after stop every action is refused; a locked screen is an environment stop; a stale epoch is refused where the action reads the observation", async () => {
     const { ex, w, sim } = setup();
     const s = await ex.begin();
     const { o } = await find(ex, w.id, "取消旗标");
+    const e = o.elements.find((x) => x.actions.includes("click"))!;
     sim.lock();
     expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: o.epoch })).status).toBe("environment");
     sim.lock(false);
-    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: s.epoch })).status).toBe("stale");
-    const fresh = await ex.snapshot();
-    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: fresh.epoch })).status).toBe("ok");
+    // the lock moved the epoch: a click decided on the old look is refused; a wait decided nothing on a look, it goes
+    expect((await ex.act({ action: { kind: "click", window: w.id, target: e.id }, epoch: o.epoch })).status).toBe("stale");
+    expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: s.epoch })).status).toBe("ok");
     ex.stop();
     expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: (await ex.snapshot()).epoch })).status).toBe("stopped");
     expect(ex.receipts.map((r) => r.result.status)).toEqual(["environment", "stale", "ok", "stopped"]);

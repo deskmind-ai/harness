@@ -664,14 +664,21 @@ export class Executor {
     if (a.kind === "wait" || a.kind === "focus_window" || a.kind === "scroll") return { consequence: "read", object, why: "changes no content" };
     if (a.kind === "open_window") {
       // a URL handed to a browser the user already has open lands as a tab in their window (deskmind#73): that is
-      // the user's thing and asks first; without a URL, or for an app not running, a new window of the task's own
-      const theirs = a.url ? this.last?.windows.find((w) => w.owner === "user" && (w.app === a.app || w.id.startsWith(a.app + "#"))) : undefined;
+      // the user's thing and asks first; without a URL, or for an app not running, a new window of the task's own.
+      // A driver that promises urls land only in the task's own window (hands since #48) makes it the task's step:
+      // taking it for the user's window raised a card per page on a plain web search (rc.10: 9 cards, while every
+      // page loaded in the task's window all the same)
+      const own = !!a.url && !!this.driver.capabilities?.urlInOwnWindow;
+      const sameApp = (w: WindowInfo) => w.app === a.app || w.id.startsWith(a.app + "#");
+      const theirs = a.url && !own ? this.last?.windows.find((w) => w.owner === "user" && sameApp(w)) : undefined;
+      const mine = own ? this.last?.windows.find((w) => w.owner === "task" && sameApp(w)) : undefined;
       // once the task has taken in content (read a file, typed what the user did not write), a URL can carry it out:
       // a host not approved yet in this task is a send, asked once per host; a URL that is not http(s) every time
       // (owner 10-21: per-site consent, replacing the text matching of #33)
       const s = this.siteRule(a);
       if (s) return { consequence: "external", object: theirs ? `window:${theirs.id}` : object, why: s.host ? `the task has ${s.by === "read" ? "read the user's files" : "typed text the user did not write"}; opening ${s.host} may carry what it took in` : `the task has taken in content; ${a.url} is not an http(s) page and may carry it` };
       if (theirs) return { consequence: "modify_user", object: `window:${theirs.id}`, why: `opens ${a.url} in the user's ${a.app} window` };
+      if (own) return { consequence: "create", object: mine ? `window:${mine.id}` : object, why: `opens ${a.url} in a ${a.app} window of the task's own` };
       return { consequence: "create", object, why: "a window of the task's own" };
     }
     const owner = this.ledger.ownerOf(object);
@@ -898,8 +905,12 @@ export class Executor {
       if (w.end) return done({ ...base, ...w.end, epoch: now.epoch });
     }
     // after a wait too: what the user did meanwhile (selected another row) is not what the model decided on, so the
-    // action would land on something else (review of #16: "delete selected" deleted B, decided on A)
-    if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
+    // action would land on something else (review of #16: "delete selected" deleted B, decided on A). Only for an
+    // action that reads the window's observation — an element, a key or typing into what has the focus: a wait, an
+    // open (the url lands where it lands), a switch of windows decided nothing on a look, and holding them stale on a
+    // title that settled or a helper window that came and went cost a run 8 of its 11 stales (rc.10, "搜索今天北京天气")
+    const readsObs = ("target" in req.action && !!req.action.target) || req.action.kind === "key" || req.action.kind === "type";
+    if (readsObs && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
     if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
     // an element is addressed only through the window's last observation: a guessed id would skip the structural
@@ -911,7 +922,6 @@ export class Executor {
     // card and the consent: one older than the computer (a snapshot since gave the model a newer epoch) may show
     // "Preview" where the button now says "Send" — sent without asking — or draft A where B goes out (review of #16).
     // Any action that reads the observation, or needs consent, waits for the window to be looked at again
-    const readsObs = ("target" in req.action && !!req.action.target) || req.action.kind === "key" || req.action.kind === "type";
     if (obs && obs.epoch !== now.epoch && (readsObs || NEEDS_CONSENT.has(consequence))) return staleOn(now, { ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
     // the caller names elements by ids of its own observation; the driver acts on ids of its latest look, which may be
     // the executor's own (a last look before a send) and numbered otherwise. Every action that names an element finds it
@@ -940,7 +950,7 @@ export class Executor {
       now = await this.driver.snapshot();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, c.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
-      if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (readsObs && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
     }
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
@@ -968,7 +978,7 @@ export class Executor {
         now = w.now;
         if (w.end) return done({ ...base, ...w.end, epoch: now.epoch });
       }
-      if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (readsObs && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
       // a send's consent is for what it sends: the draft changed since the card is another send, asked again
       // an action token is checked here and spent only right before the effect, after the last look below passed
@@ -1028,7 +1038,7 @@ export class Executor {
       now = await this.driver.snapshot();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
-      if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (readsObs && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
     }
     const before = "window" in req.action ? this.lastObs.get(req.action.window) ?? null : null;
     // a real driver can fail on either side of the action: that is a result the model reads, never an exception

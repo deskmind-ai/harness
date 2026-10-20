@@ -168,6 +168,10 @@ export interface Driver {
    *  the user consented to); a driver that can act in the background may ignore it. */
   perform(action: Action, opts?: { foreground_ok?: boolean }): Maybe<PerformResult>;
   end?(): Maybe<void>;
+  /** What the driver promises about where its actions land. `urlInOwnWindow`: an open_window with a url always loads in
+   *  a browser window of the task's own, never in one of the user's — the executor then takes it for the task's own
+   *  step, not a change to the user's window. Without the promise a url is taken to land in the user's window. */
+  readonly capabilities?: { urlInOwnWindow?: boolean };
 }
 
 /** What a run's receipts and verification can read back: the executor's own log of what it did. */
