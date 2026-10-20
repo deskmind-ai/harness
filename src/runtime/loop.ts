@@ -32,6 +32,9 @@ import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult,
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
 /** What signs consent: the app (keychain) in production, a ConsentSigner in tests and the CLI. */
 export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject">;
+/** A plan step as the model writes it; `opens`: the URLs it opens with open_window, and in which app. */
+export interface PlanStepIn { purpose: string; objects: string[]; consequence: Consequence; opens?: { app: string; url: string }[] }
+
 export interface SkillSource { candidates(raw: string): { name: string; description: string }[]; read(name: string): string | null }
 
 export const RUNTIME_BUDGET = { tool_calls: 40, turns: 30, asks: 3, verify_retries: 2 };
@@ -214,9 +217,9 @@ export class FrontierRuntime {
       execute: async (_id, p: { action: Static<typeof ActionSchema>; epoch: number; consequence: Consequence; purpose: string }) => this.act(p),
     }));
     tools.push(tool({
-      name: "plan", label: "计划", description: "动手前列出步骤：目的、涉及的对象（窗口 id / 标签页 id / 文件路径）、后果类别。要碰用户的东西或往外发，必须先有计划。readings：原话里能有不止一种理解的地方，每处写你选的理解、其他理解、以及区分它们的依据（看到的东西：窗口标题、文件名、文件里的一行、用户的回答；原话本身不算）。依据不够的，程序会先问用户。程序把计划给用户过目，同意后改用户东西的步骤不再逐步打扰。",
-      parameters: Type.Object({ steps: Type.Array(Type.Object({ purpose: Type.String(), objects: Type.Array(Type.String()), consequence: lit(CONSEQUENCES) })), readings: Type.Optional(Type.Array(Type.Object({ point: Type.String(), reading: Type.String(), alternatives: Type.Array(Type.String()), evidence: Type.Array(Type.String()) }))) }),
-      execute: async (_id, p: { steps: { purpose: string; objects: string[]; consequence: Consequence }[]; readings?: Reading[] }) => this.plan(p.steps, p.readings ?? []),
+      name: "plan", label: "计划", description: "动手前列出步骤：目的、涉及的对象（窗口 id / 标签页 id / 文件路径）、后果类别。要碰用户的东西或往外发，必须先有计划。readings：原话里能有不止一种理解的地方，每处写你选的理解、其他理解、以及区分它们的依据（看到的东西：窗口标题、文件名、文件里的一行、用户的回答；原话本身不算）。依据不够的，程序会先问用户。程序把计划给用户过目，同意后改用户东西的步骤不再逐步打扰。某一步要用 open_window 打开网址的，在这一步的 opens 里写上应用和网址：网址可能会开在用户已有的浏览器窗口里，写上了，计划卡会一并问用户，之后打开网址就不再逐次打扰。",
+      parameters: Type.Object({ steps: Type.Array(Type.Object({ purpose: Type.String(), objects: Type.Array(Type.String()), consequence: lit(CONSEQUENCES), opens: Type.Optional(Type.Array(Type.Object({ app: Type.String(), url: Type.String() }), { description: "这一步用 open_window 打开的网址：应用和网址" })) })), readings: Type.Optional(Type.Array(Type.Object({ point: Type.String(), reading: Type.String(), alternatives: Type.Array(Type.String()), evidence: Type.Array(Type.String()) }))) }),
+      execute: async (_id, p: { steps: PlanStepIn[]; readings?: Reading[] }) => this.plan(p.steps, p.readings ?? []),
     }));
     tools.push(tool({
       name: "ask_user", label: "问用户", description: "只有用户知道的信息（要写什么、哪一个、放哪）才问；能自己看到的不要问。options 是从证据里拿的候选，2–6 个，可以为空。",
@@ -318,7 +321,12 @@ export class FrontierRuntime {
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     if (a.kind === "file") this.emit("fs.act", { cap: a.capability, args: a.args, status: r.status, consequence: r.consequence, why: r.why ?? "" });
     if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(a.kind === "file" ? describeAction(a, undefined, r.consequence, cap) : `${p.purpose}：${describeAction(a, r.after, r.consequence)}`);
-    if (r.status === "needs_plan") { this.count("needs_plan"); return err(`先交计划：${r.why}`); }
+    if (r.status === "needs_plan") {
+      this.count("needs_plan");
+      // a URL that would land in the user's browser window: say how the plan covers it (structure, not the words)
+      const hint = a.kind === "open_window" && a.url ? `\n这个网址会开在用户已有的 ${a.app} 窗口里：在计划里打开网址的那一步写上 opens: [{ app: "${a.app}", url: "…" }]，计划卡会一并问用户，之后打开网址不再逐次打扰。` : "";
+      return err(`先交计划：${r.why}${hint}`);
+    }
     // the judge's "not what the user asked": the way out is the user's answer, never another guess
     if (r.status === "refused" && (r.why ?? "").includes("意图核对")) { this.count("refused_by_judge"); return err(`${r.why}
 不确定用户想怎么做的，用 ask_user 问清楚（给出几种做法当选项），不要换一种猜法再试。`); }
@@ -339,7 +347,7 @@ export class FrontierRuntime {
     return { ...(r.status === "ok" || r.status === "unverified" ? text(J(view)) : err(J(view))), ...(notes.length ? { content: [{ type: "text", text: J(view) + "\n" + notes.join("\n") }] } : {}) };
   }
 
-  private async plan(steps: { purpose: string; objects: string[]; consequence: Consequence }[], readings: Reading[]): Promise<AgentToolResult> {
+  private async plan(steps: PlanStepIn[], readings: Reading[]): Promise<AgentToolResult> {
     this.count("plans");
     this.emit("plan", { steps, readings });
     // the start gate: readings the judge cannot settle are the user's to settle, one card each, before anything else
@@ -366,15 +374,20 @@ export class FrontierRuntime {
     // music app's window the executor counted as the user's, so no plan card was shown and every step asked on its own
     // card — 「打开网易云播放安溥的宝贝」, 10-20). A declared external stays external; sending still asks per action
     // only looks: nothing to ask, nothing to resolve
-    if (steps.every((s) => s.consequence === "read")) return text("计划记下了；这些步骤不需要用户同意，直接做。");
+    if (steps.every((s) => s.consequence === "read" && !s.opens?.length)) return text("计划记下了；这些步骤不需要用户同意，直接做。");
     const snap = await this.o.executor.snapshot();           // one look for the whole plan
-    const objectsOf = await Promise.all(steps.map((s) => this.canonObjects(s.objects, snap)));
+    // a URL a step opens lands where the executor's floor for that open_window says: in the user's browser window when
+    // the app has one (「搜索今天北京天气」, rc.10: nine cards for nine pages in the user's Chrome). That window is one
+    // of the step's objects, by the executor's view — listed on the card and covered by one approval
+    const opensInto = steps.map((s) => [...new Set((s.opens ?? []).flatMap((o) => { const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url }); return f.consequence === "modify_user" && f.object.startsWith("window:") ? [f.object] : []; }))]);
+    const objectsOf = (await Promise.all(steps.map((s) => this.canonObjects(s.objects, snap)))).map((os, i) => [...new Set([...os, ...opensInto[i]!])]);
     // only what is there: a window or tab on screen, a file in the task folder (a raw "window:…" the model wrote that names
     // nothing would otherwise be called the user's by the ledger and signed — review of #31)
     const there = new Set([...snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]), ...(this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [])]);
     const theirs = (o: string) => there.has(o) && this.o.executor.ledger.ownerOf(o) === "user";
     // a step declared "read" stays a look (the floor of looking is read; an action it turns into asks on its own)
-    const classes = steps.map((s, i) => (s.consequence === "external" || s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence));
+    // (a URL opened into the user's window is no look, whatever the step was declared)
+    const classes = steps.map((s, i) => (s.consequence === "external" ? s.consequence : opensInto[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence));
     const signFor = [...new Set(objectsOf.flatMap((os, i) => (classes[i] === "read" ? [] : os.filter(theirs))))];
     // an app the hands driver can only operate in front: hands#54 lists bundle ids on the snapshot (`needs_foreground`,
     // known once the app was observed or brought forward), matched against a window's app or its id's "bundle#" prefix;
@@ -393,9 +406,10 @@ export class FrontierRuntime {
     // the objects as the user knows them, from the snapshot — the app and its window's title, a tab's title and site, a
     // file's path in the task folder — not the model's words (「窗口 com.netease.163music#30144」 told the user nothing,
     // review of #31); what did not resolve is shown as the model wrote it, and is not signed
+    const opening = new Set(opensInto.flat());
     const shown = (o: string): string => {
       const id = o.slice(o.indexOf(":") + 1);
-      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return windowLabel(w, this.o.lang); }
+      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return opening.has(o) ? this.t.openInYours(appName(w)) : windowLabel(w, this.o.lang); }
       if (o.startsWith("tab:")) for (const w of snap.windows) { const t = w.tabs?.find((x) => x.id === id); if (t) { let site = ""; try { site = new URL(t.url).host; } catch { /* no site */ } return `「${t.title}」${site ? `（${site}）` : ""}`; } }
       if (o.startsWith("path:") && there.has(o)) return id;
       return o;

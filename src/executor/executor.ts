@@ -78,6 +78,22 @@ export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pix
 
 const RETURN = /\b(return|enter)\b/i;
 
+/** A container's own descriptions of its role, in the languages the accessibility tree speaks (macOS's role
+ *  descriptions): an element labelled only with one of these says nothing of its own. */
+const GENERIC: Record<string, string[]> = {
+  group: ["组", "群组", "分组", "group"], scrollarea: ["滚动区域", "scroll area"], splitgroup: ["拆分组", "split group"],
+  layoutarea: ["布局区域", "layout area"], toolbar: ["工具栏", "toolbar"], unknown: ["未知", "unknown"], generic: [""],
+};
+/** An element with no identity of its own, left out of a send's binding: no value, nothing the user typed or chose
+ *  (not focused or selected), not a sender, nothing to do on it beyond a click, and a label that is empty or only its
+ *  role's generic description (「组」 on a group). Everything with a real label or a value — fields, recipients, rows,
+ *  the Send button — stays bound. */
+export const anonymous = (e: Element): boolean => {
+  if (e.value || e.focused || e.sends || e.actions.some((a) => a !== "click")) return false;
+  const label = e.label.trim().toLowerCase(), role = e.role.replace(/^ax/i, "").replace(/[\s_-]/g, "").toLowerCase();
+  return !label || label === role || (GENERIC[role] ?? []).includes(label);
+};
+
 /** An element whose focus flag says where the keyboard is, not what is selected: a text entry (a text field or area, a
  *  search field, a combo box, anything that takes typed text or a set value), a web area, or the control that sends.
  *  Everywhere else hands' `focused` is the selection (Peekaboo's is_selected) — a row, an item, a recipient tag, a web
@@ -769,8 +785,11 @@ export class Executor {
     const focusOf = (e: Element) => withFocus || !keyboardFocus(e);
     const focused = withFocus ? look?.elements.find((e) => e.focused) : undefined;
     const pixels = !!look?.elements.some(fromScreen);
-    const whole = pixels && look ? look.elements.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
-    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), elements: look.elements.map((e) => identOf(e, focusOf(e))), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
+    // what is bound: every element with an identity of its own — not an anonymous container (rc.10: an empty 「组」
+    // vanishing re-asked a mail send)
+    const bindable = look ? look.elements.filter((e) => !anonymous(e)) : [];
+    const whole = pixels && look ? bindable.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
+    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), elements: bindable.map((e) => identOf(e, focusOf(e))), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el };
