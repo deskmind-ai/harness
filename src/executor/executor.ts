@@ -23,7 +23,7 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, rank } from "./types.js";
-import { ConsentVerifier, canon, digestOf } from "./consent.js";
+import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import { T, type Lang } from "../runtime/text.js";
@@ -78,6 +78,20 @@ export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pix
 
 const RETURN = /\b(return|enter)\b/i;
 
+/** Container roles: elements that hold others and say nothing of their own (accessibility role names, no language). */
+const CONTAINERS = new Set(["group", "scrollarea", "splitgroup", "layoutarea", "layoutitem", "toolbar", "generic", "unknown", "section"]);
+/** A container with no identity of its own: a container role, no value, not focused or selected, not a sender, nothing
+ *  to do on it beyond a click, and a label that is empty, or only its role described — hands' `role_description`
+ *  (AXRoleDescription, 「组」 on a group) or its `label_from_role` flag; no table of words. Such an element vanishing
+ *  does not ask a send again (rc.10: an empty 「组」); one appearing still counts as an addition (review of #33: a new
+ *  recipient chip is such a group with the address beside it). Unnamed buttons, links and rows are not containers. */
+export const anonymous = (e: Element): boolean => {
+  if (e.value || e.focused || e.sends || e.actions.some((a) => a !== "click")) return false;
+  if (!CONTAINERS.has(e.role.replace(/^ax/i, "").replace(/[\s_-]/g, "").toLowerCase())) return false;
+  const label = e.label.trim();
+  return !label || e.label_from_role === true || (!!e.role_description && label === e.role_description.trim());
+};
+
 /** An element whose focus flag says where the keyboard is, not what is selected: a text entry (a text field or area, a
  *  search field, a combo box, anything that takes typed text or a set value), a web area, or the control that sends.
  *  Everywhere else hands' `focused` is the selection (Peekaboo's is_selected) — a row, an item, a recipient tag, a web
@@ -97,12 +111,13 @@ const NEAR_PX = 16;
  *  (`act`), and whether it came from the accessibility tree (`ax`). Never its id: text recognition renumbers its ids
  *  every look, and so does Peekaboo for the accessibility tree (elem_N in traversal order: an incoming message ahead of
  *  the Send button shifts every later id). An id is a handle into one observation, not an identity (review of #25). */
-interface Ident { c: string; at: [number, number] | null; act?: true; ax?: true }
+interface Ident { c: string; at: [number, number] | null; act?: true; ax?: true; anon?: true }
 const identOf = (e: Element, withFocus = true): Ident => ({
   c: canon([e.role, e.label, e.value ?? null, fromScreen(e) ? "pixels" : "ax", ...(withFocus ? [!!e.focused] : [])]),
   at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null,
   ...(e.actions.length ? { act: true as const } : {}),
   ...(fromScreen(e) ? {} : { ax: true as const }),
+  ...(anonymous(e) ? { anon: true as const } : {}),
 });
 const close = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) <= NEAR_PX && Math.abs(a[1] - b[1]) <= NEAR_PX;
 /** Two elements, each already found, are the same: same content, and roughly the same place when both have one. */
@@ -120,21 +135,26 @@ function pair(bound: Ident[], now: Ident[]): Set<number> | null {
   if (bound.every((b) => b.at) && now.every((n) => n.at)) {
     const used = new Set<number>();
     for (const c of new Set(bound.map((b) => b.c))) {
+      // an anonymous container bound may be gone; everything else bound must be paired, and no more of a content than
+      // was bound may be there now (more is an addition)
       const bs = bound.filter((b) => b.c === c), ns = now.map((n, i) => ({ n, i })).filter((x) => x.n.c === c);
-      if (bs.length !== ns.length) return null;
+      const must = bs.filter((b) => !b.anon).length;
+      if (ns.length > bs.length || ns.length < must) return null;
       const d = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
       const cand = bs.flatMap((b, k) => ns.filter((x) => close(b.at!, x.n.at!)).map((x) => ({ k, i: x.i, d: d(b.at!, x.n.at!) }))).sort((x, y) => x.d - y.d);
       const done = new Set<number>();
       for (const x of cand) if (!done.has(x.k) && !used.has(x.i)) { done.add(x.k); used.add(x.i); }
-      if (done.size !== bs.length) return null;
+      if (bs.some((b, k) => !b.anon && !done.has(k))) return null;
     }
     return used;
   }
+  // an anonymous container bound may be gone: only the rest must appear, in order
+  const req = bound.filter((b) => !b.anon);
   const first: number[] = [], last: number[] = [];
   let j = 0;
-  for (const b of bound) { while (j < now.length && now[j]!.c !== b.c) j += 1; if (j >= now.length) return null; first.push(j); j += 1; }
+  for (const b of req) { while (j < now.length && now[j]!.c !== b.c) j += 1; if (j >= now.length) return null; first.push(j); j += 1; }
   j = now.length - 1;
-  for (let k = bound.length - 1; k >= 0; k -= 1) { while (j >= 0 && now[j]!.c !== bound[k]!.c) j -= 1; if (j < 0) return null; last.unshift(j); j -= 1; }
+  for (let k = req.length - 1; k >= 0; k -= 1) { while (j >= 0 && now[j]!.c !== req[k]!.c) j -= 1; if (j < 0) return null; last.unshift(j); j -= 1; }
   return first.every((x, i) => x === last[i]) ? new Set(first) : null;
 }
 
@@ -176,7 +196,7 @@ function resolve(decided: Observation, id: string, look: Observation): Element |
  *  the header that said 张三, by id or by place). */
 interface SendBinding { window: { app: string; title: string; url: string | null; tab: string | null }; modal: string | null; typed: string[]; target: Ident | null; focused: Ident | null; elements: Ident[];
   /** A window read from the screen: every element (role, label, value, focus, and its centre), for the strict policy */
-  whole?: { c: string; at: [number, number] | null }[] }
+  whole?: { c: string; at: [number, number] | null; anon?: boolean }[] }
 
 /** Is what the user consented to still there: the window, the dialog and the typed text unchanged, the same target and
  *  focused element, and every bound element matched one to one by an element of the new look with the same content and
@@ -231,6 +251,7 @@ export function bindingDiff(bound: SendBinding, now: SendBinding, pixels: PixelS
   const rl = (c: string) => { const x = JSON.parse(c) as unknown[]; return canon(strict ? [x[0], x[1]] : [x[0], x[1], x[3]]); };
   for (const k of leftA) {
     const a = A[k]!;
+    if ((a as { anon?: boolean }).anon) continue;                // an anonymous container gone: not a change
     const i = B.findIndex((b, j) => !usedB.has(j) && rl(b.c) === rl(a.c));
     if (i < 0) { push({ part: "element", before: sig(a), after: null }); continue; }
     usedB.add(i);
@@ -250,17 +271,18 @@ const JITTER_PX = 4;
  *  is within JITTER_PX on both axes. Identical neighbours (a duplicate text-recognition box) are interchangeable: within
  *  a content they are paired nearest first (review of #26: requiring one candidate each never paired them, and a send
  *  never went through on an unchanged screen). */
-export function sameScreen(a: { c: string; at: [number, number] | null }[] | undefined, b: { c: string; at: [number, number] | null }[] | undefined): boolean {
-  if (!a || !b || a.length !== b.length) return false;
+export function sameScreen(a: { c: string; at: [number, number] | null; anon?: boolean }[] | undefined, b: { c: string; at: [number, number] | null; anon?: boolean }[] | undefined): boolean {
+  if (!a || !b) return false;
   const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (!x.at || !y.at ? !x.at && !y.at : Math.abs(x.at[0] - y.at[0]) <= JITTER_PX && Math.abs(x.at[1] - y.at[1]) <= JITTER_PX);
   const d = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (x.at && y.at ? Math.abs(x.at[0] - y.at[0]) + Math.abs(x.at[1] - y.at[1]) : 0);
-  for (const c of new Set(a.map((e) => e.c))) {
+  for (const c of new Set([...a.map((e) => e.c), ...b.map((e) => e.c)])) {
+    // every element now must pair with one bound (nothing added); every bound one must pair, except an anonymous
+    // container, which may be gone
     const as = a.filter((e) => e.c === c), bs = b.filter((e) => e.c === c);
-    if (as.length !== bs.length) return false;
     const cand = as.flatMap((x, k) => bs.map((y, i) => ({ k, i, ok: near(x, y), d: d(x, y) }))).filter((p) => p.ok).sort((p, q) => p.d - q.d);
     const ka = new Set<number>(), kb = new Set<number>();
     for (const p of cand) if (!ka.has(p.k) && !kb.has(p.i)) { ka.add(p.k); kb.add(p.i); }
-    if (ka.size !== as.length) return false;
+    if (kb.size !== bs.length || as.some((x, k) => !x.anon && !ka.has(k))) return false;
   }
   return true;
 }
@@ -325,7 +347,9 @@ export class Executor {
     this.challenges.set(c.nonce, { action, epoch, object, consequence });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
-    return c;
+    // a host asked about after the task took in content: the yes approves the host for the rest of the task
+    const site = consequence === "external" ? this.siteRule(action)?.host : undefined;
+    return site ? { ...c, site } : c;
   }
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
@@ -483,13 +507,17 @@ export class Executor {
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
   attachFiles(workspace: Workspace, registry: Registry) { this.opts.files = { workspace, registry }; }
 
-  setRequest(raw: string) { this.opts.raw = raw; }
+  setRequest(raw: string) { if (this.opts.raw) this.earlierRequests.push(this.opts.raw); this.opts.raw = raw; }
+  /** The request as it was before each steer: still the user's words. */
+  private earlierRequests: string[] = [];
 
   /** What the user answered when asked during the task: their words as much as the request, read by every judge
    *  question (intent, evidence, verdict) — a judge that saw only the request refused the step the user had just asked
    *  for (10-18, "点稍后关掉弹窗"). */
   private answers: { question: string; text: string }[] = [];
-  addAnswer(question: string, text: string) { this.answers.push({ question, text }); }
+  addAnswer(question: string, text: string, o: { userWrote?: boolean } = {}) { this.answers.push({ question, text }); if (o.userWrote) this.userWrote.push(text); }
+  /** What the user wrote in their own words on cards (not an option the model offered): theirs to send. */
+  private userWrote: string[] = [];
   /** A tutorial the runtime is following this task (one the user taught or admitted): what "整理一下" means here, so
    *  a judge does not refuse the moves the tutorial prescribes as "not what the user asked" (10-18, skills-002/003). */
   private skillsInUse: { name: string; text: string }[] = [];
@@ -638,6 +666,11 @@ export class Executor {
       // a URL handed to a browser the user already has open lands as a tab in their window (deskmind#73): that is
       // the user's thing and asks first; without a URL, or for an app not running, a new window of the task's own
       const theirs = a.url ? this.last?.windows.find((w) => w.owner === "user" && (w.app === a.app || w.id.startsWith(a.app + "#"))) : undefined;
+      // once the task has taken in content (read a file, typed what the user did not write), a URL can carry it out:
+      // a host not approved yet in this task is a send, asked once per host; a URL that is not http(s) every time
+      // (owner 10-21: per-site consent, replacing the text matching of #33)
+      const s = this.siteRule(a);
+      if (s) return { consequence: "external", object: theirs ? `window:${theirs.id}` : object, why: s.host ? `the task has ${s.by === "read" ? "read the user's files" : "typed text the user did not write"}; opening ${s.host} may carry what it took in` : `the task has taken in content; ${a.url} is not an http(s) page and may carry it` };
       if (theirs) return { consequence: "modify_user", object: `window:${theirs.id}`, why: `opens ${a.url} in the user's ${a.app} window` };
       return { consequence: "create", object, why: "a window of the task's own" };
     }
@@ -678,6 +711,40 @@ export class Executor {
     if (a.kind === "key" && RETURN.test(a.chord)) return true;
     if (a.kind === "key" || a.kind === "select") return !!this.lastObs.get(a.window)?.elements.some((e) => e.sends) || !!this.typed.get(a.window)?.length;
     return false;
+  }
+
+  /** Has the task taken in content in this run: read a file (a file action of a capability that only observes — a read,
+   *  a listing with previews — that returned output; a write's receipt is not a read), been shown files' content another
+   *  way (noteTakenIn: the task folder's listing with previews in the model's prompt), or typed text that is not in the
+   *  user's own words (the request, before and after a steer, and what they wrote in answer on cards; not an option the
+   *  model offered)? What it read on screen is not counted (a known gap, docs/0.5-decisions.md). */
+  private tookIn(): "read" | "typed" | null {
+    if (this.shown.length) return "read";
+    const observes = (id: string) => this.opts.files?.registry.get(id)?.effect === "observe";
+    if (this.receipts.some((r) => r.request.action.kind === "file" && observes(r.request.action.capability) && r.result.output && Object.keys(r.result.output).length)) return "read";
+    const theirs = [this.opts.raw ?? "", ...this.earlierRequests, ...this.userWrote].join("\n").toLowerCase();
+    return this.typedEver.some((t) => t.trim() && !theirs.includes(t.trim().toLowerCase())) ? "typed" : null;
+  }
+  /** Files' content shown to the model outside a file action (what, for the trace): counted as a read. */
+  private shown: string[] = [];
+  noteTakenIn(what: string) { if (!this.shown.includes(what)) { this.shown.push(what); this.emit("executor.taken_in", { what }); } }
+  /** Every text the task typed (type / set_value that went through), never cleared: what tookIn reads. */
+  private typedEver: string[] = [];
+  /** Hosts the user approved in this task for opening after content was taken in (a site token at external). */
+  private sites = new Set<string>();
+
+  /** The per-site rule for an open_window with a URL, when it makes the open a send: after the task took in content, an
+   *  http(s) URL to a host not approved yet (`host` is that host; consent is per host for the rest of the task), and
+   *  any other URL, file: included (`host` null: asked every time — a page the task wrote can redirect or fetch out,
+   *  and which file a path names on macOS is too slippery to tell by its string: case, Unicode forms, escapes). Null
+   *  when the rule does not apply. */
+  private siteRule(a: Action): { host: string | null; by: "read" | "typed" } | null {
+    if (a.kind !== "open_window" || !a.url) return null;
+    const by = this.tookIn();
+    if (!by) return null;
+    const host = siteOf(a.url);
+    if (host && this.sites.has(host)) return null;
+    return { host, by };
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
@@ -769,18 +836,24 @@ export class Executor {
     const focusOf = (e: Element) => withFocus || !keyboardFocus(e);
     const focused = withFocus ? look?.elements.find((e) => e.focused) : undefined;
     const pixels = !!look?.elements.some(fromScreen);
-    const whole = pixels && look ? look.elements.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
-    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), elements: look.elements.map((e) => identOf(e, focusOf(e))), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
+    // every element is bound; an anonymous container is marked, so its going away does not ask again while its coming
+    // still counts as an addition (review of #33)
+    const bindable = look ? look.elements : [];
+    const whole = pixels && look ? bindable.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null, ...(anonymous(e) ? { anon: true } : {}) })) : undefined;
+    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), elements: bindable.map((e) => identOf(e, focusOf(e))), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
+    // an open the per-site rule makes a send: the card names the site (not the page) and why — nothing on screen goes out
+    const site = consequence === "external" ? this.siteRule(a) : null;
+    if (site && a.kind === "open_window") return { sending: null, typed: [], content: undefined, text: site.host ? t.openSite(a.app, site.host, shortUrl(a.url!), site.by) : t.openLink(a.app, shortUrl(a.url!), site.by), act, lost: false };
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el };
   }
 
   /** classify's cache key: the action, the screen it is decided on — the epoch and which observation of the window —
-   *  the model's class, and the text the task typed into the window so far (evidence the judge read: other text is
-   *  another question). */
+   *  the model's class, the text the task typed into the window so far (evidence the judge read: other text is
+   *  another question), and for an open_window the per-site rule as it stands (content taken in, the host approved). */
   private classifyKey(a: Action, epoch: number, declared?: Consequence): string {
-    return canon({ a, epoch, seen: "window" in a ? this.obsSeq.get(a.window) ?? 0 : null, declared: declared ?? null, typed: this.typedIn(a) });
+    return canon({ a, epoch, seen: "window" in a ? this.obsSeq.get(a.window) ?? 0 : null, declared: declared ?? null, typed: this.typedIn(a), site: this.siteRule(a) });
   }
 
   /** What `act` would decide before doing anything, without waiting on a judge: `classify`'s answer when it has been
@@ -908,6 +981,8 @@ export class Executor {
       // action" was said of the same click whose window had changed)
       const same = !!stored && req.consent?.digest === digestOf(req.action, base.object, consequence, stored);
       if (why === "consent is for another action" && same) why = "what goes out changed since it was approved";
+      // a site token at external that covers this open: the host is approved for the rest of the task
+      if (!why && req.consent?.scope === "site" && consequence === "external" && req.action.kind === "open_window" && req.action.url) { const h = siteOf(req.action.url); if (h) this.sites.add(h); }
       if (why) {
         if ((why === "consent is for another action" || why === "what goes out changed since it was approved") && req.consent) {
           const was = this.challenges.get(req.consent.nonce);
@@ -986,6 +1061,7 @@ export class Executor {
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
     // send that went through took it with it
     if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
+      if (req.action.kind === "type" || req.action.kind === "set_value") this.typedEver.push(req.action.kind === "type" ? req.action.text : req.action.value);
       if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) this.typed.delete(req.action.window);
       else if (req.action.kind === "type" || req.action.kind === "set_value") this.typed.set(req.action.window, this.typedIn(req.action));
     }
@@ -1177,12 +1253,19 @@ export class Executor {
    *  the task touched, the receipts, what other programs changed, and the runtime's own account (effects, an answer,
    *  the model's claim) — and says pass / fail / unknown. unknown is not done. The runtime and the MCP service call
    *  the same method, so a run cannot end "done" on any runtime without it. */
-  async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string }> {
+  async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string; missing_kind?: "action" | "evidence" }> {
     const ev = await this.verify();
     const ws = this.opts.files?.workspace;
     const brief = (o: Observation) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) });
     const evidence: Record<string, unknown> = {
       任务结束时整台电脑: ev.snapshot,
+      // what the system says is sending sound (hands#55), with whether it already was when the task began: one playing
+      // before is not the task's doing; one that started during the task is evidence of playback (no title: the
+      // windows say which track)
+      ...(ev.snapshot.audio_playing || this.beginSnapshot?.audio_playing ? { "正在发声的应用（系统给的，不含曲目名）": (() => {
+        const before = new Set((this.beginSnapshot?.audio_playing ?? []).map((x) => x.bundle.toLowerCase()));
+        return (ev.snapshot.audio_playing ?? []).map((x) => ({ 应用: x.app_name || x.bundle, bundle: x.bundle, 何时开始: before.has(x.bundle.toLowerCase()) ? "任务开始时就在发声（不是本任务做的）" : "任务期间开始发声" }));
+      })(), "任务开始时就在发声的应用": (this.beginSnapshot?.audio_playing ?? []).map((x) => x.app_name || x.bundle) } : {}),
       任务看过的窗口现在的样子: ev.windows.map(brief),
       "任务第一次看到这些窗口时的样子（和现在逐条比：少了的行就是被删或移走的，多了的就是新建的；元素 id 在两边是同一个）": ev.windows.map((o) => this.firstObs.get(o.window.id)).filter((o): o is Observation => !!o).map(brief),
       ...(ev.unreadable.length ? { "任务看过、现在读不出来的窗口（只知道读不出来，不知道它现在的样子）": ev.unreadable } : {}),
@@ -1199,8 +1282,9 @@ export class Executor {
     if (!this.opts.judge) return { verdict: "unknown", reason: "no judge to verify with" };
     const ans = await this.opts.judge.choose(VERIFY_QUESTION, { ...this.userWords(), 证据: evidence }, VERIFY_OPTIONS, "verify");
     if (!ans) return { verdict: "unknown", reason: "the judge could not answer" };
-    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "" });
-    return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by };
+    const missing = ans.choice === "unknown" && ans.missing_kind ? { missing_kind: ans.missing_kind } : {};
+    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "", ...missing });
+    return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by, ...missing };
   }
 
   /** Which of the task's effects can be taken back, newest first, and why not: a file action through its capability's
@@ -1358,6 +1442,20 @@ export function windowLabel(w: { app: string; app_name?: string; title: string; 
   return w.title.trim() ? `${app}「${w.title}」` : t.mainWindow(app);
 }
 
+/** Characters a card must not show as they are: C0 and C1 controls (newlines included), line and paragraph separators,
+ *  and bidi / format controls (marks, embeddings and overrides, isolates, zero-width ones, the BOM) — a URL decoded with
+ *  them could forge text on the card (a fake line, text shown reversed). */
+const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+
+/** A URL as a card shows it: escapes decoded where they decode, then the characters above escaped again (%XX), cut
+ *  after 160 characters with the full length said. The start (scheme and host) always stays. */
+export function shortUrl(u: string): string {
+  let s = u;
+  try { s = decodeURI(u); } catch { /* as it is */ }
+  const chars = Array.from(s.replace(UNSAFE, (c) => encodeURIComponent(c)));
+  return chars.length > 160 ? chars.slice(0, 160).join("") + `…（共 ${chars.length} 字）` : chars.join("");
+}
+
 /** The consent card's text: the action in words, with the element it touches and what that means. */
 export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability, lang?: Lang): string {
   const t = T(lang);
@@ -1372,7 +1470,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
     : a.kind === "type" ? t.type(el?.label ?? a.target, a.text)
     : a.kind === "select" ? t.select(el?.label ?? a.target, a.option)
     : a.kind === "key" ? t.key(a.chord)
-    : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? t.openWindow(a.app) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
+    : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, a.url) : t.openWindow(a.app)) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
   const cls = consequence === "external" ? t.sends : consequence === "modify_user" ? t.modifies : "";
   return `${where ? t.at(where) : ""}${what}${cls ? "（" + cls + "）" : ""}`;
 }

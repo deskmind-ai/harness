@@ -41,6 +41,8 @@ export interface Snapshot { epoch: number; locked: boolean; front_app: string; w
   /** Why the epoch last moved, when the driver says (hands#53): {epoch, at, by: action{kind, window} | input{to: app |
    *  unknown} | windows{app, appeared | vanished | renamed}}. Carried into a stale result's trace; never decides. */
   epoch_reason?: unknown;
+  /** Apps sending audio to an output device right now (hands#55; no track title — the system keeps that closed). */
+  audio_playing?: { bundle: string; app_name?: string }[];
   /** Apps the driver can operate only in front (hands), when it says so per snapshot rather than per window. */
   needs_foreground?: string[] }
 
@@ -55,6 +57,9 @@ export interface Element {
    *  recognition, controls hands made up, Eyes). Until hands sends it, the executor infers it from the id prefix
    *  (`ocr:`, `gen:`, `icon:`, `desc:` are read from the screen). */
   source?: "ax" | "pixels";
+  /** The role as the accessibility tree describes it (AXRoleDescription, 「组」 on a group; hands), and whether hands
+   *  took the label from the role: a label that only describes the role names nothing. */
+  role_description?: string; label_from_role?: boolean;
   rect?: [number, number, number, number];
 }
 
@@ -86,17 +91,20 @@ export interface ExternalChange { path: string; seen: string; now: string; at: n
 /** The consent an action carries: a token the app signed for a challenge the executor issued (consent.ts). */
 export interface ConsentToken {
   nonce: string;                     // the challenge it answers (action scope), or a fresh one (object / rule scope)
-  scope: "action" | "object" | "rule";
+  scope: "action" | "object" | "rule" | "site";
   digest?: string;                   // action scope: the exact action
   object?: string;                   // object scope: the window / tab / path it covers
   consequence: Consequence;          // the highest class it allows
   task?: string;                     // object scope: only this task
   rule?: string;                     // rule scope: a durable permission, in the executor's rule store
+  hosts?: string[];                  // site scope: opening http(s) pages of these hosts (open_window; the URL's full hostname) in `object`, nothing else
   expires_at: number;                // ms since epoch
   sig: string;                       // base64 Ed25519 over canon(token without sig)
 }
 
-export interface Challenge { nonce: string; digest: string; object: string; consequence: Consequence; text: string; expires_at: number }
+/** `site`: the host a yes approves for the rest of the task (an open_window to a host not yet approved, after the task
+ *  took in content): the app answers it with a site token for that host, not a one-time action token. */
+export interface Challenge { nonce: string; digest: string; object: string; consequence: Consequence; text: string; expires_at: number; site?: string }
 
 export interface ActRequest {
   action: Action;

@@ -73,7 +73,9 @@ export const IntentAnswer = z.object({
 export type IntentAnswer = z.infer<typeof IntentAnswer>;
 
 export const choiceAnswer = (ids: readonly [string, ...string[]]) =>
-  z.object({ choice: z.enum(ids), reason: z.string().optional(), scores: z.record(z.number()).optional() });
+  z.object({ choice: z.enum(ids), reason: z.string().optional(), scores: z.record(z.number()).optional(),
+    /** the verdict's unknown: what is missing — an action not done, or only the evidence for what was done */
+    missing_kind: z.enum(["action", "evidence"]).optional() });
 
 export const VerifyAnswer = z.object({ verdict: z.enum(["pass", "fail", "unknown"]), reason: z.string().default(""), scores: z.record(z.number()).optional() });
 export type VerifyAnswer = z.infer<typeof VerifyAnswer>;

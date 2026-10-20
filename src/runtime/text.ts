@@ -17,9 +17,14 @@ const ZH = {
   byRule: (rules: string[]) => `按你以前定的规则做的：${rules.join("、")}`,
   typed: (t: string) => `这次任务打的字：${t}`,
   mainWindow: (app: string) => `${app} 的主窗口`,
+  openInYours: (app: string, hosts: string[]) => `在你的 ${app} 窗口里打开这些网站的网页：${hosts.join("、")}`,
+  openUrl: (app: string, url: string) => `在 ${app} 里打开网页 ${url}`,
+  openSite: (app: string, host: string, url: string, by: "read" | "typed") => `在 ${app} 里打开网站 ${host}（这次是 ${url}）。这次任务${by === "read" ? "读过你的文件" : "输入过不是你原话的文字"}，打开 ${host} 可能把这些内容带过去。同意后，这次任务里再打开 ${host} 的网页不再问`,
+  openLink: (app: string, url: string, by: "read" | "typed") => `在 ${app} 里打开 ${url}。这次任务${by === "read" ? "读过你的文件" : "输入过不是你原话的文字"}，打开它可能把这些内容带过去。这类链接每次都会问`,
   openedMain: (app: string) => `DeskMind 打开的 ${app} 主窗口`, openedTitled: (app: string, title: string) => `DeskMind 打开的 ${app}「${title}」`,
   leftOpen: (app: string) => `打开 ${app}（撤回时不关它：窗口里可能有你的东西）`,
   undoKeepsOpen: (apps: string[]) => `撤回不会关掉：${apps.join("、")}`,
+  checkYourself: (what: string) => `该做的都做了，但我没法确认结果，请你看一下：${what}`,
   foreground: (apps: string[]) => `注意：${apps.join("、")} 只能在前台操作。做这些步骤时，我会把它短暂切到前台；这段时间请先别用电脑。`,
 };
 const EN: typeof ZH = {
@@ -35,9 +40,14 @@ const EN: typeof ZH = {
   byRule: (rules: string[]) => `Under your standing rule: ${rules.join(", ")}`,
   typed: (t: string) => `typed by this task: ${t}`,
   mainWindow: (app: string) => `${app}'s main window`,
+  openInYours: (app: string, hosts: string[]) => `open pages of these sites in your ${app} window: ${hosts.join(", ")}`,
+  openUrl: (app: string, url: string) => `open ${url} in ${app}`,
+  openSite: (app: string, host: string, url: string, by: "read" | "typed") => `open the site ${host} in ${app} (this time ${url}). This task has ${by === "read" ? "read your files" : "typed text you did not write"}; opening ${host} may carry it there. Once you agree, other pages of ${host} open without asking in this task`,
+  openLink: (app: string, url: string, by: "read" | "typed") => `open ${url} in ${app}. This task has ${by === "read" ? "read your files" : "typed text you did not write"}; opening it may carry that along. Links like this ask every time`,
   openedMain: (app: string) => `the ${app} main window DeskMind opened`, openedTitled: (app: string, title: string) => `${app} "${title}" (opened by DeskMind)`,
   leftOpen: (app: string) => `open ${app} (left open on undo: it may hold your things)`,
   undoKeepsOpen: (apps: string[]) => `Undo will not close: ${apps.join(", ")}`,
+  checkYourself: (what: string) => `Everything was done, but I could not confirm the result; please check: ${what}`,
   foreground: (apps: string[]) => `Note: ${apps.join(", ")} can only be operated in front. For these steps I will bring it to the front briefly; please leave the Mac alone meanwhile.`,
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);
