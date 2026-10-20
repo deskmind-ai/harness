@@ -376,3 +376,27 @@ describe("frontier runtime: a stale action", () => {
     expect(JSON.parse(retried.split("\n")[0]!).status).toBe("ok");
   });
 });
+
+describe("frontier runtime: a stale action after a stop", () => {
+  it("is not looked at again: the run ends at the stop instead of waiting for the driver (review of #24)", async () => {
+    let epoch = 1, calls = 0, stopped = false;
+    const w = { id: "w", app: "Editor", title: "Doc" };
+    let rt!: FrontierRuntime;
+    const driver: import("../src/executor/types.js").Driver = {
+      // the action's look at the computer: the user presses stop while it is on its way, and the window moves on
+      snapshot: async () => { calls += 1; if (calls === 2) { rt.stop("the app stopped the task"); stopped = true; epoch += 1; } return { epoch, locked: false, front_app: w.app, windows: [w] }; },
+      // once stopped, the driver never answers a look (a real one may wait up to two minutes)
+      observe: () => (stopped ? new Promise<never>(() => {}) : { epoch, window: w, modal: null, elements: [{ id: "b", role: "button", label: "Go", actions: ["click"] }] }),
+      perform: () => ({ status: "ok", window: "w" }),
+    };
+    const app = ConsentSigner.fresh(), ex = new Executor(driver, { task: "t1", publicKey: app.publicKey });
+    const steps: Step[] = [
+      { calls: [{ name: "computer_observe", args: { window: "w" } }] },
+      (ms) => ({ calls: [{ name: "computer_act", args: { action: { kind: "click", window: "w", target: "b" }, epoch: last(ms).epoch, consequence: "read", purpose: "go" } }] }),
+      { calls: [{ name: "finish", args: { outcome: "cannot", summary: "x" } }] },
+    ];
+    rt = new FrontierRuntime({ task: "t1", raw: "go", executor: ex, signer: app, user: user(approveAll), gateway: new Gateway(scriptedTable), model: { ...model, streamFn: scriptedStream(steps) } });
+    const result = await Promise.race([rt.run().then((r) => r.status), new Promise<string>((r) => setTimeout(() => r("still waiting"), 1000))]);
+    expect(result).toBe("stopped");
+  });
+});

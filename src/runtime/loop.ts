@@ -148,6 +148,14 @@ export class FrontierRuntime {
   /** The app's stop: the executor refuses every later action, and the loop is aborted. */
   stop(why = "stopped") { this.o.executor.stop(); if (!this.status) { this.status = "stopped"; this.reason = why; } this.abort.abort(); }
 
+  /** What `f` gives, unless the app stops the task first: then null at once, without waiting for it (a card the user
+   *  is answering, a driver's look that may take minutes). `f` is not started at all once stopped. */
+  private untilStopped<T>(f: () => Promise<T>): Promise<T | null> {
+    const stop = this.abort.signal;
+    if (stop.aborted) return Promise.resolve(null);
+    return Promise.race([f(), new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
+  }
+
   private end(status: RuntimeStatus, reason: string): AgentToolResult {
     // a stop is final: the card it cancelled comes back unanswered, and that is not a failure of its own
     if (this.status !== "stopped") { this.status = status; this.reason = reason; }
@@ -159,8 +167,7 @@ export class FrontierRuntime {
     this.count("cards"); this.count(`cards:${card.kind}`);
     this.emit("card", { kind: card.kind, text: card.text, options: card.options.map((o) => o.kind) });
     // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16)
-    const stop = this.abort.signal;
-    const a = stop.aborted ? null : await Promise.race([this.o.user.ask(card), new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
+    const a = await this.untilStopped(() => Promise.resolve(this.o.user.ask(card)));
     if (a === null) return null;
     if ("option" in a) { const o = card.options[a.option]; return o ? { option: o, text: o.text } : null; }
     return { option: null, text: a.text };
@@ -298,9 +305,11 @@ export class FrontierRuntime {
     // a stale action did nothing: the window moved on after the model looked. It is looked at again here, so the model
     // decides on what is there now (its epoch, its element ids) — told only "observe again", models retried the same
     // click on the old look until the run gave up (rc.6 end to end)
+    // Not after the app's stop: the run ends there, not after a look a real driver may take minutes over (review of #24)
     let relooked = false;
     if (r.status === "stale" && "window" in a && a.window) {
-      try { r = { ...r, after: await this.o.executor.observe(a.window) }; relooked = true; } catch { /* gone or unreadable: the why says so */ }
+      const win = a.window;
+      try { const fresh = await this.untilStopped(() => this.o.executor.observe(win)); if (fresh) { r = { ...r, after: fresh }; relooked = true; } } catch { /* gone or unreadable: the why says so */ }
     }
     this.count("actions"); this.count(`actions:${r.status}`);
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
