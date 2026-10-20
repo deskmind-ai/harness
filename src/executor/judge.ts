@@ -4,7 +4,7 @@
  * question goes to the first tier (DeskMind Brain, local, calibrated probabilities); when its confidence is under the
  * tier's floor it goes to the next (a frontier model through the gateway); when every tier fails, the answer is null
  * and the caller takes the conservative branch (ask the user, or refuse). Codex's guardian is the precedent: an
- * isolated reviewer beside the acting model, with a budget and a cache; ours sits in the executor so it goes wherever
+ * isolated reviewer beside the acting model, with a budget and a cache (ours keeps the cache, no budget by default); ours sits in the executor so it goes wherever
  * the executor goes (docs/0.5-decisions.md 结论 3).
  */
 import { createHash } from "node:crypto";
@@ -63,7 +63,7 @@ export class TierStats {
 export class Judge {
   private readonly cache = new Map<string, JudgeAnswer>();
   calls = 0;
-  constructor(readonly tiers: JudgeTier[], readonly opts: { budget?: number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
+  constructor(readonly tiers: JudgeTier[], readonly opts: { /** a cap on model calls per task; none unless set */ budget?: number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
     /** adaptive routing: skip a lower tier on question kinds it never settles */ stats?: TierStats;
     /** measurement: after a lower tier settles, ask the top tier too and report whether they agree (costs the top
      *  call). true: every time; a number in (0, 1): that share of settled answers, at random — the audit sample that
@@ -79,7 +79,9 @@ export class Judge {
     const key = createHash("sha256").update(JSON.stringify({ question, context, options })).digest("hex").slice(0, 24);
     const hit = this.cache.get(key);
     if (hit) return { ...hit, cached: true };
-    if (this.calls >= (this.opts.budget ?? 40)) { this.opts.onEvent?.("judge.budget", {}); return null; }
+    // no cap by default (owner 10-20: a count cap only turned finished tasks into "not done" when it ran out; the loop's
+    // own limits already bound how many questions a task can raise, and the cache stops repeats). Evaluations may set one.
+    if (this.opts.budget !== undefined && this.calls >= this.opts.budget) { this.opts.onEvent?.("judge.budget", {}); return null; }
     const ids = options.map((o) => o.id) as [string, ...string[]];
     const kind = TierStats.kindOf(question, context);
     let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null, lower: JudgeAnswer | null = null;
