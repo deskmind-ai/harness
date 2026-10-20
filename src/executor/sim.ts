@@ -23,7 +23,17 @@ export const ZH_MAIL_TEXTS: Record<string, string> = { replied: "已回复", inb
 
 interface Win { id: string; app: string; kind: "mail" | "editor" | "browser" | "settings"; title: string; focused: boolean; minimized: boolean; modal: { title: string; buttons: string[] } | null; state: any; gen: number }
 
+/** The browsers the simulated computer has installed: a url opened in any of them comes up in a new window of the
+ *  task's own (perform → addBrowser), which is the promise `urlInOwnBrowserWindow` makes. */
+export const SIM_BROWSERS = [
+  { bundle: "com.apple.Safari", names: ["Safari", "Safari 浏览器"] },
+  { bundle: "com.google.Chrome", names: ["Google Chrome", "Chrome"] },
+  { bundle: "org.mozilla.firefox", names: ["Firefox"] },
+];
+
 export class SimComputer implements Driver {
+  /** Like hands since #48: a url given to a browser opens in a window of the task's own (the sim always opens a new one). */
+  readonly capabilities: { urlInOwnBrowserWindow?: boolean } = { urlInOwnBrowserWindow: true };
   epoch = 1;
   locked = false;
   user_active = false;
@@ -69,7 +79,7 @@ export class SimComputer implements Driver {
 
   // --- driver --------------------------------------------------------------------------------------------------------
   snapshot(): Snapshot {
-    return { epoch: this.epoch, locked: this.locked, front_app: this.wins.find((w) => w.focused)?.app ?? "", windows: this.wins.map((w) => this.info(w)), user_active: this.user_active };
+    return { epoch: this.epoch, locked: this.locked, front_app: this.wins.find((w) => w.focused)?.app ?? "", windows: this.wins.map((w) => this.info(w)), user_active: this.user_active, browsers: SIM_BROWSERS };
   }
 
   observe(windowId: string): Observation {

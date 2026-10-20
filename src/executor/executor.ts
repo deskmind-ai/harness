@@ -670,8 +670,18 @@ export class Executor {
       // cards, while every page loaded in the task's window all the same). Only where the driver marks the app's
       // windows a browser: any other app gets the url from `open` and shows it in the user's window (a slack:// link
       // switches their conversation), and an older driver that marks nothing keeps the old floor (review of #34)
-      const sameApp = (w: WindowInfo) => w.app === a.app || w.id.startsWith(a.app + "#");
-      const own = !!a.url && !!this.driver.capabilities?.urlInOwnBrowserWindow && !!this.last?.windows.some((w) => sameApp(w) && w.browser === true);
+      // the app as the model names it, against every name the snapshot has for an app — what the driver calls it, its
+      // localized names, its bundle id, a window id's prefix — ignoring case: matched only by the exact display name,
+      // "com.google.chrome" or "Slack" in the model's words met no window of the user's, and the url (resolved by hands
+      // all the same) landed in their window with no card (review of #34). Structure decides, and what cannot be
+      // placed is taken to be the user's: an app on screen is judged by its windows; one with no window is a browser
+      // only if the computer lists it among its installed browsers (snapshot.browsers)
+      const want = a.app.trim().toLowerCase();
+      const named = (n?: string) => !!n && n.trim().toLowerCase() === want;
+      const sameApp = (w: WindowInfo) => [w.app, w.app_name, w.bundle, w.id.includes("#") ? w.id.slice(0, w.id.lastIndexOf("#")) : ""].some(named);
+      const onScreen = !!this.last?.windows.some(sameApp);
+      const browser = onScreen ? !!this.last?.windows.some((w) => sameApp(w) && w.browser === true) : !!this.last?.browsers?.some((b) => named(b.bundle) || b.names.some(named));
+      const own = !!a.url && !!this.driver.capabilities?.urlInOwnBrowserWindow && browser;
       const theirs = a.url && !own ? this.last?.windows.find((w) => w.owner === "user" && sameApp(w)) : undefined;
       const mine = own ? this.last?.windows.find((w) => w.owner === "task" && sameApp(w)) : undefined;
       // once the task has taken in content (read a file, typed what the user did not write), a URL can carry it out:
@@ -680,6 +690,10 @@ export class Executor {
       const s = this.siteRule(a);
       if (s) return { consequence: "external", object: theirs ? `window:${theirs.id}` : object, why: s.host ? `the task has ${s.by === "read" ? "read the user's files" : "typed text the user did not write"}; opening ${s.host} may carry what it took in` : `the task has taken in content; ${a.url} is not an http(s) page and may carry it` };
       if (theirs) return { consequence: "modify_user", object: `window:${theirs.id}`, why: `opens ${a.url} in the user's ${a.app} window` };
+      // a url for an app with no window on screen that is not a known browser — an alias of an app the user has open,
+      // or one not running that may bring back the user's last session on launch: where it lands is not known, taken
+      // to be the user's (a browser not running, on a driver that does not list browsers, costs one card: the safe side)
+      if (a.url && !onScreen && !own) return { consequence: "modify_user", object, why: `opens ${a.url} in ${a.app}, which has no window on screen and is not a known browser: it may land in a window of the user's` };
       if (own) return { consequence: "create", object: mine ? `window:${mine.id}` : object, why: `opens ${a.url} in a ${a.app} window of the task's own` };
       return { consequence: "create", object, why: "a window of the task's own" };
     }

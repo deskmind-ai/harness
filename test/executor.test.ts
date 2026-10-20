@@ -620,14 +620,16 @@ describe("executor: the user at the keyboard", () => {
 
   it("a URL handed to a browser the user has open is the user's window: plan and consent first", async () => {
     const { ex, sim, app } = setup();
+    sim.capabilities.urlInOwnBrowserWindow = false;                   // a driver that hands a url to the user's open browser (no urlInOwnBrowserWindow): the floor these tests are about
     const b = sim.addBrowser("Safari", [{ title: "首页", url: "https://example.com" }]);
     await ex.begin();
     const pre = ex.preview({ action: { kind: "open_window", app: "Safari", url: "https://music.163.com" }, epoch: ex.currentEpoch });
     expect(pre).toMatchObject({ consequence: "modify_user", object: `window:${b.id}`, needs_consent: true });
     expect((await ex.act({ action: { kind: "open_window", app: "Safari", url: "https://music.163.com" }, epoch: ex.currentEpoch })).status).toBe("needs_plan");
-    // no URL, or an app the user does not have open: the task's own window
+    // no URL: the task's own window. A url for an app with no window that is not a known browser (an editor not
+    // running may bring back the user's last session on launch) is taken to be the user's (review of #34)
     expect(ex.preview({ action: { kind: "open_window", app: "Safari" }, epoch: ex.currentEpoch }).consequence).toBe("create");
-    expect(ex.preview({ action: { kind: "open_window", app: "编辑器", url: "x" }, epoch: ex.currentEpoch }).consequence).toBe("create");
+    expect(ex.preview({ action: { kind: "open_window", app: "编辑器", url: "x" }, epoch: ex.currentEpoch }).consequence).toBe("modify_user");
     void app;
   });
 });
