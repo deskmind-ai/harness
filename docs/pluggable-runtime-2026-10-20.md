@@ -39,7 +39,7 @@
 | 停止 | app 直接发给执行层 | 不经过 agent |
 | 做没做成 | 执行层的 verify 加判官；app 只信执行层的结论 | Stop 类钩子让 agent 拿不到结论就继续，这只是提质量 |
 | 判官（Brain、判官模型、路由表） | 执行层内部 | 不对外暴露；退路见下文「判官的档位与退路」 |
-| 看屏幕、Eyes 定位 | hands、Eyes | MCP 工具 |
+| 看屏幕 | hands；没有辅助功能信息的窗口，由 Eyes 从画面认（见「Eyes：从画面看的那一路」） | MCP 工具（snapshot、observe）；Eyes 不单独给 agent |
 | 教程 | Agent Skills 文件，加 find_skills 工具 | observe 结果里按应用附上匹配的教程（见下文「借鉴 Codex 的电脑操作」）；宿主有提交钩子的，再注入一遍候选 |
 | 基础规矩 | 基础技能 deskmind-computer-use | skill，或写进 AGENTS.md |
 | 授权卡、结果卡、trace | app，数据来自执行层的事件 | 支持 MCP Apps 的宿主可以直接显示卡片（可选） |
@@ -128,6 +128,53 @@
 
 现在的默认配置：Brain 就绪时先由 Brain 放行，其余交给和动手相同的 DeepSeek（app 设 `DESKMIND_BRAIN_JUDGE=1`，配置 ds-flash 所有角色都是 deepseek-flash）。所以加入第 3 档不会比现在差。每个回答已经记了由哪一档判（`by`），真正要补的是把它带到结果卡和 trace 上，让人看出结束时的核对是不是独立判的。
 
+## Eyes：从画面看的那一路
+
+（10-20 补充）
+
+### 是什么
+
+[deskmind-ai/eyes](https://github.com/deskmind-ai/eyes)：给一张截图和一句描述（「发送按钮」），返回要点的位置。
+- 模型是 Eyes-4B：GUI-Owl-1.5-4B-Instruct 加一个用强化学习训的 LoRA。
+- app 里用 4-bit MLX 在本机跑，服务只监听 127.0.0.1；截图按本机路径传，不离开这台 Mac。
+- 按 app 的跑法，在 ScreenSpot-Pro 上是 50.9（文字 64.8，图标 28.3）；小图标是弱项。
+
+### 现在怎么接
+
+依据：app `app/Helper/HarnessRun.swift`；hands `deskmind_hands/vision.py`、`deskmind_hands/drivers/peekaboo.py`、`deskmind_hands/executor.py`。
+
+- **app：** 任务可能要看图（`mayNeedVision`），而且 Eyes 模型已经下载，就先启动 Eyes 服务，把地址和令牌交给 hands（`HANDS_GROUNDER_URL`、`HANDS_GROUNDER_TOKEN`）。
+- **hands 什么时候改从画面读：** 第一次读某个应用时，辅助功能树几乎是空的，就记下这个应用，之后都从画面读。不按应用名写规则。
+- **从画面读出的元素：**
+  - 屏幕上的字：用 macOS 自带的文字识别（本机），每个词是一个可以点的元素，角色是 listitem；再按位置分组成列表项。
+  - 搜索框：屏幕上的字表明有搜索时才提供。
+  - 常见的图标按钮（播放、暂停、返回、关闭、更多、设置、添加等 12 个）：先列给模型，模型选中了才让 Eyes 去定位；点了以后界面没有变化，就标记为不存在。
+  - 因为 Eyes 对不存在的目标也会给出一个位置，所以控件只在有证据时才提供（deskmind#68）。
+- **动手：** 按坐标点击。
+- **标记：** 这些元素在 hands 里标了 `synthetic`，但执行层拿到的元素里没有带这个标记，模型和判官看不出它们来自画面。
+
+### 在可插拔的设计里放在哪
+
+- Eyes 属于执行层这一侧，挂在 hands 下面，是 observe 的第二个信息来源。它不单独给 agent，换哪个运行时都一样。
+- 窗口归属、同意凭证，按窗口和动作算，和元素从哪来无关。
+
+### 要补的三处
+
+1. **元素带上来源：** observe 返回的每个元素加 `source`（`ax` 或 `pixels`）。来自画面的再带上把握（识别的置信度、Eyes 有没有核对过它存在）。模型、判官和授权卡都能看出这是从画面认出来的。
+2. **画面元素的后果下限要保守（现有的缺口）：**
+   - 现在「会不会往外发」靠元素的角色和文字判断（hands `executor.py` 的 `sends()`，只认按钮一类的角色）。画面里的字角色是 listitem，图标没有文字，所以画面里的「发送」不会被认成往外发。后果是：
+     - 在任务自己的窗口里，下限是「改任务自己的」，不需要同意；
+     - 在用户的窗口里，下限是「改用户的」，计划里拿到的对象凭证就能放行，不会为「往外发」再单独问一次。
+   - **建议：** 从画面读的窗口里，点击、回车这类动作的下限一律按「往外发」算，每次单独同意，直到能从结构上判断。代价是这类应用里多弹卡；这类应用不多，先量弹卡次数。
+3. **点之前先核对（deskmind#68）：**
+   - Eyes 先回答「这个东西存不存在」，再给位置；
+   - 位置要落在目标窗口里；
+   - 点完界面没变化就标记为不存在（已有）。
+
+### 给别的 agent
+
+自带按坐标点击的 agent（比如 Codex），可以把 Eyes 的定位做成一个只读的 MCP 工具：`locate(window, description)`，返回位置和「存不存在」。它们真正去点的时候，仍然要过执行层「按坐标查窗口归谁」那一道。
+
 ## 借鉴 Codex 的电脑操作
 
 依据 codex-cu（gxcsoccer/codex-cu，按 Codex Computer Use 的协议和行为做的复刻；README 写明自己的代码按 MIT 许可，仓库里没有单独的 LICENSE 文件）的 `docs/REPORT.md`、`docs/PROTOCOL.md`、`docs/CONFORMANCE.md`、`skill/codex-cu/SKILL.md`。
@@ -171,6 +218,7 @@
    - 任何 agent 接进来都先过这一套，成绩写明是哪个运行时、步数上限多少。
 5. **先接 Codex：** 它的 MCP、elicitation、钩子、skills、沙箱最全，适合用来验证接口。然后接 pi，再接其他的。我们自己的运行时继续作为默认，本地模型的跑法也留在这里。
 6. **借鉴项：** observe 附教程、按特征重新找元素、文字版差异，按上面「采用」表逐项做，每项用练习场量前后差别。
+7. **Eyes：** 元素带上来源；从画面读的窗口，后果下限按「往外发」算；点之前核对存在（deskmind#68）。改完量这类应用里的弹卡次数。
 
 ## 待定
 
@@ -181,12 +229,14 @@
 - **sampling 支持：**
   - Codex：源码只在 `codex-rs/rmcp-client/src/tool_input.rs` 解析 sampling 请求，客户端没有实现作答，对外声明的能力里也没有 sampling。按不支持处理：对 Codex，第 3 档目前等于第 4 档。要在 Codex 上有判官，得靠 Brain 或用户另配一个判官模型。
   - Claude Code 和 pi 是否支持，还没查。
+- **画面元素的后果下限：** 建议一律按「往外发」算，待负责人定；另一种做法是只在用户的窗口里这样算，任务自己的窗口交给判官的意图核对。
 - **「DeepSeek 的 agent」** 具体指哪个项目，待负责人给链接。
 
 ## 来源
 
 - 本仓库：`src/runtime/loop.ts`、`src/executor/executor.ts`、`src/executor/judge.ts`、`src/cli/mcp.ts`。
+- hands：`deskmind_hands/vision.py`、`deskmind_hands/drivers/peekaboo.py`、`deskmind_hands/executor.py`；Eyes：`deskmind-ai/eyes` 的 README；app：`app/Helper/HarnessRun.swift`。
 - Codex 源码（本地 `openai/codex`）：`codex-rs/hooks/src/events/pre_tool_use.rs`、`codex-rs/core/src/guardian/`、`codex-rs/ext/guardian-reviewer/src/`、`codex-rs/rmcp-client/src/`、`codex-rs/network-proxy/`、`codex-rs/ext/goal/templates/goals/continuation.md`。
 - codex-cu：`README.md`、`docs/REPORT.md`、`docs/PROTOCOL.md`、`docs/CONFORMANCE.md`、`docs/INSTALL.md`、`docs/REVERSE-ENGINEERING.md`、`docs/COMPATIBILITY.md`、`docs/OPEN-QUESTIONS.md`、`skill/codex-cu/SKILL.md`。
 - 之前的设计：`docs/0.5-plan.md`、`docs/consent-spec.md`；openjev 仓库的 `docs/design/skills-layer-2026-10-18.md`、`docs/research/harness-survey-2026-10-18.md`。
-- 流程图（现状，按代码画）：https://claude.ai/artifact/K9nv8B478qrBf898M6ZoZq
+- 流程图（现状，按代码画，含 Eyes 和 Brain）：https://claude.ai/artifact/K9nv8B478qrBf898M6ZoZq ；飞书版 https://bytedance.larkoffice.com/docx/P2m6dP5eaox38ZxrHvFcW3gVnKb
