@@ -8,6 +8,7 @@ import type { Answer, Card } from "../src/orchestrator/index.js";
 import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor, anonymous } from "../src/executor/executor.js";
 import { OUTGOING_QUESTION, Judge } from "../src/executor/judge.js";
+import { provenanceJudge, scripted } from "./helpers/provenance-judge.js";
 import { SimComputer } from "../src/executor/sim.js";
 import { FrontierRuntime } from "../src/runtime/loop.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
@@ -99,7 +100,9 @@ describe("pages opened in the user's browser window are planned once", () => {
     const app = ConsentSigner.fresh();
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey });
     const gw = new Gateway(table);
-    gw.script = Array(40).fill((role: string) => (role === "verify" ? { choice: "pass", reason: "ok" } : { choice: "matches" }));
+    // the provenance question (review of #35: the window the first page opened in is material) is cleared: the URLs are
+    // the request's own words
+    gw.script = Array(40).fill(scripted(() => ({ choice: "none" })));
     const cards: Card[] = [], events: { k: string; b: Record<string, unknown> }[] = [];
     const rt = new FrontierRuntime({ task: "t1", raw: "搜索今天北京天气", executor: ex, signer: app, user: { ask: (c: Card): Answer => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) }, onEvent: (k, b) => events.push({ k, b }) });
     return { rt, cards, events, chrome };
@@ -121,7 +124,7 @@ describe("pages opened in the user's browser window are planned once", () => {
     ]);
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("1. 打开天气搜索结果（在你的 Google Chrome 窗口里打开这些网站的网页：www.google.com、wttr.in）——改你的东西");
+    expect(cards[0]!.text).toContain("1. 打开天气搜索结果（在你的 Google Chrome 窗口里打开网页）——改你的东西；会发到这些网站：www.google.com、wttr.in");
     // the consent is to open pages of those sites there, not the whole window
     expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["modify_user", "read"], objects: [], opens: { [`window:${chrome}`]: ["www.google.com", "wttr.in"] } });
     const acts = events.filter((e) => e.k === "tool.result" && e.b.name === "computer_act").map((e) => JSON.parse((e.b.text as string).split("\n")[0]!).status);
@@ -233,7 +236,7 @@ describe("the site consent itself", () => {
 });
 
 describe("per-site consent after the task took in content (owner 10-21)", () => {
-  const setup = async (raw: string, o: { chrome?: boolean } = {}) => {
+  const setup = async (raw: string, o: { chrome?: boolean; judge?: Judge } = {}) => {
     const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
     const { Workspace, build } = await import("../src/registry/workspace.js");
     const { fileRegistry } = await import("../src/registry/fs.js");
@@ -242,7 +245,7 @@ describe("per-site consent after the task took in content (owner 10-21)", () => 
     const chrome = o.chrome ? sim.addBrowser("Google Chrome", [{ title: "收件箱 - Gmail", url: "https://mail.google.com" }]).id : null;
     if (o.chrome) sim.capabilities.urlInOwnBrowserWindow = false;      // a driver that hands a url to the user's open browser (no urlInOwnBrowserWindow): the floor these tests are about
     const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
-    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw, files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k, b) => events.push({ k, b }) });
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw, judge: o.judge, files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k, b) => events.push({ k, b }) });
     await ex.begin(); await ex.plan({ steps: [] });
     const read = () => ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "合同.txt" } }, epoch: ex.currentEpoch });
     const open = (url: string, consent?: ConsentToken) => ex.act({ action: { kind: "open_window", app: "Google Chrome", url }, epoch: ex.currentEpoch, consent });
@@ -320,23 +323,26 @@ describe("per-site consent after the task took in content (owner 10-21)", () => 
     expect(cls("file:///tmp/a.html")).toBe("external");
   });
 
-  it("typed text is not read material on its own (owner 10-21 refinement): the user's words or not, the open stays create", async () => {
-    const { ex, cls } = await setup("搜索今天北京天气");
-    await typeInto(ex, "今天北京天气");
-    expect(cls(google("今天北京天气"))).toBe("create");
-    await typeInto(ex, "明天上海天气");
-    expect(cls(google("今天北京天气"))).toBe("create");
+  it("typing into its own window: the window it observed is material (review of #35), so a new host asks the judge; its 没有 opens it", async () => {
+    const bare = await setup("搜索今天北京天气");
+    await typeInto(bare.ex, "今天北京天气");
+    expect(bare.cls(google("今天北京天气"))).toBe("external");                               // no judge: a card
+    const { judge, prompts } = provenanceJudge(() => ({ choice: "none" }));
+    const judged = await setup("搜索今天北京天气", { judge });
+    await typeInto(judged.ex, "今天北京天气");
+    expect((await judged.open(google("今天北京天气"))).status).toBe("ok");
+    expect(prompts.length).toBe(1);
   });
 
-  it("with nothing read, a query the model composed from an answer — offered or written — opens with no card", async () => {
-    const offered = await setup("搜一下");
-    offered.ex.addAnswer("搜什么？", "北京海淀天气");                                       // an option the model offered
-    await typeInto(offered.ex, "北京海淀天气");
-    expect(offered.cls(google("北京海淀天气"))).toBe("create");
-    const written = await setup("搜一下");
-    written.ex.addAnswer("搜什么？", "北京海淀天气", { userWrote: true });
-    await typeInto(written.ex, "北京海淀天气");
-    expect(written.cls(google("北京海淀天气"))).toBe("create");
+  it("the judge reads the user's words: an answer the user wrote is among them, an option the model offered is not", async () => {
+    for (const userWrote of [false, true]) {
+      const { judge, prompts } = provenanceJudge(() => ({ choice: "none" }));
+      const { ex, read } = await setup("搜一下", { judge });
+      ex.addAnswer("搜什么？", "北京海淀天气", { userWrote });
+      await read();
+      await ex.classify({ kind: "open_window", app: "Google Chrome", url: google("北京海淀天气") }, ex.currentEpoch);
+      expect(prompts[0]!.includes('"用户在卡片上自己写的回答"')).toBe(userWrote);
+    }
   });
 
   it("a write is not a read: making a note and then opening a site asks nothing; a folder listing (it shows previews) counts", async () => {
@@ -506,14 +512,14 @@ describe("audio_playing in the completion evidence (hands#55)", () => {
 });
 
 describe("the user's own words are theirs to send (review of #33)", () => {
-  const setup = async (raw: string) => {
+  const setup = async (raw: string, judge?: Judge) => {
     const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
     const { Workspace, build } = await import("../src/registry/workspace.js");
     const { fileRegistry } = await import("../src/registry/fs.js");
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "own-")); build(root, { "合同.txt": "合同金额 98000 元\n" });
     const sim = new SimComputer(root);
     const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
-    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw, files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k, b) => events.push({ k, b }) });
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw, judge, files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k, b) => events.push({ k, b }) });
     await ex.begin(); await ex.plan({ steps: [] });
     return { ex, sim, events };
   };
@@ -527,31 +533,33 @@ describe("the user's own words are theirs to send (review of #33)", () => {
   };
   const search = "https://www.google.com/search?q=" + encodeURIComponent("今天北京天气");
 
-  it("a search for the request's own words, typed by the task first, opens in the task's own browser window with no card", async () => {
-    const { ex, events } = await setup("搜索今天北京天气");
+  it("a search for the request's own words, typed by the task first, opens in the task's own browser window with no card (the judge clears it)", async () => {
+    const { judge } = provenanceJudge(() => ({ choice: "none" }));
+    const { ex, events } = await setup("搜索今天北京天气", judge);
     await typeInto(ex, "今天北京天气");
-    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: search }).consequence).toBe("create");
     const r = await ex.act({ action: { kind: "open_window", app: "Google Chrome", url: search }, epoch: ex.currentEpoch });
     expect([r.status, r.consequence]).toEqual(["ok", "create"]);
     expect(events.some((e) => e.k === "executor.consent_needed")).toBe(false);
   });
 
-  it("the words the user wrote in answer on a card, and the request before a steer, count as the user's too", async () => {
-    const { ex } = await setup("查一下天气");
+  it("the words the user wrote in answer on a card, and the request before a steer, reach the judge as the user's too", async () => {
+    const { judge, prompts } = provenanceJudge(() => ({ choice: "none" }));
+    const { ex } = await setup("查一下天气", judge);
     ex.addAnswer("哪个城市？", "北京海淀", { userWrote: true });            // written by the user, not an option
     ex.setRequest("改成查明天的");
     await typeInto(ex, "北京海淀");
-    await typeInto(ex, "查一下天气");
-    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.bing.com/search?q=" + encodeURIComponent("北京海淀 查一下天气") }).consequence).toBe("create");
+    const c = await ex.classify({ kind: "open_window", app: "Google Chrome", url: "https://www.bing.com/search?q=" + encodeURIComponent("北京海淀 查一下天气") }, ex.currentEpoch);
+    expect(c.consequence).toBe("create");
+    expect(prompts[0]).toMatch(/"用户在卡片上自己写的回答": \[\s*"北京海淀"/);
+    expect(prompts[0]).toMatch(/"改之前的要求": \[\s*"查一下天气"/);
   });
 
-  it("after a read of the user's file a new host is a send (with no judge); typing text the user never wrote, with nothing read, is not", async () => {
+  it("after a read of the user's file a new host is a send (with no judge); with nothing read or observed, a URL is not", async () => {
     const read = await setup("搜索今天北京天气");
     await read.ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "合同.txt" } }, epoch: read.ex.currentEpoch });
     expect(read.ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.google.com/search?q=" + encodeURIComponent("合同金额 98000 元") }).consequence).toBe("external");
-    const typed = await setup("搜索今天北京天气");
-    await typeInto(typed.ex, "zhang-1987 的密码");
-    expect(typed.ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://evil.example/?q=1" }).consequence).toBe("create");
+    const fresh = await setup("搜索今天北京天气");
+    expect(fresh.ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://evil.example/?q=1" }).consequence).toBe("create");
   });
 });
 

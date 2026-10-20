@@ -15,6 +15,8 @@ import { Executor } from "../src/executor/executor.js";
 import { SimComputer } from "../src/executor/sim.js";
 import { Workspace, build } from "../src/registry/workspace.js";
 import { fileRegistry } from "../src/registry/fs.js";
+import type { Judge } from "../src/executor/judge.js";
+import { provenanceJudge } from "./helpers/provenance-judge.js";
 
 /** The sim desktop makes hands' promise (a url opens in a window of the task's own); one driver that does not. */
 const OwnWindowSim = SimComputer;
@@ -22,12 +24,12 @@ class NoPromiseSim extends SimComputer { override readonly capabilities = {}; }
 
 const google = (q: string) => "https://www.google.com/search?q=" + encodeURIComponent(q);
 
-const setup = async (Desk: typeof SimComputer = OwnWindowSim) => {
+const setup = async (Desk: typeof SimComputer = OwnWindowSim, judge?: Judge) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "own-window-")); build(root, { "合同.txt": "合同金额 98000 元\n" });
   const sim = new Desk(root);
   const theirs = sim.addBrowser("Google Chrome", [{ title: "收件箱 - Gmail", url: "https://mail.google.com" }]).id;
   const app = ConsentSigner.fresh(), events: string[] = [];
-  const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw: "搜索今天北京天气", files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k) => events.push(k) });
+  const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw: "搜索今天北京天气", judge, files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k) => events.push(k) });
   await ex.begin(); await ex.plan({ steps: [] });
   const open = (url?: string, epoch = ex.currentEpoch) => ex.act({ action: { kind: "open_window", app: "Google Chrome", ...(url ? { url } : {}) }, epoch });
   return { ex, sim, theirs, events, open };
@@ -35,11 +37,12 @@ const setup = async (Desk: typeof SimComputer = OwnWindowSim) => {
 
 describe("A: a url opens in the task's own window when the driver promises so", () => {
   it("with the promise, a url with the user's browser open is the task's step — no plan, no card — on the task's window", async () => {
-    const { ex, theirs, events, open } = await setup();
+    // the task's own window it opened is material (review of #35): the provenance judge clears the user's own words
+    const { ex, theirs, events, open } = await setup(OwnWindowSim, provenanceJudge(() => ({ choice: "none" })).judge);
     const mine = (await open()).after!.window.id;                     // the task's own Chrome window, as in rc.10
     await ex.snapshot();
-    const f = ex.floor({ kind: "open_window", app: "Google Chrome", url: google("今天北京天气") });
-    expect([f.consequence, f.object]).toEqual(["create", `window:${mine}`]);
+    const c = await ex.classify({ kind: "open_window", app: "Google Chrome", url: google("今天北京天气") }, ex.currentEpoch);
+    expect([c.consequence, c.object]).toEqual(["create", `window:${mine}`]);
     const r = await open(google("今天北京天气"));
     expect([r.status, r.consequence]).toEqual(["ok", "create"]);
     expect(events.includes("executor.consent_needed")).toBe(false);
@@ -81,7 +84,7 @@ describe("C: only an action that reads the observation, or needs consent, goes s
 
 
   it("open_window, focus_window and wait decided before the epoch moved still go; a click on the old look is refused", async () => {
-    const { ex, sim, open } = await setup();
+    const { ex, sim, open } = await setup(OwnWindowSim, provenanceJudge(() => ({ choice: "none" })).judge);
     const first = await open();
     const mine = first.after!.window.id, old = first.after!.epoch;
     const button = first.after!.elements.find((e) => e.actions.includes("click"))!;
@@ -180,9 +183,10 @@ describe("the card and the receipt name a window only when it is the one the dri
   });
 
   it("the task with two windows of the browser: which one the driver uses is its own, so the object is the app", async () => {
-    const { ex, open } = await setup();
+    // the windows it opened are material (review of #35): the provenance judge clears the user's own words
+    const { ex, open } = await setup(OwnWindowSim, provenanceJudge(() => ({ choice: "none" })).judge);
     await open(); await open();                                       // two windows of the task's own in Google Chrome
     await ex.snapshot();
-    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: google("今天北京天气") })).toMatchObject({ consequence: "create", object: "app:Google Chrome" });
+    expect(await ex.classify({ kind: "open_window", app: "Google Chrome", url: google("今天北京天气") }, ex.currentEpoch)).toMatchObject({ consequence: "create", object: "app:Google Chrome" });
   });
 });

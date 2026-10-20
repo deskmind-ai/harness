@@ -37,12 +37,15 @@ export class ConsentSigner {
    *  `task`, up to `consequence`, and nothing else: not a click, not typing. Per full hostname, so another subdomain
    *  asks again (owner 10-21: per-site consent, docs/0.5-decisions.md). The token itself is checked against `object`
    *  (the user's browser window a URL lands in, or the app a new window opens in) when it is passed with an action.
-   *  modify_user: the plan's pages in the user's window. External: the user's yes on a card for a host the task had not
-   *  opened since it took in content — once it covered an open, the executor counts that host as approved for the rest
-   *  of the task, whatever window its later pages land in (they are then no send, and need only what their class does). */
-  forSite(object: string, hosts: string[], task: string, consequence: Consequence = "modify_user", ttlMs = 60 * 60_000): ConsentToken {
+   *  modify_user: a plan's sites — their pages in the user's window, and (`sends`, host → what the card said goes there)
+   *  the content the user approved sending to each, which the executor gives the provenance judge; never a pass for a
+   *  send (review of #35). External: the user's yes on a card for a host the task had not opened since it read
+   *  material — once it covered an open, the executor counts that host as approved for the rest of the task, whatever
+   *  window its later pages land in (they are then no send, and need only what their class does). */
+  forSite(object: string, hosts: string[], task: string, consequence: Consequence = "modify_user", ttlMs = 60 * 60_000, sends?: Record<string, string[]>): ConsentToken {
     const ok = [...new Set(hosts.map((h) => h.toLowerCase()).filter(Boolean))].sort();
-    return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "site", object, hosts: ok, consequence, task, expires_at: this.now() + ttlMs, sig: "" });
+    const said = sends ? Object.fromEntries(Object.entries(sends).map(([h, w]) => [h.toLowerCase(), w]).filter(([h]) => ok.includes(h as string))) : undefined;
+    return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "site", object, hosts: ok, consequence, task, ...(said && Object.keys(said).length ? { sends: said } : {}), expires_at: this.now() + ttlMs, sig: "" });
   }
 
   /** Consent for every action on `object` in `task` up to `consequence`, until it expires. */
@@ -141,12 +144,12 @@ export class ConsentVerifier {
     return "no consent";
   }
 
-  /** The hosts a site token approves for `task` at external — a plan the user accepted declares the sites it visits
-   *  (owner 10-21 refinement), and the app signs them so — when it is validly signed, unexpired, of that task and at
-   *  external; none otherwise. The runtime hands the token over; it cannot add a host itself. */
-  approvedSites(t: ConsentToken, task: string): string[] {
-    if (t.scope !== "site" || t.task !== task || t.consequence !== "external" || this.valid(t)) return [];
-    return t.hosts ?? [];
+  /** A plan's sites from its site token (owner 10-21 refinement, review of #35): the hosts and what the card said goes
+   *  to each, when the token is validly signed, unexpired and of that task; nothing otherwise. The runtime hands the
+   *  token over; it cannot add a host or approved content itself. */
+  planSitesOf(t: ConsentToken, task: string): { hosts: string[]; sends: Record<string, string[]> } {
+    if (t.scope !== "site" || t.task !== task || this.valid(t)) return { hosts: [], sends: {} };
+    return { hosts: t.hosts ?? [], sends: t.sends ?? {} };
   }
 
   /** What a challenge this executor issued was bound to (a send's content), so a later look can be held against what

@@ -103,12 +103,13 @@ export interface ConsentToken {
   task?: string;                     // object scope: only this task
   rule?: string;                     // rule scope: a durable permission, in the executor's rule store
   hosts?: string[];                  // site scope: opening http(s) pages of these hosts (open_window; the URL's full hostname) in `object`, nothing else
+  sends?: Record<string, string[]>;  // site scope, a plan's: host → what the plan card said goes there (given to the provenance judge)
   expires_at: number;                // ms since epoch
   sig: string;                       // base64 Ed25519 over canon(token without sig)
 }
 
 /** `site`: the host a yes approves for the rest of the task (an open_window to a host not yet approved, after the task
- *  took in content): the app answers it with a site token for that host, not a one-time action token. */
+ *  read material): the app answers it with a site token for that host, not a one-time action token. */
 export interface Challenge { nonce: string; digest: string; object: string; consequence: Consequence; text: string; expires_at: number; site?: string }
 
 export interface ActRequest {
