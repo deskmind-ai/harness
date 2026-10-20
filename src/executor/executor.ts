@@ -329,6 +329,8 @@ export class Executor {
   }
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
+  /** The window each open_window brought up for the user's app (by receipt seq): undo leaves it open. */
+  private openedForUser = new Map<number, string>();
 
   /** What a restart found: an action the previous process started and never receipted, what became of it, and the
    *  files other programs changed while no process was watching (from the journal's versions, so they are facts of
@@ -560,8 +562,16 @@ export class Executor {
     return this.last;
   }
 
+  /** A window the task's launch of an app brought up (hands#54 `opened_window`): still the user's — its content is
+   *  theirs, so its floor is unchanged and undo leaves it open — but known as one DeskMind opened: the foreground route
+   *  is allowed for it, and the cards say so. */
+  private taskOpened = new Set<string>();
+  /** Marks a window the task opened (`opened`), for what the user reads. */
+  private mark<W extends { id: string }>(w: W): W & { opened?: true } { return this.taskOpened.has(w.id) ? { ...w, opened: true as const } : w; }
+
   async snapshot(): Promise<Snapshot> {
-    const s = this.ledger.stamp(await this.driver.snapshot());
+    const raw = this.ledger.stamp(await this.driver.snapshot());
+    const s = { ...raw, windows: raw.windows.map((w) => this.mark(w)) };
     this.epoch = s.epoch;
     this.last = s;
     return s;
@@ -569,7 +579,7 @@ export class Executor {
 
   async observe(windowId: string, opts?: { screenshot?: boolean }): Promise<Observation> {
     const o = await this.driver.observe(windowId, opts);
-    const stamped: Observation = { ...o, window: { ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) } };
+    const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
     this.epoch = o.epoch;
     this.lastObs.set(windowId, stamped);
     this.looks.set(windowId, stamped);
@@ -582,7 +592,7 @@ export class Executor {
    *  caller was shown — the caller's ids stay those of its own observation. */
   private async look(windowId: string): Promise<Observation> {
     const o = await this.driver.observe(windowId);
-    const stamped: Observation = { ...o, window: { ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) } };
+    const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
     this.looks.set(windowId, stamped);
     return stamped;
   }
@@ -963,7 +973,7 @@ export class Executor {
     // window without consent. Sent to the driver only; the model never sees it
     const fgWindow = "window" in act ? act.window : null;
     const objectToken = !!fgWindow && req.consent?.scope === "object" && req.consent.object === `window:${fgWindow}` && this.consent.check(act, `window:${fgWindow}`, "modify_user", this.opts.task, req.consent) === null;
-    foregroundOk = !!fgWindow && (this.ledger.ownerOf(`window:${fgWindow}`) === "task" || objectToken || stepConsented);
+    foregroundOk = !!fgWindow && (this.ledger.ownerOf(`window:${fgWindow}`) === "task" || this.taskOpened.has(fgWindow) || objectToken || stepConsented);
     if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence) });
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
     try { r = await this.driver.perform(act, foregroundOk ? { foreground_ok: true } : undefined); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
@@ -982,6 +992,10 @@ export class Executor {
     // driver reports `new_window` only for a window it can prove it made)
     const openedId = r.new_window?.id;
     if (openedId && !now.windows.some((w) => w.id === openedId)) { this.ledger.created(`window:${openedId}`); this.openedWindows.set(this.receipts.length + 1, openedId); }
+    // a window the launch brought up without proof the task made it (hands#54 `opened_window`): the user's, and known
+    // as opened by DeskMind; undo leaves it open (it may hold the user's state)
+    const broughtUp = r.opened_window?.id;
+    if (broughtUp && !now.windows.some((w) => w.id === broughtUp)) { this.taskOpened.add(broughtUp); this.openedForUser.set(this.receipts.length + 1, broughtUp); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
     // credited to it once the window is read back (its name there is the evidence), not found later as "changed by
     // another program" (rc.1 end-to-end: hello.txt, 10-18)
@@ -992,7 +1006,7 @@ export class Executor {
     if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch });
     const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
     const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}) };
-    const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id);
+    const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id ?? r.opened_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
       try {
         const obs = await this.observe(win);
@@ -1192,7 +1206,12 @@ export class Executor {
       const a = r.request.action;
       const t = T(this.opts.lang);
       if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap, this.opts.lang), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap, this.opts.lang), can: false, why: t.noUndoFor(a.capability) }); continue; }
-      if (a.kind === "open_window") { steps.push(this.openedWindows.has(r.seq) ? { seq: r.seq, text: t.openWindow(a.app), can: true } : { seq: r.seq, text: t.openWindow(a.app), can: false, why: t.openedInYours }); continue; }
+      if (a.kind === "open_window") {
+        // the task's own window is closed; one it brought up for the user's app is left open (it may hold their state):
+        // nothing to take back there
+        steps.push(this.openedWindows.has(r.seq) ? { seq: r.seq, text: t.openWindow(a.app), can: true } : this.openedForUser.has(r.seq) ? { seq: r.seq, text: t.leftOpen(a.app), can: true } : { seq: r.seq, text: t.openWindow(a.app), can: false, why: t.openedInYours });
+        continue;
+      }
       steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, undefined, this.opts.lang), can: false, why: t.undoable });
     }
     return { reversible: steps.every((s) => s.can), steps };
@@ -1324,6 +1343,14 @@ export function outgoing(obs: Observation | undefined): { fields: string[]; show
 /** The app as the user knows it: hands' localized `app_name`, else what the driver calls it (a bundle id on hands). */
 export const appName = (w: { app: string; app_name?: string }): string => w.app_name?.trim() || w.app;
 
+/** A window as the user knows it: the app and its title, an untitled one as the app's main window, and one DeskMind's
+ *  launch of the app brought up said to be so (it is still the user's: the cards mark changes in it as theirs). */
+export function windowLabel(w: { app: string; app_name?: string; title: string; opened?: boolean }, lang?: Lang): string {
+  const t = T(lang), app = appName(w);
+  if (w.opened) return w.title.trim() ? t.openedTitled(app, w.title) : t.openedMain(app);
+  return w.title.trim() ? `${app}「${w.title}」` : t.mainWindow(app);
+}
+
 /** The consent card's text: the action in words, with the element it touches and what that means. */
 export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability, lang?: Lang): string {
   const t = T(lang);
@@ -1332,7 +1359,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
     return consequence === "external" ? `${what}（${t.sends}）` : consequence === "modify_user" ? `${what}（${t.modifiesFile}）` : what;
   }
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
-  const where = obs ? `${appName(obs.window)}「${obs.window.title}」` : "window" in a ? a.window : "";
+  const where = obs ? (obs.window.opened ? windowLabel(obs.window, lang) : `${appName(obs.window)}「${obs.window.title}」`) : "window" in a ? a.window : "";
   const what = a.kind === "click" ? t.click(el?.label ?? a.target) : a.kind === "double_click" ? t.doubleClick(el?.label ?? a.target)
     : a.kind === "set_value" ? t.set(el?.label ?? a.target, a.value)
     : a.kind === "type" ? t.type(el?.label ?? a.target, a.text)

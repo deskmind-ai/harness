@@ -153,3 +153,68 @@ describe("skills by the computer's apps when the request names none", () => {
     expect(names(skillsFor({ raw: "x" }, ws, () => null, [dir])).sort()).toEqual(["play-on-netease", "tidy-finder"]);
   });
 });
+
+describe("a window the launch brought up (hands#54 opened_window)", () => {
+  /** A desk whose open_window reports the app's restored window as opened_window: no proof the task made it. */
+  class LaunchDesk extends Desk {
+    perform(action: Action, opts?: { foreground_ok?: boolean }) {
+      if (action.kind !== "open_window") return super.perform(action, opts);
+      this.performed.push({ action, ...(opts ? { opts } : {}) }); this.epoch += 1;
+      const info = music("com.netease.163music#5");
+      this.wins.push({ info, elements: els });
+      return { status: "ok" as const, window: info.id, opened_window: info };
+    }
+  }
+  async function launched() {
+    const desk = new LaunchDesk([]);
+    const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, onEvent: (k, b) => events.push({ k, b }) });
+    await ex.begin(); await ex.plan({ steps: [] });
+    expect((await ex.act({ action: { kind: "open_window", app: "网易云音乐" }, epoch: ex.currentEpoch })).status).toBe("ok");
+    return { desk, app, ex, events };
+  }
+
+  it("stays the user's (a change in it asks), but the foreground route is allowed for it", async () => {
+    const { desk, ex } = await launched();
+    expect(ex.ledger.ownerOf("window:com.netease.163music#5")).toBe("user");
+    const o = await ex.observe("com.netease.163music#5");
+    expect(o.window.opened).toBe(true);
+    expect((await ex.act({ action: { kind: "scroll", window: "com.netease.163music#5", dy: 3 }, epoch: o.epoch })).status).toBe("ok");
+    expect(desk.performed.at(-1)!.opts).toEqual({ foreground_ok: true });
+    const o2 = await ex.observe("com.netease.163music#5");
+    const r = await ex.act({ action: { kind: "double_click", window: "com.netease.163music#5", target: "ocr:2" }, epoch: o2.epoch });
+    expect(r).toMatchObject({ status: "needs_consent", consequence: "modify_user" });
+    expect(r.challenge!.text).toContain("DeskMind 打开的 网易云音乐 主窗口");
+    expect(r.challenge!.text).toContain("改动你的东西");
+  });
+
+  it("the plan card names it as the window DeskMind opened, still 「改你的东西」", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { scriptedStream } = await import("../src/runtime/scripted.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const desk = new LaunchDesk([]);
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });
+    const gw = new Gateway(table); gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));
+    const cards: { text: string }[] = [];
+    const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as any };
+    const steps: any[] = [
+      { calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "网易云音乐" }, epoch: 1, consequence: "create", purpose: "打开网易云" } }] },
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "搜索并播放", objects: ["窗口 com.netease.163music#5"], consequence: "create" }] } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] },
+    ];
+    const rt = new FrontierRuntime({ task: "t1", raw: "打开网易云播放安溥的宝贝", executor: ex, signer: app, user: { ask: (c: any) => { cards.push(c); return { option: c.options.findIndex((o: any) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
+    await rt.run();
+    expect(cards[0]!.text).toContain("1. 搜索并播放（DeskMind 打开的 网易云音乐 主窗口）——改你的东西");
+  });
+
+  it("undo leaves it open", async () => {
+    const { desk, ex } = await launched();
+    const plan = ex.undoable();
+    expect(plan).toMatchObject({ reversible: true, steps: [{ can: true, text: "打开 网易云音乐（撤回时不关它：窗口里可能有你的东西）" }] });
+    expect(await ex.undo()).toMatchObject({ refused: null });
+    expect(desk.performed.filter((p) => p.action.kind === "close_window")).toEqual([]);
+    expect(desk.wins.some((w) => w.info.id === "com.netease.163music#5")).toBe(true);
+  });
+});

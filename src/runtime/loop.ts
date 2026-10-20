@@ -24,7 +24,7 @@ import * as R from "../protocol/roles.js";
 import type { Workspace } from "../registry/workspace.js";
 import { canon } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
-import { Executor, appName, describeAction } from "../executor/executor.js";
+import { Executor, appName, describeAction, windowLabel } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
 import { defaultJudge } from "../executor/judge.js";
 import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "../executor/types.js";
@@ -395,7 +395,7 @@ export class FrontierRuntime {
     // review of #31); what did not resolve is shown as the model wrote it, and is not signed
     const shown = (o: string): string => {
       const id = o.slice(o.indexOf(":") + 1);
-      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return w.title.trim() ? `${appName(w)}「${w.title}」` : this.t.mainWindow(appName(w)); }
+      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return windowLabel(w, this.o.lang); }
       if (o.startsWith("tab:")) for (const w of snap.windows) { const t = w.tabs?.find((x) => x.id === id); if (t) { let site = ""; try { site = new URL(t.url).host; } catch { /* no site */ } return `「${t.title}」${site ? `（${site}）` : ""}`; } }
       if (o.startsWith("path:") && there.has(o)) return id;
       return o;
