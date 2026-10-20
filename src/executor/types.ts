@@ -43,6 +43,9 @@ export interface Snapshot { epoch: number; locked: boolean; front_app: string; w
   /** Why the epoch last moved, when the driver says (hands#53): {epoch, at, by: action{kind, window} | input{to: app |
    *  unknown} | windows{app, appeared | vanished | renamed}}. Carried into a stale result's trace; never decides. */
   epoch_reason?: unknown;
+  /** The web browsers installed on the computer, running or not, by bundle id and every name the app goes by (its
+   *  localized names): what an app named in an open_window is, before it has a window to say so. Absent: not known. */
+  browsers?: { bundle: string; names: string[] }[];
   /** Apps sending audio to an output device right now (hands#55; no track title — the system keeps that closed). */
   audio_playing?: { bundle: string; app_name?: string }[];
   /** Apps the driver can operate only in front (hands), when it says so per snapshot rather than per window. */

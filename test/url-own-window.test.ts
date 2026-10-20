@@ -16,8 +16,9 @@ import { SimComputer } from "../src/executor/sim.js";
 import { Workspace, build } from "../src/registry/workspace.js";
 import { fileRegistry } from "../src/registry/fs.js";
 
-/** The sim desktop with hands' promise: a url opens in a window of the task's own (the sim always opens a new one). */
-class OwnWindowSim extends SimComputer { readonly capabilities = { urlInOwnBrowserWindow: true }; }
+/** The sim desktop makes hands' promise (a url opens in a window of the task's own); one driver that does not. */
+const OwnWindowSim = SimComputer;
+class NoPromiseSim extends SimComputer { override readonly capabilities = {}; }
 
 const google = (q: string) => "https://www.google.com/search?q=" + encodeURIComponent(q);
 
@@ -46,7 +47,7 @@ describe("A: a url opens in the task's own window when the driver promises so", 
   });
 
   it("without the promise, the old floor stands: a url with the user's browser open is a change to their window", async () => {
-    const { ex, theirs } = await setup(SimComputer);
+    const { ex, theirs } = await setup(NoPromiseSim);
     expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: google("今天北京天气") })).toMatchObject({ consequence: "modify_user", object: `window:${theirs}` });
   });
 
@@ -90,5 +91,80 @@ describe("C: only an action that reads the observation, or needs consent, goes s
     expect((await ex.act({ action: { kind: "wait", ms: 1 }, epoch: old })).status).toBe("ok");
     sim.epoch += 1;
     expect((await ex.act({ action: { kind: "click", window: mine, target: button.id }, epoch: old })).status).toBe("stale");
+  });
+});
+
+describe("which app the model means: every name the computer has for it, ignoring case (review of #34)", () => {
+  // the shape hands' snapshot has: a window's app is its display name, with app_name, bundle and the browser flag;
+  // snapshot.browsers lists the installed browsers, running or not
+  const chrome = { id: "com.google.Chrome#29773", app: "Google Chrome", app_name: "Google Chrome", bundle: "com.google.Chrome", browser: true, title: "收件箱 - Gmail" };
+  const slack = { id: "com.tinyspeck.slackmacgap#5", app: "Slack", app_name: "Slack", bundle: "com.tinyspeck.slackmacgap", title: "general" };
+  const browsers = [{ bundle: "com.google.Chrome", names: ["Google Chrome"] }, { bundle: "com.apple.Safari", names: ["Safari"] }];
+  const desk = async (o: { promise: boolean; windows: object[]; browsers?: typeof browsers }) => {
+    const driver = {
+      capabilities: { urlInOwnBrowserWindow: o.promise },
+      snapshot: () => ({ epoch: 1, locked: false, front_app: "", windows: o.windows as never, ...(o.browsers ? { browsers: o.browsers } : {}) }),
+      observe: () => { throw new Error("not used"); }, perform: () => ({ status: "ok" as const }),
+    };
+    const ex = new Executor(driver, { task: "t1", publicKey: ConsentSigner.fresh().publicKey });
+    await ex.begin();
+    return (app: string, url = "https://example.com/x") => ex.floor({ kind: "open_window", app, url });
+  };
+
+  it("a lowercase bundle id finds the user's open Chrome: without the promise it is their window, with it the task's own", async () => {
+    expect((await desk({ promise: false, windows: [chrome], browsers }))("com.google.chrome")).toMatchObject({ consequence: "modify_user", object: `window:${chrome.id}` });
+    expect((await desk({ promise: true, windows: [chrome], browsers }))("com.google.chrome").consequence).toBe("create");
+  });
+
+  it("a short name that matches no window and no installed browser is taken to be the user's", async () => {
+    expect((await desk({ promise: true, windows: [chrome], browsers }))("Chrome")).toMatchObject({ consequence: "modify_user", object: "app:Chrome" });
+  });
+
+  it("a non-browser app with a url gets a card: open (named in lowercase) or not running", async () => {
+    expect((await desk({ promise: true, windows: [slack], browsers }))("slack", "slack://channel?id=C1")).toMatchObject({ consequence: "modify_user", object: `window:${slack.id}` });
+    expect((await desk({ promise: true, windows: [], browsers }))("Notes", "notes://x").consequence).toBe("modify_user");
+  });
+
+  it("a browser not running: listed among the installed browsers with the promise, no card; with no list (older hands), one card", async () => {
+    expect((await desk({ promise: true, windows: [], browsers }))("safari").consequence).toBe("create");
+    expect((await desk({ promise: true, windows: [] }))("Safari").consequence).toBe("modify_user");
+  });
+});
+
+describe("the app is settled once and the driver is handed it (review of #36)", () => {
+  const fooBrowser = { id: "com.foo.browser#1", app: "Foo", app_name: "Foo", bundle: "com.foo.browser", browser: true, title: "a page" };
+  const fooNotes = { id: "com.foo.notes#2", app: "Foo", app_name: "Foo", bundle: "com.foo.notes", title: "my notes" };
+  const chrome = { id: "com.google.Chrome#29773", app: "Google Chrome", app_name: "Google Chrome", bundle: "com.google.Chrome", browser: true, title: "收件箱 - Gmail" };
+  const browsers = [{ bundle: "com.google.Chrome", names: ["Google Chrome"] }, { bundle: "com.apple.Safari", names: ["Safari"] }];
+  const desk = async (windows: object[]) => {
+    const handed: Record<string, unknown>[] = [];
+    const driver = {
+      capabilities: { urlInOwnBrowserWindow: true },
+      snapshot: () => ({ epoch: 1, locked: false, front_app: "", windows: windows as never, browsers }),
+      observe: () => { throw new Error("not used"); },
+      perform: (a: never) => { handed.push(a); return { status: "ok" as const }; },
+    };
+    const ex = new Executor(driver, { task: "t1", publicKey: ConsentSigner.fresh().publicKey });
+    await ex.begin();
+    return { ex, handed };
+  };
+
+  it("two apps called Foo, one a browser: a url to Foo is not the task's step but the user's", async () => {
+    const { ex } = await desk([fooBrowser, fooNotes]);
+    expect(ex.floor({ kind: "open_window", app: "Foo", url: "foo://x" }).consequence).toBe("modify_user");
+  });
+
+  it("the driver is handed the bundle the executor judged, not the model's words; an unsettled name goes as written", async () => {
+    let d = await desk([chrome]);
+    expect((await d.ex.act({ action: { kind: "open_window", app: "google chrome", url: "https://example.com" }, epoch: 1 })).status).toBe("ok");
+    expect(d.handed.map((a) => a.app)).toEqual(["com.google.Chrome"]);
+    expect(d.ex.receipts.at(-1)!.request.action).toMatchObject({ app: "google chrome" });      // the receipt keeps the model's words
+    d = await desk([]);
+    await d.ex.act({ action: { kind: "open_window", app: "safari", url: "https://example.com" }, epoch: 1 });
+    expect(d.handed.map((a) => a.app)).toEqual(["com.apple.Safari"]);
+    d = await desk([fooBrowser, fooNotes]);
+    expect(d.ex.preview({ action: { kind: "open_window", app: "Foo" }, epoch: 1 }).consequence).toBe("create");
+    await d.ex.act({ action: { kind: "open_window", app: "Foo" }, epoch: 1 });
+    expect(d.handed.map((a) => a.app)).toEqual(["Foo"]);
   });
 });

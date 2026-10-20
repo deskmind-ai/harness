@@ -94,6 +94,7 @@ describe("anonymous containers are not bound to a send", () => {
 describe("pages opened in the user's browser window are planned once", () => {
   const run = (steps: Step[]) => {
     const sim = new SimComputer();
+    sim.capabilities.urlInOwnBrowserWindow = false;                   // a driver that hands a url to the user's open browser (no urlInOwnBrowserWindow): the floor these tests are about
     const chrome = sim.addBrowser("Google Chrome", [{ title: "收件箱 - Gmail", url: "https://mail.google.com" }]).id;
     const app = ConsentSigner.fresh();
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey });
@@ -239,6 +240,7 @@ describe("per-site consent after the task took in content (owner 10-21)", () => 
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "site-")); build(root, { "合同.txt": "合同金额 98000 元\n" });
     const sim = new SimComputer(root);
     const chrome = o.chrome ? sim.addBrowser("Google Chrome", [{ title: "收件箱 - Gmail", url: "https://mail.google.com" }]).id : null;
+    if (o.chrome) sim.capabilities.urlInOwnBrowserWindow = false;      // a driver that hands a url to the user's open browser (no urlInOwnBrowserWindow): the floor these tests are about
     const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
     const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw, files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k, b) => events.push({ k, b }) });
     await ex.begin(); await ex.plan({ steps: [] });
