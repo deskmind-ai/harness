@@ -13,6 +13,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_HANDS_DIR = path.resolve(here, "..", "..", "..", "hands");
 
 export class HandsDriver implements Driver {
+  /** hands#48: in a web browser, a url is loaded in DeskMind's own browser window (one it opens if the task has none);
+   *  the user's browser windows are never navigated, and a browser that cannot give it a window of its own stops the
+   *  step instead. Other apps get the url from `open`, wherever they put it — not covered. */
+  readonly capabilities = { urlInOwnBrowserWindow: true };
   private proc: ChildProcessWithoutNullStreams | null = null;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private n = 0;

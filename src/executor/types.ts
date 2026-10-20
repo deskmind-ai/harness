@@ -25,6 +25,8 @@ export interface WindowInfo {
   owner?: Owner;                      // filled by the executor from its ledger; a driver never says
   focused?: boolean; minimized?: boolean;
   url?: string; tabs?: TabInfo[];     // a browser window
+  /** The driver knows the app is a web browser (hands' is_browser). Absent: not known, not "no". */
+  browser?: boolean;
   /** The app's localized name (hands; falls back to the bundle id there), for what the user reads; and its bundle id. */
   app_name?: string; bundle?: string;
   /** Brought up by the task's launch of the app (hands#54 `opened_window`), filled by the executor: still the user's. */
@@ -168,6 +170,12 @@ export interface Driver {
    *  the user consented to); a driver that can act in the background may ignore it. */
   perform(action: Action, opts?: { foreground_ok?: boolean }): Maybe<PerformResult>;
   end?(): Maybe<void>;
+  /** What the driver promises about where its actions land. `urlInOwnBrowserWindow`: an open_window with a url in a web
+   *  browser (an app whose windows the driver marks `browser: true`) always loads in a browser window of the task's own,
+   *  never in one of the user's — the executor then takes it for the task's own step. It says nothing of other apps: a
+   *  url handed to any other app (hands: `open -g -b <app> <url>`) opens where that app likes, usually in the user's
+   *  window, so without the promise, or for an app not marked a browser, a url is taken to land in the user's window. */
+  readonly capabilities?: { urlInOwnBrowserWindow?: boolean };
 }
 
 /** What a run's receipts and verification can read back: the executor's own log of what it did. */

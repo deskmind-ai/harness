@@ -63,7 +63,7 @@ export class SimComputer implements Driver {
   private win(id: string): Win { const w = this.wins.find((x) => x.id === id); if (!w) throw new Error(`no window ${id}`); return w; }
   private info(w: Win): WindowInfo {
     const base: WindowInfo = { id: w.id, app: w.app, title: w.title, focused: w.focused, minimized: w.minimized };
-    if (w.kind === "browser") { base.url = w.state.tabs[w.state.active]?.url; base.tabs = w.state.tabs.map((t: any, i: number) => ({ id: t.id, title: t.title, url: t.url, active: i === w.state.active })); }
+    if (w.kind === "browser") { base.browser = true; base.url = w.state.tabs[w.state.active]?.url; base.tabs = w.state.tabs.map((t: any, i: number) => ({ id: t.id, title: t.title, url: t.url, active: i === w.state.active })); }
     return base;
   }
 
