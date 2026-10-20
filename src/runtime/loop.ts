@@ -341,7 +341,6 @@ export class FrontierRuntime {
 
   private async plan(steps: { purpose: string; objects: string[]; consequence: Consequence }[], readings: Reading[]): Promise<AgentToolResult> {
     this.count("plans");
-    const need = steps.filter((s) => NEEDS_CONSENT.has(s.consequence));
     this.emit("plan", { steps, readings });
     // the start gate: readings the judge cannot settle are the user's to settle, one card each, before anything else
     let settled = readings;
@@ -362,14 +361,31 @@ export class FrontierRuntime {
       if (chosen === null) return text(`用户对「${r.point}」的回答：${got.text}。按这个重新理解，再交一次计划。`);
       settled = settled.map((x) => (x === r ? { ...x, reading: chosen, alternatives: [], evidence: [`用户的回答：${chosen}`] } : x));
     }
-    if (!need.length) return text("计划记下了；这些步骤不需要用户同意，直接做。");
-    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${s.consequence === "modify_user" ? this.t.modifyYours : s.consequence === "external" ? this.t.external : ""}`);
-    const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
+    // what each step touches, by the executor's own view rather than the class the model wrote: a step on a window or a
+    // file that is the user's changes the user's things, whatever the model declared (a real run wrote "create" for the
+    // music app's window the executor counted as the user's, so no plan card was shown and every step asked on its own
+    // card — 「打开网易云播放安溥的宝贝」, 10-20). A declared external stays external; sending still asks per action
+    const snap = await this.o.executor.snapshot();
+    const objectsOf = await Promise.all(steps.map((s) => this.canonObjects(s.objects)));
+    const theirs = (o: string) => /^(window|tab|path):/.test(o) && this.o.executor.ledger.ownerOf(o) === "user";
+    // a step declared "read" stays a look (the floor of looking is read; an action it turns into asks on its own)
+    const classes = steps.map((s, i) => (s.consequence === "external" || s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence));
+    const signFor = [...new Set(objectsOf.flatMap((os, i) => (classes[i] === "read" ? [] : os.filter(theirs))))];
+    // an app the hands driver can only operate in front (needs_foreground): said plainly on the card, and in the trace
+    const fgApps = [...new Set([...(snap.needs_foreground ?? []), ...snap.windows.filter((w) => w.needs_foreground && objectsOf.flat().includes(`window:${w.id}`)).map((w) => w.app)])]
+      .filter((app) => snap.windows.some((w) => w.app === app && objectsOf.flat().includes(`window:${w.id}`)));
+    if (fgApps.length) this.emit("plan.foreground", { apps: fgApps });
+    this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor });
+    if (!classes.some((c) => NEEDS_CONSENT.has(c))) return text("计划记下了；这些步骤不需要用户同意，直接做。");
+    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? this.t.external : ""}`);
+    const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     if (!got) return this.end("failed", "no answer from the user");
     if (got.option?.kind === "cancel") return this.end("cancelled", "the user stopped the task");
     if (!got.option) return text(`用户没有同意，而是说：${got.text}。按这个改计划。`);
-    for (const s of need) if (s.consequence === "modify_user") for (const obj of await this.canonObjects(s.objects)) {
+    // the user's objects the plan names, by the executor's view: covered up to modify_user (never a send). An object the
+    // plan does not name is not covered: an action on it asks on its own card
+    for (const obj of signFor) {
       const t = this.o.signer.forObject(obj, "modify_user", this.o.task);
       this.tokens.set(obj, t);
       this.consents.push({ scope: "object", object: obj, consequence: "modify_user" });

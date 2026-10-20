@@ -16,6 +16,7 @@ const ZH = {
   outgoing: (fields: string[], shown: string[]) => `\n要发出去的：${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : "窗口里看不到要发出的内容"}`,
   byRule: (rules: string[]) => `按你以前定的规则做的：${rules.join("、")}`,
   typed: (t: string) => `这次任务打的字：${t}`,
+  foreground: (apps: string[]) => `注意：${apps.join("、")} 只能在前台操作。做这些步骤时，我会把它短暂切到前台；这段时间请先别用电脑。`,
 };
 const EN: typeof ZH = {
   ok: "OK", okPlan: "OK, go ahead", skipStep: "Skip this step", cancel: "Stop here", delegate: "You decide", fine: "Fine", undo: "Undo",
@@ -29,5 +30,6 @@ const EN: typeof ZH = {
   outgoing: (fields: string[], shown: string[]) => `\nWhat goes out:${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : " not visible in the window"}`,
   byRule: (rules: string[]) => `Under your standing rule: ${rules.join(", ")}`,
   typed: (t: string) => `typed by this task: ${t}`,
+  foreground: (apps: string[]) => `Note: ${apps.join(", ")} can only be operated in front. For these steps I will bring it to the front briefly; please leave the Mac alone meanwhile.`,
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);
