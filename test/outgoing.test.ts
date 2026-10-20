@@ -21,11 +21,13 @@ interface FakeWin { info: WindowInfo; elements: Element[]; text: string }
 class FakeDesk implements Driver {
   epoch = 1;
   log: Action[] = [];
+  /** false: actions do not move the epoch (hands#49 counts only input into the task's apps) */
+  bumps = true;
   constructor(public wins: FakeWin[], private readonly opens?: FakeWin) {}
   snapshot() { return { epoch: this.epoch, locked: false, front_app: this.wins[0]?.info.app ?? "", windows: this.wins.map((w) => w.info) }; }
   observe(id: string) { const w = this.wins.find((x) => x.info.id === id)!; return { epoch: this.epoch, window: w.info, modal: null, elements: w.elements, text: w.text }; }
   perform(a: Action) {
-    this.log.push(a); this.epoch += 1;
+    this.log.push(a); if (this.bumps) this.epoch += 1;
     if (a.kind === "open_window" && this.opens) { this.wins.push(this.opens); return { status: "ok" as const, window: this.opens.info.id, new_window: this.opens.info }; }
     return { status: "ok" as const, window: "window" in a ? a.window : undefined };
   }
@@ -287,5 +289,116 @@ describe("outgoing check: in the agent loop", () => {
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
     expect(desk.log.at(-1)).toEqual({ kind: "key", window: "site", chord: "return" });
     expect(r.status).toBe("succeeded");
+  });
+});
+
+describe("outgoing check: review of #23", () => {
+  it("a class judged on an older observation is not kept under a newer epoch: 「预览」 judged, 「发送」 clicked asks per action", async () => {
+    const asked: string[] = [];
+    const { judge } = judged((u) => { const s = /"名字": "发送"/.test(u.split("窗口里标了")[0]!); asked.push(s ? "sends" : "stays"); return { choice: s ? "sends" : "stays" }; });
+    const w: FakeWin = { info: { id: "w", app: "Mail", title: "回复" }, elements: [{ id: "ax:3", role: "button", label: "预览", actions: ["click"] }], text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    await ex.observe("w");                                                              // epoch 1: ax:3 is 预览
+    w.elements = [{ id: "ax:3", role: "button", label: "发送", actions: ["click"], sends: true }]; desk.epoch = 2;
+    const a: Action = { kind: "click", window: "w", target: "ax:3" };
+    expect(await ex.classify(a, 2)).toMatchObject({ consequence: "external" });         // the model took epoch 2 from a snapshot
+    expect(asked).toEqual([]);                                                          // nothing asked about an old look
+    await ex.observe("w");                                                              // epoch 2: ax:3 is 发送
+    const r = await ex.act({ action: a, epoch: 2, consent: app.forObject("window:w", "modify_user", "t1") });
+    expect(r).toMatchObject({ status: "needs_consent", consequence: "external" });
+    expect(desk.log).toEqual([]);
+  });
+
+  it("the text typed so far is part of the cache key: typed more on the same epoch, the judge is asked again", async () => {
+    const answers = ["stays", "sends"];
+    const { judge } = judged(() => ({ choice: answers.shift() }));
+    const { ex, desk, app } = await setup([chat()], judge);
+    desk.bumps = false;
+    const o = await ex.observe("chat");
+    const ret: Action = { kind: "key", window: "chat", chord: "return" };
+    expect((await ex.classify(ret, o.epoch)).consequence).toBe("modify_user");
+    expect((await ex.act({ action: { kind: "type", window: "chat", target: "ocr:1", text: "明天见" }, epoch: o.epoch, consent: app.forObject("window:chat", "modify_user", "t1") })).status).toBe("ok");
+    expect(desk.epoch).toBe(o.epoch);
+    expect(await ex.classify(ret, o.epoch)).toMatchObject({ consequence: "external", by: "frontier" });
+    expect(answers).toEqual([]);
+  });
+
+  it("a target on hands' name list stays external whatever the judge says, and the judge is not asked", async () => {
+    let asked = 0;
+    const { judge } = judged(() => { asked += 1; return { choice: "stays" }; });
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: [{ id: "send", role: "button", label: "发送", actions: ["click"], sends: true }], text: "" };
+    const { ex } = await setup([w], judge);
+    const o = await ex.observe("w");
+    expect(await ex.classify({ kind: "click", window: "w", target: "send" }, o.epoch)).toMatchObject({ consequence: "external", by: "structure" });
+    expect(asked).toBe(0);
+  });
+
+  it("a key without Return is not asked about", async () => {
+    let asked = 0;
+    const { judge } = judged(() => { asked += 1; return { choice: "sends" }; });
+    const { ex } = await setup([chat()], judge);
+    const o = await ex.observe("chat");
+    expect(await ex.classify({ kind: "key", window: "chat", chord: "cmd+a" }, o.epoch)).toMatchObject({ consequence: "modify_user", by: "structure" });
+    expect(await ex.classify({ kind: "key", window: "chat", chord: "cmd+enter" }, o.epoch)).toMatchObject({ consequence: "external" });
+    expect(asked).toBe(1);
+  });
+
+  it("typed text is taken as gone only after a certain send: not after「拿不准」on an attach button; the card shows it even when the history has the words", async () => {
+    const w = chat();
+    w.elements.push({ id: "icon:attach", role: "button", label: "附件", actions: ["click"] });
+    w.text = "张三：明天见\n输入消息…\n发送";                                            // the history holds the same words
+    const { judge } = judged((u) => ({ choice: /"名字": "附件"/.test(u.split("窗口里标了")[0]!) ? "unsure" : "sends" }));   // the target's own name only
+    const { ex, app } = await setup([w], judge);
+    const mine = app.forObject("window:chat", "modify_user", "t1");
+    let o = await ex.observe("chat");
+    await ex.act({ action: { kind: "type", window: "chat", target: "ocr:1", text: "明天见" }, epoch: o.epoch, consent: mine });
+    o = await ex.observe("chat");
+    const attach: Action = { kind: "click", window: "chat", target: "icon:attach" };
+    const r1 = await ex.act({ action: attach, epoch: o.epoch, consent: mine });
+    expect(r1).toMatchObject({ status: "needs_consent", consequence: "external" });
+    expect(r1.challenge!.text).toContain("这次任务打的字：明天见");
+    expect((await ex.act({ action: attach, epoch: o.epoch, consent: app.forAction(r1.challenge!) })).status).toBe("ok");
+    o = await ex.observe("chat");
+    const ret: Action = { kind: "key", window: "chat", chord: "return" };
+    const r2 = await ex.act({ action: ret, epoch: o.epoch, consent: mine });
+    expect(r2.challenge!.text).toContain("这次任务打的字：明天见");                   // still there after the attach
+    expect((await ex.act({ action: ret, epoch: o.epoch, consent: app.forAction(r2.challenge!) })).status).toBe("ok");
+    o = await ex.observe("chat");
+    const r3 = await ex.act({ action: ret, epoch: o.epoch, consent: mine });
+    expect(r3.status).toBe("needs_consent");
+    expect(r3.challenge!.text).not.toContain("这次任务打的字");                         // gone with the send the judge called certain
+  });
+
+  it("right before a send the window is looked at again: draft A consented, draft B there without an epoch change → asked again, not sent", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: [
+      { id: "body", role: "textArea", label: "正文", value: "草稿 A", actions: ["set_value"] },
+      { id: "b7", role: "button", label: "", actions: ["click"] },
+    ], text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    const o = await ex.observe("w");
+    const a: Action = { kind: "click", window: "w", target: "b7" };
+    const r = await ex.act({ action: a, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+    expect(r.challenge!.text).toContain("草稿 A");
+    w.elements = [{ ...w.elements[0]!, value: "草稿 B" }, w.elements[1]!];              // a sync changed it; the epoch did not move
+    const again = await ex.act({ action: a, epoch: o.epoch, consent: app.forAction(r.challenge!) });
+    expect(again.status).toBe("needs_consent");
+    expect(again.challenge!.text).toContain("草稿 B");
+    expect(desk.log).toEqual([]);
+    expect((await ex.act({ action: a, epoch: o.epoch, consent: app.forAction(again.challenge!) })).status).toBe("ok");
+    expect(desk.log).toEqual([a]);
+  });
+
+  it("a stop that arrives during the look before a send is seen before the effect", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: [{ id: "b7", role: "button", label: "", actions: ["click"] }], text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    const o = await ex.observe("w");
+    const a: Action = { kind: "click", window: "w", target: "b7" };
+    const r = await ex.act({ action: a, epoch: o.epoch });
+    const observe = desk.observe.bind(desk);
+    desk.observe = (id: string) => { ex.stop(); return observe(id); };
+    expect((await ex.act({ action: a, epoch: o.epoch, consent: app.forAction(r.challenge!) })).status).toBe("stopped");
+    expect(desk.log).toEqual([]);
   });
 });

@@ -274,12 +274,12 @@ export class FrontierRuntime {
     const a = p.action as unknown as Action;
     const bad = checkAction(a);
     if (bad) return err(bad);
-    // which consent token to bring: by the class act will settle on (classify, cached — act asks it again and gets the
-    // same answer). A preview without the judge would take the old send hints for a class and leave the plan's object
-    // token behind for a site search the judge clears, asking the user a card the plan already covered
-    const pre = await this.o.executor.classify(a, p.epoch, p.consequence);
-    let consent = this.tokens.get(pre.object);
-    if (consent && rank(consent.consequence) < rank(pre.consequence)) consent = undefined;
+    // the plan's object token for what the action touches goes along whatever the class: act settles the class itself
+    // (the judge is asked only after its own checks that the action is current) and asks for a card when the token
+    // does not cover it — a send is never covered by one. Choosing by a class guessed here either paid the judge on
+    // stale actions or, by the old send hints, left the token behind for a site search the judge clears
+    const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
+    const consent = this.tokens.get(pre.object);
     let r: ActResult;
     try { r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
     catch (e) { if (e instanceof Crash) { this.crash = e; this.abort.abort(); return { ...text("crash"), terminate: true }; } throw e; }
