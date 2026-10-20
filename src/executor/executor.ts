@@ -20,6 +20,7 @@ import { parentOf } from "../registry/spec.js";
 import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, rank } from "./types.js";
@@ -713,29 +714,48 @@ export class Executor {
     return false;
   }
 
-  /** Has the task taken in content in this run: read a file (a file action that returned output), or typed text that
-   *  is not in the user's own words (the request, before and after a steer, and what they wrote in answer on cards;
-   *  not an option the model offered)? What it read on screen is not counted (a known gap, docs/0.5-decisions.md). */
+  /** Has the task taken in content in this run: read a file (a file action of a capability that only observes — a read,
+   *  a listing with previews — that returned output; a write's receipt is not a read), been shown files' content another
+   *  way (noteTakenIn: the task folder's listing with previews in the model's prompt), or typed text that is not in the
+   *  user's own words (the request, before and after a steer, and what they wrote in answer on cards; not an option the
+   *  model offered)? What it read on screen is not counted (a known gap, docs/0.5-decisions.md). */
   private tookIn(): "read" | "typed" | null {
-    if (this.receipts.some((r) => r.request.action.kind === "file" && r.result.output && Object.keys(r.result.output).length)) return "read";
+    if (this.shown.length) return "read";
+    const observes = (id: string) => this.opts.files?.registry.get(id)?.effect === "observe";
+    if (this.receipts.some((r) => r.request.action.kind === "file" && observes(r.request.action.capability) && r.result.output && Object.keys(r.result.output).length)) return "read";
     const theirs = [this.opts.raw ?? "", ...this.earlierRequests, ...this.userWrote].join("\n").toLowerCase();
     return this.typedEver.some((t) => t.trim() && !theirs.includes(t.trim().toLowerCase())) ? "typed" : null;
   }
+  /** Files' content shown to the model outside a file action (what, for the trace): counted as a read. */
+  private shown: string[] = [];
+  noteTakenIn(what: string) { if (!this.shown.includes(what)) { this.shown.push(what); this.emit("executor.taken_in", { what }); } }
   /** Every text the task typed (type / set_value that went through), never cleared: what tookIn reads. */
   private typedEver: string[] = [];
   /** Hosts the user approved in this task for opening after content was taken in (a site token at external). */
   private sites = new Set<string>();
 
   /** The per-site rule for an open_window with a URL, when it makes the open a send: after the task took in content, an
-   *  http(s) URL to a host not approved yet (`host` is that host; consent is per host for the rest of the task) and
-   *  any other URL but file: (`host` null: asked every time). Null when the rule does not apply. */
+   *  http(s) URL to a host not approved yet (`host` is that host; consent is per host for the rest of the task), a
+   *  file: URL of a file this run wrote or changed (a page the task wrote can redirect or fetch out), and any other URL
+   *  (`host` null: asked every time). The user's own files by file: URL keep their class. Null when the rule does not
+   *  apply. */
   private siteRule(a: Action): { host: string | null; by: "read" | "typed" } | null {
-    if (a.kind !== "open_window" || !a.url || /^file:/i.test(a.url.trim())) return null;
+    if (a.kind !== "open_window" || !a.url) return null;
     const by = this.tookIn();
     if (!by) return null;
+    if (/^file:/i.test(a.url.trim())) return this.taskWroteFile(a.url) ? { host: null, by } : null;
     const host = siteOf(a.url);
     if (host && this.sites.has(host)) return null;
     return { host, by };
+  }
+
+  /** Does this file: URL point at a file in the task folder that this run wrote or changed (by a file action, or a
+   *  screen action whose write was credited to the task)? */
+  private taskWroteFile(url: string): boolean {
+    if (!this.opts.files) return false;
+    let p: string | null;
+    try { p = this.inFolder(fileURLToPath(url.trim())); } catch { return false; }
+    return !!p && [...this.taskContent].some((k) => k.slice(0, k.lastIndexOf("@")) === p);
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
@@ -835,7 +855,7 @@ export class Executor {
     const t = T(this.opts.lang);
     // an open the per-site rule makes a send: the card names the site (not the page) and why — nothing on screen goes out
     const site = consequence === "external" ? this.siteRule(a) : null;
-    if (site && a.kind === "open_window") return { sending: null, typed: [], content: undefined, text: site.host ? t.openSite(a.app, site.host, site.by) : t.openLink(a.app, a.url!, site.by), act, lost: false };
+    if (site && a.kind === "open_window") return { sending: null, typed: [], content: undefined, text: site.host ? t.openSite(a.app, site.host, shortUrl(a.url!), site.by) : t.openLink(a.app, shortUrl(a.url!), site.by), act, lost: false };
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el };
   }
@@ -1431,6 +1451,13 @@ export function windowLabel(w: { app: string; app_name?: string; title: string; 
   const t = T(lang), app = appName(w);
   if (w.opened) return w.title.trim() ? t.openedTitled(app, w.title) : t.openedMain(app);
   return w.title.trim() ? `${app}「${w.title}」` : t.mainWindow(app);
+}
+
+/** A URL as a card shows it: escapes decoded where they decode, cut to 160 characters. */
+export function shortUrl(u: string): string {
+  let s = u;
+  try { s = decodeURI(u); } catch { /* as it is */ }
+  return s.length > 160 ? s.slice(0, 159) + "…" : s;
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */

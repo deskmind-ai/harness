@@ -348,7 +348,7 @@ export class FrontierRuntime {
     if (r.status === "needs_plan") {
       this.count("needs_plan");
       // a URL that would land in the user's browser window: say how the plan covers it (structure, not the words)
-      const hint = a.kind === "open_window" && a.url ? `\n这个网址会开在用户已有的 ${a.app} 窗口里：在计划里打开网址的那一步写上 opens: [{ app: "${a.app}", url: "…" }]，计划卡会一并问用户，之后打开这些网站的网页不再逐次打扰。` : "";
+      const hint = a.kind === "open_window" && a.url ? `\n这个网址会开在用户已有的 ${a.app} 窗口里：在计划里打开网址的那一步写上 opens: [{ app: "${a.app}", url: "…" }]，计划卡会一并问用户。任务读过文件、看过任务目录里文件的开头，或者输入过用户没写的字以后，打开还没同意过的网站仍会单独问。` : "";
       return err(`先交计划：${r.why}${hint}`);
     }
     // the judge's "not what the user asked": the way out is the user's answer, never another guess
@@ -410,8 +410,8 @@ export class FrontierRuntime {
       for (const o of s.opens ?? []) {
         const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url });
         // the site (http or https; the full hostname): another subdomain asks on its own
-        const u = siteOf(o.url);
-        if (u && f.consequence === "modify_user" && f.object.startsWith("window:")) { const h = into.get(f.object) ?? new Set<string>(); h.add(u); into.set(f.object, h); }
+        const host = siteOf(o.url);
+        if (host && f.consequence === "modify_user" && f.object.startsWith("window:")) { const hs = into.get(f.object) ?? new Set<string>(); hs.add(host); into.set(f.object, hs); }
       }
       return into;
     });
@@ -539,7 +539,10 @@ export class FrontierRuntime {
     const cands = this.o.skills?.candidates(this.o.raw) ?? [];
     const skills = cands.length ? "\n\n## 可能适用的教程\n" + cands.map((c) => `- ${c.name}：${c.description}`).join("\n") + "\n适用的用 read_skill 读全文。" : "";
     // the folder's absolute path too: a save sheet in an app (⌘⇧G) needs it, and the model cannot find it out otherwise
-    const ws = this.o.workspace ? `\n\n## 任务目录\n用户选定的文件夹，文件工具的路径都相对它；它在这台电脑上的完整路径是 ${this.o.workspace.root}（应用的存储对话框里用这个）。现在的内容：${J(this.o.workspace.listing())}` : "";
+    const listing = this.o.workspace?.listing();
+    // the files' first lines are shown to the model: content taken in, as much as a read (a URL can carry it out)
+    if (listing?.entries.some((e) => e.preview)) this.o.executor.noteTakenIn("the task folder's listing with previews");
+    const ws = this.o.workspace ? `\n\n## 任务目录\n用户选定的文件夹，文件工具的路径都相对它；它在这台电脑上的完整路径是 ${this.o.workspace.root}（应用的存储对话框里用这个）。现在的内容：${J(listing)}` : "";
     return `你是桌面助手 DeskMind。只用工具做事；每一轮要么调用工具，要么用 finish 结束。\n\n${base}${skills}${ws}`;
   }
 

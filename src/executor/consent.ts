@@ -5,8 +5,8 @@
  * on use.
  *
  * Four scopes (docs/0.5-decisions.md D4, D5, rc.10 10-21): action (this one action), object (this object, this task,
- * up to the class signed), site (opening pages of these hosts in this object, this task), rule (a durable permission
- * the executor keeps).
+ * up to the class signed), site (opening pages of these hosts, this task), rule (a durable permission the executor
+ * keeps).
  */
 import { createHash, generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from "node:crypto";
 import type { Action, Challenge, Consequence, ConsentToken } from "./types.js";
@@ -33,11 +33,13 @@ export class ConsentSigner {
     return this.sign({ nonce: c.nonce, scope: "action", digest: c.digest, object: c.object, consequence: c.consequence, expires_at: this.now() + ttlMs, sig: "" });
   }
 
-  /** Consent to open pages of these sites (open_window with an http or https URL whose hostname is one of `hosts`)
-   *  in `object` — the user's browser window a URL lands in, or the app a new window opens in — in `task`, up to
-   *  `consequence`, and nothing else there: not a click, not typing. Per full hostname, so another subdomain asks again
-   *  (owner 10-21: per-site consent, docs/0.5-decisions.md). External: the user's yes on a card for a host the task
-   *  had not opened since it took in content; modify_user: the plan's pages in the user's window. */
+  /** Consent to open pages of these sites (open_window with an http or https URL whose hostname is one of `hosts`) in
+   *  `task`, up to `consequence`, and nothing else: not a click, not typing. Per full hostname, so another subdomain
+   *  asks again (owner 10-21: per-site consent, docs/0.5-decisions.md). The token itself is checked against `object`
+   *  (the user's browser window a URL lands in, or the app a new window opens in) when it is passed with an action.
+   *  modify_user: the plan's pages in the user's window. External: the user's yes on a card for a host the task had not
+   *  opened since it took in content — once it covered an open, the executor counts that host as approved for the rest
+   *  of the task, whatever window its later pages land in (they are then no send, and need only what their class does). */
   forSite(object: string, hosts: string[], task: string, consequence: Consequence = "modify_user", ttlMs = 60 * 60_000): ConsentToken {
     const ok = [...new Set(hosts.map((h) => h.toLowerCase()).filter(Boolean))].sort();
     return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "site", object, hosts: ok, consequence, task, expires_at: this.now() + ttlMs, sig: "" });
