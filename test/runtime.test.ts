@@ -348,3 +348,31 @@ describe("frontier runtime: the cards' language", () => {
     expect((seen[0]![0] as any).content).toContain("看得宽，动得窄");
   });
 });
+
+describe("frontier runtime: a stale action", () => {
+  it("is answered with the window looked at again, so the next try acts on what is there now (rc.6: the same click went stale over and over)", async () => {
+    const sim = new SimComputer();
+    let win = "";
+    const steps: Step[] = [
+      { calls: [{ name: "computer_snapshot", args: {} }] },
+      (ms) => ({ calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "编辑器" }, epoch: last(ms).epoch, consequence: "create", purpose: "open" } }] }),
+      (ms) => {
+        const j = last(ms); win = j.after.window.id;
+        sim.epoch++;                                              // the window moves on after the model looked
+        const id = j.after.elements.find((e: any) => e.label === "新建文档").id;
+        return { calls: [{ name: "computer_act", args: { action: { kind: "click", window: win, target: id }, epoch: j.after.epoch, consequence: "create", purpose: "new doc" } }] };
+      },
+      // the model only does what the last result lets it: the same element, at the epoch that result shows
+      (ms) => { const j = last(ms); const id = (j.after?.elements ?? []).find((e: any) => e.label === "新建文档")?.id ?? "?"; return { calls: [{ name: "computer_act", args: { action: { kind: "click", window: win, target: id }, epoch: epochOf(ms), consequence: "create", purpose: "new doc" } }] }; },
+      (ms) => ({ calls: [{ name: "finish", args: { outcome: "cannot", summary: JSON.stringify(last(ms)).slice(0, 300) } }] }),
+    ];
+    const seen: Message[][] = [];
+    const { rt } = runtime(sim, steps, user(approveAll), undefined, { model: { ...model, streamFn: scriptedStream(steps, seen) } });
+    await rt.run();
+    const results = seen.at(-1)!.filter((m) => m.role === "toolResult").map((m: any) => m.content[0].text as string);
+    const stale = results.at(-2)!, retried = results.at(-1)!;
+    expect(JSON.parse(stale.split("\n")[0]!).status).toBe("stale");
+    expect(stale).toContain("重新看");
+    expect(JSON.parse(retried.split("\n")[0]!).status).toBe("ok");
+  });
+});
