@@ -1,5 +1,5 @@
 /**
- * The execution layer as an MCP service (stdio, JSON-RPC 2.0): seven tools over the Executor, so any runtime (Codex,
+ * The execution layer as an MCP service (stdio, JSON-RPC 2.0): eight tools over the Executor, so any runtime (Codex,
  * Claude Code, our own) gets the same ownership, consequence floor, consent, start gate, intent check and completion
  * verdict. The judge and the verdict use the gateway config; the runtime above only sees refusals and reasons.
  *
