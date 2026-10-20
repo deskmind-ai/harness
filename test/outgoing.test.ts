@@ -899,3 +899,84 @@ describe("outgoing check: review of #25", () => {
     }
   });
 });
+
+describe("outgoing check: external review of #25 (P1, P2)", () => {
+  const compose = (withRects: boolean, extra: Element[] = []): Element[] => [
+    ...extra,
+    { role: "textfield", label: "收件人", value: "a@x.com", actions: ["set_value", "type"], rect: [10, 10, 300, 20] },
+    { role: "textarea", label: "正文", value: "报价单", actions: ["set_value", "type"], rect: [10, 100, 300, 200] },
+    { role: "button", label: "发送", actions: ["click"], rect: [320, 10, 40, 20] },
+  ].map((e, i) => ({ ...(e as Element), id: `elem_${i + 1}`, ...(withRects ? {} : { rect: undefined }) }));
+
+  it("P1: after the executor's own look renumbered the window, the caller's edit with its own ids goes to the element it named", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: compose(true), text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    const mine = app.forObject("window:w", "modify_user", "t1");
+    const o = await ex.observe("w");                                                          // elem_2 is 正文 here
+    const send: Action = { kind: "click", window: "w", target: "elem_3" };
+    const r1 = await ex.act({ action: send, epoch: o.epoch, consent: mine });
+    w.elements = compose(true, [{ id: "x", role: "button", label: "抄送：b@x.com", actions: ["click"], rect: [10, 40, 200, 20] }]);   // a tag ahead: ids shift
+    const r2 = await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r1.challenge!) });
+    expect(r2.status).toBe("needs_consent");                                                  // the executor's own look is now elem_3 = 正文
+    const edit = await ex.act({ action: { kind: "set_value", window: "w", target: "elem_2", value: "新报价" }, epoch: o.epoch, consent: mine });
+    expect(edit.status).toBe("ok");
+    const done = desk.log.at(-1) as Extract<Action, { kind: "set_value" }>;
+    expect(w.elements.find((e) => e.id === done.target)?.label).toBe("正文");
+  });
+
+  it("P2: accessibility ids renumbered by an incoming message ahead of the Send button: no stale, no re-ask, sent to the same button", async () => {
+    for (const withRects of [true, false]) {
+      const { judge } = judged(() => ({ choice: "sends" }));
+      const w: FakeWin = { info: { id: "w", app: "Chat", title: "Chat" }, elements: compose(withRects), text: "" };
+      const { ex, desk, app } = await setup([w], judge);
+      const o = await ex.observe("w");
+      const send: Action = { kind: "click", window: "w", target: "elem_3" };
+      const r1 = await ex.act({ action: send, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+      w.elements = compose(withRects, [{ id: "x", role: "statictext", label: "a@x.com：收到", actions: [], rect: [10, 400, 200, 20] }]);
+      const r2 = await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r1.challenge!) });
+      expect([withRects, r2.status]).toEqual([withRects, "ok"]);
+      expect(desk.log).toEqual([{ kind: "click", window: "w", target: "elem_4" }]);
+    }
+  });
+
+  it("P2: without places, the same name further down does not stand in for the header (order), and a label change on the same id asks again", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const els = (header: string, history: string[]): Element[] => [
+      { role: "statictext", label: header, actions: [] }, { role: "textarea", label: "消息", value: "明天见", actions: ["type"] }, { role: "button", label: "发送", actions: ["click"] },
+      ...history.map((h) => ({ role: "statictext", label: h, actions: [] })),
+    ].map((e, i) => ({ ...(e as Element), id: `elem_${i + 1}` }));
+    for (const [after, want] of [[els("周末群", ["张三"]), "needs_consent"], [els("李四", []), "needs_consent"], [els("张三", ["张三：在吗"]), "ok"]] as const) {
+      const w: FakeWin = { info: { id: "w", app: "Chat", title: "Chat" }, elements: els("张三", []), text: "" };
+      const { ex, app } = await setup([w], judge);
+      const o = await ex.observe("w");
+      const send: Action = { kind: "click", window: "w", target: "elem_3" };
+      const r1 = await ex.act({ action: send, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+      w.elements = after as Element[];
+      const rr = await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r1.challenge!) });
+      expect(rr.status).toBe(want);
+    }
+  });
+});
+
+describe("outgoing check: external review of #25 (P1, keys)", () => {
+  it("a key decided with the focus in the message box is not pressed when the executor's latest look has it in the search box", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const els = (focus: "msg" | "search"): Element[] => [
+      { id: "elem_1", role: "textfield", label: "搜索", actions: ["type"], focused: focus === "search", rect: [10, 10, 200, 20] },
+      { id: "elem_2", role: "textarea", label: "消息", value: "明天见", actions: ["type"], focused: focus === "msg", rect: [10, 500, 300, 40] },
+      { id: "elem_3", role: "button", label: "发送", actions: ["click"], rect: [320, 500, 40, 40] },
+    ];
+    const w: FakeWin = { info: { id: "w", app: "Chat", title: "Chat" }, elements: els("msg"), text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    const mine = app.forObject("window:w", "modify_user", "t1");
+    const o = await ex.observe("w");
+    const send: Action = { kind: "click", window: "w", target: "elem_3" };
+    const r1 = await ex.act({ action: send, epoch: o.epoch, consent: mine });
+    w.elements = els("search");
+    expect((await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r1.challenge!) })).status).toBe("needs_consent");
+    const paste = await ex.act({ action: { kind: "key", window: "w", chord: "cmd+v" }, epoch: o.epoch, consent: mine });
+    expect(paste.status).toBe("stale");
+    expect(desk.log).toEqual([]);
+  });
+});

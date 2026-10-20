@@ -85,34 +85,64 @@ const RETURN = /\b(return|enter)\b/i;
  *  here; content moving inside the window (a scroll) does. */
 const NEAR_PX = 16;
 
-/** One element as the binding knows it: its content (role, label, value, focus, and where it was read from), its
- *  identity — the id for an accessibility element, its position for one read from the screen (text recognition
- *  renumbers its ids every look) — and whether it can be acted on (`act`). Peekaboo's accessibility ids (elem_N) are
- *  not stable either: they are numbered per look. Pairing by id is safe only because every element of the window is
- *  bound: the same id with another label is a change, and a renumbering that pairs nothing asks again (more cards,
- *  never fewer). */
-interface Ident { c: string; id?: string; at: [number, number] | null; act?: true }
+/** One element as the binding knows it: its content (role, label, value, focus, and where it was read from), its place
+ *  (the centre of its rect, in the window's own coordinates) when the driver gives one, whether it can be acted on
+ *  (`act`), and whether it came from the accessibility tree (`ax`). Never its id: text recognition renumbers its ids
+ *  every look, and so does Peekaboo for the accessibility tree (elem_N in traversal order: an incoming message ahead of
+ *  the Send button shifts every later id). An id is a handle into one observation, not an identity (review of #25). */
+interface Ident { c: string; at: [number, number] | null; act?: true; ax?: true }
 const identOf = (e: Element, withFocus = true): Ident => ({
   c: canon([e.role, e.label, e.value ?? null, fromScreen(e) ? "pixels" : "ax", ...(withFocus ? [!!e.focused] : [])]),
-  ...(fromScreen(e) ? {} : { id: e.id }),
-  ...(e.actions.length ? { act: true as const } : {}),
   at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null,
+  ...(e.actions.length ? { act: true as const } : {}),
+  ...(fromScreen(e) ? {} : { ax: true as const }),
 });
-/** The same element: same content, and the same id (accessibility) or roughly the same place (screen; without a
- *  position on either side, content alone). */
-const sameEl = (a: Ident, b: Ident): boolean => a.c === b.c && (a.id !== undefined || b.id !== undefined ? a.id === b.id : !a.at || !b.at || (Math.abs(a.at[0] - b.at[0]) <= NEAR_PX && Math.abs(a.at[1] - b.at[1]) <= NEAR_PX));
-const dist = (a: Ident, b: Ident) => (a.at && b.at ? Math.abs(a.at[0] - b.at[0]) + Math.abs(a.at[1] - b.at[1]) : 0);
+const close = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) <= NEAR_PX && Math.abs(a[1] - b[1]) <= NEAR_PX;
+/** Two elements, each already found, are the same: same content, and roughly the same place when both have one. */
+const sameEl = (a: Ident, b: Ident): boolean => a.c === b.c && (a.at && b.at ? close(a.at, b.at) : !a.at && !b.at);
 
-/** The element an action decided on (`id` in the observation it was decided on), found in another look of the window
- *  by identity: the driver acts on ids of its latest look, and text recognition's ids shift between looks. Null when
- *  it is gone, or not one of a kind — already where it was decided (two「发送」 in one place) or in the look. */
+/** Pair every element of `bound` with one of `now`, one to one; null when one cannot be paired or the pairing is not
+ *  certain. With a place on every element: the same content within NEAR_PX, exactly one candidate. Without: by order
+ *  — `bound` must appear in `now` in the same order (things may have come in between), and in one way only (the
+ *  earliest and the latest such pairing agree); a same-named line elsewhere breaks the order, a duplicate makes it
+ *  uncertain. Returns the indexes of `now` that were paired. */
+function pair(bound: Ident[], now: Ident[]): Set<number> | null {
+  if (bound.every((b) => b.at) && now.every((n) => n.at)) {
+    const used = new Set<number>();
+    for (const b of bound) {
+      const fit = now.map((n, i) => (n.c === b.c && close(n.at!, b.at!) ? i : -1)).filter((i) => i >= 0);
+      if (fit.length !== 1 || used.has(fit[0]!)) return null;
+      used.add(fit[0]!);
+    }
+    return used;
+  }
+  const first: number[] = [], last: number[] = [];
+  let j = 0;
+  for (const b of bound) { while (j < now.length && now[j]!.c !== b.c) j += 1; if (j >= now.length) return null; first.push(j); j += 1; }
+  j = now.length - 1;
+  for (let k = bound.length - 1; k >= 0; k -= 1) { while (j >= 0 && now[j]!.c !== bound[k]!.c) j -= 1; if (j < 0) return null; last.unshift(j); j -= 1; }
+  return first.every((x, i) => x === last[i]) ? new Set(first) : null;
+}
+
+/** The element an action names (`id` in the caller's observation `decided`), found in `look` — what the driver acts on
+ *  now, whose ids may be numbered otherwise. With a place: the same content within NEAR_PX, one of a kind both where it
+ *  was decided and now. An accessibility element without a place: its order among elements of the same content, the
+ *  same count in both. A screen element without a place: its content, one of a kind in both. Null otherwise: gone, or
+ *  not certain which — the caller looks again. */
 function resolve(decided: Observation, id: string, look: Observation): Element | null {
   const was = decided.elements.find((e) => e.id === id);
   if (!was) return null;
   const w = identOf(was, false);
-  if (decided.elements.some((e) => e !== was && sameEl(identOf(e, false), w))) return null;
-  const like = look.elements.filter((e) => sameEl(identOf(e, false), w));
-  return like.length === 1 ? like[0]! : null;
+  const like = (o: Observation) => o.elements.filter((e) => identOf(e, false).c === w.c);
+  if (w.at) {
+    const near = (e: Element) => { const i = identOf(e, false); return !!i.at && close(i.at, w.at!); };
+    if (like(decided).some((e) => e !== was && near(e))) return null;
+    const now = like(look).filter(near);
+    return now.length === 1 ? now[0]! : null;
+  }
+  const d = like(decided), l = like(look);
+  if (w.ax) return d.length === l.length && !l[d.indexOf(was)]!.rect ? l[d.indexOf(was)]! : null;
+  return d.length === 1 && l.length === 1 ? l[0]! : null;
 }
 
 /** What a consent to a send is bound to: the window, the dialog's title, the typed text, the target and the focused
@@ -135,18 +165,13 @@ function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding):
   if (!one(bound.target, now.target) || !one(bound.focused, now.focused)) return false;
   // strict, for a window read from the screen: nothing may have changed at all
   if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return sameScreen(bound.whole, now.whole);
-  const used = new Set<number>();
-  for (const b of bound.elements) {
-    let best = -1;
-    now.elements.forEach((n, i) => { if (!used.has(i) && sameEl(b, n) && (best < 0 || dist(b, n) < dist(b, now.elements[best]!))) best = i; });
-    if (best < 0) return false;
-    used.add(best);
-  }
+  const used = pair(bound.elements, now.elements);
+  if (!used) return false;
   // what came since: in a window read from the accessibility tree, only what cannot be acted on (an incoming message,
   // a "typing…" line); a new button, tag, link or field may be a new recipient (review of #25: 「b@evil.com」 added).
   // Text recognition offers every row as clickable, so in a screen-read window under `match` nothing tells them apart:
   // additions stay allowed there (the owner's trade-off; `strict` is the default)
-  if (now.elements.some((n, i) => !used.has(i) && n.act && n.id !== undefined)) return false;
+  if (now.elements.some((n, i) => !used.has(i) && n.act && n.ax)) return false;
   return true;
 }
 
@@ -700,6 +725,22 @@ export class Executor {
     // Any action that reads the observation, or needs consent, waits for the window to be looked at again
     const readsObs = ("target" in req.action && !!req.action.target) || req.action.kind === "key" || req.action.kind === "type";
     if (obs && obs.epoch !== now.epoch && (readsObs || NEEDS_CONSENT.has(consequence))) return done({ ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
+    // the caller names elements by ids of its own observation; the driver acts on ids of its latest look, which may be
+    // the executor's own (a last look before a send) and numbered otherwise. Every action that names an element finds it
+    // in that latest look by what it is and where (resolve), exactly one, or the caller looks again; the card and the
+    // effect then both use that element (review of #25: the card said 正文, the text went into 收件人). Where a key or
+    // typed text goes — the focused element — must be the same in both too
+    const latest = target ? this.looks.get(target) ?? obs : undefined;
+    let act: Action = req.action;
+    if (obs && latest && "target" in req.action && req.action.target) {
+      const el = resolve(obs, req.action.target, latest);
+      if (!el) return done({ ...base, status: "stale", why: `element ${req.action.target} cannot be found for certain in what ${target} shows now (gone, or not one of a kind); observe it again`, epoch: now.epoch });
+      if (el.id !== req.action.target) act = { ...req.action, target: el.id } as Action;
+    }
+    if (obs && latest && latest !== obs && (req.action.kind === "key" || req.action.kind === "type")) {
+      const f1 = obs.elements.find((e) => e.focused), f2 = latest.elements.find((e) => e.focused);
+      if (!f1 !== !f2 || (f1 && f2 && !sameEl(identOf(f1, false), identOf(f2, false)))) return done({ ...base, status: "stale", why: `the focus in ${target} is not where it was when this was decided; observe it again`, epoch: now.epoch });
+    }
     // the class, settled here and never taken from the caller: structure, the model's class, and the judge's "will this
     // send something out?" (only raises; cached, so a preview's or a classify call's answer is the same one)
     const asked = this.classified.size;
@@ -760,7 +801,6 @@ export class Executor {
     // #23: 「预览」 decided, 「发送」 there). For a send, what goes out is worked out again from that look; when it is not
     // what the consent was bound to, nothing is sent and the user is asked about what is there now (rc.6 end-to-end,
     // harness-dd's proposal (b)). Only what goes out is compared — a new incoming message or a clock does not ask again
-    let act: Action = req.action;
     if (target && obs && (this.mightSend(req.action) || consequence === "external")) {
       let fresh: Observation;
       try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
