@@ -282,6 +282,9 @@ export class Executor {
   private stopped = false;
   private epoch = 0;
   private last: Snapshot | null = null;
+  /** The computer as the task began (null before begin): facts for whatever is filtered by structure — which apps are
+   *  on screen — never by the user's words. */
+  beginSnapshot: Snapshot | null = null;
   private lastObs = new Map<string, Observation>();
   /** Each window as the task first saw it: what "that row was X and is now gone" is proved against. */
   private firstObs = new Map<string, Observation>();
@@ -552,6 +555,7 @@ export class Executor {
     if (ws && !this.recovered) this.journal("begin", { versions: { ...this.seen } });     // what a restart compares against
     this.epoch = raw.epoch;
     this.last = this.ledger.stamp(raw);
+    this.beginSnapshot = this.last;
     this.emit("executor.begin", { windows: this.last.windows.length, locked: this.last.locked, ...(this.last.input_watch !== undefined ? { input_watch: this.last.input_watch } : {}) });
     return this.last;
   }
@@ -786,11 +790,12 @@ export class Executor {
     // why the epoch moved, when the driver says (hands#53: the snapshot's epoch_reason — an action, the user's input and
     // to which app, a window that appeared, vanished or was renamed), for a stale result's trace; older drivers say nothing
     let epochWhy: unknown;
+    let stepConsented = false, foregroundOk = false;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       const { consent, ...rest } = req;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: r });
-      this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}) });
+      this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -950,10 +955,18 @@ export class Executor {
         return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
       }
       this.challenges.delete(req.consent.nonce);                 // spent: nothing will be explained against it any more
+      stepConsented = true;
     }
+    // the foreground route (hands#54: `foreground_ok` on the action lets an app that can only be operated in front come
+    // forward for this one step) only where the user is not overridden: the task's own window, or a window the user
+    // consented to — an object token for it, verified here, or this very step's own token, spent above. Never a user's
+    // window without consent. Sent to the driver only; the model never sees it
+    const fgWindow = "window" in act ? act.window : null;
+    const objectToken = !!fgWindow && req.consent?.scope === "object" && req.consent.object === `window:${fgWindow}` && this.consent.check(act, `window:${fgWindow}`, "modify_user", this.opts.task, req.consent) === null;
+    foregroundOk = !!fgWindow && (this.ledger.ownerOf(`window:${fgWindow}`) === "task" || objectToken || stepConsented);
     if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence) });
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
-    try { r = await this.driver.perform(act); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    try { r = await this.driver.perform(act, foregroundOk ? { foreground_ok: true } : undefined); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
@@ -1308,6 +1321,9 @@ export function outgoing(obs: Observation | undefined): { fields: string[]; show
   return { fields, shown, bound };
 }
 
+/** The app as the user knows it: hands' localized `app_name`, else what the driver calls it (a bundle id on hands). */
+export const appName = (w: { app: string; app_name?: string }): string => w.app_name?.trim() || w.app;
+
 /** The consent card's text: the action in words, with the element it touches and what that means. */
 export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability, lang?: Lang): string {
   const t = T(lang);
@@ -1316,7 +1332,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
     return consequence === "external" ? `${what}（${t.sends}）` : consequence === "modify_user" ? `${what}（${t.modifiesFile}）` : what;
   }
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
-  const where = obs ? `${obs.window.app}「${obs.window.title}」` : "window" in a ? a.window : "";
+  const where = obs ? `${appName(obs.window)}「${obs.window.title}」` : "window" in a ? a.window : "";
   const what = a.kind === "click" ? t.click(el?.label ?? a.target) : a.kind === "double_click" ? t.doubleClick(el?.label ?? a.target)
     : a.kind === "set_value" ? t.set(el?.label ?? a.target, a.value)
     : a.kind === "type" ? t.type(el?.label ?? a.target, a.text)

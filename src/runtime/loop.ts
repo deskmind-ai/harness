@@ -24,7 +24,7 @@ import * as R from "../protocol/roles.js";
 import type { Workspace } from "../registry/workspace.js";
 import { canon } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
-import { Executor, describeAction } from "../executor/executor.js";
+import { Executor, appName, describeAction } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
 import { defaultJudge } from "../executor/judge.js";
 import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "../executor/types.js";
@@ -382,7 +382,7 @@ export class FrontierRuntime {
     const named = new Set(objectsOf.flat());
     const fgList = (snap.needs_foreground ?? []).map((b) => b.toLowerCase());
     const inFront = (w: { id: string; app: string; needs_foreground?: boolean }) => !!w.needs_foreground || fgList.some((b) => b === w.app.toLowerCase() || w.id.toLowerCase().startsWith(b + "#"));
-    const fgApps = [...new Set(snap.windows.filter((w) => named.has(`window:${w.id}`) && inFront(w)).map((w) => w.app))];
+    const fgApps = [...new Set(snap.windows.filter((w) => named.has(`window:${w.id}`) && inFront(w)).map((w) => appName(w)))];
     if (fgApps.length) this.emit("plan.foreground", { apps: fgApps });
     this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor });
     if (!classes.some((c) => NEEDS_CONSENT.has(c))) return text("计划记下了；这些步骤不需要用户同意，直接做。");
@@ -395,7 +395,7 @@ export class FrontierRuntime {
     // review of #31); what did not resolve is shown as the model wrote it, and is not signed
     const shown = (o: string): string => {
       const id = o.slice(o.indexOf(":") + 1);
-      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return w.title.trim() ? `${w.app}「${w.title}」` : this.t.mainWindow(w.app); }
+      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return w.title.trim() ? `${appName(w)}「${w.title}」` : this.t.mainWindow(appName(w)); }
       if (o.startsWith("tab:")) for (const w of snap.windows) { const t = w.tabs?.find((x) => x.id === id); if (t) { let site = ""; try { site = new URL(t.url).host; } catch { /* no site */ } return `「${t.title}」${site ? `（${site}）` : ""}`; } }
       if (o.startsWith("path:") && there.has(o)) return id;
       return o;
