@@ -23,7 +23,7 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, rank } from "./types.js";
-import { ConsentVerifier, canon, digestOf } from "./consent.js";
+import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import { T, type Lang } from "../runtime/text.js";
@@ -347,7 +347,9 @@ export class Executor {
     this.challenges.set(c.nonce, { action, epoch, object, consequence });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
-    return c;
+    // a host asked about after the task took in content: the yes approves the host for the rest of the task
+    const site = consequence === "external" ? this.siteRule(action)?.host : undefined;
+    return site ? { ...c, site } : c;
   }
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
@@ -661,13 +663,14 @@ export class Executor {
     const object = objectOf(a);
     if (a.kind === "wait" || a.kind === "focus_window" || a.kind === "scroll") return { consequence: "read", object, why: "changes no content" };
     if (a.kind === "open_window") {
-      // a URL that carries what the task typed or read (a query with the draft, a path with a line of a file) sends it
-      // to that site: external, asked every time — by the executor's own record of typed and read text, not by meaning
-      // (review of #33)
-      if (a.url && this.carriesTaskText(a.url)) return { consequence: "external", object, why: `the URL carries text the task typed or read: ${a.url}` };
       // a URL handed to a browser the user already has open lands as a tab in their window (deskmind#73): that is
       // the user's thing and asks first; without a URL, or for an app not running, a new window of the task's own
       const theirs = a.url ? this.last?.windows.find((w) => w.owner === "user" && (w.app === a.app || w.id.startsWith(a.app + "#"))) : undefined;
+      // once the task has taken in content (read a file, typed what the user did not write), a URL can carry it out:
+      // a host not approved yet in this task is a send, asked once per host; a URL that is not http(s) every time
+      // (owner 10-21: per-site consent, replacing the text matching of #33)
+      const s = this.siteRule(a);
+      if (s) return { consequence: "external", object: theirs ? `window:${theirs.id}` : object, why: s.host ? `the task has ${s.by === "read" ? "read the user's files" : "typed text the user did not write"}; opening ${s.host} may carry what it took in` : `the task has taken in content; ${a.url} is not an http(s) page and may carry it` };
       if (theirs) return { consequence: "modify_user", object: `window:${theirs.id}`, why: `opens ${a.url} in the user's ${a.app} window` };
       return { consequence: "create", object, why: "a window of the task's own" };
     }
@@ -710,20 +713,29 @@ export class Executor {
     return false;
   }
 
-  /** Does this URL carry text the task typed (anywhere) or read from a file in this run — other than the user's own
-   *  words (the request, before and after a steer, and what they wrote in answer on cards; not an option the model
-   *  offered)? Compared as text: overlapping windows of what was typed or read (4 characters of a run of CJK, 8 of a run
-   *  of letters and digits — a run of 5 to 8 whole) against every reading of the URL (urlReadings: decoded run by run,
-   *  its values joined, base64 tokens decoded). A window found in the user's words does not count. An extra card is the
-   *  cost of a coincidence; the other way is content leaving without one. */
-  private carriesTaskText(url: string): boolean {
-    const hay = urlReadings(url);
+  /** Has the task taken in content in this run: read a file (a file action that returned output), or typed text that
+   *  is not in the user's own words (the request, before and after a steer, and what they wrote in answer on cards;
+   *  not an option the model offered)? What it read on screen is not counted (a known gap, docs/0.5-decisions.md). */
+  private tookIn(): "read" | "typed" | null {
+    if (this.receipts.some((r) => r.request.action.kind === "file" && r.result.output && Object.keys(r.result.output).length)) return "read";
     const theirs = [this.opts.raw ?? "", ...this.earlierRequests, ...this.userWrote].join("\n").toLowerCase();
-    const texts: string[] = [];
-    for (const list of this.typed.values()) texts.push(...list);
-    for (const r of this.receipts) if (r.request.action.kind === "file" && r.result.output) for (const v of Object.values(r.result.output)) if (typeof v === "string") texts.push(v.slice(0, 200_000));
-    for (const t of texts) for (const w of textWindows(t)) if (!theirs.includes(w) && hay.some((h) => h.includes(w))) return true;
-    return false;
+    return this.typedEver.some((t) => t.trim() && !theirs.includes(t.trim().toLowerCase())) ? "typed" : null;
+  }
+  /** Every text the task typed (type / set_value that went through), never cleared: what tookIn reads. */
+  private typedEver: string[] = [];
+  /** Hosts the user approved in this task for opening after content was taken in (a site token at external). */
+  private sites = new Set<string>();
+
+  /** The per-site rule for an open_window with a URL, when it makes the open a send: after the task took in content, an
+   *  http(s) URL to a host not approved yet (`host` is that host; consent is per host for the rest of the task) and
+   *  any other URL but file: (`host` null: asked every time). Null when the rule does not apply. */
+  private siteRule(a: Action): { host: string | null; by: "read" | "typed" } | null {
+    if (a.kind !== "open_window" || !a.url || /^file:/i.test(a.url.trim())) return null;
+    const by = this.tookIn();
+    if (!by) return null;
+    const host = siteOf(a.url);
+    if (host && this.sites.has(host)) return null;
+    return { host, by };
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
@@ -821,15 +833,18 @@ export class Executor {
     const whole = pixels && look ? bindable.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null, ...(anonymous(e) ? { anon: true } : {}) })) : undefined;
     const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), elements: bindable.map((e) => identOf(e, focusOf(e))), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
+    // an open the per-site rule makes a send: the card names the site (not the page) and why — nothing on screen goes out
+    const site = consequence === "external" ? this.siteRule(a) : null;
+    if (site && a.kind === "open_window") return { sending: null, typed: [], content: undefined, text: site.host ? t.openSite(a.app, site.host, site.by) : t.openLink(a.app, a.url!, site.by), act, lost: false };
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el };
   }
 
   /** classify's cache key: the action, the screen it is decided on — the epoch and which observation of the window —
-   *  the model's class, and the text the task typed into the window so far (evidence the judge read: other text is
-   *  another question). */
+   *  the model's class, the text the task typed into the window so far (evidence the judge read: other text is
+   *  another question), and for an open_window the per-site rule as it stands (content taken in, the host approved). */
   private classifyKey(a: Action, epoch: number, declared?: Consequence): string {
-    return canon({ a, epoch, seen: "window" in a ? this.obsSeq.get(a.window) ?? 0 : null, declared: declared ?? null, typed: this.typedIn(a) });
+    return canon({ a, epoch, seen: "window" in a ? this.obsSeq.get(a.window) ?? 0 : null, declared: declared ?? null, typed: this.typedIn(a), site: this.siteRule(a) });
   }
 
   /** What `act` would decide before doing anything, without waiting on a judge: `classify`'s answer when it has been
@@ -957,6 +972,8 @@ export class Executor {
       // action" was said of the same click whose window had changed)
       const same = !!stored && req.consent?.digest === digestOf(req.action, base.object, consequence, stored);
       if (why === "consent is for another action" && same) why = "what goes out changed since it was approved";
+      // a site token at external that covers this open: the host is approved for the rest of the task
+      if (!why && req.consent?.scope === "site" && consequence === "external" && req.action.kind === "open_window" && req.action.url) { const h = siteOf(req.action.url); if (h) this.sites.add(h); }
       if (why) {
         if ((why === "consent is for another action" || why === "what goes out changed since it was approved") && req.consent) {
           const was = this.challenges.get(req.consent.nonce);
@@ -1035,6 +1052,7 @@ export class Executor {
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
     // send that went through took it with it
     if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
+      if (req.action.kind === "type" || req.action.kind === "set_value") this.typedEver.push(req.action.kind === "type" ? req.action.text : req.action.value);
       if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) this.typed.delete(req.action.window);
       else if (req.action.kind === "type" || req.action.kind === "set_value") this.typed.set(req.action.window, this.typedIn(req.action));
     }
@@ -1413,36 +1431,6 @@ export function windowLabel(w: { app: string; app_name?: string; title: string; 
   const t = T(lang), app = appName(w);
   if (w.opened) return w.title.trim() ? t.openedTitled(app, w.title) : t.openedMain(app);
   return w.title.trim() ? `${app}「${w.title}」` : t.mainWindow(app);
-}
-
-/** Every reading of a URL to look for text in, lower-cased: as written; with each run of %XX escapes decoded on its
- *  own (one stray "%" does not stop the rest — review of #33) and "+" as a space; the host, the path's segments and the
- *  query's values joined end to end (text split across parameters); and each base64-looking token decoded. */
-export function urlReadings(url: string): string[] {
-  const runs = (x: string) => x.replace(/(?:%[0-9a-fA-F]{2})+/g, (r) => { try { return decodeURIComponent(r); } catch { return r; } });
-  const out = [url, runs(url.replace(/\+/g, " "))];
-  let host = "", segs: string[] = [], vals: string[] = [];
-  try {
-    const u = new URL(url); host = u.host;
-    segs = u.pathname.split("/");
-    vals = u.search.replace(/^\?/, "").split("&").map((kv) => kv.slice(kv.indexOf("=") + 1));       // the values, not the keys
-  } catch { segs = url.split(/[/?&=#]/); }
-  const dec = (xs: string[]) => xs.map((x) => runs(x.replace(/\+/g, " ")));
-  const values = [...dec(segs), ...dec(vals)];
-  out.push(host, dec(segs).join(""), dec(vals).join(""), values.join(" "));
-  for (const v of [...values, ...host.split(".")]) if (/^[A-Za-z0-9+/_-]{4,}={0,2}$/.test(v)) {
-    try { const d = Buffer.from(v.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"); if (d && !/[\u0000-\u0008\ufffd]/.test(d)) out.push(d); } catch { /* not base64 */ }
-  }
-  return out.map((x) => x.toLowerCase());
-}
-
-/** Overlapping windows of a text to look for elsewhere, lower-cased: every 4 characters of a run of CJK (runs shorter
- *  than 4 are too common to mean anything), every 8 of a run of letters and digits, and a run of 5 to 8 whole. */
-export function textWindows(text: string): string[] {
-  const t = text.toLowerCase(), out = new Set<string>();
-  for (const m of t.matchAll(/[\u3400-\u9fff\uf900-\ufaff]+/g)) { const r = [...m[0]]; for (let i = 0; i + 4 <= r.length; i += 1) out.add(r.slice(i, i + 4).join("")); }
-  for (const m of t.matchAll(/[a-z0-9]+/g)) { const r = m[0]; if (r.length >= 5 && r.length <= 8) out.add(r); else for (let i = 0; i + 8 <= r.length; i += 1) out.add(r.slice(i, i + 8)); }
-  return [...out];
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */

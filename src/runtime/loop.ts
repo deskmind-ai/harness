@@ -22,7 +22,7 @@ import type { Capability, Registry } from "../registry/capability.js";
 import * as P from "../orchestrator/prompts.js";
 import * as R from "../protocol/roles.js";
 import type { Workspace } from "../registry/workspace.js";
-import { canon, normalUrl } from "../executor/consent.js";
+import { canon, siteOf } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
 import { Executor, appName, describeAction, windowLabel } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
@@ -31,10 +31,9 @@ import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult,
 
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
 /** What signs consent: the app (keychain) in production, a ConsentSigner in tests and the CLI. */
-export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject" | "forOpen">;
+export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject" | "forSite">;
 const LOOK_ONLY = "the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed";
 /** A URL on a card: readable (decoded), without the scheme, cut at 120 characters (the query stays visible up to there). */
-const shortUrl = (u: string) => { let s = u.replace(/^https?:\/\//, ""); try { s = decodeURI(s); } catch { /* as it is */ } return s.length > 120 ? s.slice(0, 117) + "…" : s; };
 
 /** A plan step as the model writes it; `opens`: the URLs it opens with open_window, and in which app. */
 export interface PlanStepIn { purpose: string; objects: string[]; consequence: Consequence; opens?: { app: string; url: string }[] }
@@ -109,8 +108,9 @@ export class FrontierRuntime {
   readonly effects: string[] = [];
   readonly verdicts: RuntimeResult["verdicts"] = [];
   private tokens = new Map<string, ConsentToken>();       // object → consent from an approved plan
-  /** window → consent to open pages of the plan's sites there (open_window with a URL), from an approved plan */
-  private openTokens = new Map<string, ConsentToken>();
+  /** Consents to open pages of some sites in a window (open_window with an http(s) URL): the plan's sites there
+   *  (modify_user), and each host the user approved on a card after the task took in content (external) */
+  private siteTokens: ConsentToken[] = [];
   /** After a verdict that only the evidence is missing: the model may look, not act (finish's lookOnly). */
   private lookOnly = false;
   /** The user's yes to one action, kept when the executor then found the screen changed (stale) and the model retries
@@ -193,7 +193,11 @@ export class FrontierRuntime {
     const got = await this.askCard(card);
     this.emit("consent.asked", { object: c.object, consequence: c.consequence, picked: got?.option?.kind ?? null });
     if (!got) return null;
-    if (got.option?.kind === "approve") { const t = this.o.signer.forAction(c); this.consents.push({ scope: "action", object: c.object, consequence: c.consequence }); return t; }
+    if (got.option?.kind === "approve") {
+      // a host asked about after the task took in content: the yes is for that site for the rest of the task
+      if (c.site) { const t = this.o.signer.forSite(c.object, [c.site], this.o.task, c.consequence); this.siteTokens.push(t); this.consents.push({ scope: "site", object: c.object, consequence: c.consequence }); return t; }
+      const t = this.o.signer.forAction(c); this.consents.push({ scope: "action", object: c.object, consequence: c.consequence }); return t;
+    }
     if (got.option?.kind === "cancel") return "cancel";
     this.count("declined");
     return "declined";
@@ -311,10 +315,10 @@ export class FrontierRuntime {
     // does not cover it — a send is never covered by one. Choosing by a class guessed here either paid the judge on
     // stale actions or, by the old send hints, left the token behind for a site search the judge clears
     const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
-    // a URL to open in a window the plan covered for its site: that consent; anything else there, the plan's object
-    // consent if it named the window — the executor checks either against the action
-    const page = a.kind === "open_window" && a.url ? normalUrl(a.url) : null;
-    const opening = page && this.openTokens.get(pre.object)?.urls?.includes(page) ? this.openTokens.get(pre.object) : undefined;
+    // a URL of a site consented to there (the plan's, or a host approved on a card): that consent, the highest class
+    // first; anything else there, the plan's object consent if it named the window — the executor checks either
+    const host = a.kind === "open_window" && a.url ? siteOf(a.url) : null;
+    const opening = host ? this.siteTokens.filter((t) => t.object === pre.object && t.hosts?.includes(host)).sort((x, y) => rank(y.consequence) - rank(x.consequence))[0] : undefined;
     const consent = this.retryTokens.get(canon(a)) ?? opening ?? this.tokens.get(pre.object);
     let r: ActResult;
     try { r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
@@ -344,7 +348,7 @@ export class FrontierRuntime {
     if (r.status === "needs_plan") {
       this.count("needs_plan");
       // a URL that would land in the user's browser window: say how the plan covers it (structure, not the words)
-      const hint = a.kind === "open_window" && a.url ? `\n这个网址会开在用户已有的 ${a.app} 窗口里：在计划里打开网址的那一步写上 opens: [{ app: "${a.app}", url: "…" }]，计划卡会一并问用户，之后打开网址不再逐次打扰。` : "";
+      const hint = a.kind === "open_window" && a.url ? `\n这个网址会开在用户已有的 ${a.app} 窗口里：在计划里打开网址的那一步写上 opens: [{ app: "${a.app}", url: "…" }]，计划卡会一并问用户，之后打开这些网站的网页不再逐次打扰。` : "";
       return err(`先交计划：${r.why}${hint}`);
     }
     // the judge's "not what the user asked": the way out is the user's answer, never another guess
@@ -398,15 +402,15 @@ export class FrontierRuntime {
     const snap = await this.o.executor.snapshot();           // one look for the whole plan
     // a URL a step opens lands where the executor's floor for that open_window says: in the user's browser window when
     // the app has one (「搜索今天北京天气」, rc.10: nine cards for nine pages in the user's Chrome). That window is one
-    // of the step's objects, by the executor's view — listed on the card and covered by one approval
-    // — listed with the sites it opens, and covered by a consent to open pages of those sites there, nothing else (not
-    // the whole window: review of #33)
+    // of the step's objects, by the executor's view — listed on the card with the sites it opens, and covered by a
+    // consent to open pages of those sites there, nothing else (not the whole window: review of #33). An open the
+    // floor calls a send (a new host after the task took in content) is not covered here: it asks on its own card
     const opensInto = steps.map((s) => {
       const into = new Map<string, Set<string>>();
       for (const o of s.opens ?? []) {
         const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url });
-        // exactly this page (http or https; a query can carry content): another page of the site asks on its own
-        const u = normalUrl(o.url);
+        // the site (http or https; the full hostname): another subdomain asks on its own
+        const u = siteOf(o.url);
         if (u && f.consequence === "modify_user" && f.object.startsWith("window:")) { const h = into.get(f.object) ?? new Set<string>(); h.add(u); into.set(f.object, h); }
       }
       return into;
@@ -451,7 +455,7 @@ export class FrontierRuntime {
     };
     const listed = steps.map((_s, i) => [
       ...objectsOf[i]!.map(shown).filter((x): x is string => x !== null),
-      ...[...opensInto[i]!].filter(([w]) => theirs(w)).map(([w, us]) => this.t.openInYours(appName(snap.windows.find((x) => `window:${x.id}` === w)!), [...us].map(shortUrl))),
+      ...[...opensInto[i]!].filter(([w]) => theirs(w)).map(([w, us]) => this.t.openInYours(appName(snap.windows.find((x) => `window:${x.id}` === w)!), [...us])),
     ]);
     const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
     const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
@@ -467,9 +471,9 @@ export class FrontierRuntime {
       this.consents.push({ scope: "object", object: obj, consequence: "modify_user" });
     }
     for (const [obj, hosts] of openGrants) {
-      const t = this.o.signer.forOpen(obj, [...hosts], this.o.task);
-      this.openTokens.set(obj, t);
-      this.consents.push({ scope: "open", object: obj, consequence: "modify_user" });
+      const t = this.o.signer.forSite(obj, [...hosts], this.o.task, "modify_user");
+      this.siteTokens.push(t);
+      this.consents.push({ scope: "site", object: obj, consequence: "modify_user" });
     }
     this.emit("plan.confirmed", { objects: [...this.tokens.keys()], opens: Object.fromEntries([...openGrants].map(([w, h]) => [w, [...h]])) });
     return text("用户同意了计划。改用户东西的步骤可以做了；往外发的步骤到时候会再确认一次。");

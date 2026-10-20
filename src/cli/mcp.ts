@@ -67,7 +67,7 @@ export class McpExecutorServer {
         if (r.status === "needs_consent" && r.challenge && this.signer) {
           // development only: this process stands in for the app and signs; every such consent is logged
           this.o.log?.(JSON.stringify({ k: "auto_consent", text: r.challenge.text }));
-          r = await ex.act({ ...req, epoch: r.epoch, consent: this.signer.forAction(r.challenge) });
+          r = await ex.act({ ...req, epoch: r.epoch, consent: r.challenge.site ? this.signer.forSite(r.challenge.object, [r.challenge.site], ex.opts.task, r.challenge.consequence) : this.signer.forAction(r.challenge) });
         }
         const { after, ...rest } = r;
         return { ...rest, ...(after ? { after: { epoch: after.epoch, window: after.window, modal: after.modal, elements: after.elements, text: after.text } } : {}) } as unknown as Json;

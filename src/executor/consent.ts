@@ -4,8 +4,9 @@
  * action, object and class — and, for a send, to what goes out — and every token expires and (action scope) is spent
  * on use.
  *
- * Three scopes (docs/0.5-decisions.md D4, D5): action (this one action), object (this object, this task, up to the
- * class signed), rule (a durable permission the executor keeps).
+ * Four scopes (docs/0.5-decisions.md D4, D5, rc.10 10-21): action (this one action), object (this object, this task,
+ * up to the class signed), site (opening pages of these hosts in this object, this task), rule (a durable permission
+ * the executor keeps).
  */
 import { createHash, generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from "node:crypto";
 import type { Action, Challenge, Consequence, ConsentToken } from "./types.js";
@@ -32,12 +33,14 @@ export class ConsentSigner {
     return this.sign({ nonce: c.nonce, scope: "action", digest: c.digest, object: c.object, consequence: c.consequence, expires_at: this.now() + ttlMs, sig: "" });
   }
 
-  /** Consent to open exactly these pages (open_window with one of these URLs, normalised; http and https only) in
-   *  `object` — the user's browser window a URL lands in — in `task`, and nothing else there: not a click, not typing,
-   *  not another page of the same site (a query can carry what the task typed — review of #33). */
-  forOpen(object: string, urls: string[], task: string, ttlMs = 60 * 60_000): ConsentToken {
-    const ok = [...new Set(urls.map(normalUrl).filter((u): u is string => u !== null))].sort();
-    return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "open", object, urls: ok, consequence: "modify_user", task, expires_at: this.now() + ttlMs, sig: "" });
+  /** Consent to open pages of these sites (open_window with an http or https URL whose hostname is one of `hosts`)
+   *  in `object` — the user's browser window a URL lands in, or the app a new window opens in — in `task`, up to
+   *  `consequence`, and nothing else there: not a click, not typing. Per full hostname, so another subdomain asks again
+   *  (owner 10-21: per-site consent, docs/0.5-decisions.md). External: the user's yes on a card for a host the task
+   *  had not opened since it took in content; modify_user: the plan's pages in the user's window. */
+  forSite(object: string, hosts: string[], task: string, consequence: Consequence = "modify_user", ttlMs = 60 * 60_000): ConsentToken {
+    const ok = [...new Set(hosts.map((h) => h.toLowerCase()).filter(Boolean))].sort();
+    return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "site", object, hosts: ok, consequence, task, expires_at: this.now() + ttlMs, sig: "" });
   }
 
   /** Consent for every action on `object` in `task` up to `consequence`, until it expires. */
@@ -109,13 +112,13 @@ export class ConsentVerifier {
         if (this.spent.has(t.nonce)) return "consent already used";
         return null;
       }
-      if (t.scope === "open") {
+      if (t.scope === "site") {
         if (t.task !== task) return "consent is for another task";
         if (t.object !== object) return "consent is for another object";
         if (action.kind !== "open_window" || !action.url) return "consent covers opening pages only";
-        const u = normalUrl(action.url);
-        if (!u) return "consent covers http(s) pages only";
-        return t.urls?.includes(u) ? null : `consent does not cover ${u}`;
+        const h = siteOf(action.url);
+        if (!h) return "consent covers http(s) pages only";
+        return t.hosts?.includes(h) ? null : `consent does not cover ${h}`;
       }
       if (t.scope === "object") {
         if (t.task !== task) return "consent is for another task";
@@ -149,10 +152,10 @@ export class ConsentVerifier {
   }
 }
 
-/** A URL as an open consent binds it: scheme, host, path and query (the fragment dropped); null for anything but http
- *  and https (file:, view-source:, javascript: are never covered). */
-export function normalUrl(url: string): string | null {
-  try { const u = new URL(url); return u.protocol === "http:" || u.protocol === "https:" ? `${u.protocol}//${u.host}${u.pathname}${u.search}` : null; } catch { return null; }
+/** The site a URL opens, as a site consent binds it: the full hostname (lower-cased and punycoded by URL), for http
+ *  and https only; null for anything else (file:, mailto:, view-source:, an app's own scheme are never covered). */
+export function siteOf(url: string): string | null {
+  try { const u = new URL(url); return (u.protocol === "http:" || u.protocol === "https:") && u.hostname ? u.hostname : null; } catch { return null; }
 }
 
 /** `app:*`, `window:*`, an exact id, or `*`. */
