@@ -102,17 +102,24 @@ const close = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]
 const sameEl = (a: Ident, b: Ident): boolean => a.c === b.c && (a.at && b.at ? close(a.at, b.at) : !a.at && !b.at);
 
 /** Pair every element of `bound` with one of `now`, one to one; null when one cannot be paired or the pairing is not
- *  certain. With a place on every element: the same content within NEAR_PX, exactly one candidate. Without: by order
+ *  certain. With a place on every element: elements of the same content form a group, which must have as many members
+ *  on both sides; within a group they are paired nearest first, each within NEAR_PX — identical neighbours (nested
+ *  empty groups sharing a rect, a duplicate text-recognition box) are interchangeable, so which goes with which does
+ *  not matter (review of #26: requiring one candidate each never paired them, and a send never went through). Without: by order
  *  — `bound` must appear in `now` in the same order (things may have come in between), and in one way only (the
  *  earliest and the latest such pairing agree); a same-named line elsewhere breaks the order, a duplicate makes it
  *  uncertain. Returns the indexes of `now` that were paired. */
 function pair(bound: Ident[], now: Ident[]): Set<number> | null {
   if (bound.every((b) => b.at) && now.every((n) => n.at)) {
     const used = new Set<number>();
-    for (const b of bound) {
-      const fit = now.map((n, i) => (n.c === b.c && close(n.at!, b.at!) ? i : -1)).filter((i) => i >= 0);
-      if (fit.length !== 1 || used.has(fit[0]!)) return null;
-      used.add(fit[0]!);
+    for (const c of new Set(bound.map((b) => b.c))) {
+      const bs = bound.filter((b) => b.c === c), ns = now.map((n, i) => ({ n, i })).filter((x) => x.n.c === c);
+      if (bs.length !== ns.length) return null;
+      const d = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
+      const cand = bs.flatMap((b, k) => ns.filter((x) => close(b.at!, x.n.at!)).map((x) => ({ k, i: x.i, d: d(b.at!, x.n.at!) }))).sort((x, y) => x.d - y.d);
+      const done = new Set<number>();
+      for (const x of cand) if (!done.has(x.k) && !used.has(x.i)) { done.add(x.k); used.add(x.i); }
+      if (done.size !== bs.length) return null;
     }
     return used;
   }
@@ -125,23 +132,34 @@ function pair(bound: Ident[], now: Ident[]): Set<number> | null {
 }
 
 /** The element an action names (`id` in the caller's observation `decided`), found in `look` — what the driver acts on
- *  now, whose ids may be numbered otherwise. With a place: the same content within NEAR_PX, one of a kind both where it
- *  was decided and now. An accessibility element without a place: its order among elements of the same content, the
- *  same count in both. A screen element without a place: its content, one of a kind in both. Null otherwise: gone, or
- *  not certain which — the caller looks again. */
+ *  now, whose ids may be numbered otherwise. When `look` is the caller's own observation, the id is exact (review of
+ *  #26: re-finding there made compact lists go stale). Otherwise: elements of the same content near where it was
+ *  (NEAR_PX) — or, without a place, the same count of same-content elements and its order among them; when the window
+ *  holds more than one element of that content (a 「删除」 on every row), the previous and next elements must match
+ *  too (in the accessibility tree; read from the screen, only when more than one is near, since text recognition
+ *  reorders its rows), so a list that scrolled or two same-named rows that swapped do not land on the other row
+ *  (review of #26); what is still more than one is the same thing read twice (a duplicate box), the nearest is taken. Null when it is gone
+ *  or uncertain — the caller looks again. */
 function resolve(decided: Observation, id: string, look: Observation): Element | null {
   const was = decided.elements.find((e) => e.id === id);
   if (!was) return null;
+  if (look === decided) return was;
   const w = identOf(was, false);
+  const cOf = (o: Observation, i: number) => (i >= 0 && i < o.elements.length ? identOf(o.elements[i]!, false).c : null);
+  const ctx = (o: Observation, e: Element) => { const i = o.elements.indexOf(e); return canon([cOf(o, i - 1), cOf(o, i + 1)]); };
   const like = (o: Observation) => o.elements.filter((e) => identOf(e, false).c === w.c);
+  const many = like(decided).length > 1;
+  const sameCtx = (e: Element) => ctx(look, e) === ctx(decided, was);
   if (w.at) {
-    const near = (e: Element) => { const i = identOf(e, false); return !!i.at && close(i.at, w.at!); };
-    if (like(decided).some((e) => e !== was && near(e))) return null;
-    const now = like(look).filter(near);
-    return now.length === 1 ? now[0]! : null;
+    // by place; the neighbours are asked when the window has more of that content and they are in a stable order (the
+    // accessibility tree), or when more than one is near (text recognition reorders its rows, so there only then)
+    let near = like(look).filter((e) => { const i = identOf(e, false); return !!i.at && close(i.at, w.at!); });
+    if (many && (w.ax || near.length > 1)) near = near.filter(sameCtx);
+    const d = (e: Element) => { const i = identOf(e, false).at!; return Math.abs(i[0] - w.at![0]) + Math.abs(i[1] - w.at![1]); };
+    return near.sort((a, b) => d(a) - d(b))[0] ?? null;
   }
   const d = like(decided), l = like(look);
-  if (w.ax) return d.length === l.length && !l[d.indexOf(was)]!.rect ? l[d.indexOf(was)]! : null;
+  if (w.ax) { const e = d.length === l.length ? l[d.indexOf(was)]! : undefined; return e && !e.rect && (!many || sameCtx(e)) ? e : null; }
   return d.length === 1 && l.length === 1 ? l[0]! : null;
 }
 
@@ -179,17 +197,22 @@ function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding):
  *  screen: its jitter is a pixel or two. More is a change (strict policy). */
 const JITTER_PX = 4;
 
-/** The strict policy's "nothing changed" for a window read from the screen: the same elements, none added or gone, each
- *  paired one to one with an element of the same role, label, value and focus whose centre is within JITTER_PX on both
- *  axes. An element with two such candidates cannot be told apart, which counts as changed. */
+/** The strict policy's "nothing changed" for a window read from the screen: the same elements, none added or gone —
+ *  as many of each content on both sides — each paired with one of the same role, label, value and focus whose centre
+ *  is within JITTER_PX on both axes. Identical neighbours (a duplicate text-recognition box) are interchangeable: within
+ *  a content they are paired nearest first (review of #26: requiring one candidate each never paired them, and a send
+ *  never went through on an unchanged screen). */
 export function sameScreen(a: { c: string; at: [number, number] | null }[] | undefined, b: { c: string; at: [number, number] | null }[] | undefined): boolean {
   if (!a || !b || a.length !== b.length) return false;
   const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (!x.at || !y.at ? !x.at && !y.at : Math.abs(x.at[0] - y.at[0]) <= JITTER_PX && Math.abs(x.at[1] - y.at[1]) <= JITTER_PX);
-  const used = new Set<number>();
-  for (const e of a) {
-    const fit = b.map((n, i) => (!used.has(i) && n.c === e.c && near(e, n) ? i : -1)).filter((i) => i >= 0);
-    if (fit.length !== 1) return false;
-    used.add(fit[0]!);
+  const d = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (x.at && y.at ? Math.abs(x.at[0] - y.at[0]) + Math.abs(x.at[1] - y.at[1]) : 0);
+  for (const c of new Set(a.map((e) => e.c))) {
+    const as = a.filter((e) => e.c === c), bs = b.filter((e) => e.c === c);
+    if (as.length !== bs.length) return false;
+    const cand = as.flatMap((x, k) => bs.map((y, i) => ({ k, i, ok: near(x, y), d: d(x, y) }))).filter((p) => p.ok).sort((p, q) => p.d - q.d);
+    const ka = new Set<number>(), kb = new Set<number>();
+    for (const p of cand) if (!ka.has(p.k) && !kb.has(p.i)) { ka.add(p.k); kb.add(p.i); }
+    if (ka.size !== as.length) return false;
   }
   return true;
 }
