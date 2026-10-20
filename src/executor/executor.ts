@@ -494,7 +494,7 @@ export class Executor {
     if (ws && !this.recovered) this.journal("begin", { versions: { ...this.seen } });     // what a restart compares against
     this.epoch = raw.epoch;
     this.last = this.ledger.stamp(raw);
-    this.emit("executor.begin", { windows: this.last.windows.length, locked: this.last.locked });
+    this.emit("executor.begin", { windows: this.last.windows.length, locked: this.last.locked, ...(this.last.input_watch !== undefined ? { input_watch: this.last.input_watch } : {}) });
     return this.last;
   }
 

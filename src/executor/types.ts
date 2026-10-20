@@ -28,7 +28,10 @@ export interface WindowInfo {
 }
 
 /** The whole computer, every app in one format. Read-only, so nothing is hidden: the user's windows are listed too. */
-export interface Snapshot { epoch: number; locked: boolean; front_app: string; windows: WindowInfo[]; user_active?: boolean }
+export interface Snapshot { epoch: number; locked: boolean; front_app: string; windows: WindowInfo[]; user_active?: boolean;
+  /** What the hands driver hears of the user's input: "keys" (keyboard and mouse, by target), "mouse" (no Input Monitoring:
+   *  every key press counts), "" (no tap: every input counts). Told in the run's trace so a check knows which it had. */
+  input_watch?: string }
 
 export interface Element {
   id: string; role: string; label: string; actions: string[];
