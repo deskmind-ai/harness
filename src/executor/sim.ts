@@ -21,7 +21,7 @@ export interface MailMessage { id: string; from: string; subject: string; body: 
 export interface MailState { app: string; inbox: MailMessage[]; flagged: string[]; deleted: string[]; replies: { to: string; body: string }[]; selected: string | null; composing: { to: string; body: string } | null; dialog: { kind: "delete"; id: string } | null; texts: Record<string, string> }
 export const ZH_MAIL_TEXTS: Record<string, string> = { replied: "已回复", inbox: "收件箱", reply: "回复", delete: "删除", flag: "加旗标", unflag: "取消旗标", send: "发送", cancel: "取消", confirm: "确认删除", confirmText: "确定删除这封邮件吗？", body: "回复内容", meeting: "会议时间：%s", empty: "选择一封邮件" };
 
-interface Win { id: string; app: string; kind: "mail" | "editor" | "browser" | "settings"; title: string; focused: boolean; minimized: boolean; modal: { title: string; buttons: string[] } | null; state: any; gen: number }
+interface Win { id: string; app: string; bundle?: string; kind: "mail" | "editor" | "browser" | "settings"; title: string; focused: boolean; minimized: boolean; modal: { title: string; buttons: string[] } | null; state: any; gen: number }
 
 /** The browsers the simulated computer has installed: a url opened in any of them comes up in a new window of the
  *  task's own (perform → addBrowser), which is the promise `urlInOwnBrowserWindow` makes. */
@@ -30,6 +30,9 @@ export const SIM_BROWSERS = [
   { bundle: "com.google.Chrome", names: ["Google Chrome", "Chrome"] },
   { bundle: "org.mozilla.firefox", names: ["Firefox"] },
 ];
+
+/** One of the sim's browsers by any of its names or its bundle id, ignoring case. */
+const simBrowser = (name: string) => { const n = name.trim().toLowerCase(); return SIM_BROWSERS.find((b) => b.bundle.toLowerCase() === n || b.names.some((x) => x.toLowerCase() === n)); };
 
 export class SimComputer implements Driver {
   /** Like hands since #48: a url given to a browser opens in a window of the task's own (the sim always opens a new one). */
@@ -58,7 +61,7 @@ export class SimComputer implements Driver {
   }
   addBrowser(app: string, tabs: { title: string; url: string; text?: string }[]): Win {
     const id = this.nextId("browser");
-    const w: Win = { id, app, kind: "browser", title: tabs[0]?.title ?? app, focused: this.wins.length === 0, minimized: false, modal: null, gen: 0,
+    const w: Win = { id, app, ...(simBrowser(app) ? { bundle: simBrowser(app)!.bundle } : {}), kind: "browser", title: tabs[0]?.title ?? app, focused: this.wins.length === 0, minimized: false, modal: null, gen: 0,
       state: { tabs: tabs.map((t, i) => ({ id: `${id}-tab${i + 1}`, ...t, text: t.text ?? "" })), active: 0, address: tabs[0]?.url ?? "" } };
     this.wins.push(w); this.bump(); return w;
   }
@@ -73,6 +76,7 @@ export class SimComputer implements Driver {
   private win(id: string): Win { const w = this.wins.find((x) => x.id === id); if (!w) throw new Error(`no window ${id}`); return w; }
   private info(w: Win): WindowInfo {
     const base: WindowInfo = { id: w.id, app: w.app, title: w.title, focused: w.focused, minimized: w.minimized };
+    if (w.bundle) base.bundle = w.bundle;
     if (w.kind === "browser") { base.browser = true; base.url = w.state.tabs[w.state.active]?.url; base.tabs = w.state.tabs.map((t: any, i: number) => ({ id: t.id, title: t.title, url: t.url, active: i === w.state.active })); }
     return base;
   }
@@ -165,9 +169,11 @@ export class SimComputer implements Driver {
     if (a.kind === "double_click") a = { ...a, kind: "click" };     // the fake apps open on a click; a real one may need two
     if (a.kind === "open_window") {
       // which fake app opens: the kind an app of that name already has on this desktop (as a real one is resolved
-      // from the running apps), a browser when a URL is asked for, otherwise an editor — no app names in code
-      const known = this.wins.find((x) => x.app.toLowerCase() === a.app.toLowerCase())?.kind;
-      const w = known === "mail" ? null : known === "browser" || (!known && a.url) ? this.addBrowser(a.app, [{ title: a.url ?? "新标签页", url: a.url ?? "about:blank" }]) : this.addEditor(a.app);
+      // from the running apps), one of its installed browsers by name or bundle id (the executor hands it the bundle
+      // it settled on), a browser when a URL is asked for, otherwise an editor — no app names in code
+      const b = simBrowser(a.app), name = b ? b.names[0]! : a.app;
+      const known = this.wins.find((x) => x.app.toLowerCase() === name.toLowerCase() || x.bundle?.toLowerCase() === a.app.toLowerCase())?.kind ?? (b ? "browser" : undefined);
+      const w = known === "mail" ? null : known === "browser" || (!known && a.url) ? this.addBrowser(name, [{ title: a.url ?? "新标签页", url: a.url ?? "about:blank" }]) : this.addEditor(name);
       if (!w) return { status: "unsupported", why: `cannot open ${a.app}` };
       for (const x of this.wins) x.focused = x === w;
       this.log.push({ opened: w.id });

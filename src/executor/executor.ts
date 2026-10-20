@@ -670,20 +670,13 @@ export class Executor {
       // cards, while every page loaded in the task's window all the same). Only where the driver marks the app's
       // windows a browser: any other app gets the url from `open` and shows it in the user's window (a slack:// link
       // switches their conversation), and an older driver that marks nothing keeps the old floor (review of #34)
-      // the app as the model names it, against every name the snapshot has for an app — what the driver calls it, its
-      // localized names, its bundle id, a window id's prefix — ignoring case: matched only by the exact display name,
-      // "com.google.chrome" or "Slack" in the model's words met no window of the user's, and the url (resolved by hands
-      // all the same) landed in their window with no card (review of #34). Structure decides, and what cannot be
-      // placed is taken to be the user's: an app on screen is judged by its windows; one with no window is a browser
-      // only if the computer lists it among its installed browsers (snapshot.browsers)
-      const want = a.app.trim().toLowerCase();
-      const named = (n?: string) => !!n && n.trim().toLowerCase() === want;
-      const sameApp = (w: WindowInfo) => [w.app, w.app_name, w.bundle, w.id.includes("#") ? w.id.slice(0, w.id.lastIndexOf("#")) : ""].some(named);
-      const onScreen = !!this.last?.windows.some(sameApp);
-      const browser = onScreen ? !!this.last?.windows.some((w) => sameApp(w) && w.browser === true) : !!this.last?.browsers?.some((b) => named(b.bundle) || b.names.some(named));
-      const own = !!a.url && !!this.driver.capabilities?.urlInOwnBrowserWindow && browser;
-      const theirs = a.url && !own ? this.last?.windows.find((w) => w.owner === "user" && sameApp(w)) : undefined;
-      const mine = own ? this.last?.windows.find((w) => w.owner === "task" && sameApp(w)) : undefined;
+      // which app the model means is settled once (appNamed) and is what the driver is handed: a browser only when it
+      // is beyond doubt, and what cannot be placed is taken to be the user's
+      const app = this.appNamed(a.app);
+      const onScreen = app.windows.length > 0;
+      const own = !!a.url && !!this.driver.capabilities?.urlInOwnBrowserWindow && app.browser;
+      const theirs = a.url && !own ? app.windows.find((w) => w.owner === "user") : undefined;
+      const mine = own ? app.windows.find((w) => w.owner === "task") : undefined;
       // once the task has taken in content (read a file, typed what the user did not write), a URL can carry it out:
       // a host not approved yet in this task is a send, asked once per host; a URL that is not http(s) every time
       // (owner 10-21: per-site consent, replacing the text matching of #33)
@@ -700,6 +693,36 @@ export class Executor {
     const owner = this.ledger.ownerOf(object);
     if (a.kind === "close_window") return owner === "user" ? { consequence: "modify_user", object, why: "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
+  }
+
+  /** The app the model names in an open_window, as the computer knows it: the windows on screen it matches, by every
+   *  name the snapshot has for a window's app (what the driver calls it, its localized name, its bundle id, the id's
+   *  prefix), ignoring case; and, with no window, the installed browsers (snapshot.browsers). Matched by the exact
+   *  display name only, "com.google.chrome" or "Slack" in the model's words met no window of the user's, and the url
+   *  — resolved by hands all the same — landed in their window with no card (review of #34). `bundle` is set only when
+   *  every match is one app, and `browser` only when that app is beyond doubt a browser: two apps both called "Foo",
+   *  one of them a browser, are neither (review of #36: hands might pick the other). */
+  private appNamed(name: string): { windows: WindowInfo[]; bundle?: string; browser: boolean } {
+    const want = name.trim().toLowerCase();
+    const named = (n?: string) => !!n && n.trim().toLowerCase() === want;
+    const windows = (this.last?.windows ?? []).filter((w) => [w.app, w.app_name, w.bundle, w.id.includes("#") ? w.id.slice(0, w.id.lastIndexOf("#")) : ""].some(named));
+    if (windows.length) {
+      const bundles = new Set(windows.map((w) => w.bundle?.toLowerCase()));
+      const bundle = bundles.size === 1 && windows[0]!.bundle ? windows[0]!.bundle : undefined;
+      return { windows, bundle, browser: !!bundle && windows.every((w) => w.browser === true) };
+    }
+    const listed = (this.last?.browsers ?? []).filter((b) => named(b.bundle) || b.names.some(named));
+    return listed.length === 1 ? { windows, bundle: listed[0]!.bundle, browser: true } : { windows, browser: false };
+  }
+
+  /** The action as the driver is handed it: an open_window names the app by the bundle settled here, when there is
+   *  one, so the driver opens exactly the app this executor judged — harness and hands each resolving the model's
+   *  words on their own could route a url into an app the floor never looked at (review of #36). The receipt and the
+   *  card keep the model's words. */
+  private forDriver(a: Action): Action {
+    if (a.kind !== "open_window") return a;
+    const bundle = this.appNamed(a.app).bundle;
+    return bundle ? { ...a, app: bundle } : a;
   }
 
   /** The old structural send hints for a screen action: the target is marked `sends` (hands' name list), and Return or
@@ -1084,7 +1107,7 @@ export class Executor {
     foregroundOk = !!fgWindow && (this.ledger.ownerOf(`window:${fgWindow}`) === "task" || this.taskOpened.has(fgWindow) || objectToken || stepConsented);
     if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence) });
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
-    try { r = await this.driver.perform(act, foregroundOk ? { foreground_ok: true } : undefined); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    try { r = await this.driver.perform(this.forDriver(act), foregroundOk ? { foreground_ok: true } : undefined); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a

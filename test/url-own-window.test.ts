@@ -130,3 +130,41 @@ describe("which app the model means: every name the computer has for it, ignorin
     expect((await desk({ promise: true, windows: [] }))("Safari").consequence).toBe("modify_user");
   });
 });
+
+describe("the app is settled once and the driver is handed it (review of #36)", () => {
+  const fooBrowser = { id: "com.foo.browser#1", app: "Foo", app_name: "Foo", bundle: "com.foo.browser", browser: true, title: "a page" };
+  const fooNotes = { id: "com.foo.notes#2", app: "Foo", app_name: "Foo", bundle: "com.foo.notes", title: "my notes" };
+  const chrome = { id: "com.google.Chrome#29773", app: "Google Chrome", app_name: "Google Chrome", bundle: "com.google.Chrome", browser: true, title: "收件箱 - Gmail" };
+  const browsers = [{ bundle: "com.google.Chrome", names: ["Google Chrome"] }, { bundle: "com.apple.Safari", names: ["Safari"] }];
+  const desk = async (windows: object[]) => {
+    const handed: Record<string, unknown>[] = [];
+    const driver = {
+      capabilities: { urlInOwnBrowserWindow: true },
+      snapshot: () => ({ epoch: 1, locked: false, front_app: "", windows: windows as never, browsers }),
+      observe: () => { throw new Error("not used"); },
+      perform: (a: never) => { handed.push(a); return { status: "ok" as const }; },
+    };
+    const ex = new Executor(driver, { task: "t1", publicKey: ConsentSigner.fresh().publicKey });
+    await ex.begin();
+    return { ex, handed };
+  };
+
+  it("two apps called Foo, one a browser: a url to Foo is not the task's step but the user's", async () => {
+    const { ex } = await desk([fooBrowser, fooNotes]);
+    expect(ex.floor({ kind: "open_window", app: "Foo", url: "foo://x" }).consequence).toBe("modify_user");
+  });
+
+  it("the driver is handed the bundle the executor judged, not the model's words; an unsettled name goes as written", async () => {
+    let d = await desk([chrome]);
+    expect((await d.ex.act({ action: { kind: "open_window", app: "google chrome", url: "https://example.com" }, epoch: 1 })).status).toBe("ok");
+    expect(d.handed.map((a) => a.app)).toEqual(["com.google.Chrome"]);
+    expect(d.ex.receipts.at(-1)!.request.action).toMatchObject({ app: "google chrome" });      // the receipt keeps the model's words
+    d = await desk([]);
+    await d.ex.act({ action: { kind: "open_window", app: "safari", url: "https://example.com" }, epoch: 1 });
+    expect(d.handed.map((a) => a.app)).toEqual(["com.apple.Safari"]);
+    d = await desk([fooBrowser, fooNotes]);
+    expect(d.ex.preview({ action: { kind: "open_window", app: "Foo" }, epoch: 1 }).consequence).toBe("create");
+    await d.ex.act({ action: { kind: "open_window", app: "Foo" }, epoch: 1 });
+    expect(d.handed.map((a) => a.app)).toEqual(["Foo"]);
+  });
+});
