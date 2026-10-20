@@ -168,3 +168,21 @@ describe("the app is settled once and the driver is handed it (review of #36)", 
     expect(d.handed.map((a) => a.app)).toEqual(["Foo"]);
   });
 });
+
+describe("the card and the receipt name a window only when it is the one the driver will use", () => {
+  it("a name two apps go by: the card names the app, not one of their windows", async () => {
+    const fooBrowser = { id: "com.foo.browser#1", app: "Foo", app_name: "Foo", bundle: "com.foo.browser", browser: true, title: "a page" };
+    const fooNotes = { id: "com.foo.notes#2", app: "Foo", app_name: "Foo", bundle: "com.foo.notes", title: "my notes" };
+    const driver = { capabilities: { urlInOwnBrowserWindow: true }, snapshot: () => ({ epoch: 1, locked: false, front_app: "", windows: [fooBrowser, fooNotes] as never }), observe: () => { throw new Error("not used"); }, perform: () => ({ status: "ok" as const }) };
+    const ex = new Executor(driver, { task: "t1", publicKey: ConsentSigner.fresh().publicKey });
+    await ex.begin();
+    expect(ex.floor({ kind: "open_window", app: "Foo", url: "foo://x" })).toMatchObject({ consequence: "modify_user", object: "app:Foo" });
+  });
+
+  it("the task with two windows of the browser: which one the driver uses is its own, so the object is the app", async () => {
+    const { ex, open } = await setup();
+    await open(); await open();                                       // two windows of the task's own in Google Chrome
+    await ex.snapshot();
+    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: google("今天北京天气") })).toMatchObject({ consequence: "create", object: "app:Google Chrome" });
+  });
+});
