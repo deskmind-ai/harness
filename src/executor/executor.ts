@@ -193,6 +193,47 @@ function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding):
   return true;
 }
 
+/** One difference between what a consent was bound to and what is there now, for the trace (never for the user's
+ *  card): which part, and its signature before and after — role, label, value, where read from, focus, place; no ids. */
+export interface BindingChange { part: "window" | "modal" | "field" | "typed" | "target" | "focus" | "element"; before: unknown; after: unknown }
+
+/** What differs between two send bindings, at most `max` items (a real Mac's re-ask is read from the trace: rc.9, the
+ *  user approved one send four times). Elements: each one bound is paired (same content, near or both without a
+ *  place); what is left over is reported as changed — same role and label on both sides: its value ("field"), its
+ *  focus ("focus") or its place ("element") — or gone, and then what came that can be acted on (accessibility tree)
+ *  or anything that came (strict, screen-read). */
+export function bindingDiff(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding, max = 10): BindingChange[] {
+  const out: BindingChange[] = [];
+  const push = (c: BindingChange) => { if (out.length < max) out.push(c); };
+  const sig = (i: { c: string; at: [number, number] | null } | null) => (i ? { sig: JSON.parse(i.c) as unknown[], at: i.at } : null);
+  for (const k of ["app", "title", "url", "tab"] as const) if (bound.window[k] !== now.window[k]) push({ part: "window", before: { [k]: bound.window[k] }, after: { [k]: now.window[k] } });
+  if (bound.modal !== now.modal) push({ part: "modal", before: bound.modal, after: now.modal });
+  if (canon(bound.typed) !== canon(now.typed)) push({ part: "typed", before: bound.typed, after: now.typed });
+  const one = (a: Ident | null, b: Ident | null) => (a === null || b === null ? a === b : sameEl(a, b));
+  if (!one(bound.target, now.target)) push({ part: "target", before: sig(bound.target), after: sig(now.target) });
+  if (!one(bound.focused, now.focused)) push({ part: "focus", before: sig(bound.focused), after: sig(now.focused) });
+  const strict = pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined);
+  const A: { c: string; at: [number, number] | null; act?: true; ax?: true }[] = strict ? bound.whole ?? [] : bound.elements;
+  const B: { c: string; at: [number, number] | null; act?: true; ax?: true }[] = strict ? now.whole ?? [] : now.elements;
+  const tol = strict ? JITTER_PX : NEAR_PX;
+  const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (x.at && y.at ? Math.abs(x.at[0] - y.at[0]) <= tol && Math.abs(x.at[1] - y.at[1]) <= tol : !x.at && !y.at);
+  const usedB = new Set<number>(), leftA: number[] = [];
+  A.forEach((a, k) => { const i = B.findIndex((b, j) => !usedB.has(j) && b.c === a.c && near(a, b)); if (i >= 0) usedB.add(i); else leftA.push(k); });
+  // the content's parts: [role, label, value, source, focus] in the binding, [role, label, value, focus] in strict's whole
+  const F = strict ? 3 : 4;
+  const rl = (c: string) => { const x = JSON.parse(c) as unknown[]; return canon(strict ? [x[0], x[1]] : [x[0], x[1], x[3]]); };
+  for (const k of leftA) {
+    const a = A[k]!;
+    const i = B.findIndex((b, j) => !usedB.has(j) && rl(b.c) === rl(a.c));
+    if (i < 0) { push({ part: "element", before: sig(a), after: null }); continue; }
+    usedB.add(i);
+    const x = JSON.parse(a.c) as unknown[], y = JSON.parse(B[i]!.c) as unknown[];
+    push({ part: canon(x[2]) !== canon(y[2]) ? "field" : canon(x[F]) !== canon(y[F]) ? "focus" : "element", before: sig(a), after: sig(B[i]!) });
+  }
+  B.forEach((b, j) => { if (!usedB.has(j) && (strict || (b.act && b.ax))) push({ part: "element", before: null, after: sig(b) }); });
+  return out;
+}
+
 /** How far (px, on each axis) text recognition's box for an unchanged element may move between two reads of the same
  *  screen: its jitter is a pixel or two. More is a change (strict policy). */
 const JITTER_PX = 4;
@@ -266,6 +307,14 @@ export class Executor {
   /** The latest look at each window, the executor's own last looks included. The caller's ids refer to `lastObs` (what
    *  it was shown); what is on screen now is here. */
   private looks = new Map<string, Observation>();
+  /** Every challenge this executor issued, as it issued it: what "consent is for another action" is explained against
+   *  in the trace (the token's action, epoch, object and class beside the request's). */
+  private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence }>();
+  private issue(action: Action, object: string, consequence: Consequence, text: string, epoch: number, content?: unknown) {
+    const c = this.consent.challenge(action, object, consequence, text, undefined, content);
+    this.challenges.set(c.nonce, { action, epoch, object, consequence });
+    return c;
+  }
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
 
@@ -714,10 +763,12 @@ export class Executor {
     const f = this.floor(req.action);
     let consequence = higher(f.consequence, req.consequence ?? "read");
     let base = { consequence, object: f.object };
+    // why consent was asked again, in parts, for the trace (executor.consent_needed and executor.act carry it)
+    let diag: Record<string, unknown> | undefined;
     const done = (r: ActResult): ActResult => {
       const { consent, ...rest } = req;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: r });
-      this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "" });
+      this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}) });
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -813,8 +864,16 @@ export class Executor {
       accepted = stored && content && within(stored, content, this.pixelPolicy) ? stored : content;
       const why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
       if (why) {
-        const challenge = this.consent.challenge(req.action, base.object, consequence, text, undefined, content);
-        this.emit("executor.consent_needed", { why, consequence, object: base.object });
+        if (why === "consent is for another action" && req.consent) {
+          const was = this.challenges.get(req.consent.nonce);
+          diag = {
+            token: was ? { action: canon(was.action), epoch: was.epoch, object: was.object, consequence: was.consequence } : null,
+            request: { action: canon(req.action), epoch: req.epoch, object: base.object, consequence },
+            ...(stored && content ? { binding: bindingDiff(stored, content, this.pixelPolicy) } : {}),
+          };
+        }
+        const challenge = this.issue(req.action, base.object, consequence, text, now.epoch, content);
+        this.emit("executor.consent_needed", { why, consequence, object: base.object, ...(diag ? { changed: diag } : {}) });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
     }
@@ -837,8 +896,9 @@ export class Executor {
       if (this.mightSend(req.action) && !sameSendFacts(req.action, obs, fresh)) return changed("the focus, or which controls send");
       if (consequence === "external") {
         if (!accepted || !again.content || !within(accepted, again.content, this.pixelPolicy)) {
-          const challenge = this.consent.challenge(req.action, base.object, consequence, again.text, undefined, again.content);
-          this.emit("executor.consent_needed", { why: "what goes out changed right before sending", consequence, object: base.object });
+          diag = { binding: accepted && again.content ? bindingDiff(accepted, again.content, this.pixelPolicy) : null, epoch: fresh.epoch };
+          const challenge = this.issue(req.action, base.object, consequence, again.text, fresh.epoch, again.content);
+          this.emit("executor.consent_needed", { why: "what goes out changed right before sending", consequence, object: base.object, changed: diag });
           return done({ ...base, status: "needs_consent", why: "what goes out changed right before sending; asked again with what is there now", challenge, epoch: fresh.epoch });
         }
       }
@@ -857,7 +917,7 @@ export class Executor {
     // the action's one-time token is spent now, with every look behind it (a token spent before a refused look was lost)
     if (NEEDS_CONSENT.has(consequence) && req.consent?.scope === "action" && !this.consent.spend(req.consent)) {
       const card = this.card(req.action, this.lastObs.get(target ?? "") ?? obs, consequence);
-      const challenge = this.consent.challenge(req.action, base.object, consequence, card.text, undefined, card.content);
+      const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content);
       return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
     }
     if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence) });
@@ -991,7 +1051,7 @@ export class Executor {
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
-        const challenge = this.consent.challenge(a, object, consequence, text);
+        const challenge = this.issue(a, object, consequence, text, epoch);
         this.emit("executor.consent_needed", { why, consequence, object });
         return { ...base, status: "needs_consent", why, challenge };
       }
