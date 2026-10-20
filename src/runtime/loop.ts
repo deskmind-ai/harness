@@ -35,8 +35,9 @@ export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject" | "f
 const LOOK_ONLY = "the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed";
 /** A URL on a card: readable (decoded), without the scheme, cut at 120 characters (the query stays visible up to there). */
 
-/** A plan step as the model writes it; `opens`: the URLs it opens with open_window, and in which app. */
-export interface PlanStepIn { purpose: string; objects: string[]; consequence: Consequence; opens?: { app: string; url: string }[] }
+/** A plan step as the model writes it; `opens`: the URLs it opens with open_window, in which app, and what the URL
+ *  sends to the site in a few words (`sends`, e.g. 搜索「北京天气」; shown on the plan card). */
+export interface PlanStepIn { purpose: string; objects: string[]; consequence: Consequence; opens?: { app: string; url: string; sends?: string }[] }
 
 export interface SkillSource { candidates(raw: string): { name: string; description: string }[]; read(name: string): string | null }
 
@@ -229,8 +230,8 @@ export class FrontierRuntime {
       execute: async (_id, p: { action: Static<typeof ActionSchema>; epoch: number; consequence: Consequence; purpose: string }) => this.act(p),
     }));
     tools.push(tool({
-      name: "plan", label: "计划", description: "动手前列出步骤：目的、涉及的对象（窗口 id / 标签页 id / 文件路径）、后果类别。要碰用户的东西或往外发，必须先有计划。readings：原话里能有不止一种理解的地方，每处写你选的理解、其他理解、以及区分它们的依据（看到的东西：窗口标题、文件名、文件里的一行、用户的回答；原话本身不算）。依据不够的，程序会先问用户。程序把计划给用户过目，同意后改用户东西的步骤不再逐步打扰。某一步要用 open_window 打开网址的，在这一步的 opens 里写上应用和网址：网址可能会开在用户已有的浏览器窗口里，写上了，计划卡会一并问用户，之后打开网址就不再逐次打扰。",
-      parameters: Type.Object({ steps: Type.Array(Type.Object({ purpose: Type.String(), objects: Type.Array(Type.String()), consequence: lit(CONSEQUENCES), opens: Type.Optional(Type.Array(Type.Object({ app: Type.String(), url: Type.String() }), { description: "这一步用 open_window 打开的网址：应用和网址" })) })), readings: Type.Optional(Type.Array(Type.Object({ point: Type.String(), reading: Type.String(), alternatives: Type.Array(Type.String()), evidence: Type.Array(Type.String()) }))) }),
+      name: "plan", label: "计划", description: "动手前列出步骤：目的、涉及的对象（窗口 id / 标签页 id / 文件路径）、后果类别。要碰用户的东西或往外发，必须先有计划。readings：原话里能有不止一种理解的地方，每处写你选的理解、其他理解、以及区分它们的依据（看到的东西：窗口标题、文件名、文件里的一行、用户的回答；原话本身不算）。依据不够的，程序会先问用户。程序把计划给用户过目，同意后改用户东西的步骤不再逐步打扰。某一步要用 open_window 打开网址的，在这一步的 opens 里写上应用、网址，以及网址会把什么发到那个网站（sends，一句话，比如「搜索『北京天气』」）：计划卡会列出这些网站和发过去的内容，用户同意计划后，这次任务里打开这些网站就不再逐次打扰。",
+      parameters: Type.Object({ steps: Type.Array(Type.Object({ purpose: Type.String(), objects: Type.Array(Type.String()), consequence: lit(CONSEQUENCES), opens: Type.Optional(Type.Array(Type.Object({ app: Type.String(), url: Type.String(), sends: Type.Optional(Type.String({ description: "网址会把什么发到这个网站，一句话，比如「搜索『北京天气』」" })) }), { description: "这一步用 open_window 打开的网址：应用、网址、发过去的内容" })) })), readings: Type.Optional(Type.Array(Type.Object({ point: Type.String(), reading: Type.String(), alternatives: Type.Array(Type.String()), evidence: Type.Array(Type.String()) }))) }),
       execute: async (_id, p: { steps: PlanStepIn[]; readings?: Reading[] }) => this.plan(p.steps, p.readings ?? []),
     }));
     tools.push(tool({
@@ -348,7 +349,7 @@ export class FrontierRuntime {
     if (r.status === "needs_plan") {
       this.count("needs_plan");
       // a URL that would land in the user's browser window: say how the plan covers it (structure, not the words)
-      const hint = a.kind === "open_window" && a.url ? `\n这个网址会开在用户已有的 ${a.app} 窗口里：在计划里打开网址的那一步写上 opens: [{ app: "${a.app}", url: "…" }]，计划卡会一并问用户。任务读过文件、看过任务目录里文件的开头，或者输入过用户没写的字以后，打开还没同意过的网站仍会单独问。` : "";
+      const hint = a.kind === "open_window" && a.url ? `\n这个网址会开在用户已有的 ${a.app} 窗口里：在计划里打开网址的那一步写上 opens: [{ app: "${a.app}", url: "…" }]，计划卡会一并问用户。计划里没写的网站，任务读过文件、看过任务目录里文件的开头或用户的窗口以后，要先核对网址里有没有带着读到的内容，核对不过就单独问。` : "";
       return err(`先交计划：${r.why}${hint}`);
     }
     // the judge's "not what the user asked": the way out is the user's answer, never another guess
@@ -403,18 +404,28 @@ export class FrontierRuntime {
     // a URL a step opens lands where the executor's floor for that open_window says: in the user's browser window when
     // the app has one (「搜索今天北京天气」, rc.10: nine cards for nine pages in the user's Chrome). That window is one
     // of the step's objects, by the executor's view — listed on the card with the sites it opens, and covered by a
-    // consent to open pages of those sites there, nothing else (not the whole window: review of #33). An open the
-    // floor calls a send (a new host after the task took in content) is not covered here: it asks on its own card
+    // consent to open pages of those sites there, nothing else (not the whole window: review of #33). An open the floor
+    // calls a send (a new host after the task read material) lands there too: declared, it is the user's window all the
+    // same, and accepting the plan approves its site (owner 10-21 refinement)
     const opensInto = steps.map((s) => {
       const into = new Map<string, Set<string>>();
       for (const o of s.opens ?? []) {
         const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url });
         // the site (http or https; the full hostname): another subdomain asks on its own
         const host = siteOf(o.url);
-        if (host && f.consequence === "modify_user" && f.object.startsWith("window:")) { const hs = into.get(f.object) ?? new Set<string>(); hs.add(host); into.set(f.object, hs); }
+        if (host && (f.consequence === "modify_user" || f.consequence === "external") && f.object.startsWith("window:")) { const hs = into.get(f.object) ?? new Set<string>(); hs.add(host); into.set(f.object, hs); }
       }
       return into;
     });
+    // every http(s) site a step declares (owner 10-21 refinement): where the floor says it lands, and what it sends there.
+    // Accepting the plan approves exactly these hosts for the task, at external; a declared open the floor already calls
+    // a send (read material, host not approved) makes the step one the user approves
+    const sitesOf = steps.map((s) => (s.opens ?? []).flatMap((o) => {
+      const host = siteOf(o.url);
+      if (!host) return [];
+      const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url });
+      return [{ host, app: o.app, object: f.object, sends: f.consequence === "external", what: o.sends?.trim() || null }];
+    }));
     const objectsOf = await Promise.all(steps.map((s) => this.canonObjects(s.objects, snap)));
     // only what is there: a window or tab on screen, a file in the task folder (a raw "window:…" the model wrote that names
     // nothing would otherwise be called the user's by the ledger and signed — review of #31)
@@ -436,7 +447,8 @@ export class FrontierRuntime {
     const fgApps = [...new Set(snap.windows.filter((w) => named.has(`window:${w.id}`) && inFront(w)).map((w) => appName(w)))];
     if (fgApps.length) this.emit("plan.foreground", { apps: fgApps });
     this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor, opens: Object.fromEntries([...openGrants].map(([w, h]) => [w, [...h]])) });
-    if (!classes.some((c) => NEEDS_CONSENT.has(c))) return text("计划记下了；这些步骤不需要用户同意，直接做。");
+    const toSites = sitesOf.map((ds) => ds.some((d) => d.sends));
+    if (!classes.some((c) => NEEDS_CONSENT.has(c)) && !toSites.some(Boolean)) return text("计划记下了；这些步骤不需要用户同意，直接做。");
     // a step that sends from the user's window also changes the user's things on the way (the row picked, the reply
     // opened, the body filled): the card says both, and only what the card says changes the user's things is signed
     // (review of #31: 「回复并发送」 signed the mail window under a line that said only 「会发出去」)
@@ -455,9 +467,14 @@ export class FrontierRuntime {
     };
     const listed = steps.map((_s, i) => [
       ...objectsOf[i]!.map(shown).filter((x): x is string => x !== null),
-      ...[...opensInto[i]!].filter(([w]) => theirs(w)).map(([w, us]) => this.t.openInYours(appName(snap.windows.find((x) => `window:${x.id}` === w)!), [...us])),
+      ...[...opensInto[i]!].filter(([w]) => theirs(w)).map(([w, us]) => this.t.openInYours(appName(snap.windows.find((x) => `window:${x.id}` === w)!), [...us].map((h) => this.t.site(h, sitesOf[i]!.find((d) => d.host === h)?.what ?? null)))),
+      // the other sites the step declares (a window of the task's own, or a send by the per-site rule), by app
+      ...[...new Set(sitesOf[i]!.map((d) => d.app))].flatMap((app) => {
+        const rest = sitesOf[i]!.filter((d) => d.app === app && ![...opensInto[i]!].some(([w, hs]) => theirs(w) && hs.has(d.host) && w === d.object));
+        return rest.length ? [this.t.openSites(app, [...new Map(rest.map((d) => [d.host, this.t.site(d.host, d.what)])).values()])] : [];
+      }),
     ]);
-    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
+    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${classes[i] === "modify_user" ? (toSites[i] ? this.t.modifyAndSites : this.t.modifyYours) : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : toSites[i] ? this.t.toSites : ""}`);
     const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     if (!got) return this.end("failed", "no answer from the user");
@@ -470,12 +487,18 @@ export class FrontierRuntime {
       this.tokens.set(obj, t);
       this.consents.push({ scope: "object", object: obj, consequence: "modify_user" });
     }
-    for (const [obj, hosts] of openGrants) {
-      const t = this.o.signer.forSite(obj, [...hosts], this.o.task, "modify_user");
+    // the sites the plan declares, wherever they land: approved for this task at external (owner 10-21 refinement) — one
+    // token per place the floor puts them (the user's window, or the app a window of the task's own opens in), handed to
+    // the executor, which checks the signature and counts the hosts approved for the rest of the task
+    const siteGrants = new Map<string, Set<string>>();
+    for (const ds of sitesOf) for (const d of ds) { const g = siteGrants.get(d.object) ?? new Set<string>(); g.add(d.host); siteGrants.set(d.object, g); }
+    for (const [obj, hosts] of siteGrants) {
+      const t = this.o.signer.forSite(obj, [...hosts], this.o.task, "external");
       this.siteTokens.push(t);
-      this.consents.push({ scope: "site", object: obj, consequence: "modify_user" });
+      this.o.executor.approveSites(t);
+      this.consents.push({ scope: "site", object: obj, consequence: "external" });
     }
-    this.emit("plan.confirmed", { objects: [...this.tokens.keys()], opens: Object.fromEntries([...openGrants].map(([w, h]) => [w, [...h]])) });
+    this.emit("plan.confirmed", { objects: [...this.tokens.keys()], opens: Object.fromEntries([...openGrants].map(([w, h]) => [w, [...h]])), sites: Object.fromEntries([...siteGrants].map(([w, h]) => [w, [...h]])) });
     return text("用户同意了计划。改用户东西的步骤可以做了；往外发的步骤到时候会再确认一次。");
   }
 
@@ -555,7 +578,7 @@ export class FrontierRuntime {
     }
     // the prompt shows the model the task folder's files' first lines: content taken in, as much as a read (a URL can
     // carry it out)
-    if (this.o.workspace?.listing().entries.some((e) => e.preview)) ex.noteTakenIn("the task folder's listing with previews");
+    if (this.o.workspace?.listing().entries.some((e) => e.preview)) ex.noteTakenIn("the task folder's listing with previews", J(this.o.workspace.listing()));
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await ex.end().catch(() => undefined); return this.result(); }
     const rec = ex.recovered;

@@ -141,6 +141,14 @@ export class ConsentVerifier {
     return "no consent";
   }
 
+  /** The hosts a site token approves for `task` at external — a plan the user accepted declares the sites it visits
+   *  (owner 10-21 refinement), and the app signs them so — when it is validly signed, unexpired, of that task and at
+   *  external; none otherwise. The runtime hands the token over; it cannot add a host itself. */
+  approvedSites(t: ConsentToken, task: string): string[] {
+    if (t.scope !== "site" || t.task !== task || t.consequence !== "external" || this.valid(t)) return [];
+    return t.hosts ?? [];
+  }
+
   /** What a challenge this executor issued was bound to (a send's content), so a later look can be held against what
    *  the user saw — not only against its digest. */
   contentOf(nonce: string): unknown { return this.issued.get(nonce); }

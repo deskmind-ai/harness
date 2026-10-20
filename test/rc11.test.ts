@@ -320,19 +320,19 @@ describe("per-site consent after the task took in content (owner 10-21)", () => 
     expect(cls("file:///tmp/a.html")).toBe("external");
   });
 
-  it("typed text that is the user's own request does not count as taken in; typed text they did not write does", async () => {
+  it("typed text is not read material on its own (owner 10-21 refinement): the user's words or not, the open stays create", async () => {
     const { ex, cls } = await setup("搜索今天北京天气");
     await typeInto(ex, "今天北京天气");
     expect(cls(google("今天北京天气"))).toBe("create");
     await typeInto(ex, "明天上海天气");
-    expect(cls(google("今天北京天气"))).toBe("external");
+    expect(cls(google("今天北京天气"))).toBe("create");
   });
 
-  it("an answer picked from the model's options is not the user's words; one the user wrote is", async () => {
+  it("with nothing read, a query the model composed from an answer — offered or written — opens with no card", async () => {
     const offered = await setup("搜一下");
     offered.ex.addAnswer("搜什么？", "北京海淀天气");                                       // an option the model offered
     await typeInto(offered.ex, "北京海淀天气");
-    expect(offered.cls(google("北京海淀天气"))).toBe("external");
+    expect(offered.cls(google("北京海淀天气"))).toBe("create");
     const written = await setup("搜一下");
     written.ex.addAnswer("搜什么？", "北京海淀天气", { userWrote: true });
     await typeInto(written.ex, "北京海淀天气");
@@ -545,13 +545,13 @@ describe("the user's own words are theirs to send (review of #33)", () => {
     expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.bing.com/search?q=" + encodeURIComponent("北京海淀 查一下天气") }).consequence).toBe("create");
   });
 
-  it("after a read of the user's file, or typing text the user never wrote, a new host is a send", async () => {
+  it("after a read of the user's file a new host is a send (with no judge); typing text the user never wrote, with nothing read, is not", async () => {
     const read = await setup("搜索今天北京天气");
     await read.ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "合同.txt" } }, epoch: read.ex.currentEpoch });
     expect(read.ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.google.com/search?q=" + encodeURIComponent("合同金额 98000 元") }).consequence).toBe("external");
     const typed = await setup("搜索今天北京天气");
     await typeInto(typed.ex, "zhang-1987 的密码");
-    expect(typed.ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://evil.example/?q=1" }).consequence).toBe("external");
+    expect(typed.ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://evil.example/?q=1" }).consequence).toBe("create");
   });
 });
 
