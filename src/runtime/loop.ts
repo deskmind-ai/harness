@@ -554,7 +554,9 @@ export class FrontierRuntime {
     if (u.reversible) options.push({ kind: "undo", text: this.t.undo });
     const consented = this.consents.filter((c) => c.scope !== "action" || c.consequence === "external").map((c) => c.object);
     const rules = [...this.o.executor.consent.rulesUsed];
-    const text = [this.t.did(this.effects.slice(-6)), ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(u.reversible ? [] : [this.t.noUndo(u.steps.find((x) => !x.can)?.why ?? this.t.undoable)])].join("\n");
+    const text = [this.t.did(this.effects.slice(-6)), ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(u.reversible ? [] : [this.t.noUndo(u.steps.find((x) => !x.can)?.why ?? this.t.undoable)]),
+      // undo takes the run back but leaves open what a launch brought up of the user's apps: said, not implied
+      ...(u.reversible && u.steps.some((x) => x.left_open) ? [this.t.undoKeepsOpen([...new Set(u.steps.flatMap((x) => (x.left_open ? [x.left_open] : [])))])] : [])].join("\n");
     return { kind: "result", text, options, free_text: false, blocking: false };
   }
 

@@ -19,6 +19,7 @@ const ZH = {
   mainWindow: (app: string) => `${app} 的主窗口`,
   openedMain: (app: string) => `DeskMind 打开的 ${app} 主窗口`, openedTitled: (app: string, title: string) => `DeskMind 打开的 ${app}「${title}」`,
   leftOpen: (app: string) => `打开 ${app}（撤回时不关它：窗口里可能有你的东西）`,
+  undoKeepsOpen: (apps: string[]) => `撤回不会关掉：${apps.join("、")}`,
   foreground: (apps: string[]) => `注意：${apps.join("、")} 只能在前台操作。做这些步骤时，我会把它短暂切到前台；这段时间请先别用电脑。`,
 };
 const EN: typeof ZH = {
@@ -36,6 +37,7 @@ const EN: typeof ZH = {
   mainWindow: (app: string) => `${app}'s main window`,
   openedMain: (app: string) => `the ${app} main window DeskMind opened`, openedTitled: (app: string, title: string) => `${app} "${title}" (opened by DeskMind)`,
   leftOpen: (app: string) => `open ${app} (left open on undo: it may hold your things)`,
+  undoKeepsOpen: (apps: string[]) => `Undo will not close: ${apps.join(", ")}`,
   foreground: (apps: string[]) => `Note: ${apps.join(", ")} can only be operated in front. For these steps I will bring it to the front briefly; please leave the Mac alone meanwhile.`,
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);

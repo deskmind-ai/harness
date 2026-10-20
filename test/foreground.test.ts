@@ -218,3 +218,80 @@ describe("a window the launch brought up (hands#54 opened_window)", () => {
     expect(desk.wins.some((w) => w.info.id === "com.netease.163music#5")).toBe(true);
   });
 });
+
+describe("review of #32", () => {
+  /** A desk with a minimised window of the user's that a launch brings back — reported as `kind` of window. */
+  class BackDesk extends Desk {
+    constructor(public says: "opened_window" | "new_window", public via: "open_window" | "click" = "open_window") { super([{ info: { ...music("com.netease.163music#7"), minimized: true }, elements: els }]); }
+    perform(action: Action, opts?: { foreground_ok?: boolean }) {
+      this.performed.push({ action, ...(opts ? { opts } : {}) }); this.epoch += 1;
+      const info = music(this.via === "open_window" ? "com.netease.163music#7" : "com.netease.163music#8");
+      if (this.via === "click") this.wins.push({ info, elements: els });
+      return { status: "ok" as const, window: "window" in action ? action.window : info.id, [this.says]: info };
+    }
+  }
+  const go = async (desk: Desk) => {
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });
+    await ex.begin(); await ex.plan({ steps: [] });
+    return { ex, app };
+  };
+
+  it("a window of the user's that the launch brings back is neither opened by DeskMind nor the task's — minimised (still listed) or hidden since begin (no longer listed)", async () => {
+    for (const says of ["opened_window", "new_window"] as const) for (const hidden of [false, true]) {
+      const desk = new BackDesk(says);
+      const { ex } = await go(desk);
+      const back = desk.wins[0]!;
+      if (hidden) desk.wins = [];                                                          // the app was hidden after begin
+      const perform = desk.perform.bind(desk);
+      desk.perform = (a: Action, o?: { foreground_ok?: boolean }) => { if (!desk.wins.includes(back)) desk.wins.push(back); return perform(a, o); };
+      await ex.act({ action: { kind: "open_window", app: "网易云音乐" }, epoch: (await ex.snapshot()).epoch });
+      expect([says, ex.ledger.ownerOf("window:com.netease.163music#7")]).toEqual([says, "user"]);
+      const o = await ex.observe("com.netease.163music#7");
+      expect([says, o.window.opened]).toEqual([says, undefined]);
+      await ex.act({ action: { kind: "scroll", window: "com.netease.163music#7", dy: 1 }, epoch: o.epoch });
+      expect([says, desk.performed.at(-1)!.opts]).toEqual([says, undefined]);
+      expect([says, hidden, ex.undoable().steps.some((x) => x.left_open)]).toEqual([says, hidden, false]);
+    }
+  });
+
+  it("opened_window counts only for open_window: a click that reports one does not make it DeskMind-opened", async () => {
+    const desk = new BackDesk("opened_window", "click");
+    const { ex, app } = await go(desk);
+    const o = await ex.observe("com.netease.163music#7");
+    await ex.act({ action: { kind: "click", window: "com.netease.163music#7", target: "ocr:2" }, epoch: o.epoch, consent: app.forObject("window:com.netease.163music#7", "modify_user", "t1") });
+    const o2 = await ex.observe("com.netease.163music#8");
+    expect(o2.window.opened).toBeUndefined();
+  });
+
+  it("an `opened` flag from the driver is not believed", async () => {
+    const desk = new Desk([{ info: { ...music("com.netease.163music#1"), opened: true }, elements: els }]);
+    const { ex } = await go(desk);
+    expect(ex.beginSnapshot!.windows[0]!.opened).toBeUndefined();
+    expect((await ex.snapshot()).windows[0]!.opened).toBeUndefined();
+    const o = await ex.observe("com.netease.163music#1");
+    expect(o.window.opened).toBeUndefined();
+    await ex.act({ action: { kind: "scroll", window: "com.netease.163music#1", dy: 1 }, epoch: o.epoch });
+    expect(desk.performed.at(-1)!.opts).toBeUndefined();
+  });
+
+  it("the result card names the launched app undo will leave open", async () => {
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { scriptedStream } = await import("../src/runtime/scripted.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
+    const desk = new Desk([]);
+    desk.perform = (action: Action) => { desk.epoch += 1; const info = music("com.netease.163music#5"); desk.wins.push({ info, elements: els }); return { status: "ok" as const, window: info.id, opened_window: info } as never; };
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });
+    const gw = new Gateway(table); gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));
+    const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as any };
+    const steps: any[] = [
+      { calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "网易云音乐" }, epoch: 1, consequence: "create", purpose: "打开网易云" } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "开好了" } }] },
+    ];
+    const rt = new FrontierRuntime({ task: "t1", raw: "打开网易云", executor: ex, signer: app, user: { ask: () => null }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
+    const r = await rt.run();
+    expect(r.result_card!.text).toContain("撤回不会关掉：网易云音乐");
+  });
+});
