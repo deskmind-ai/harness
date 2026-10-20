@@ -505,7 +505,9 @@ export class Executor {
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
   attachFiles(workspace: Workspace, registry: Registry) { this.opts.files = { workspace, registry }; }
 
-  setRequest(raw: string) { this.opts.raw = raw; }
+  setRequest(raw: string) { if (this.opts.raw) this.earlierRequests.push(this.opts.raw); this.opts.raw = raw; }
+  /** The request as it was before each steer: still the user's words. */
+  private earlierRequests: string[] = [];
 
   /** What the user answered when asked during the task: their words as much as the request, read by every judge
    *  question (intent, evidence, verdict) — a judge that saw only the request refused the step the user had just asked
@@ -706,18 +708,26 @@ export class Executor {
     return false;
   }
 
-  /** Does this URL carry text the task typed (anywhere) or read from a file in this run? Compared as text, in the URL
-   *  as written and decoded: each typed entry (2 characters or more) and each line read (4 or more), and pieces of long
-   *  ones. An extra card is the cost of a coincidence; the other way is content leaving without one. */
+  /** Does this URL carry text the task typed (anywhere) or read from a file in this run — other than the user's own
+   *  words (the request, before and after a steer, and their answers on cards)? Compared as text, in the URL as written
+   *  and decoded: each typed entry (2 characters or more) and each line read (4 or more), and pieces of long ones; a
+   *  piece that is in the user's words does not count. An extra card is the cost of a coincidence; the other way is
+   *  content leaving without one. */
   private carriesTaskText(url: string): boolean {
     let decoded = url;
     try { decoded = decodeURIComponent(url.replace(/\+/g, " ")); } catch { /* as written */ }
     const hay = `${url}\n${decoded}`.toLowerCase();
+    // segments: text split at spaces and punctuation (a query made of the user's words joined by a space is still
+    // theirs), at least 2 characters of what was typed and 4 of what was read
+    const segs = (t: string, min: number) => t.split(/[\s,，。.;；:：、!！?？"“”'‘’()（）]+/).map((x) => x.trim()).filter((x) => [...x].length >= min);
     const needles: string[] = [];
-    for (const list of this.typed.values()) for (const t of list) if (t.trim().length >= 2) needles.push(t.trim());
-    for (const r of this.receipts) if (r.request.action.kind === "file" && r.result.output) for (const v of Object.values(r.result.output)) if (typeof v === "string") for (const line of v.split("\n").slice(0, 2000)) if (line.trim().length >= 4) needles.push(line.trim());
+    for (const list of this.typed.values()) for (const t of list) needles.push(...segs(t, 2));
+    for (const r of this.receipts) if (r.request.action.kind === "file" && r.result.output) for (const v of Object.values(r.result.output)) if (typeof v === "string") for (const line of v.split("\n").slice(0, 2000)) needles.push(...segs(line, 4));
+    // what the user asked to send is theirs to send: a piece found in the request (as it was before any steer, too) or
+    // in the user's answers on cards is left out — a web search for the user's own query is no leak (review of #33)
+    const theirs = [this.opts.raw ?? "", ...this.earlierRequests, ...this.answers.map((a) => a.text)].join("\n").toLowerCase();
     const pieces = (t: string) => (t.length <= 20 ? [t] : Array.from({ length: Math.ceil((t.length - 20) / 10) + 1 }, (_, i) => t.slice(i * 10, i * 10 + 20)));
-    return needles.some((n) => pieces(n.toLowerCase()).some((p) => hay.includes(p)));
+    return needles.some((n) => pieces(n.toLowerCase()).some((p) => !theirs.includes(p) && hay.includes(p)));
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
