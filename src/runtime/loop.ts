@@ -102,6 +102,9 @@ export class FrontierRuntime {
   readonly effects: string[] = [];
   readonly verdicts: RuntimeResult["verdicts"] = [];
   private tokens = new Map<string, ConsentToken>();       // object → consent from an approved plan
+  /** The user's yes to one action, kept when the executor then found the screen changed (stale) and the model retries
+   *  the same action: the executor still holds the token to what the user saw, so it is not asked again for nothing. */
+  private retryTokens = new Map<string, ConsentToken>();
   private status: RuntimeStatus | null = null;
   /** The request as it stands: the app can change it mid-run (steer); the verdict judges against the latest. */
   raw: string;
@@ -274,9 +277,12 @@ export class FrontierRuntime {
     const a = p.action as unknown as Action;
     const bad = checkAction(a);
     if (bad) return err(bad);
+    // the plan's object token for what the action touches goes along whatever the class: act settles the class itself
+    // (the judge is asked only after its own checks that the action is current) and asks for a card when the token
+    // does not cover it — a send is never covered by one. Choosing by a class guessed here either paid the judge on
+    // stale actions or, by the old send hints, left the token behind for a site search the judge clears
     const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
-    let consent = this.tokens.get(pre.object);
-    if (consent && rank(consent.consequence) < rank(pre.consequence)) consent = undefined;
+    const consent = this.retryTokens.get(canon(a)) ?? this.tokens.get(pre.object);
     let r: ActResult;
     try { r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
     catch (e) { if (e instanceof Crash) { this.crash = e; this.abort.abort(); return { ...text("crash"), terminate: true }; } throw e; }
@@ -286,7 +292,9 @@ export class FrontierRuntime {
       if (t === "cancel") return this.end("cancelled", "the user stopped the task");
       if (t === "declined") return this.declined(`用户不同意这一步：${r.challenge.text}。换一种不需要它的做法，或者 finish 说明。`);
       r = await this.o.executor.act({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t });
+      if (r.status === "stale") this.retryTokens.set(canon(a), t);
     }
+    if (r.status !== "stale" && r.status !== "needs_consent") this.retryTokens.delete(canon(a));
     this.count("actions"); this.count(`actions:${r.status}`);
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     if (a.kind === "file") this.emit("fs.act", { cap: a.capability, args: a.args, status: r.status, consequence: r.consequence, why: r.why ?? "" });
@@ -302,8 +310,11 @@ export class FrontierRuntime {
     const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: after.window, modal: after.modal, elements: after.elements, text: after.text } } : {}) };
     // the step check: a state change with nothing visibly changed is said so, in the result the model reads
     const noChange = r.status === "ok" && rank(r.consequence) >= rank("create") && r.changed && r.changed.elements === 0 && !r.changed.new_windows?.length;
-    const sig = canon({ a, after: after?.elements.map((e) => [e.id, e.value ?? ""]) ?? null });
-    this.repeats = sig === this.lastSig ? this.repeats + 1 : 0; this.lastSig = sig;
+    // a stale result did nothing: the screen moved under the action, which is not the model going round in circles
+    if (r.status !== "stale") {
+      const sig = canon({ a, after: after?.elements.map((e) => [e.id, e.value ?? ""]) ?? null });
+      this.repeats = sig === this.lastSig ? this.repeats + 1 : 0; this.lastSig = sig;
+    }
     const notes = [...(noChange ? ["注意：这一步做了，但界面上没有任何变化；预期的变化没出现就换个办法。"] : []), ...(this.repeats >= 1 ? ["注意：同一个动作在同一个界面上重复了，没有进展（原地打转）。换别的路，或者问用户。"] : [])];
     if (this.repeats >= 3) return this.end("failed", "no progress: the same action on an unchanged screen");
     return { ...(r.status === "ok" || r.status === "unverified" ? text(J(view)) : err(J(view))), ...(notes.length ? { content: [{ type: "text", text: J(view) + "\n" + notes.join("\n") }] } : {}) };

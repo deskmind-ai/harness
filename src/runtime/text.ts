@@ -15,6 +15,7 @@ const ZH = {
   openedInYours: "在你已开着的窗口里打开的页面撤不回",
   outgoing: (fields: string[], shown: string[]) => `\n要发出去的：${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : "窗口里看不到要发出的内容"}`,
   byRule: (rules: string[]) => `按你以前定的规则做的：${rules.join("、")}`,
+  typed: (t: string) => `这次任务打的字：${t}`,
 };
 const EN: typeof ZH = {
   ok: "OK", okPlan: "OK, go ahead", skipStep: "Skip this step", cancel: "Stop here", delegate: "You decide", fine: "Fine", undo: "Undo",
@@ -27,5 +28,6 @@ const EN: typeof ZH = {
   openedInYours: "a page opened in a window of yours cannot be undone",
   outgoing: (fields: string[], shown: string[]) => `\nWhat goes out:${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : " not visible in the window"}`,
   byRule: (rules: string[]) => `Under your standing rule: ${rules.join(", ")}`,
+  typed: (t: string) => `typed by this task: ${t}`,
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);

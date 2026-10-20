@@ -12,6 +12,7 @@ import { Gateway } from "../src/gateway/index.js";
 import type { Answer, Card } from "../src/orchestrator/index.js";
 import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor } from "../src/executor/executor.js";
+import { OUTGOING_QUESTION } from "../src/executor/judge.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import { FrontierRuntime, type RuntimeUser } from "../src/runtime/loop.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
@@ -51,7 +52,8 @@ function runtime(sim: SimComputer, steps: Step[], u: RuntimeUser, verify: unknow
   // the judge asks the intent role before every consequential action; unanswered, it falls through to consent
   // the verdict is a judge question too: scripted as {verdict, reason}, answered as the choice
   const v = verify as { verdict: string; reason: string };
-  gw.script = Array(60).fill((role: string) => (role === "verify" ? { choice: v.verdict, reason: v.reason } : role === "intent" ? { choice: "matches" } : { outcome: "error", error: "unexpected role " + role }));
+  // the outgoing check (an intent-role choice too) is answered as a plain judge would: what hands' name list marks sends
+  gw.script = Array(60).fill((role: string, _s: string, u: string) => (role === "verify" ? { choice: v.verdict, reason: v.reason } : role === "intent" && u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: /"目标名字命中发送词表":\s*true/.test(u) ? "sends" : "stays" } : role === "intent" ? { choice: "matches" } : { outcome: "error", error: "unexpected role " + role }));
   const seen: Message[][] = [];
   const rt = new FrontierRuntime({ task: "t1", raw: "在信鸽里回复林晓关于“Q3 预算”的邮件：“收到，谢谢”", executor: ex, signer: app, user: u, gateway: gw, model: { ...model, streamFn: scriptedStream(steps, seen) }, ...extra });
   return { rt, ex, gw, seen };

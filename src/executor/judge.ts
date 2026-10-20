@@ -19,12 +19,23 @@ import * as R from "../protocol/roles.js";
 export interface JudgeTier { name: string; gateway: Gateway; role?: Role; floor?: number }
 export interface JudgeOption { id: string; text: string }
 export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean }
+/** How one question is routed (all optional; leaving them out keeps the behaviour every question had before):
+ *  - `settle`: the option a lower tier may settle on its own above its floor; the default is the first option (the
+ *    direction a later check still covers). The outgoing check's safe direction is「会发出去」, so it names that.
+ *  - `route: false`: this question is never skipped for a lower tier by the "settles too rarely" rule — a question
+ *    whose lower tier is meant to escalate most of the time (and is measured on those escalations) would otherwise be
+ *    taken away from it before any comparisons are in. */
+export interface ChooseOptions { settle?: string; route?: boolean }
 
 /** How often a lower tier settles each kind of question (kinds: the question's first words — intent, verify, and
  *  the evidence questions share a prefix), kept across tasks when a path is given: a tier that never settles a kind
  *  is not asked it any more, except for an occasional probe, so its latency is not paid for nothing. */
 export class TierStats {
-  private readonly data: Record<string, Record<string, { asked: number; settled: number; compared?: number; agreed?: number; turns?: number }>> = {};
+  private readonly data: Record<string, Record<string, { asked: number; settled: number; compared?: number; agreed?: number; turns?: number;
+    /** escalations: the lower tier answered `choice` and passed the question up; how often the top tier then gave the
+     *  same answer, per lower-tier choice (e.g. how often the top agreed when Brain said「不会」). Measurement only —
+     *  routing (`skip`) does not read it. */
+    escalated?: Record<string, { compared: number; agreed: number }> }>> = {};
   constructor(private readonly path?: string) {
     if (path) { try { Object.assign(this.data, JSON.parse(readFileSync(path, "utf-8"))); } catch { /* fresh */ } }
   }
@@ -44,6 +55,14 @@ export class TierStats {
   note(tier: string, kind: string, settled: boolean) { const k = this.at(tier, kind); k.asked += 1; if (settled) k.settled += 1; this.save(); }
   /** A shadow comparison: did the slow tier agree with what the fast tier settled? */
   noteAgreement(tier: string, kind: string, agree: boolean) { const k = this.at(tier, kind); k.compared = (k.compared ?? 0) + 1; k.agreed = (k.agreed ?? 0) + (agree ? 1 : 0); this.save(); }
+  /** An escalation both tiers answered: the lower tier said `choice` (and did not settle), the top tier answered too —
+   *  did they agree? Every escalation is a comparison at no extra cost (the top was asked anyway). */
+  noteEscalation(tier: string, kind: string, choice: string, agree: boolean) {
+    const k = this.at(tier, kind);
+    const e = ((k.escalated ??= {})[choice] ??= { compared: 0, agreed: 0 });
+    e.compared += 1; if (agree) e.agreed += 1;
+    this.save();
+  }
   /** Skip the tier for this kind when it has shown it is not worth asking: it settles under `floor` of the questions
    *  (asked at least `min` times), or — measured by shadow comparisons — the slow tier agreed with its settled
    *  answers under `agreeFloor` of the time (compared at least `minCompared` times). A probe turn now and then keeps
@@ -75,7 +94,7 @@ export class Judge {
      *  comparison) is emitted as a `judge.sample` with the prompt, the options and both answers */ samples?: boolean } = {}) {}
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. */
-  async choose(question: string, context: unknown, options: JudgeOption[], role?: Role): Promise<JudgeAnswer | null> {
+  async choose(question: string, context: unknown, options: JudgeOption[], role?: Role, how: ChooseOptions = {}): Promise<JudgeAnswer | null> {
     const key = createHash("sha256").update(JSON.stringify({ question, context, options })).digest("hex").slice(0, 24);
     const hit = this.cache.get(key);
     if (hit) return { ...hit, cached: true };
@@ -85,10 +104,12 @@ export class Judge {
     const ids = options.map((o) => o.id) as [string, ...string[]];
     const kind = TierStats.kindOf(question, context);
     let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null, lower: JudgeAnswer | null = null;
+    const escalations: JudgeAnswer[] = [];                // lower tiers that answered and passed the question up
+    const settleOn = how.settle ?? options[0]?.id;
     const prompt = P.choicePrompt(question, context, options);
     const sample = (top: string | null) => { if (this.opts.samples && lower && top) this.opts.onEvent?.("judge.sample", { question_kind: kind, prompt, options, lower, top }); };
     const topTier = this.tiers[this.tiers.length - 1]!;
-    const skipped = new Set(this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)));
+    const skipped = new Set(how.route === false ? [] : this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)));
     const lowerAsked = this.tiers.length - 1 > skipped.size;
     // shadow is drawn before the race: a sampled question keeps the raced top answer for the comparison instead of
     // abandoning it (with both on, aborting first left the agreement routing with no samples — deskmind#86 review)
@@ -106,13 +127,19 @@ export class Judge {
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
       last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason };
-      if (final) { settled = true; sample(last.choice); break; }
+      if (final) {
+        settled = true; sample(last.choice);
+        // every lower answer that was passed up now has the top's answer beside it: counted per lower choice
+        for (const e of escalations) this.opts.stats?.noteEscalation(e.by, kind, e.choice, e.choice === last.choice);
+        break;
+      }
       lower = last;
       // a lower tier may approve on its own when confident; refusing is the top tier's call (a cheap model's confident
       // "no" blocked right actions in the 10-18 probe), and "not enough evidence" is never final below the top
-      const canSettle = last.choice === options[0]?.id && confidence !== undefined && confidence >= (tier.floor ?? 0);
+      const canSettle = last.choice === settleOn && confidence !== undefined && confidence >= (tier.floor ?? 0);
       this.opts.stats?.note(tier.name, kind, canSettle);
       if (canSettle) { settled = true; settledBy = tier; if (raced && !shadowNow) { raced.promise?.catch(() => undefined); raced.controller.abort(); this.opts.onEvent?.("judge.raced", { won: tier.name }); } break; }
+      escalations.push(last);
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
@@ -139,6 +166,18 @@ export const INTENT_OPTIONS: JudgeOption[] = [
   { id: "insufficient", text: "证据不够：动作里有的值是猜的，或看不出对象是不是用户说的那个" },
 ];
 export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取好参数）。这是完成用户要求过程中的一步，不是全部：只判断这一步和用户的话（原话，以及用户对提问的回答）是否一致——对象是不是用户说的那个、内容是不是用户给的、有没有做用户没要求的事。一步只做了一部分不算「不是」。只为把路让开的中间步骤——关掉挡住的弹窗（选「稍后」「取消」这种不改东西的项）、滚动、切换窗口、在结果里切换分类标签 / 翻页 / 展开列表——不算「用户没要求的事」，只要它本身不改用户的内容、不往外发；点「立即更新」「确定删除」这类会改东西的项才要和用户的话对得上。只看给出的材料，不替用户补充意图。";
+
+/** The outgoing check (docs/outgoing-check-2026-10-20.md): will this step send something out? Asked of screen actions
+ *  that change something and are below external after structure and the model's class. The judge only raises: 会 /
+ *  拿不准 / no answer → external; 不会 → the class stays. A lower tier may settle only「会发出去」alone (the safe
+ *  direction), so its「不会」always goes up and is compared with the top's answer (TierStats.noteEscalation). Its
+ *  first words differ from INTENT_QUESTION's: TierStats.kindOf routes by the first 12 characters. */
+export const OUTGOING_QUESTION = "这一步会不会把内容发出去——发给别人，或者发到这台电脑以外（发消息、发邮件、提交表单、发布、分享、支付、点赞、关注、转发都算）？只看给出的材料：动作、目标元素（角色、名字、是不是从画面认出来的）、窗口和窗口里的其他控件、按的键、这次任务在这个窗口里打过的字。名字命中发送词表、回车或换行只是线索，不是结论：站内搜索框里按回车、只打开分享面板还没发，都不算发出去；没有名字、只有图标的按钮，要结合它所在的窗口和刚打过的字判断。看不出来就选「拿不准」。";
+export const OUTGOING_OPTIONS: JudgeOption[] = [
+  { id: "sends", text: "会发出去：这一步会把内容发给别人，或发到这台电脑以外" },
+  { id: "stays", text: "不会：内容留在这台电脑上（本地编辑、搜索、浏览、打开面板、切换）" },
+  { id: "unsure", text: "拿不准：材料看不出这一步会不会发出去" },
+];
 
 /** The judge a runtime gets by default: the gateway's intent role, with an optional first tier that answers first and
  *  may approve on its own above its floor, never refuse alone:
