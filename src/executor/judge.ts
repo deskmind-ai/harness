@@ -18,7 +18,7 @@ import * as R from "../protocol/roles.js";
 
 export interface JudgeTier { name: string; gateway: Gateway; role?: Role; floor?: number }
 export interface JudgeOption { id: string; text: string }
-export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean }
+export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean; missing_kind?: "action" | "evidence" }
 /** How one question is routed (all optional; leaving them out keeps the behaviour every question had before):
  *  - `settle`: the option a lower tier may settle on its own above its floor; the default is the first option (the
  *    direction a later check still covers). The outgoing check's safe direction is「会发出去」, so it names that.
@@ -126,7 +126,7 @@ export class Judge {
       if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
-      last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason };
+      last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason, ...(rep.data!.missing_kind ? { missing_kind: rep.data!.missing_kind } : {}) };
       if (final) {
         settled = true; sample(last.choice);
         // every lower answer that was passed up now has the top's answer beside it: counted per lower choice
@@ -219,6 +219,7 @@ export const VERIFY_QUESTION = [
   "界面上「删掉 / 移走 X」的证据是：X 在窗口第一次观察里有、现在没有，而且回执里有导致它消失的那串动作（选中它那一行、点删除、确认）——删除按钮是通用控件，不会以那一行为目标，所以不要去找「以那一行为目标的删除动作」，也不要求看到废纸篓或已删除文件夹，那是应用的事。用户对提问的回答和原话一样算证据，用它来消歧。",
   "用户说了在哪个应用里做、怎么做（「在文本编辑里保存为…」）的，证据要证明是那样做成的：用别的路子（比如文件工具直接写出一个同名文件）得到的结果不算那条要求的证据；任务自己的窗口到结束还带着未保存的改动（标题里的「已编辑」、未命名），和「保存了」矛盾。",
   "每条都被证明才选 pass；有一条证据矛盾选 fail；有一条证据不够、没有或间接，选 unknown。reason 里写明哪一条、缺什么。",
+  "选 unknown 时，missing_kind 写缺的是哪一种：action（还有要求没做、没做完）；evidence（回执里该做的动作都做了，只是现在能看到的证据证明不了结果，比如从画面读的应用里看不出是不是在播放）。",
 ].join("\n");
 export const VERIFY_OPTIONS: JudgeOption[] = [
   { id: "pass", text: "做成了：每一条要求都有现在状态的证据" },

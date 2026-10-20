@@ -32,6 +32,12 @@ export class ConsentSigner {
     return this.sign({ nonce: c.nonce, scope: "action", digest: c.digest, object: c.object, consequence: c.consequence, expires_at: this.now() + ttlMs, sig: "" });
   }
 
+  /** Consent to open pages of these sites (open_window with a URL whose host is listed) in `object` — the user's
+   *  browser window a URL lands in — in `task`, and nothing else there: not a click, not typing, not another site. */
+  forOpen(object: string, hosts: string[], task: string, ttlMs = 60 * 60_000): ConsentToken {
+    return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "open", object, hosts: [...new Set(hosts)].sort(), consequence: "modify_user", task, expires_at: this.now() + ttlMs, sig: "" });
+  }
+
   /** Consent for every action on `object` in `task` up to `consequence`, until it expires. */
   forObject(object: string, consequence: Consequence, task: string, ttlMs = 60 * 60_000): ConsentToken {
     return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "object", object, consequence, task, expires_at: this.now() + ttlMs, sig: "" });
@@ -100,6 +106,14 @@ export class ConsentVerifier {
         if (t.digest !== digestOf(action, object, consequence, content)) return "consent is for another action";
         if (this.spent.has(t.nonce)) return "consent already used";
         return null;
+      }
+      if (t.scope === "open") {
+        if (t.task !== task) return "consent is for another task";
+        if (t.object !== object) return "consent is for another object";
+        if (action.kind !== "open_window" || !action.url) return "consent covers opening pages only";
+        let host = "";
+        try { host = new URL(action.url).host; } catch { return "consent covers opening pages only"; }
+        return t.hosts?.includes(host) ? null : `consent does not cover ${host}`;
       }
       if (t.scope === "object") {
         if (t.task !== task) return "consent is for another task";

@@ -173,7 +173,7 @@ describe("the plan card by the executor's view", () => {
 });
 
 describe("the plan card names the objects as the user knows them (review of #31)", () => {
-  it("a window by its app and title, an untitled window as the app's main window, a tab by title and site, a file by its path; unresolved as written", async () => {
+  it("a window by its app and title, an untitled window as the app's main window, a tab by title and site, a file by its path; what does not resolve is left off", async () => {
     const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
     const { Workspace, build } = await import("../src/registry/workspace.js");
     const { fileRegistry } = await import("../src/registry/fs.js");
@@ -193,7 +193,8 @@ describe("the plan card names the objects as the user knows them (review of #31)
     const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "整理", objects: [`窗口 ${mailW}`, `window:${ed.id}`, `tab:${tab}`, "notes/todo.txt", "那个不存在的东西"], consequence: "create" }] } }] }, finish];
     const rt = new FrontierRuntime({ task: "t1", raw: "整理一下", executor: ex, signer: app, user: { ask: (c: Card): Answer => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) }, workspace: ws, registry: fileRegistry() });
     await rt.run();
-    expect(cards[0]!.text).toContain("1. 整理（信鸽「收件箱」、编辑器 的主窗口、「合同续签 - Mailora」（127.0.0.1:8977）、notes/todo.txt、那个不存在的东西）——改你的东西");
+    // what names nothing (words, an element id) is not on the card (run_ac5345ce: 「…、ocr:26」)
+    expect(cards[0]!.text).toContain("1. 整理（信鸽「收件箱」、编辑器 的主窗口、「合同续签 - Mailora」（127.0.0.1:8977）、notes/todo.txt）——改你的东西");
     expect(cards[0]!.text).not.toContain(mailW);
   });
 

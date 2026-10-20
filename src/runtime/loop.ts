@@ -31,7 +31,7 @@ import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult,
 
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
 /** What signs consent: the app (keychain) in production, a ConsentSigner in tests and the CLI. */
-export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject">;
+export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject" | "forOpen">;
 /** A plan step as the model writes it; `opens`: the URLs it opens with open_window, and in which app. */
 export interface PlanStepIn { purpose: string; objects: string[]; consequence: Consequence; opens?: { app: string; url: string }[] }
 
@@ -105,6 +105,10 @@ export class FrontierRuntime {
   readonly effects: string[] = [];
   readonly verdicts: RuntimeResult["verdicts"] = [];
   private tokens = new Map<string, ConsentToken>();       // object → consent from an approved plan
+  /** window → consent to open pages of the plan's sites there (open_window with a URL), from an approved plan */
+  private openTokens = new Map<string, ConsentToken>();
+  /** After a verdict that only the evidence is missing: the model may look, not act (finish's lookOnly). */
+  private lookOnly = false;
   /** The user's yes to one action, kept when the executor then found the screen changed (stale) and the model retries
    *  the same action: the executor still holds the token to what the user saw, so it is not asked again for nothing. */
   private retryTokens = new Map<string, ConsentToken>();
@@ -290,12 +294,21 @@ export class FrontierRuntime {
     const a = p.action as unknown as Action;
     const bad = checkAction(a);
     if (bad) return err(bad);
+    // looking for evidence only: a wait or a file read; nothing that changes something or brings an app forward
+    if (this.lookOnly && !(a.kind === "wait" || (a.kind === "file" && this.o.executor.preview({ action: a, epoch: p.epoch, consequence: "read" }).consequence === "read"))) {
+      this.count("refused_look_only");
+      return err("the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed");
+    }
     // the plan's object token for what the action touches goes along whatever the class: act settles the class itself
     // (the judge is asked only after its own checks that the action is current) and asks for a card when the token
     // does not cover it — a send is never covered by one. Choosing by a class guessed here either paid the judge on
     // stale actions or, by the old send hints, left the token behind for a site search the judge clears
     const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
-    const consent = this.retryTokens.get(canon(a)) ?? this.tokens.get(pre.object);
+    // a URL to open in a window the plan covered for its site: that consent; anything else there, the plan's object
+    // consent if it named the window — the executor checks either against the action
+    let host = ""; if (a.kind === "open_window" && a.url) { try { host = new URL(a.url).host; } catch { /* not a URL */ } }
+    const opening = host && this.openTokens.get(pre.object)?.hosts?.includes(host) ? this.openTokens.get(pre.object) : undefined;
+    const consent = this.retryTokens.get(canon(a)) ?? opening ?? this.tokens.get(pre.object);
     let r: ActResult;
     try { r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
     catch (e) { if (e instanceof Crash) { this.crash = e; this.abort.abort(); return { ...text("crash"), terminate: true }; } throw e; }
@@ -379,25 +392,38 @@ export class FrontierRuntime {
     // a URL a step opens lands where the executor's floor for that open_window says: in the user's browser window when
     // the app has one (「搜索今天北京天气」, rc.10: nine cards for nine pages in the user's Chrome). That window is one
     // of the step's objects, by the executor's view — listed on the card and covered by one approval
-    const opensInto = steps.map((s) => [...new Set((s.opens ?? []).flatMap((o) => { const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url }); return f.consequence === "modify_user" && f.object.startsWith("window:") ? [f.object] : []; }))]);
-    const objectsOf = (await Promise.all(steps.map((s) => this.canonObjects(s.objects, snap)))).map((os, i) => [...new Set([...os, ...opensInto[i]!])]);
+    // — listed with the sites it opens, and covered by a consent to open pages of those sites there, nothing else (not
+    // the whole window: review of #33)
+    const opensInto = steps.map((s) => {
+      const into = new Map<string, Set<string>>();
+      for (const o of s.opens ?? []) {
+        const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url });
+        let host = ""; try { host = new URL(o.url).host; } catch { /* not a URL: nothing to cover */ }
+        if (host && f.consequence === "modify_user" && f.object.startsWith("window:")) { const h = into.get(f.object) ?? new Set<string>(); h.add(host); into.set(f.object, h); }
+      }
+      return into;
+    });
+    const objectsOf = await Promise.all(steps.map((s) => this.canonObjects(s.objects, snap)));
     // only what is there: a window or tab on screen, a file in the task folder (a raw "window:…" the model wrote that names
     // nothing would otherwise be called the user's by the ledger and signed — review of #31)
     const there = new Set([...snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]), ...(this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [])]);
     const theirs = (o: string) => there.has(o) && this.o.executor.ledger.ownerOf(o) === "user";
     // a step declared "read" stays a look (the floor of looking is read; an action it turns into asks on its own)
     // (a URL opened into the user's window is no look, whatever the step was declared)
-    const classes = steps.map((s, i) => (s.consequence === "external" ? s.consequence : opensInto[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence));
+    const classes = steps.map((s, i) => (s.consequence === "external" ? s.consequence : [...opensInto[i]!.keys()].some(theirs) ? higher(s.consequence, "modify_user") : s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence));
     const signFor = [...new Set(objectsOf.flatMap((os, i) => (classes[i] === "read" ? [] : os.filter(theirs))))];
     // an app the hands driver can only operate in front: hands#54 lists bundle ids on the snapshot (`needs_foreground`,
     // known once the app was observed or brought forward), matched against a window's app or its id's "bundle#" prefix;
     // a per-window flag is read too. Said plainly on the card, and in the trace
-    const named = new Set(objectsOf.flat());
+    const named = new Set([...objectsOf.flat(), ...opensInto.flatMap((m) => [...m.keys()])]);
+    // pages to open, per user's window, across the plan: one consent each, for those sites
+    const openGrants = new Map<string, Set<string>>();
+    for (const m of opensInto) for (const [w, hs] of m) if (theirs(w)) { const g = openGrants.get(w) ?? new Set<string>(); for (const h of hs) g.add(h); openGrants.set(w, g); }
     const fgList = (snap.needs_foreground ?? []).map((b) => b.toLowerCase());
     const inFront = (w: { id: string; app: string; needs_foreground?: boolean }) => !!w.needs_foreground || fgList.some((b) => b === w.app.toLowerCase() || w.id.toLowerCase().startsWith(b + "#"));
     const fgApps = [...new Set(snap.windows.filter((w) => named.has(`window:${w.id}`) && inFront(w)).map((w) => appName(w)))];
     if (fgApps.length) this.emit("plan.foreground", { apps: fgApps });
-    this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor });
+    this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor, opens: Object.fromEntries([...openGrants].map(([w, h]) => [w, [...h]])) });
     if (!classes.some((c) => NEEDS_CONSENT.has(c))) return text("计划记下了；这些步骤不需要用户同意，直接做。");
     // a step that sends from the user's window also changes the user's things on the way (the row picked, the reply
     // opened, the body filled): the card says both, and only what the card says changes the user's things is signed
@@ -406,15 +432,20 @@ export class FrontierRuntime {
     // the objects as the user knows them, from the snapshot — the app and its window's title, a tab's title and site, a
     // file's path in the task folder — not the model's words (「窗口 com.netease.163music#30144」 told the user nothing,
     // review of #31); what did not resolve is shown as the model wrote it, and is not signed
-    const opening = new Set(opensInto.flat());
-    const shown = (o: string): string => {
+    // only what resolved to a window, a tab or a file appears on the card: an element id (ocr:26, elem_12) or words that
+    // name nothing tell the user nothing, and sign nothing (owner's run run_ac5345ce: 「…main window、ocr:26」)
+    const shown = (o: string): string | null => {
       const id = o.slice(o.indexOf(":") + 1);
-      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return opening.has(o) ? this.t.openInYours(appName(w)) : windowLabel(w, this.o.lang); }
+      if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return windowLabel(w, this.o.lang); }
       if (o.startsWith("tab:")) for (const w of snap.windows) { const t = w.tabs?.find((x) => x.id === id); if (t) { let site = ""; try { site = new URL(t.url).host; } catch { /* no site */ } return `「${t.title}」${site ? `（${site}）` : ""}`; } }
       if (o.startsWith("path:") && there.has(o)) return id;
-      return o;
+      return null;
     };
-    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${objectsOf[i]!.length ? "（" + objectsOf[i]!.map(shown).join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
+    const listed = steps.map((_s, i) => [
+      ...objectsOf[i]!.map(shown).filter((x): x is string => x !== null),
+      ...[...opensInto[i]!].filter(([w]) => theirs(w)).map(([w, hs]) => this.t.openInYours(appName(snap.windows.find((x) => `window:${x.id}` === w)!), [...hs])),
+    ]);
+    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
     const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     if (!got) return this.end("failed", "no answer from the user");
@@ -427,7 +458,12 @@ export class FrontierRuntime {
       this.tokens.set(obj, t);
       this.consents.push({ scope: "object", object: obj, consequence: "modify_user" });
     }
-    this.emit("plan.confirmed", { objects: [...this.tokens.keys()] });
+    for (const [obj, hosts] of openGrants) {
+      const t = this.o.signer.forOpen(obj, [...hosts], this.o.task);
+      this.openTokens.set(obj, t);
+      this.consents.push({ scope: "open", object: obj, consequence: "modify_user" });
+    }
+    this.emit("plan.confirmed", { objects: [...this.tokens.keys()], opens: Object.fromEntries([...openGrants].map(([w, h]) => [w, [...h]])) });
     return text("用户同意了计划。改用户东西的步骤可以做了；往外发的步骤到时候会再确认一次。");
   }
 
@@ -469,15 +505,20 @@ export class FrontierRuntime {
     // never shows an empty "verified:"
     if (v.verdict === "pass") return this.end("succeeded", "verified: " + (v.reason.trim() || `by ${v.by ?? "judge"}`).slice(0, 200));
     this.count("verify_failed");
-    if ((this.counters["verify_failed"] ?? 0) > this.budget.verify_retries) return this.end("unconfirmed", `verification did not pass: ${v.reason.slice(0, 200)}`);
+    // done as far as actions go, only the evidence is missing (the judge says so in the verdict's answer, not in words we
+    // read): from here the model may only look — clicking a screen-read app for evidence brought it to the front again
+    // and again until the owner stopped the run (run_ac5345ce). A verdict that something is still to do lifts it
+    this.lookOnly = v.verdict === "unknown" && v.missing_kind === "evidence";
+    if ((this.counters["verify_failed"] ?? 0) > this.budget.verify_retries) return this.end("unconfirmed", this.lookOnly ? this.t.checkYourself(v.reason.slice(0, 200)) : `verification did not pass: ${v.reason.slice(0, 200)}`);
+    if (this.lookOnly) return err(`核对没有通过（unknown，缺的是证据）：${v.reason}\n该做的动作已经做完了。接下来只能看：computer_snapshot、computer_observe、读文件，找能证明结果的东西；找不到就 finish unconfirmed，说明缺什么。不要再点、输入、切换或打开窗口。`);
     return err(`核对没有通过（${v.verdict}）：${v.reason}\n没做成就接着做；确认不了就 finish unconfirmed 并说明缺什么。不要再直接说 done。`);
   }
 
   /** The independent verdict: the computer and files after, every window the task touched, what it did, its claim. */
-  private async verify(summary: string): Promise<{ verdict: string; reason: string; by?: string }> {
+  private async verify(summary: string): Promise<{ verdict: string; reason: string; by?: string; missing_kind?: "action" | "evidence" }> {
     this.count("model_calls");
     const v = await this.o.executor.verdict(summary, { 本任务做过的动作: this.effects, ...(this.answers.length ? { "用户对提问的回答（和原话一样是证据）": this.answers } : {}), ...(this.answer !== null ? { 给用户的答案: this.answer } : {}) });
-    return { verdict: v.verdict, reason: v.reason, by: v.by };
+    return { verdict: v.verdict, reason: v.reason, by: v.by, ...(v.missing_kind ? { missing_kind: v.missing_kind } : {}) };
   }
 
   // --- the loop --------------------------------------------------------------------------------------------------------

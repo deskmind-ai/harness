@@ -78,20 +78,18 @@ export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pix
 
 const RETURN = /\b(return|enter)\b/i;
 
-/** A container's own descriptions of its role, in the languages the accessibility tree speaks (macOS's role
- *  descriptions): an element labelled only with one of these says nothing of its own. */
-const GENERIC: Record<string, string[]> = {
-  group: ["组", "群组", "分组", "group"], scrollarea: ["滚动区域", "scroll area"], splitgroup: ["拆分组", "split group"],
-  layoutarea: ["布局区域", "layout area"], toolbar: ["工具栏", "toolbar"], unknown: ["未知", "unknown"], generic: [""],
-};
-/** An element with no identity of its own, left out of a send's binding: no value, nothing the user typed or chose
- *  (not focused or selected), not a sender, nothing to do on it beyond a click, and a label that is empty or only its
- *  role's generic description (「组」 on a group). Everything with a real label or a value — fields, recipients, rows,
- *  the Send button — stays bound. */
+/** Container roles: elements that hold others and say nothing of their own (accessibility role names, no language). */
+const CONTAINERS = new Set(["group", "scrollarea", "splitgroup", "layoutarea", "layoutitem", "toolbar", "generic", "unknown", "section"]);
+/** A container with no identity of its own: a container role, no value, not focused or selected, not a sender, nothing
+ *  to do on it beyond a click, and a label that is empty, or only its role described — hands' `role_description`
+ *  (AXRoleDescription, 「组」 on a group) or its `label_from_role` flag; no table of words. Such an element vanishing
+ *  does not ask a send again (rc.10: an empty 「组」); one appearing still counts as an addition (review of #33: a new
+ *  recipient chip is such a group with the address beside it). Unnamed buttons, links and rows are not containers. */
 export const anonymous = (e: Element): boolean => {
   if (e.value || e.focused || e.sends || e.actions.some((a) => a !== "click")) return false;
-  const label = e.label.trim().toLowerCase(), role = e.role.replace(/^ax/i, "").replace(/[\s_-]/g, "").toLowerCase();
-  return !label || label === role || (GENERIC[role] ?? []).includes(label);
+  if (!CONTAINERS.has(e.role.replace(/^ax/i, "").replace(/[\s_-]/g, "").toLowerCase())) return false;
+  const label = e.label.trim();
+  return !label || e.label_from_role === true || (!!e.role_description && label === e.role_description.trim());
 };
 
 /** An element whose focus flag says where the keyboard is, not what is selected: a text entry (a text field or area, a
@@ -113,12 +111,13 @@ const NEAR_PX = 16;
  *  (`act`), and whether it came from the accessibility tree (`ax`). Never its id: text recognition renumbers its ids
  *  every look, and so does Peekaboo for the accessibility tree (elem_N in traversal order: an incoming message ahead of
  *  the Send button shifts every later id). An id is a handle into one observation, not an identity (review of #25). */
-interface Ident { c: string; at: [number, number] | null; act?: true; ax?: true }
+interface Ident { c: string; at: [number, number] | null; act?: true; ax?: true; anon?: true }
 const identOf = (e: Element, withFocus = true): Ident => ({
   c: canon([e.role, e.label, e.value ?? null, fromScreen(e) ? "pixels" : "ax", ...(withFocus ? [!!e.focused] : [])]),
   at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null,
   ...(e.actions.length ? { act: true as const } : {}),
   ...(fromScreen(e) ? {} : { ax: true as const }),
+  ...(anonymous(e) ? { anon: true as const } : {}),
 });
 const close = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) <= NEAR_PX && Math.abs(a[1] - b[1]) <= NEAR_PX;
 /** Two elements, each already found, are the same: same content, and roughly the same place when both have one. */
@@ -136,21 +135,26 @@ function pair(bound: Ident[], now: Ident[]): Set<number> | null {
   if (bound.every((b) => b.at) && now.every((n) => n.at)) {
     const used = new Set<number>();
     for (const c of new Set(bound.map((b) => b.c))) {
+      // an anonymous container bound may be gone; everything else bound must be paired, and no more of a content than
+      // was bound may be there now (more is an addition)
       const bs = bound.filter((b) => b.c === c), ns = now.map((n, i) => ({ n, i })).filter((x) => x.n.c === c);
-      if (bs.length !== ns.length) return null;
+      const must = bs.filter((b) => !b.anon).length;
+      if (ns.length > bs.length || ns.length < must) return null;
       const d = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
       const cand = bs.flatMap((b, k) => ns.filter((x) => close(b.at!, x.n.at!)).map((x) => ({ k, i: x.i, d: d(b.at!, x.n.at!) }))).sort((x, y) => x.d - y.d);
       const done = new Set<number>();
       for (const x of cand) if (!done.has(x.k) && !used.has(x.i)) { done.add(x.k); used.add(x.i); }
-      if (done.size !== bs.length) return null;
+      if (bs.some((b, k) => !b.anon && !done.has(k))) return null;
     }
     return used;
   }
+  // an anonymous container bound may be gone: only the rest must appear, in order
+  const req = bound.filter((b) => !b.anon);
   const first: number[] = [], last: number[] = [];
   let j = 0;
-  for (const b of bound) { while (j < now.length && now[j]!.c !== b.c) j += 1; if (j >= now.length) return null; first.push(j); j += 1; }
+  for (const b of req) { while (j < now.length && now[j]!.c !== b.c) j += 1; if (j >= now.length) return null; first.push(j); j += 1; }
   j = now.length - 1;
-  for (let k = bound.length - 1; k >= 0; k -= 1) { while (j >= 0 && now[j]!.c !== bound[k]!.c) j -= 1; if (j < 0) return null; last.unshift(j); j -= 1; }
+  for (let k = req.length - 1; k >= 0; k -= 1) { while (j >= 0 && now[j]!.c !== req[k]!.c) j -= 1; if (j < 0) return null; last.unshift(j); j -= 1; }
   return first.every((x, i) => x === last[i]) ? new Set(first) : null;
 }
 
@@ -192,7 +196,7 @@ function resolve(decided: Observation, id: string, look: Observation): Element |
  *  the header that said 张三, by id or by place). */
 interface SendBinding { window: { app: string; title: string; url: string | null; tab: string | null }; modal: string | null; typed: string[]; target: Ident | null; focused: Ident | null; elements: Ident[];
   /** A window read from the screen: every element (role, label, value, focus, and its centre), for the strict policy */
-  whole?: { c: string; at: [number, number] | null }[] }
+  whole?: { c: string; at: [number, number] | null; anon?: boolean }[] }
 
 /** Is what the user consented to still there: the window, the dialog and the typed text unchanged, the same target and
  *  focused element, and every bound element matched one to one by an element of the new look with the same content and
@@ -247,6 +251,7 @@ export function bindingDiff(bound: SendBinding, now: SendBinding, pixels: PixelS
   const rl = (c: string) => { const x = JSON.parse(c) as unknown[]; return canon(strict ? [x[0], x[1]] : [x[0], x[1], x[3]]); };
   for (const k of leftA) {
     const a = A[k]!;
+    if ((a as { anon?: boolean }).anon) continue;                // an anonymous container gone: not a change
     const i = B.findIndex((b, j) => !usedB.has(j) && rl(b.c) === rl(a.c));
     if (i < 0) { push({ part: "element", before: sig(a), after: null }); continue; }
     usedB.add(i);
@@ -266,17 +271,18 @@ const JITTER_PX = 4;
  *  is within JITTER_PX on both axes. Identical neighbours (a duplicate text-recognition box) are interchangeable: within
  *  a content they are paired nearest first (review of #26: requiring one candidate each never paired them, and a send
  *  never went through on an unchanged screen). */
-export function sameScreen(a: { c: string; at: [number, number] | null }[] | undefined, b: { c: string; at: [number, number] | null }[] | undefined): boolean {
-  if (!a || !b || a.length !== b.length) return false;
+export function sameScreen(a: { c: string; at: [number, number] | null; anon?: boolean }[] | undefined, b: { c: string; at: [number, number] | null; anon?: boolean }[] | undefined): boolean {
+  if (!a || !b) return false;
   const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (!x.at || !y.at ? !x.at && !y.at : Math.abs(x.at[0] - y.at[0]) <= JITTER_PX && Math.abs(x.at[1] - y.at[1]) <= JITTER_PX);
   const d = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (x.at && y.at ? Math.abs(x.at[0] - y.at[0]) + Math.abs(x.at[1] - y.at[1]) : 0);
-  for (const c of new Set(a.map((e) => e.c))) {
+  for (const c of new Set([...a.map((e) => e.c), ...b.map((e) => e.c)])) {
+    // every element now must pair with one bound (nothing added); every bound one must pair, except an anonymous
+    // container, which may be gone
     const as = a.filter((e) => e.c === c), bs = b.filter((e) => e.c === c);
-    if (as.length !== bs.length) return false;
     const cand = as.flatMap((x, k) => bs.map((y, i) => ({ k, i, ok: near(x, y), d: d(x, y) }))).filter((p) => p.ok).sort((p, q) => p.d - q.d);
     const ka = new Set<number>(), kb = new Set<number>();
     for (const p of cand) if (!ka.has(p.k) && !kb.has(p.i)) { ka.add(p.k); kb.add(p.i); }
-    if (ka.size !== as.length) return false;
+    if (kb.size !== bs.length || as.some((x, k) => !x.anon && !ka.has(k))) return false;
   }
   return true;
 }
@@ -785,10 +791,10 @@ export class Executor {
     const focusOf = (e: Element) => withFocus || !keyboardFocus(e);
     const focused = withFocus ? look?.elements.find((e) => e.focused) : undefined;
     const pixels = !!look?.elements.some(fromScreen);
-    // what is bound: every element with an identity of its own — not an anonymous container (rc.10: an empty 「组」
-    // vanishing re-asked a mail send)
-    const bindable = look ? look.elements.filter((e) => !anonymous(e)) : [];
-    const whole = pixels && look ? bindable.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
+    // every element is bound; an anonymous container is marked, so its going away does not ask again while its coming
+    // still counts as an addition (review of #33)
+    const bindable = look ? look.elements : [];
+    const whole = pixels && look ? bindable.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null, ...(anonymous(e) ? { anon: true } : {}) })) : undefined;
     const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), elements: bindable.map((e) => identOf(e, focusOf(e))), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
@@ -1196,7 +1202,7 @@ export class Executor {
    *  the task touched, the receipts, what other programs changed, and the runtime's own account (effects, an answer,
    *  the model's claim) — and says pass / fail / unknown. unknown is not done. The runtime and the MCP service call
    *  the same method, so a run cannot end "done" on any runtime without it. */
-  async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string }> {
+  async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string; missing_kind?: "action" | "evidence" }> {
     const ev = await this.verify();
     const ws = this.opts.files?.workspace;
     const brief = (o: Observation) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) });
@@ -1218,8 +1224,9 @@ export class Executor {
     if (!this.opts.judge) return { verdict: "unknown", reason: "no judge to verify with" };
     const ans = await this.opts.judge.choose(VERIFY_QUESTION, { ...this.userWords(), 证据: evidence }, VERIFY_OPTIONS, "verify");
     if (!ans) return { verdict: "unknown", reason: "the judge could not answer" };
-    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "" });
-    return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by };
+    const missing = ans.choice === "unknown" && ans.missing_kind ? { missing_kind: ans.missing_kind } : {};
+    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "", ...missing });
+    return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by, ...missing };
   }
 
   /** Which of the task's effects can be taken back, newest first, and why not: a file action through its capability's

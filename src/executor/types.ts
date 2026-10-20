@@ -55,6 +55,9 @@ export interface Element {
    *  recognition, controls hands made up, Eyes). Until hands sends it, the executor infers it from the id prefix
    *  (`ocr:`, `gen:`, `icon:`, `desc:` are read from the screen). */
   source?: "ax" | "pixels";
+  /** The role as the accessibility tree describes it (AXRoleDescription, 「组」 on a group; hands), and whether hands
+   *  took the label from the role: a label that only describes the role names nothing. */
+  role_description?: string; label_from_role?: boolean;
   rect?: [number, number, number, number];
 }
 
@@ -86,12 +89,13 @@ export interface ExternalChange { path: string; seen: string; now: string; at: n
 /** The consent an action carries: a token the app signed for a challenge the executor issued (consent.ts). */
 export interface ConsentToken {
   nonce: string;                     // the challenge it answers (action scope), or a fresh one (object / rule scope)
-  scope: "action" | "object" | "rule";
+  scope: "action" | "object" | "rule" | "open";
   digest?: string;                   // action scope: the exact action
   object?: string;                   // object scope: the window / tab / path it covers
   consequence: Consequence;          // the highest class it allows
   task?: string;                     // object scope: only this task
   rule?: string;                     // rule scope: a durable permission, in the executor's rule store
+  hosts?: string[];                  // open scope: opening pages of these sites (open_window with a URL) in `object`, nothing else
   expires_at: number;                // ms since epoch
   sig: string;                       // base64 Ed25519 over canon(token without sig)
 }
