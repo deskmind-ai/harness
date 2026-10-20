@@ -78,9 +78,12 @@ export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pix
 
 const RETURN = /\b(return|enter)\b/i;
 
-/** An element whose focus flag is a selection, not where the keyboard is: one that can be acted on, holds no value, is
- *  not a text entry and does not itself send — a row, a list item, a recipient tag. outgoing() shows it as 「✓」. */
-const selectable = (e: Element): boolean => !e.value && e.actions.length > 0 && !e.sends && !/text|field|area|search|combo|web/i.test(e.role);
+/** An element whose focus flag says where the keyboard is, not what is selected: a text entry (a text field or area, a
+ *  search field, a combo box, anything that takes typed text or a set value), a web area, or the control that sends.
+ *  Everywhere else hands' `focused` is the selection (Peekaboo's is_selected) — a row, an item, a recipient tag, a web
+ *  ARIA option that reads as static text, with or without a value — which the card shows as 「✓」 and which can be who
+ *  it goes to (review of #30). */
+const keyboardFocus = (e: Element): boolean => !!e.sends || /^(ax)?(textfield|textarea|searchfield|combobox|webarea)$/i.test(e.role.replace(/[\s_-]/g, "")) || e.actions.includes("type") || e.actions.includes("set_value");
 
 /** How far (px, on each axis) an element read again may have moved and still be the same one: text recognition's boxes
  *  jitter by a few pixels, while two lines of a chat or two controls are at least a line apart (~20 px and more at
@@ -317,6 +320,8 @@ export class Executor {
   private issue(action: Action, object: string, consequence: Consequence, text: string, epoch: number, content?: unknown) {
     const c = this.consent.challenge(action, object, consequence, text, undefined, content);
     this.challenges.set(c.nonce, { action, epoch, object, consequence });
+    // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
+    while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
     return c;
   }
   /** The window each open_window really made (by receipt seq): what its undo closes. */
@@ -738,11 +743,12 @@ export class Executor {
     // keyboard focus is bound only where it decides what goes out: a key or typed text lands in the focused element. A
     // click, double-click or menu choice goes to its target, and the keyboard focus moves on its own when the user
     // answers our card (DeskMind comes forward, Safari's focused element is cleared): bound, it asked one send four
-    // times (rc.9, 10-20). What the focus flag means on a row, an item or a tag — the selection, which the card shows as
-    // 「✓」 and which can be who it goes to (review of #16: Alice selected, Bob sent) — stays bound for every action.
+    // times (rc.9, 10-20). Only where the flag means the keyboard (keyboardFocus) is it left out; everywhere else it is the
+    // selection, which the card shows as 「✓」 and which can be who it goes to (review of #16: Alice selected, Bob sent;
+    // review of #30: a static-text option), and it stays bound for every action.
     // Recipient, content and target stay bound by role, label, value, source and place
     const withFocus = a.kind === "key" || a.kind === "type";
-    const focusOf = (e: Element) => withFocus || selectable(e);
+    const focusOf = (e: Element) => withFocus || !keyboardFocus(e);
     const focused = withFocus ? look?.elements.find((e) => e.focused) : undefined;
     const pixels = !!look?.elements.some(fromScreen);
     const whole = pixels && look ? look.elements.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
@@ -906,7 +912,9 @@ export class Executor {
     if (target && obs && (this.mightSend(req.action) || consequence === "external")) {
       let fresh: Observation;
       try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
-      if (fresh.epoch !== req.epoch) return staleOn(await this.driver.snapshot(), { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
+      // why it moved: from a snapshot taken now (the look itself carries no reason). Taking it may move the epoch again,
+      // so the reason may describe a later change; a snapshot that fails leaves the reason out, the result is the same
+      if (fresh.epoch !== req.epoch) return staleOn(await Promise.resolve().then(() => this.driver.snapshot()).catch(() => ({ epoch: fresh.epoch } as Snapshot)), { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
       const changed = (what: string) => done({ ...base, status: "stale", why: `${target} changed right before acting (${what}); observe it again and decide anew`, epoch: fresh.epoch });
       // the target, always found again by identity (content, and id or place) and required one of a kind: the driver acts
       // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
@@ -935,10 +943,13 @@ export class Executor {
     // meanwhile must not be followed by the effect (review of deskmind#80, 10-18)
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
     // the action's one-time token is spent now, with every look behind it (a token spent before a refused look was lost)
-    if (NEEDS_CONSENT.has(consequence) && req.consent?.scope === "action" && !this.consent.spend(req.consent)) {
-      const card = this.card(req.action, this.lastObs.get(target ?? "") ?? obs, consequence);
-      const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content);
-      return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
+    if (NEEDS_CONSENT.has(consequence) && req.consent?.scope === "action") {
+      if (!this.consent.spend(req.consent)) {
+        const card = this.card(req.action, this.lastObs.get(target ?? "") ?? obs, consequence);
+        const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content);
+        return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
+      }
+      this.challenges.delete(req.consent.nonce);                 // spent: nothing will be explained against it any more
     }
     if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence) });
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;

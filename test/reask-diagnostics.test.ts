@@ -206,3 +206,55 @@ describe("why the epoch moved, in a stale act's trace (hands#53 epoch_reason)", 
     expect(acts.every((a) => !("epoch_reason" in a))).toBe(true);
   });
 });
+
+describe("review of #30", () => {
+  const picker = (role: string, who: string, withValue: boolean): Element[] => [
+    { id: "elem_1", role, label: "张三", ...(withValue ? { value: "zhang@x.com" } : {}), actions: ["click"], rect: [0, 0, 100, 20], ...(who === "张三" ? { focused: true } : {}) },
+    { id: "elem_2", role, label: "李四", ...(withValue ? { value: "li@x.com" } : {}), actions: ["click"], rect: [0, 30, 100, 20], ...(who === "李四" ? { focused: true } : {}) },
+    { id: "elem_3", role: "textArea", label: "消息", value: "明天见", actions: ["click", "type"], rect: [200, 300, 300, 50] },
+    { id: "elem_4", role: "button", label: "发送", actions: ["click"], sends: true, rect: [520, 300, 40, 20] },
+  ];
+
+  it("a selection shown as static text (a web ARIA option), with or without a value, moving from 张三 to 李四 asks again", async () => {
+    for (const role of ["staticText", "AXStaticText", "row"]) for (const withValue of [false, true]) {
+      const { ex, desk, w, app, mine } = await setup(picker(role, "张三", withValue));
+      const o = await ex.observe("w");
+      const send: Action = { kind: "click", window: "w", target: "elem_4" };
+      const r1 = await ex.act({ action: send, epoch: o.epoch, consent: mine });
+      w.elements = picker(role, "李四", withValue);
+      const r2 = await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r1.challenge!) });
+      expect([role, withValue, r2.status, desk.log.length]).toEqual([role, withValue, "needs_consent", 0]);
+    }
+  });
+
+  it("the epoch_reason snapshot failing leaves the reason out; the result is still stale", async () => {
+    const w: Win = { info: { id: "w", app: "com.apple.Safari", title: "Mailora" }, elements: mail("我看一下再说", false), text: "" };
+    const desk = new Desk(w), app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
+    let broken = false;
+    const snap = desk.snapshot.bind(desk);
+    desk.snapshot = () => { if (broken) throw new Error("hands went away"); return { ...snap(), epoch_reason: { epoch: desk.epoch, at: 1, by: { input: { to: "unknown" } } } }; };
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, onEvent: (k, b) => events.push({ k, b }) });
+    await ex.begin(); await ex.plan({ steps: [] });
+    const o = await ex.observe("w");
+    const send: Action = { kind: "click", window: "w", target: "elem_3" };
+    const r1 = await ex.act({ action: send, epoch: o.epoch, consequence: "external" });
+    const observe = desk.observe.bind(desk);
+    desk.observe = () => { desk.epoch += 1; broken = true; return observe(); };
+    const r2 = await ex.act({ action: send, epoch: o.epoch, consequence: "external", consent: app.forAction(r1.challenge!) });
+    expect(r2.status).toBe("stale");
+    expect("epoch_reason" in [...events].reverse().find((e) => e.k === "executor.act")!.b).toBe(false);
+  });
+
+  it("a spent card is forgotten, and no more than 200 are kept", async () => {
+    const { ex, app, mine } = await setup(mail("我看一下再说", false));
+    const challenges = (ex as unknown as { challenges: Map<string, unknown> }).challenges;
+    const o = await ex.observe("w");
+    const send: Action = { kind: "click", window: "w", target: "elem_3" };
+    let r = await ex.act({ action: send, epoch: o.epoch, consent: mine });
+    for (let i = 0; i < 210; i++) r = await ex.act({ action: send, epoch: o.epoch, consent: mine });
+    expect(challenges.size).toBe(200);
+    expect(challenges.has(r.challenge!.nonce)).toBe(true);
+    expect((await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r.challenge!) })).status).toBe("ok");
+    expect(challenges.has(r.challenge!.nonce)).toBe(false);
+  });
+});
