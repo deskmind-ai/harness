@@ -153,7 +153,10 @@ export class FrontierRuntime {
   private untilStopped<T>(f: () => Promise<T>): Promise<T | null> {
     const stop = this.abort.signal;
     if (stop.aborted) return Promise.resolve(null);
-    return Promise.race([f(), new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
+    const p = f();
+    // left behind at a stop, it may still fail (the driver's process is killed at the end): nobody waits for it then
+    p.catch(() => undefined);
+    return Promise.race([p, new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
   }
 
   private end(status: RuntimeStatus, reason: string): AgentToolResult {

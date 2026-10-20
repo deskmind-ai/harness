@@ -66,5 +66,18 @@ export class HandsDriver implements Driver {
   async snapshot(): Promise<Snapshot> { if (!this.begun) return this.begin(); return this.call<Snapshot>("snapshot"); }
   async observe(windowId: string, o?: { screenshot?: boolean }): Promise<Observation> { if (!this.begun) await this.begin(); return this.call<Observation>("observe", { window: windowId, screenshot: !!o?.screenshot }); }
   async perform(action: Action): Promise<PerformResult> { if (!this.begun) await this.begin(); return this.call<PerformResult>("perform", { action }); }
-  async end(): Promise<void> { if (!this.proc) return; try { await this.call("end"); } catch { /* already gone */ } this.proc?.kill(); this.proc = null; }
+  /** Close the executor process. `end` is tidying only, so it is never waited for behind a request still running:
+   *  the process answers one request at a time, and an `end` queued after a look the task stopped waiting for took
+   *  that look's whole timeout (review of harness #24). With a request in flight the process is killed at once (the
+   *  request fails with the exit); otherwise `end` gets a few seconds, then the process is killed all the same. */
+  async end(): Promise<void> {
+    if (!this.proc) return;
+    if (this.pending.size === 0) {
+      let timer: NodeJS.Timeout | undefined;
+      const done = this.call("end").catch(() => undefined);
+      await Promise.race([done, new Promise((r) => { timer = setTimeout(r, 5_000); })]);
+      clearTimeout(timer);
+    }
+    this.proc?.kill(); this.proc = null;
+  }
 }
