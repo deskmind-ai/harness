@@ -47,7 +47,21 @@ export interface ExecutorOptions {
   crashAfterFirstEffect?: boolean;
   /** The task folder and the file capabilities: files are objects like windows (owner, version, last seen). */
   files?: { workspace: Workspace; registry: Registry };
+  /** A judgement policy (owner 10-20; the app's settings panel will show it, deskmind#90 item 3): how a consent to a
+   *  send is held against a window read from the screen. Unset: `DESKMIND_PIXEL_SEND_BINDING`, else strict. */
+  pixelSendBinding?: PixelSendBinding;
 }
+
+/** How a consent to a send is held, in a window whose elements were read from the screen, against what is there right
+ *  before the effect (windows read from the accessibility tree always use containment by id):
+ *  - `strict` (default): any change of that window — any element's role, label, value, position or focus, the title,
+ *    the dialog — asks again with what is there now. Text recognition has no stable identity, and an incoming message
+ *    scrolls everything anyway, so matching is a guess (docs/0.5-decisions.md, fourth review of #23).
+ *  - `match`: each bound element paired one to one by content and position (within 16 px); new ones allowed. */
+export type PixelSendBinding = "strict" | "match";
+/** The policy from the environment (the app passes `DESKMIND_PIXEL_SEND_BINDING`): only "match" chooses match; anything
+ *  else, unset or unknown, is strict. */
+export const pixelSendBindingFrom = (v: string | undefined): PixelSendBinding => (v?.trim() === "match" ? "match" : "strict");
 
 /** An action's class, as `classify` settles it, and who settled it: structure (ownership, a capability's declared
  *  effect, or — with no judge attached — the old send hints), the model's own class, a judge tier (its name: "brain",
@@ -100,14 +114,19 @@ function resolve(decided: Observation, id: string, look: Observation): Element |
  *  element, and every element of the window by identity (review of #23: who it goes to may be only a text-recognition
  *  row or a recipient tag with actions of its own; the same name elsewhere — a group's history line「张三」 — is not
  *  the header that said 张三, by id or by place). */
-interface SendBinding { window: { app: string; title: string; url: string | null; tab: string | null }; modal: string | null; typed: string[]; target: Ident | null; focused: Ident | null; elements: Ident[] }
+interface SendBinding { window: { app: string; title: string; url: string | null; tab: string | null }; modal: string | null; typed: string[]; target: Ident | null; focused: Ident | null; elements: Ident[];
+  /** A window read from the screen: the whole observation (every element's role, label, value, position and focus;
+   *  sorted, as text recognition's order is not identity), for the strict policy */
+  whole?: string }
 
 /** Is what the user consented to still there: the window, the dialog and the typed text unchanged, the same target and
  *  focused element, and every bound element matched one to one by an element of the new look with the same content and
  *  identity (id, or place)? New elements may have come (an incoming message, a "typing…" line); any bound one changed,
  *  moved or gone is another send. */
-function within(bound: SendBinding, now: SendBinding): boolean {
+function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding): boolean {
   if (canon([bound.window, bound.modal, bound.typed]) !== canon([now.window, now.modal, now.typed])) return false;
+  // strict, for a window read from the screen: nothing may have changed at all
+  if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return bound.whole === now.whole;
   const one = (a: Ident | null, b: Ident | null) => (a === null || b === null ? a === b : sameEl(a, b));
   if (!one(bound.target, now.target) || !one(bound.focused, now.focused)) return false;
   const used = new Set<number>();
@@ -178,8 +197,12 @@ export class Executor {
   recovered: { action: Action; finding: "happened" | "not_happened" | "unknown"; text: string; external: string[] } | null = null;
   private crashed = false;
 
+  /** The pixel send-binding policy in force (ExecutorOptions.pixelSendBinding, else the environment). */
+  readonly pixelPolicy: PixelSendBinding;
+
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
+    this.pixelPolicy = opts.pixelSendBinding ?? pixelSendBindingFrom(process.env.DESKMIND_PIXEL_SEND_BINDING);
   }
 
   private journal(kind: "begin" | "intent" | "receipt", body: Record<string, unknown>) {
@@ -582,7 +605,9 @@ export class Executor {
     const typed = sending ? this.typedIn(a).filter((t) => t.trim()) : [];
     const typedLines = typed.filter((t) => !sending!.fields.some((l) => l.includes(t.trim())));
     const focused = look?.elements.find((e) => e.focused);
-    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null } : undefined;
+    const pixels = !!look?.elements.some(fromScreen);
+    const whole = pixels && look ? canon(look.elements.map((e) => canon([e.role, e.label, e.value ?? null, e.rect ?? null, !!e.focused])).sort()) : undefined;
+    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el };
@@ -691,7 +716,7 @@ export class Executor {
       // a send's token stands while what the user saw is still there (every bound item present unchanged; new ones may
       // have come): it is checked against the binding it was issued for
       const stored = req.consent?.scope === "action" ? this.consent.contentOf(req.consent.nonce) as SendBinding | undefined : undefined;
-      accepted = stored && content && within(stored, content) ? stored : content;
+      accepted = stored && content && within(stored, content, this.pixelPolicy) ? stored : content;
       const why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
       if (why) {
         const challenge = this.consent.challenge(req.action, base.object, consequence, text, undefined, content);
@@ -718,7 +743,7 @@ export class Executor {
       act = again.act;
       if (this.mightSend(req.action) && !sameSendFacts(req.action, obs, fresh)) return changed("the focus, or which controls send");
       if (consequence === "external") {
-        if (!accepted || !again.content || !within(accepted, again.content)) {
+        if (!accepted || !again.content || !within(accepted, again.content, this.pixelPolicy)) {
           const challenge = this.consent.challenge(req.action, base.object, consequence, again.text, undefined, again.content);
           this.emit("executor.consent_needed", { why: "what goes out changed right before sending", consequence, object: base.object });
           return done({ ...base, status: "needs_consent", why: "what goes out changed right before sending; asked again with what is there now", challenge, epoch: fresh.epoch });
