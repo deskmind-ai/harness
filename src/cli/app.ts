@@ -125,11 +125,13 @@ function driverFor(name: Request["driver"], scope?: string): Driver {
 
 /** Every executor and runtime event as it was emitted, beside the run's protocol events: the app shows only the
  *  protocol (steps, cards, refusals), and a problem on a real Mac -- why a consent was asked again, what an action's
- *  `why` was -- could not be read from the run afterwards (rc.8, 10-20). Local, like the run's other files; long
- *  strings are cut so a prompt or an observation does not make the file huge. */
+ *  `why` was -- could not be read from the run afterwards (rc.8, 10-20). What it holds is the user's: their words
+ *  (the request, their free answers on cards), what was read from their windows, the judge's prompts. It stays on
+ *  this Mac, like the run's other files, and is pruned with them; nothing sends it anywhere. Long strings and long
+ *  lists are cut, with a "…(+n)" mark of what was left out, so a prompt or an observation does not make it huge. */
 export function traceWriter(file: string): (kind: string, body: Record<string, unknown>) => void {
   const cut = (v: unknown): unknown => typeof v === "string" ? (v.length > 4000 ? v.slice(0, 4000) + `…(+${v.length - 4000})` : v)
-    : Array.isArray(v) ? v.slice(0, 200).map(cut)
+    : Array.isArray(v) ? (v.length > 200 ? [...v.slice(0, 200).map(cut), `…(+${v.length - 200})`] : v.map(cut))
     : v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, cut(x)])) : v;
   return (kind, body) => {
     try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(cut(body ?? {}) as Record<string, unknown>) }) + "\n"); } catch { /* the trace never stops a run */ }
