@@ -367,17 +367,28 @@ export class FrontierRuntime {
     // card — 「打开网易云播放安溥的宝贝」, 10-20). A declared external stays external; sending still asks per action
     const snap = await this.o.executor.snapshot();
     const objectsOf = await Promise.all(steps.map((s) => this.canonObjects(s.objects)));
-    const theirs = (o: string) => /^(window|tab|path):/.test(o) && this.o.executor.ledger.ownerOf(o) === "user";
+    // only what is there: a window or tab on screen, a file in the task folder (a raw "window:…" the model wrote that names
+    // nothing would otherwise be called the user's by the ledger and signed — review of #31)
+    const there = new Set([...snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]), ...(this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [])]);
+    const theirs = (o: string) => there.has(o) && this.o.executor.ledger.ownerOf(o) === "user";
     // a step declared "read" stays a look (the floor of looking is read; an action it turns into asks on its own)
     const classes = steps.map((s, i) => (s.consequence === "external" || s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence));
     const signFor = [...new Set(objectsOf.flatMap((os, i) => (classes[i] === "read" ? [] : os.filter(theirs))))];
-    // an app the hands driver can only operate in front (needs_foreground): said plainly on the card, and in the trace
-    const fgApps = [...new Set([...(snap.needs_foreground ?? []), ...snap.windows.filter((w) => w.needs_foreground && objectsOf.flat().includes(`window:${w.id}`)).map((w) => w.app)])]
-      .filter((app) => snap.windows.some((w) => w.app === app && objectsOf.flat().includes(`window:${w.id}`)));
+    // an app the hands driver can only operate in front: hands#54 lists bundle ids on the snapshot (`needs_foreground`,
+    // known once the app was observed or brought forward), matched against a window's app or its id's "bundle#" prefix;
+    // a per-window flag is read too. Said plainly on the card, and in the trace
+    const named = new Set(objectsOf.flat());
+    const fgList = (snap.needs_foreground ?? []).map((b) => b.toLowerCase());
+    const inFront = (w: { id: string; app: string; needs_foreground?: boolean }) => !!w.needs_foreground || fgList.some((b) => b === w.app.toLowerCase() || w.id.toLowerCase().startsWith(b + "#"));
+    const fgApps = [...new Set(snap.windows.filter((w) => named.has(`window:${w.id}`) && inFront(w)).map((w) => w.app))];
     if (fgApps.length) this.emit("plan.foreground", { apps: fgApps });
     this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor });
     if (!classes.some((c) => NEEDS_CONSENT.has(c))) return text("计划记下了；这些步骤不需要用户同意，直接做。");
-    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? this.t.external : ""}`);
+    // a step that sends from the user's window also changes the user's things on the way (the row picked, the reply
+    // opened, the body filled): the card says both, and only what the card says changes the user's things is signed
+    // (review of #31: 「回复并发送」 signed the mail window under a line that said only 「会发出去」)
+    const mine = (i: number) => objectsOf[i]!.some(theirs);
+    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${s.objects.length ? "（" + s.objects.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
     const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     if (!got) return this.end("failed", "no answer from the user");

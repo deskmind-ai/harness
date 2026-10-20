@@ -78,6 +78,8 @@ describe("the plan card by the executor's view", () => {
     const { rt, cards } = run(sim, steps, "回复林晓：收到");
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan", "action"]);
+    // the sending step on the user's window says both: it changes the user's things on the way, and it sends
+    expect(cards[0]!.text.split("\n").find((l) => l.startsWith("3."))).toContain("改你的东西，也会往外发");
     expect(cards[1]!.text).toContain("发出去");
     expect(sim.mailState(w).replies).toEqual([{ to: "m1", body: "收到" }]);
   });
@@ -102,6 +104,60 @@ describe("the plan card by the executor's view", () => {
     const { rt, cards } = run(sim, [planCreate(w), look(w), finish]);
     await rt.run();
     expect(cards[0]!.text).toContain("信鸽 只能在前台操作");
+  });
+
+  it("a plan with only a sending step on the user's window says both on its line, and signs the window only because it says so", async () => {
+    const { sim, w } = mailSim();
+    const steps: Step[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "回复并发送", objects: [`窗口 ${w}`], consequence: "external" }] } }] }, look(w),
+      act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "create"),
+      finish,
+    ];
+    const { rt, cards, events } = run(sim, steps, "回复林晓：收到");
+    await rt.run();
+    expect(cards.map((c) => c.kind)).toEqual(["plan"]);
+    expect(cards[0]!.text).toContain("1. 回复并发送（窗口 " + w + "）——改你的东西，也会往外发");
+    expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["external"], objects: [`window:${w}`] });
+  });
+
+  it("a sending step on the task's own window says only that it sends", async () => {
+    const sim = new SimComputer();
+    const { rt, cards } = run(sim, [
+      { calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "编辑器" }, epoch: 1, consequence: "create", purpose: "开一个新文档" } }] },
+      (ms) => ({ calls: [{ name: "plan", args: { steps: [{ purpose: "发出去", objects: [`window:${last(ms).after.window.id}`], consequence: "external" }] } }] }),
+      finish,
+    ], "写好发出去");
+    await rt.run();
+    expect(cards[0]!.text).toContain("——往外发，到时候再确认一次");
+    expect(cards[0]!.text).not.toContain("改你的东西");
+  });
+
+  it("an object written as window:/path: that names nothing on screen or in the folder is not signed and asks nothing", async () => {
+    const { sim } = mailSim();
+    const { rt, cards, events } = run(sim, [{ calls: [{ name: "plan", args: { steps: [{ purpose: "改一下", objects: ["window:nope-9", "path:没有的文件.txt"], consequence: "create" }] } }] }, finish], "改一下");
+    await rt.run();
+    expect(cards).toEqual([]);
+    expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["create"], objects: [] });
+  });
+
+  it("hands#54's shape: needs_foreground lists bundle ids, matched by the window id's bundle prefix; the card names the app", async () => {
+    let epoch = 1;
+    const win = { id: "com.netease.163music#30144", app: "网易云音乐", title: "" };
+    const driver = {
+      snapshot: () => ({ epoch, locked: false, front_app: "DeskMind", windows: [win], needs_foreground: ["com.netease.163music"] }),
+      observe: () => ({ epoch, window: win, modal: null, elements: [{ id: "gen:搜索框", role: "textField", label: "搜索框", actions: ["set_value"] }], text: "" }),
+      perform: () => { epoch += 1; return { status: "ok" as const, window: win.id }; },
+    };
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(driver, { task: "t1", publicKey: app.publicKey });
+    const gw = new Gateway(table);
+    gw.script = Array(20).fill(() => ({ choice: "pass", reason: "ok" }));
+    const cards: Card[] = [];
+    const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "搜索「宝贝 安溥」", objects: ["窗口 com.netease.163music#30144"], consequence: "create" }] } }] }, finish];
+    const rt = new FrontierRuntime({ task: "t1", raw: "打开网易云播放安溥的宝贝", executor: ex, signer: app, user: { ask: (c: Card): Answer => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
+    await rt.run();
+    expect(cards[0]!.text).toContain("网易云音乐 只能在前台操作");
+    expect(cards[0]!.text).toContain("改你的东西");
   });
 
   it("steps on the task's own window declared create still need no card", async () => {
