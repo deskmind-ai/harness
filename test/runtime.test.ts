@@ -348,3 +348,55 @@ describe("frontier runtime: the cards' language", () => {
     expect((seen[0]![0] as any).content).toContain("看得宽，动得窄");
   });
 });
+
+describe("frontier runtime: a stale action", () => {
+  it("is answered with the window looked at again, so the next try acts on what is there now (rc.6: the same click went stale over and over)", async () => {
+    const sim = new SimComputer();
+    let win = "";
+    const steps: Step[] = [
+      { calls: [{ name: "computer_snapshot", args: {} }] },
+      (ms) => ({ calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "编辑器" }, epoch: last(ms).epoch, consequence: "create", purpose: "open" } }] }),
+      (ms) => {
+        const j = last(ms); win = j.after.window.id;
+        sim.epoch++;                                              // the window moves on after the model looked
+        const id = j.after.elements.find((e: any) => e.label === "新建文档").id;
+        return { calls: [{ name: "computer_act", args: { action: { kind: "click", window: win, target: id }, epoch: j.after.epoch, consequence: "create", purpose: "new doc" } }] };
+      },
+      // the model only does what the last result lets it: the same element, at the epoch that result shows
+      (ms) => { const j = last(ms); const id = (j.after?.elements ?? []).find((e: any) => e.label === "新建文档")?.id ?? "?"; return { calls: [{ name: "computer_act", args: { action: { kind: "click", window: win, target: id }, epoch: epochOf(ms), consequence: "create", purpose: "new doc" } }] }; },
+      (ms) => ({ calls: [{ name: "finish", args: { outcome: "cannot", summary: JSON.stringify(last(ms)).slice(0, 300) } }] }),
+    ];
+    const seen: Message[][] = [];
+    const { rt } = runtime(sim, steps, user(approveAll), undefined, { model: { ...model, streamFn: scriptedStream(steps, seen) } });
+    await rt.run();
+    const results = seen.at(-1)!.filter((m) => m.role === "toolResult").map((m: any) => m.content[0].text as string);
+    const stale = results.at(-2)!, retried = results.at(-1)!;
+    expect(JSON.parse(stale.split("\n")[0]!).status).toBe("stale");
+    expect(stale).toContain("重新看");
+    expect(JSON.parse(retried.split("\n")[0]!).status).toBe("ok");
+  });
+});
+
+describe("frontier runtime: a stale action after a stop", () => {
+  it("is not looked at again: the run ends at the stop instead of waiting for the driver (review of #24)", async () => {
+    let epoch = 1, calls = 0, stopped = false;
+    const w = { id: "w", app: "Editor", title: "Doc" };
+    let rt!: FrontierRuntime;
+    const driver: import("../src/executor/types.js").Driver = {
+      // the action's look at the computer: the user presses stop while it is on its way, and the window moves on
+      snapshot: async () => { calls += 1; if (calls === 2) { rt.stop("the app stopped the task"); stopped = true; epoch += 1; } return { epoch, locked: false, front_app: w.app, windows: [w] }; },
+      // once stopped, the driver never answers a look (a real one may wait up to two minutes)
+      observe: () => (stopped ? new Promise<never>(() => {}) : { epoch, window: w, modal: null, elements: [{ id: "b", role: "button", label: "Go", actions: ["click"] }] }),
+      perform: () => ({ status: "ok", window: "w" }),
+    };
+    const app = ConsentSigner.fresh(), ex = new Executor(driver, { task: "t1", publicKey: app.publicKey });
+    const steps: Step[] = [
+      { calls: [{ name: "computer_observe", args: { window: "w" } }] },
+      (ms) => ({ calls: [{ name: "computer_act", args: { action: { kind: "click", window: "w", target: "b" }, epoch: last(ms).epoch, consequence: "read", purpose: "go" } }] }),
+      { calls: [{ name: "finish", args: { outcome: "cannot", summary: "x" } }] },
+    ];
+    rt = new FrontierRuntime({ task: "t1", raw: "go", executor: ex, signer: app, user: user(approveAll), gateway: new Gateway(scriptedTable), model: { ...model, streamFn: scriptedStream(steps) } });
+    const result = await Promise.race([rt.run().then((r) => r.status), new Promise<string>((r) => setTimeout(() => r("still waiting"), 1000))]);
+    expect(result).toBe("stopped");
+  });
+});

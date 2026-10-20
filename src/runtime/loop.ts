@@ -148,6 +148,17 @@ export class FrontierRuntime {
   /** The app's stop: the executor refuses every later action, and the loop is aborted. */
   stop(why = "stopped") { this.o.executor.stop(); if (!this.status) { this.status = "stopped"; this.reason = why; } this.abort.abort(); }
 
+  /** What `f` gives, unless the app stops the task first: then null at once, without waiting for it (a card the user
+   *  is answering, a driver's look that may take minutes). `f` is not started at all once stopped. */
+  private untilStopped<T>(f: () => Promise<T>): Promise<T | null> {
+    const stop = this.abort.signal;
+    if (stop.aborted) return Promise.resolve(null);
+    const p = f();
+    // left behind at a stop, it may still fail (the driver's process is killed at the end): nobody waits for it then
+    p.catch(() => undefined);
+    return Promise.race([p, new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
+  }
+
   private end(status: RuntimeStatus, reason: string): AgentToolResult {
     // a stop is final: the card it cancelled comes back unanswered, and that is not a failure of its own
     if (this.status !== "stopped") { this.status = status; this.reason = reason; }
@@ -159,8 +170,7 @@ export class FrontierRuntime {
     this.count("cards"); this.count(`cards:${card.kind}`);
     this.emit("card", { kind: card.kind, text: card.text, options: card.options.map((o) => o.kind) });
     // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16)
-    const stop = this.abort.signal;
-    const a = stop.aborted ? null : await Promise.race([this.o.user.ask(card), new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
+    const a = await this.untilStopped(() => Promise.resolve(this.o.user.ask(card)));
     if (a === null) return null;
     if ("option" in a) { const o = card.options[a.option]; return o ? { option: o, text: o.text } : null; }
     return { option: null, text: a.text };
@@ -295,6 +305,15 @@ export class FrontierRuntime {
       if (r.status === "stale") this.retryTokens.set(canon(a), t);
     }
     if (r.status !== "stale" && r.status !== "needs_consent") this.retryTokens.delete(canon(a));
+    // a stale action did nothing: the window moved on after the model looked. It is looked at again here, so the model
+    // decides on what is there now (its epoch, its element ids) — told only "observe again", models retried the same
+    // click on the old look until the run gave up (rc.6 end to end)
+    // Not after the app's stop: the run ends there, not after a look a real driver may take minutes over (review of #24)
+    let relooked = false;
+    if (r.status === "stale" && "window" in a && a.window) {
+      const win = a.window;
+      try { const fresh = await this.untilStopped(() => this.o.executor.observe(win)); if (fresh) { r = { ...r, after: fresh }; relooked = true; } } catch { /* gone or unreadable: the why says so */ }
+    }
     this.count("actions"); this.count(`actions:${r.status}`);
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     if (a.kind === "file") this.emit("fs.act", { cap: a.capability, args: a.args, status: r.status, consequence: r.consequence, why: r.why ?? "" });
@@ -315,7 +334,7 @@ export class FrontierRuntime {
       const sig = canon({ a, after: after?.elements.map((e) => [e.id, e.value ?? ""]) ?? null });
       this.repeats = sig === this.lastSig ? this.repeats + 1 : 0; this.lastSig = sig;
     }
-    const notes = [...(noChange ? ["注意：这一步做了，但界面上没有任何变化；预期的变化没出现就换个办法。"] : []), ...(this.repeats >= 1 ? ["注意：同一个动作在同一个界面上重复了，没有进展（原地打转）。换别的路，或者问用户。"] : [])];
+    const notes = [...(relooked ? ["注意：这一步没有执行——界面在你决定之后变了。after 是刚重新看的这个窗口（新的 epoch 和元素 id），按它重新决定，不要照旧重试。"] : []), ...(noChange ? ["注意：这一步做了，但界面上没有任何变化；预期的变化没出现就换个办法。"] : []), ...(this.repeats >= 1 ? ["注意：同一个动作在同一个界面上重复了，没有进展（原地打转）。换别的路，或者问用户。"] : [])];
     if (this.repeats >= 3) return this.end("failed", "no progress: the same action on an unchanged screen");
     return { ...(r.status === "ok" || r.status === "unverified" ? text(J(view)) : err(J(view))), ...(notes.length ? { content: [{ type: "text", text: J(view) + "\n" + notes.join("\n") }] } : {}) };
   }
