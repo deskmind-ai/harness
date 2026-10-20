@@ -39,6 +39,22 @@ const started = async (ex: Executor) => { const s = await ex.begin(); await ex.p
 const find = async (ex: Executor, win: string, label: string) => { const o = await ex.observe(win); const e = o.elements.find((x) => x.label.includes(label))!; return { o, e }; };
 const click = async (ex: Executor, win: string, label: string, extra: Record<string, unknown> = {}) => { const { o, e } = await find(ex, win, label); return ex.act({ action: { kind: "click", window: win, target: e.id }, epoch: o.epoch, ...extra }); };
 
+describe("executor: the begin event", () => {
+  it("tells what the driver can hear of the user's input when the driver says (input_watch), and nothing when not", async () => {
+    for (const watch of ["keys", "mouse", "", undefined]) {
+      const { sim } = mailSim();
+      const snap = sim.snapshot.bind(sim);
+      sim.snapshot = () => ({ ...snap(), ...(watch !== undefined ? { input_watch: watch } : {}) });
+      const events: { k: string; [x: string]: unknown }[] = [];
+      const ex = new Executor(sim, { task: "t1", publicKey: ConsentSigner.fresh().publicKey, onEvent: (k, b) => events.push({ k, ...b }) });
+      await ex.begin();
+      const begin = events.find((e) => e.k === "executor.begin")!;
+      if (watch === undefined) expect("input_watch" in begin).toBe(false);
+      else expect(begin.input_watch).toBe(watch);
+    }
+  });
+});
+
 describe("executor: ownership and the consequence floor", () => {
   it("windows on screen at begin are the user's; a window the task opens is the task's", async () => {
     const { ex, w } = setup();

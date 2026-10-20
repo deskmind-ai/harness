@@ -54,6 +54,15 @@ describe("run trace", () => {
     expect(typeof lines[0].t).toBe("number");
   });
 
+  it("marks what a cut list left out", () => {
+    const file = path.join(tmp(), "trace.jsonl");
+    traceWriter(file)("executor.files_written", { paths: Array.from({ length: 250 }, (_, i) => `f${i}`) });
+    const paths = JSON.parse(fs.readFileSync(file, "utf-8").trim()).paths;
+    expect(paths).toHaveLength(201);
+    expect(paths[199]).toBe("f199");
+    expect(paths[200]).toBe("…(+50)");
+  });
+
   it("never stops a run when the file cannot be written", () => {
     const trace = traceWriter(path.join(tmp(), "no-such-dir", "trace.jsonl"));
     expect(() => trace("executor.act", { status: "ok" })).not.toThrow();
