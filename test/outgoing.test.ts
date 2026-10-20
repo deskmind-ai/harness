@@ -993,7 +993,8 @@ describe("outgoing check: external review of #25 (P1, keys)", () => {
     const o = await ex.observe("w");
     const send: Action = { kind: "click", window: "w", target: "elem_3" };
     const r1 = await ex.act({ action: send, epoch: o.epoch, consent: mine });
-    w.elements = els("search");
+    // the executor's own look before the send: the draft changed (re-ask) and the focus went to the search box
+    w.elements = els("search").map((e) => (e.id === "elem_2" ? { ...e, value: "明天见！" } : e));
     expect((await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r1.challenge!) })).status).toBe("needs_consent");
     const paste = await ex.act({ action: { kind: "key", window: "w", chord: "cmd+v" }, epoch: o.epoch, consent: mine });
     expect(paste.status).toBe("stale");

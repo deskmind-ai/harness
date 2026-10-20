@@ -476,7 +476,7 @@ export class FrontierRuntime {
         this.emit("tool.call", { name: toolCall.name, args: toolCall.arguments });
         return undefined;
       },
-      afterToolCall: async ({ toolCall, result, isError }) => { this.emit("tool.result", { name: toolCall.name, isError, text: result.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("").slice(0, 300) }); return undefined; },
+      afterToolCall: async ({ toolCall, result, isError }) => { this.emit("tool.result", { name: toolCall.name, isError, text: result.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("").slice(0, 2000) }); return undefined; },   // a re-ask on a real Mac is read from the trace: 300 cut every observation (rc.9)
       getSteeringMessages: async () => this.steers.splice(0).map((r) => ({ role: "user" as const, content: `用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：${r}`, timestamp: Date.now() })),
       finishTurn: async (turn) => {
         turns += 1; this.count("turns");

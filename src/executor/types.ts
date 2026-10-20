@@ -31,7 +31,10 @@ export interface WindowInfo {
 export interface Snapshot { epoch: number; locked: boolean; front_app: string; windows: WindowInfo[]; user_active?: boolean;
   /** What the hands driver hears of the user's input: "keys" (keyboard and mouse, by target), "mouse" (no Input Monitoring:
    *  every key press counts), "" (no tap: every input counts). Told in the run's trace so a check knows which it had. */
-  input_watch?: string }
+  input_watch?: string;
+  /** Why the epoch last moved, when the driver says (hands#53): {epoch, at, by: action{kind, window} | input{to: app |
+   *  unknown} | windows{app, appeared | vanished | renamed}}. Carried into a stale result's trace; never decides. */
+  epoch_reason?: unknown }
 
 export interface Element {
   id: string; role: string; label: string; actions: string[];

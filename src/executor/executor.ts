@@ -23,7 +23,7 @@ import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, rank } from "./types.js";
-import { ConsentVerifier, canon } from "./consent.js";
+import { ConsentVerifier, canon, digestOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import { T, type Lang } from "../runtime/text.js";
@@ -77,6 +77,10 @@ export interface Classification { consequence: Consequence; object: string; why:
 export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pixels" : /^(ocr|gen|icon|desc):/.test(e.id));
 
 const RETURN = /\b(return|enter)\b/i;
+
+/** An element whose focus flag is a selection, not where the keyboard is: one that can be acted on, holds no value, is
+ *  not a text entry and does not itself send — a row, a list item, a recipient tag. outgoing() shows it as 「✓」. */
+const selectable = (e: Element): boolean => !e.value && e.actions.length > 0 && !e.sends && !/text|field|area|search|combo|web/i.test(e.role);
 
 /** How far (px, on each axis) an element read again may have moved and still be the same one: text recognition's boxes
  *  jitter by a few pixels, while two lines of a chat or two controls are at least a line apart (~20 px and more at
@@ -731,10 +735,18 @@ export class Executor {
     const sending = consequence === "external" ? outgoing(look) : null;
     const typed = sending ? this.typedIn(a).filter((t) => t.trim()) : [];
     const typedLines = typed.filter((t) => !sending!.fields.some((l) => l.includes(t.trim())));
-    const focused = look?.elements.find((e) => e.focused);
+    // keyboard focus is bound only where it decides what goes out: a key or typed text lands in the focused element. A
+    // click, double-click or menu choice goes to its target, and the keyboard focus moves on its own when the user
+    // answers our card (DeskMind comes forward, Safari's focused element is cleared): bound, it asked one send four
+    // times (rc.9, 10-20). What the focus flag means on a row, an item or a tag — the selection, which the card shows as
+    // 「✓」 and which can be who it goes to (review of #16: Alice selected, Bob sent) — stays bound for every action.
+    // Recipient, content and target stay bound by role, label, value, source and place
+    const withFocus = a.kind === "key" || a.kind === "type";
+    const focusOf = (e: Element) => withFocus || selectable(e);
+    const focused = withFocus ? look?.elements.find((e) => e.focused) : undefined;
     const pixels = !!look?.elements.some(fromScreen);
-    const whole = pixels && look ? look.elements.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, !!e.focused]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
-    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
+    const whole = pixels && look ? look.elements.map((e) => ({ c: canon([e.role, e.label, e.value ?? null, ...(focusOf(e) ? [!!e.focused] : [])]), at: (e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null) as [number, number] | null })) : undefined;
+    const content: SendBinding | undefined = sending && look ? { ...(sending.bound as Omit<SendBinding, "typed" | "target" | "focused">), elements: look.elements.map((e) => identOf(e, focusOf(e))), typed, target: el ? identOf(el, false) : null, focused: focused ? identOf(focused, false) : null, ...(whole !== undefined ? { whole } : {}) } : undefined;
     const t = T(this.opts.lang);
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el };
@@ -765,10 +777,14 @@ export class Executor {
     let base = { consequence, object: f.object };
     // why consent was asked again, in parts, for the trace (executor.consent_needed and executor.act carry it)
     let diag: Record<string, unknown> | undefined;
+    // why the epoch moved, when the driver says (hands#53: the snapshot's epoch_reason — an action, the user's input and
+    // to which app, a window that appeared, vanished or was renamed), for a stale result's trace; older drivers say nothing
+    let epochWhy: unknown;
+    const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       const { consent, ...rest } = req;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: r });
-      this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}) });
+      this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}) });
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -785,7 +801,7 @@ export class Executor {
     }
     // after a wait too: what the user did meanwhile (selected another row) is not what the model decided on, so the
     // action would land on something else (review of #16: "delete selected" deleted B, decided on A)
-    if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
+    if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
     const target = "window" in req.action ? req.action.window : null;
     if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
     // an element is addressed only through the window's last observation: a guessed id would skip the structural
@@ -798,7 +814,7 @@ export class Executor {
     // "Preview" where the button now says "Send" — sent without asking — or draft A where B goes out (review of #16).
     // Any action that reads the observation, or needs consent, waits for the window to be looked at again
     const readsObs = ("target" in req.action && !!req.action.target) || req.action.kind === "key" || req.action.kind === "type";
-    if (obs && obs.epoch !== now.epoch && (readsObs || NEEDS_CONSENT.has(consequence))) return done({ ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
+    if (obs && obs.epoch !== now.epoch && (readsObs || NEEDS_CONSENT.has(consequence))) return staleOn(now, { ...base, status: "stale", why: `the last observation of ${target} is from epoch ${obs.epoch}, the computer is at ${now.epoch}; observe the window again`, epoch: now.epoch });
     // the caller names elements by ids of its own observation; the driver acts on ids of its latest look, which may be
     // the executor's own (a last look before a send) and numbered otherwise. Every action that names an element finds it
     // in that latest look by what it is and where (resolve), exactly one, or the caller looks again; the card and the
@@ -826,7 +842,7 @@ export class Executor {
       now = await this.driver.snapshot();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, c.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
-      if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
     }
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
@@ -854,7 +870,7 @@ export class Executor {
         now = w.now;
         if (w.end) return done({ ...base, ...w.end, epoch: now.epoch });
       }
-      if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
       // a send's consent is for what it sends: the draft changed since the card is another send, asked again
       // an action token is checked here and spent only right before the effect, after the last look below passed
@@ -862,9 +878,13 @@ export class Executor {
       // have come): it is checked against the binding it was issued for
       const stored = req.consent?.scope === "action" ? this.consent.contentOf(req.consent.nonce) as SendBinding | undefined : undefined;
       accepted = stored && content && within(stored, content, this.pixelPolicy) ? stored : content;
-      const why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
+      let why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
+      // the token answers a card for this very action: what differs is what goes out, not the action (rc.9: "another
+      // action" was said of the same click whose window had changed)
+      const same = !!stored && req.consent?.digest === digestOf(req.action, base.object, consequence, stored);
+      if (why === "consent is for another action" && same) why = "what goes out changed since it was approved";
       if (why) {
-        if (why === "consent is for another action" && req.consent) {
+        if ((why === "consent is for another action" || why === "what goes out changed since it was approved") && req.consent) {
           const was = this.challenges.get(req.consent.nonce);
           diag = {
             token: was ? { action: canon(was.action), epoch: was.epoch, object: was.object, consequence: was.consequence } : null,
@@ -886,7 +906,7 @@ export class Executor {
     if (target && obs && (this.mightSend(req.action) || consequence === "external")) {
       let fresh: Observation;
       try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
-      if (fresh.epoch !== req.epoch) return done({ ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
+      if (fresh.epoch !== req.epoch) return staleOn(await this.driver.snapshot(), { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
       const changed = (what: string) => done({ ...base, status: "stale", why: `${target} changed right before acting (${what}); observe it again and decide anew`, epoch: fresh.epoch });
       // the target, always found again by identity (content, and id or place) and required one of a kind: the driver acts
       // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
@@ -906,7 +926,7 @@ export class Executor {
       now = await this.driver.snapshot();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
-      if (req.epoch !== now.epoch) return done({ ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+      if (req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
     }
     const before = "window" in req.action ? this.lastObs.get(req.action.window) ?? null : null;
     // a real driver can fail on either side of the action: that is a result the model reads, never an exception
