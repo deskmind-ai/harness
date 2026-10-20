@@ -458,9 +458,11 @@ describe("judge: adaptive routing and shadow", () => {
     top.script = Array(60).fill(() => ({ choice: "matches" }));
     const judge = new Judge([{ name: "top", gateway: top }]);
     for (let i = 0; i < 50; i++) expect((await judge.choose("q", { i }, opts))?.choice).toBe("matches");
-    const capped = new Judge([{ name: "top", gateway: top }], { budget: 2 });
+    const ev: string[] = [];
+    const capped = new Judge([{ name: "top", gateway: top }], { budget: 2, onEvent: (k) => ev.push(k) });
     await capped.choose("q", { a: 1 }, opts); await capped.choose("q", { a: 2 }, opts);
     expect(await capped.choose("q", { a: 3 }, opts)).toBeNull();
+    expect(ev).toContain("judge.budget");
   });
 
   it("a skipped kind is still probed on schedule: the cycle counts skipped turns, not only asked ones (deskmind#86 review)", async () => {
