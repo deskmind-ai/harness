@@ -22,7 +22,7 @@ import type { Capability, Registry } from "../registry/capability.js";
 import * as P from "../orchestrator/prompts.js";
 import * as R from "../protocol/roles.js";
 import type { Workspace } from "../registry/workspace.js";
-import { canon } from "../executor/consent.js";
+import { canon, normalUrl } from "../executor/consent.js";
 import type { ConsentSigner } from "../executor/consent.js";
 import { Executor, appName, describeAction, windowLabel } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
@@ -32,6 +32,10 @@ import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult,
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
 /** What signs consent: the app (keychain) in production, a ConsentSigner in tests and the CLI. */
 export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject" | "forOpen">;
+const LOOK_ONLY = "the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed";
+/** A URL on a card: readable (decoded), without the scheme, cut at 120 characters (the query stays visible up to there). */
+const shortUrl = (u: string) => { let s = u.replace(/^https?:\/\//, ""); try { s = decodeURI(s); } catch { /* as it is */ } return s.length > 120 ? s.slice(0, 117) + "…" : s; };
+
 /** A plan step as the model writes it; `opens`: the URLs it opens with open_window, and in which app. */
 export interface PlanStepIn { purpose: string; objects: string[]; consequence: Consequence; opens?: { app: string; url: string }[] }
 
@@ -263,6 +267,8 @@ export class FrontierRuntime {
       tools.push(tool({
         name: "fs_" + cap.id.split(".").slice(1).join("_"), label: cap.id, description: `${cap.description} 路径相对任务目录。`,
         parameters: Type.Object(props), execute: async (_id, args) => {
+          // looking for evidence only: a write is refused before anything is made for it (a rewrite asks a model)
+          if (this.lookOnly && cap.effect !== "observe") { this.count("refused_look_only"); return err(LOOK_ONLY); }
           const full = await this.derive(cap, args as Record<string, string>);
           if (typeof full === "string") return err(full);
           return this.act({ action: { kind: "file", capability: cap.id, args: full }, epoch: ex.currentEpoch, consequence: "read", purpose: cap.description.split("；")[0]! });
@@ -297,7 +303,7 @@ export class FrontierRuntime {
     // looking for evidence only: a wait or a file read; nothing that changes something or brings an app forward
     if (this.lookOnly && !(a.kind === "wait" || (a.kind === "file" && this.o.executor.preview({ action: a, epoch: p.epoch, consequence: "read" }).consequence === "read"))) {
       this.count("refused_look_only");
-      return err("the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed");
+      return err(LOOK_ONLY);
     }
     // the plan's object token for what the action touches goes along whatever the class: act settles the class itself
     // (the judge is asked only after its own checks that the action is current) and asks for a card when the token
@@ -306,8 +312,8 @@ export class FrontierRuntime {
     const pre = this.o.executor.preview({ action: a, epoch: p.epoch, consequence: p.consequence });
     // a URL to open in a window the plan covered for its site: that consent; anything else there, the plan's object
     // consent if it named the window — the executor checks either against the action
-    let host = ""; if (a.kind === "open_window" && a.url) { try { host = new URL(a.url).host; } catch { /* not a URL */ } }
-    const opening = host && this.openTokens.get(pre.object)?.hosts?.includes(host) ? this.openTokens.get(pre.object) : undefined;
+    const page = a.kind === "open_window" && a.url ? normalUrl(a.url) : null;
+    const opening = page && this.openTokens.get(pre.object)?.urls?.includes(page) ? this.openTokens.get(pre.object) : undefined;
     const consent = this.retryTokens.get(canon(a)) ?? opening ?? this.tokens.get(pre.object);
     let r: ActResult;
     try { r = await this.o.executor.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
@@ -398,8 +404,9 @@ export class FrontierRuntime {
       const into = new Map<string, Set<string>>();
       for (const o of s.opens ?? []) {
         const f = this.o.executor.floor({ kind: "open_window", app: o.app, url: o.url });
-        let host = ""; try { host = new URL(o.url).host; } catch { /* not a URL: nothing to cover */ }
-        if (host && f.consequence === "modify_user" && f.object.startsWith("window:")) { const h = into.get(f.object) ?? new Set<string>(); h.add(host); into.set(f.object, h); }
+        // exactly this page (http or https; a query can carry content): another page of the site asks on its own
+        const u = normalUrl(o.url);
+        if (u && f.consequence === "modify_user" && f.object.startsWith("window:")) { const h = into.get(f.object) ?? new Set<string>(); h.add(u); into.set(f.object, h); }
       }
       return into;
     });
@@ -443,7 +450,7 @@ export class FrontierRuntime {
     };
     const listed = steps.map((_s, i) => [
       ...objectsOf[i]!.map(shown).filter((x): x is string => x !== null),
-      ...[...opensInto[i]!].filter(([w]) => theirs(w)).map(([w, hs]) => this.t.openInYours(appName(snap.windows.find((x) => `window:${x.id}` === w)!), [...hs])),
+      ...[...opensInto[i]!].filter(([w]) => theirs(w)).map(([w, us]) => this.t.openInYours(appName(snap.windows.find((x) => `window:${x.id}` === w)!), [...us].map(shortUrl))),
     ]);
     const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : ""}`);
     const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };

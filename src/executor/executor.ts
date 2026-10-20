@@ -657,6 +657,10 @@ export class Executor {
     const object = objectOf(a);
     if (a.kind === "wait" || a.kind === "focus_window" || a.kind === "scroll") return { consequence: "read", object, why: "changes no content" };
     if (a.kind === "open_window") {
+      // a URL that carries what the task typed or read (a query with the draft, a path with a line of a file) sends it
+      // to that site: external, asked every time — by the executor's own record of typed and read text, not by meaning
+      // (review of #33)
+      if (a.url && this.carriesTaskText(a.url)) return { consequence: "external", object, why: `the URL carries text the task typed or read: ${a.url}` };
       // a URL handed to a browser the user already has open lands as a tab in their window (deskmind#73): that is
       // the user's thing and asks first; without a URL, or for an app not running, a new window of the task's own
       const theirs = a.url ? this.last?.windows.find((w) => w.owner === "user" && (w.app === a.app || w.id.startsWith(a.app + "#"))) : undefined;
@@ -700,6 +704,20 @@ export class Executor {
     if (a.kind === "key" && RETURN.test(a.chord)) return true;
     if (a.kind === "key" || a.kind === "select") return !!this.lastObs.get(a.window)?.elements.some((e) => e.sends) || !!this.typed.get(a.window)?.length;
     return false;
+  }
+
+  /** Does this URL carry text the task typed (anywhere) or read from a file in this run? Compared as text, in the URL
+   *  as written and decoded: each typed entry (2 characters or more) and each line read (4 or more), and pieces of long
+   *  ones. An extra card is the cost of a coincidence; the other way is content leaving without one. */
+  private carriesTaskText(url: string): boolean {
+    let decoded = url;
+    try { decoded = decodeURIComponent(url.replace(/\+/g, " ")); } catch { /* as written */ }
+    const hay = `${url}\n${decoded}`.toLowerCase();
+    const needles: string[] = [];
+    for (const list of this.typed.values()) for (const t of list) if (t.trim().length >= 2) needles.push(t.trim());
+    for (const r of this.receipts) if (r.request.action.kind === "file" && r.result.output) for (const v of Object.values(r.result.output)) if (typeof v === "string") for (const line of v.split("\n").slice(0, 2000)) if (line.trim().length >= 4) needles.push(line.trim());
+    const pieces = (t: string) => (t.length <= 20 ? [t] : Array.from({ length: Math.ceil((t.length - 20) / 10) + 1 }, (_, i) => t.slice(i * 10, i * 10 + 20)));
+    return needles.some((n) => pieces(n.toLowerCase()).some((p) => hay.includes(p)));
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
@@ -1208,6 +1226,13 @@ export class Executor {
     const brief = (o: Observation) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) });
     const evidence: Record<string, unknown> = {
       任务结束时整台电脑: ev.snapshot,
+      // what the system says is sending sound (hands#55), with whether it already was when the task began: one playing
+      // before is not the task's doing; one that started during the task is evidence of playback (no title: the
+      // windows say which track)
+      ...(ev.snapshot.audio_playing || this.beginSnapshot?.audio_playing ? { "正在发声的应用（系统给的，不含曲目名）": (() => {
+        const before = new Set((this.beginSnapshot?.audio_playing ?? []).map((x) => x.bundle.toLowerCase()));
+        return (ev.snapshot.audio_playing ?? []).map((x) => ({ 应用: x.app_name || x.bundle, bundle: x.bundle, 何时开始: before.has(x.bundle.toLowerCase()) ? "任务开始时就在发声（不是本任务做的）" : "任务期间开始发声" }));
+      })(), "任务开始时就在发声的应用": (this.beginSnapshot?.audio_playing ?? []).map((x) => x.app_name || x.bundle) } : {}),
       任务看过的窗口现在的样子: ev.windows.map(brief),
       "任务第一次看到这些窗口时的样子（和现在逐条比：少了的行就是被删或移走的，多了的就是新建的；元素 id 在两边是同一个）": ev.windows.map((o) => this.firstObs.get(o.window.id)).filter((o): o is Observation => !!o).map(brief),
       ...(ev.unreadable.length ? { "任务看过、现在读不出来的窗口（只知道读不出来，不知道它现在的样子）": ev.unreadable } : {}),
@@ -1398,7 +1423,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
     : a.kind === "type" ? t.type(el?.label ?? a.target, a.text)
     : a.kind === "select" ? t.select(el?.label ?? a.target, a.option)
     : a.kind === "key" ? t.key(a.chord)
-    : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? t.openWindow(a.app) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
+    : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, a.url) : t.openWindow(a.app)) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
   const cls = consequence === "external" ? t.sends : consequence === "modify_user" ? t.modifies : "";
   return `${where ? t.at(where) : ""}${what}${cls ? "（" + cls + "）" : ""}`;
 }

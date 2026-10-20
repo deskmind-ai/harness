@@ -32,10 +32,12 @@ export class ConsentSigner {
     return this.sign({ nonce: c.nonce, scope: "action", digest: c.digest, object: c.object, consequence: c.consequence, expires_at: this.now() + ttlMs, sig: "" });
   }
 
-  /** Consent to open pages of these sites (open_window with a URL whose host is listed) in `object` — the user's
-   *  browser window a URL lands in — in `task`, and nothing else there: not a click, not typing, not another site. */
-  forOpen(object: string, hosts: string[], task: string, ttlMs = 60 * 60_000): ConsentToken {
-    return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "open", object, hosts: [...new Set(hosts)].sort(), consequence: "modify_user", task, expires_at: this.now() + ttlMs, sig: "" });
+  /** Consent to open exactly these pages (open_window with one of these URLs, normalised; http and https only) in
+   *  `object` — the user's browser window a URL lands in — in `task`, and nothing else there: not a click, not typing,
+   *  not another page of the same site (a query can carry what the task typed — review of #33). */
+  forOpen(object: string, urls: string[], task: string, ttlMs = 60 * 60_000): ConsentToken {
+    const ok = [...new Set(urls.map(normalUrl).filter((u): u is string => u !== null))].sort();
+    return this.sign({ nonce: randomBytes(16).toString("hex"), scope: "open", object, urls: ok, consequence: "modify_user", task, expires_at: this.now() + ttlMs, sig: "" });
   }
 
   /** Consent for every action on `object` in `task` up to `consequence`, until it expires. */
@@ -111,9 +113,9 @@ export class ConsentVerifier {
         if (t.task !== task) return "consent is for another task";
         if (t.object !== object) return "consent is for another object";
         if (action.kind !== "open_window" || !action.url) return "consent covers opening pages only";
-        let host = "";
-        try { host = new URL(action.url).host; } catch { return "consent covers opening pages only"; }
-        return t.hosts?.includes(host) ? null : `consent does not cover ${host}`;
+        const u = normalUrl(action.url);
+        if (!u) return "consent covers http(s) pages only";
+        return t.urls?.includes(u) ? null : `consent does not cover ${u}`;
       }
       if (t.scope === "object") {
         if (t.task !== task) return "consent is for another task";
@@ -145,6 +147,12 @@ export class ConsentVerifier {
     this.spent.add(token.nonce);
     return true;
   }
+}
+
+/** A URL as an open consent binds it: scheme, host, path and query (the fragment dropped); null for anything but http
+ *  and https (file:, view-source:, javascript: are never covered). */
+export function normalUrl(url: string): string | null {
+  try { const u = new URL(url); return u.protocol === "http:" || u.protocol === "https:" ? `${u.protocol}//${u.host}${u.pathname}${u.search}` : null; } catch { return null; }
 }
 
 /** `app:*`, `window:*`, an exact id, or `*`. */

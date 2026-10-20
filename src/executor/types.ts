@@ -41,6 +41,8 @@ export interface Snapshot { epoch: number; locked: boolean; front_app: string; w
   /** Why the epoch last moved, when the driver says (hands#53): {epoch, at, by: action{kind, window} | input{to: app |
    *  unknown} | windows{app, appeared | vanished | renamed}}. Carried into a stale result's trace; never decides. */
   epoch_reason?: unknown;
+  /** Apps sending audio to an output device right now (hands#55; no track title — the system keeps that closed). */
+  audio_playing?: { bundle: string; app_name?: string }[];
   /** Apps the driver can operate only in front (hands), when it says so per snapshot rather than per window. */
   needs_foreground?: string[] }
 
@@ -95,7 +97,7 @@ export interface ConsentToken {
   consequence: Consequence;          // the highest class it allows
   task?: string;                     // object scope: only this task
   rule?: string;                     // rule scope: a durable permission, in the executor's rule store
-  hosts?: string[];                  // open scope: opening pages of these sites (open_window with a URL) in `object`, nothing else
+  urls?: string[];                   // open scope: opening exactly these pages (open_window, normalised http(s) URL) in `object`, nothing else
   expires_at: number;                // ms since epoch
   sig: string;                       // base64 Ed25519 over canon(token without sig)
 }
