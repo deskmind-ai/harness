@@ -402,3 +402,94 @@ describe("outgoing check: review of #23", () => {
     expect(desk.log).toEqual([]);
   });
 });
+
+describe("outgoing check: re-review of #23", () => {
+  const relabel = () => {
+    const asked: string[] = [];
+    const { judge } = judged((u) => { const s = /"名字": "发送"/.test(u.split("窗口里标了")[0]!); asked.push(s ? "sends" : "stays"); return { choice: s ? "sends" : "stays" }; });
+    const w: FakeWin = { info: { id: "w", app: "Mail", title: "回复" }, elements: [{ id: "ax:3", role: "button", label: "预览", actions: ["click"] }], text: "" };
+    return { judge, w, asked };
+  };
+
+  it("two observations on one epoch: a class judged on the first is not used after the second (「预览」→「发送」 relabelled by another app)", async () => {
+    const { judge, w, asked } = relabel();
+    const { ex, desk, app } = await setup([w], judge);
+    const o = await ex.observe("w");
+    const a: Action = { kind: "click", window: "w", target: "ax:3" };
+    expect((await ex.classify(a, o.epoch)).consequence).toBe("modify_user");
+    w.elements = [{ id: "ax:3", role: "button", label: "发送", actions: ["click"] }];   // no `sends` mark, epoch unchanged
+    const o2 = await ex.observe("w");
+    expect(o2.epoch).toBe(o.epoch);
+    const r = await ex.act({ action: a, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+    expect(r).toMatchObject({ status: "needs_consent", consequence: "external" });
+    expect(asked).toEqual(["stays", "sends"]);
+    expect(desk.log).toEqual([]);
+  });
+
+  it("relabelled and not looked at again: the look right before the effect finds the target changed, and nothing is done", async () => {
+    const { judge, w } = relabel();
+    const { ex, desk, app } = await setup([w], judge);
+    const o = await ex.observe("w");
+    const a: Action = { kind: "click", window: "w", target: "ax:3" };
+    expect((await ex.classify(a, o.epoch)).consequence).toBe("modify_user");
+    w.elements = [{ id: "ax:3", role: "button", label: "发送", actions: ["click"], sends: true }];
+    const r = await ex.act({ action: a, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+    expect(r.status).toBe("stale");
+    expect(desk.log).toEqual([]);
+  });
+
+  it("a new incoming message or other window text right before a send does not ask again; the consented draft goes out", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const w = chat();
+    const { ex, desk, app } = await setup([w], judge);
+    const mine = app.forObject("window:chat", "modify_user", "t1");
+    let o = await ex.observe("chat");
+    await ex.act({ action: { kind: "type", window: "chat", target: "ocr:1", text: "明天见" }, epoch: o.epoch, consent: mine });
+    o = await ex.observe("chat");
+    const ret: Action = { kind: "key", window: "chat", chord: "return" };
+    const r = await ex.act({ action: ret, epoch: o.epoch, consent: mine });
+    expect(r.status).toBe("needs_consent");
+    w.elements = [...w.elements, { id: "ocr:9", role: "listitem", label: "李四：在吗", actions: ["click"] }];
+    w.text = "张三：明天开会吗？\n李四：在吗\n对方正在输入…\n输入消息…\n发送";
+    expect((await ex.act({ action: ret, epoch: o.epoch, consent: app.forAction(r.challenge!) })).status).toBe("ok");
+    expect(desk.log.at(-1)).toEqual(ret);
+  });
+
+  it("the model's own「往外发」on a name-list Send still takes the typed text as sent", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: [
+      { id: "body", role: "textArea", label: "正文", actions: ["type"] },
+      { id: "send", role: "button", label: "发送", actions: ["click"], sends: true },
+    ], text: "" };
+    const { ex, app } = await setup([w], judge);
+    const mine = app.forObject("window:w", "modify_user", "t1");
+    let o = await ex.observe("w");
+    await ex.act({ action: { kind: "type", window: "w", target: "body", text: "合同见附件" }, epoch: o.epoch, consent: mine });
+    o = await ex.observe("w");
+    const send: Action = { kind: "click", window: "w", target: "send" };
+    const r = await ex.act({ action: send, epoch: o.epoch, consequence: "external", consent: mine });
+    expect(r.challenge!.text).toContain("这次任务打的字：合同见附件");
+    expect((await ex.act({ action: send, epoch: o.epoch, consequence: "external", consent: app.forAction(r.challenge!) })).status).toBe("ok");
+    o = await ex.observe("w");
+    const after = await ex.act({ action: send, epoch: o.epoch, consequence: "external", consent: mine });
+    expect(after.challenge!.text).not.toContain("这次任务打的字");
+  });
+
+  it("an action token is not spent by a look that refused: the draft changed and changed back, the user's yes still holds", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    const draft = (v: string): Element[] => [{ id: "body", role: "textArea", label: "正文", value: v, actions: ["set_value"] }, { id: "b7", role: "button", label: "", actions: ["click"] }];
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: draft("草稿 A"), text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    const o = await ex.observe("w");
+    const a: Action = { kind: "click", window: "w", target: "b7" };
+    const r = await ex.act({ action: a, epoch: o.epoch });
+    const yes = app.forAction(r.challenge!);
+    w.elements = draft("草稿 B");
+    expect((await ex.act({ action: a, epoch: o.epoch, consent: yes })).status).toBe("needs_consent");
+    w.elements = draft("草稿 A");
+    await ex.observe("w");
+    expect((await ex.act({ action: a, epoch: o.epoch, consent: yes })).status).toBe("ok");
+    expect(desk.log).toEqual([a]);
+    expect((await ex.act({ action: a, epoch: (await ex.observe("w")).epoch, consent: yes })).status).toBe("needs_consent");   // once only
+  });
+});

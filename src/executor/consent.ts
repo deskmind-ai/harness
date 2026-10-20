@@ -87,9 +87,10 @@ export class ConsentVerifier {
     return null;
   }
 
-  /** Does this token (or a stored rule) cover the action? Spends an action-scoped token. Returns the reason it does
+  /** Does this token (or a stored rule) cover the action? Spends an action-scoped token unless `spend` is false — then
+   *  the caller spends it with `spend()` right before the effect, after its last checks. Returns the reason it does
    *  not, or null. */
-  check(action: Action, object: string, consequence: Consequence, task: string, token?: ConsentToken, content?: unknown): string | null {
+  check(action: Action, object: string, consequence: Consequence, task: string, token?: ConsentToken, content?: unknown, spend = true): string | null {
     const covers = (t: ConsentToken): string | null => {
       const bad = this.valid(t);
       if (bad) return bad;
@@ -110,13 +111,21 @@ export class ConsentVerifier {
     if (token) {
       const why = covers(token);
       if (why) return why;
-      if (token.scope === "action") this.spent.add(token.nonce);
+      if (token.scope === "action" && spend) this.spent.add(token.nonce);
       if (token.scope === "rule") { if (token.consequence === "external") return "a rule may not cover sending"; if (!this.rules.some((r) => r.nonce === token.nonce)) this.rules.push(token); this.rulesUsed.add(token.rule ?? token.nonce); }
       return null;
     }
     const rule = this.rules.find((r) => covers(r) === null);
     if (rule) { this.rulesUsed.add(rule.rule ?? rule.nonce); return null; }
     return "no consent";
+  }
+
+  /** Spend an action token checked with `spend: false`: false when it was spent meanwhile (used once only). */
+  spend(token: ConsentToken): boolean {
+    if (token.scope !== "action") return true;
+    if (this.spent.has(token.nonce)) return false;
+    this.spent.add(token.nonce);
+    return true;
   }
 }
 
