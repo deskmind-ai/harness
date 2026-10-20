@@ -25,9 +25,10 @@
 ## 现状
 
 - 执行层通过 MCP 提供 8 个工具：begin、snapshot、observe、plan、act、verify、stop、end。
-- 我们自己的循环在同一个进程里直接调用执行层，工具名是 computer_snapshot、computer_observe、computer_act、plan、fs_*。
+- 我们自己的循环在同一个进程里直接调用执行层。给模型的工具是 computer_snapshot、computer_observe、computer_act、plan、fs_*（文件工具），另有只在循环里的 ask_user、answer、read_skill、finish。
 - 执行层、判官、教程库和我们的循环在同一个包里，还没拆开。
-- app 的结果卡、文件变化、同意卡，现在是从运行时的事件里拿的。
+- app 读 harness 进程（`harness.mjs app-run`）的一条事件流：文件变化来自执行层的账本（`executor.changes()`），结果卡和同意卡来自运行时。
+- 同意凭证现在由 harness 进程里每次运行新生成的一对密钥签发，app 还没接钥匙串；下表「app 签名」是目标状态。
 
 ## 各项能力放在哪、怎么接
 
@@ -52,6 +53,9 @@
 
 - 接在宿主的「调用前 / 调用后」钩子上：Codex 和 Claude Code 叫 PreToolUse / PostToolUse，pi 叫 beforeToolCall / afterToolCall。
 - **调用前：** 钩子是我们提供的一个小命令，它把工具名和参数通过本机 socket 发给执行层。执行层按路径查开始时的归属清单，算出后果下限，然后回答三种结果之一：放行；拒绝并附理由；需要同意（同时交给 app 弹卡）。
+- **在 Codex 上要注意钩子的写法：** Codex 的 PreToolUse 不支持「ask」这种决定，返回它会被当成放行；退出码不是 0 或 2、钩子出错、没有退出码，也都不拦。所以：
+  - 「需要同意」要写成「拒绝，并说明要等用户在 app 里同意」，用户同意后由 agent 重试；
+  - 钩子连不上执行层时，必须以退出码 2 结束（拦下），不能静默放行。
 - **调用后：** 记回执，更新账本。
 
 ### 2. 事先不知道会改什么：shell、跑代码
@@ -74,7 +78,7 @@
 ### 为什么钩子和沙箱两层都要
 
 - **钩子**由宿主程序执行，模型跳不过去。它能逐个动作把关，还能把拒绝的理由告诉模型。
-- **但钩子本身可能失灵：** Codex 的 PreToolUse 在几种异常情况下会直接放行，比如钩子返回了它不认识的决定（`codex-rs/hooks/src/events/pre_tool_use.rs` 里的 `*_fails_open` 测试）。用户或 agent 的配置也可能把钩子关掉。
+- **但钩子本身可能失灵：** Codex 的 PreToolUse 在几种异常情况下会直接放行：钩子返回了它不认识的决定（包括「ask」）、退出码不是 0 或 2、钩子本身出错（`codex-rs/hooks/src/events/pre_tool_use.rs` 里的 `*_fails_open` 测试和退出码处理）。用户或 agent 的配置也可能把钩子关掉。
 - **沙箱**由操作系统强制，钩子失灵它也照样挡住，作为最后一道。
 - 这和现有设计一致：运行时守第一道，执行层守最后一道。
 
@@ -91,41 +95,51 @@
 2. **单独配置的判官模型：** 可选，比如另一家模型。
 3. **agent 自己的模型，单独调用：**
    - 我们自己的循环，直接用动手的模型另发一次调用；
-   - 别的 agent 用 MCP 的 sampling：服务端请宿主的模型答一道题，并指定不带对话上下文。
-4. **都没有：** 返回「没有结论」，走保守的一边：计划时去问用户；动手前弹授权卡让用户决定；结束时不算做成。
+   - 别的 agent 用 MCP 的 sampling：服务端请宿主的模型答一道题，并指定不带对话上下文。宿主得支持 sampling 才行，Codex 目前不支持（见「待定」）。
+4. **都没有：** 返回「没有结论」，走保守的一边：
+   - 计划时：去问用户；
+   - 动手前：照常过同意这道门，和判官说「是」时一样。没有同意凭证才弹授权卡；计划里用户同意过的对象，不再弹；
+   - 结束时：不算做成。
+
+   每个任务的 40 题额度用完，或者低档拒绝之后高档都答不上来，也会返回「没有结论」。
 
 宿主不支持 sampling 时，直接走第 4 档。不要退成「把题塞进对话里让 agent 自己答」，那等于让它给自己的动作打分。
 
-**Codex 的先例：** Codex 在执行动作前会请一个审查员判断。审查员优先用专门的审查模型，并且用较低的推理强度；目录里没有这个模型时，退回用动手的同一个模型（`core/src/guardian/reviewer_config.rs` 的 `resolve_review_model`、`ext/guardian-reviewer/src/model.rs` 的 `select_review_model`）。审查在单独的会话里进行，出错时按拒绝处理（源码注释：review errors still fail closed）。我们照这个来，再加上下面这条 Codex 没有的。
+**Codex 的先例：** Codex 打开自动审查（`approvals_reviewer = auto_review`，默认是 `user`，即由用户审批）时，对需要审批的动作请一个审查员判断。
+- 审查员优先用专门的审查模型，并且用较低的推理强度；目录里没有这个模型时，退回用动手的同一个模型（`core/src/guardian/reviewer_config.rs` 的 `resolve_review_model`、`ext/guardian-reviewer/src/model.rs` 的 `select_review_model`）。
+- 审查在分出来的会话里进行，但会带上压缩后的对话记录（`core/src/guardian/review_session.rs`、`prompt.rs`），不是不带上下文。
+- 审查失败按拒绝处理（`ext/guardian-reviewer/src/completion.rs` 的 `FailedClosed`）。
+
+我们沿用「退回动手的模型」和「失败按拒绝」，但更严：判官只看题目和证据，不带对话；再加上下面这条 Codex 没有的。
 
 ### 第 3 档能管多大的事
 
 | 题 | 第 3 档可以答吗 | 理由 |
 |---|---|---|
 | 动手前：是不是用户要的 | 可以 | 放行之后，改用户的东西、往外发仍然要有同意凭证，越不过同意这道门 |
-| 计划时：依据能不能区分 | 可以，结果要标出由谁判 | 答错的后果是少问用户一次。和现在的默认配置一样（判官云端档和动手的都是 DeepSeek） |
+| 计划时：依据能不能区分 | 可以，结果要标出由谁判 | 答错的后果是少问用户一次。和现在默认配置里 Brain 放不了行时一样：交给和动手相同的 DeepSeek |
 | 结束时：做成了没有 | 能答，但不能算「核对通过」 | 自己做、自己判，正是「没做成说成做成」这条底线要防的。结果写成「agent 自查通过，没有经过独立核对」 |
 
 ### 结果卡和 trace 写明是谁判的
 
 - **独立判：** Brain，或另一家模型；
-- **同一个模型、单独调用：** 现在的 DeepSeek 默认配置，以及第 3 档；
+- **同一个模型、单独调用：** 现在默认配置里交给云端档的题（DeepSeek，和动手的相同），以及第 3 档；
 - **没人判：** 走保守的一边。
 
-现在的默认配置其实已经是第二种：判官的云端档和动手的是同一个模型。所以加入第 3 档不会比现在差；真正要补的是，让结束时的核对能看出是不是独立判的。
+现在的默认配置：Brain 就绪时先由 Brain 放行，其余交给和动手相同的 DeepSeek（app 设 `DESKMIND_BRAIN_JUDGE=1`，配置 ds-flash 所有角色都是 deepseek-flash）。所以加入第 3 档不会比现在差。每个回答已经记了由哪一档判（`by`），真正要补的是把它带到结果卡和 trace 上，让人看出结束时的核对是不是独立判的。
 
 ## 借鉴 Codex 的电脑操作
 
-依据 codex-cu（gxcsoccer/codex-cu，按 Codex Computer Use 的协议和行为做的复刻，MIT 许可）的 `docs/REPORT.md`、`docs/PROTOCOL.md`、`docs/CONFORMANCE.md`、`skill/codex-cu/SKILL.md`。
+依据 codex-cu（gxcsoccer/codex-cu，按 Codex Computer Use 的协议和行为做的复刻；README 写明自己的代码按 MIT 许可，仓库里没有单独的 LICENSE 文件）的 `docs/REPORT.md`、`docs/PROTOCOL.md`、`docs/CONFORMANCE.md`、`skill/codex-cu/SKILL.md`。
 
 ### 采用
 
 | Codex 的做法 | 我们现在 | 改成 |
 |---|---|---|
-| 读一个应用的界面时，结果里附上这个应用的使用说明（`appSpecificInstructions`）。自带音乐、时钟、Notion、Numbers、Slack、Spotify、iPhone 镜像 7 个应用的说明，客户端负责去重 | 教程候选靠用户提交请求时的钩子注入，换成别的 agent 不一定有这个钩子 | 执行层在返回 observe 结果时，按应用附上匹配的教程（只附名字和描述，全文按需读）。不靠宿主的钩子，换哪个 agent 都能拿到 |
-| 元素 id 在整个进程里保持不变；系统通知界面有变化时把快照标成过期；下次动作时按角色、标识、标题、描述重新找到同一个元素，唯一匹配就直接用 | 画面版本号一变就退回 stale，模型要重看一遍，白白多一轮（10-19 有过把轮数用光的情况） | 只读的动作和改任务自己东西的动作，改成按特征重新找元素。改用户的东西、往外发的动作仍然要求重看，保证授权卡上显示的是现在的样子 |
-| 动作之后返回文字版的差异：新增、改变、删掉的元素 | 返回完整的新画面，加上变化的数量 | 返回差异，少花 token，模型也更容易看出「没有变化」 |
-| 一个长期运行、签了名的服务进程，系统权限只授给这一个程序；会校验调用方，不认识的直接拒绝（错误码 -10000 senderProcessNotAuthenticated） | 执行层由 app 拉起，没有校验调用方 | 执行层校验调用方，并给每个会话发一次性令牌。换成别的 agent 以后，谁都可能来连执行层，不校验的话，本机任何程序都能借我们拿到的权限去操作电脑 |
+| 读一个应用的界面时，结果里附上这个应用的使用说明（`appSpecificInstructions`），客户端负责去重。codex-cu 照原版带了 7 份说明（音乐、时钟、Notion、Numbers、Slack、Spotify、iPhone 镜像），哪份对应哪个应用有一部分是推断的 | 教程候选靠用户提交请求时的钩子注入，换成别的 agent 不一定有这个钩子 | 执行层在返回 observe 结果时，按应用附上匹配的教程（只附名字和描述，全文按需读）。不靠宿主的钩子，换哪个 agent 都能拿到 |
+| 元素 id 在整个进程里保持不变；系统通知界面有变化时把快照标成过期；下次动作时按角色、标识、标题、描述重新找到同一个元素，唯一匹配就直接用 | 画面版本号一变就退回 stale，模型要重看一遍，多花一轮 | 只读的动作和改任务自己东西的动作，改成按特征重新找元素。改用户的东西、往外发的动作仍然要求重看，保证授权卡上显示的是现在的样子 |
+| 动作本身只返回成功与否；下一次读这个应用的界面时，返回和上一次相比的文字版差异：新增、改变、删掉的元素 | 动作返回完整的新画面，加上变化的数量 | observe 默认返回和上一次相比的差异，需要时再要全量。少花 token，模型也更容易看出「没有变化」 |
+| 一个长期运行、签了名的服务进程，系统权限只授给这一个程序；会校验调用方：没有对应授权的进程得不到任何回应（错误码表里有 -10000 senderProcessNotAuthenticated；codex-cu 自己改成检查 socket 的属主） | 执行层由 app 拉起，没有校验调用方 | 执行层校验调用方，并给每个会话发一次性令牌。换成别的 agent 以后，谁都可能来连执行层，不校验的话，本机任何程序都能借我们拿到的权限去操作电脑 |
 
 ### 以后再看
 
@@ -137,8 +151,8 @@
 
 - **按应用授权**（`persistentApprovals` 里某个应用「总是允许 / 总是拒绝」，加上 `allowAllChats` 总开关）：这就是白名单，和负责人 10-17 定的「不按应用写规则」冲突。我们的同意是落到具体对象和具体动作上的凭证。
 - **授权配置读不到时放行**：codex-cu 自己标明这是和原版不一致的地方。
-- **「删除、发送之前先问用户」只写在技能文件里**：这要靠模型自觉。我们这条由执行层强制。
-- Codex 不核对任务做没做成，也不区分东西归谁。这两样正是我们和它的区别。
+- **「删除、发送之前先问用户」只写在技能文件里**（codex-cu 的 SKILL.md；原版是否也这样，没有核实）：这要靠模型自觉。我们这条由执行层强制。
+- Codex 的 goal 模式有完成审查，但审查的是动手的模型自己，没有独立核对；也不区分东西归谁。这两样正是我们和它的区别。
 
 ## 局限
 
@@ -160,19 +174,19 @@
 
 ## 待定
 
-- **联网：** 沙箱只能整体开或关网络，分不出「读网页」和「往外发」。候选做法：
-  - 默认断网，需要时每个任务请用户同意一次（倾向这个：最简单，也最守得住）；
+- **联网：** 系统沙箱本身只能整体开或关网络，分不出「读网页」和「往外发」。候选做法：
+  - 默认断网，需要时每个任务请用户同意一次（最简单，也最守得住）；
   - 默认开网，往外发的风险只靠钩子把关；
-  - 联网走我们的代理，在代理上区分读和发，代价是要多做一个组件。
+  - 联网走代理，在代理上区分读和发。Codex 已经有这样的代理（`codex-network-proxy`）：有一种「受限」模式只放行 GET、HEAD、OPTIONS 请求，也能按域名放行或拦截。在 Codex 上可以直接用它的受限模式；按域名的名单是白名单，不用。其他宿主上，这条要我们自己做代理。
 - **sampling 支持：**
-  - Codex 的源码（`codex-rs/rmcp-client/src/tool_input.rs`）能解析 sampling 请求，但会不会真的作答，还没确认；
+  - Codex：源码只在 `codex-rs/rmcp-client/src/tool_input.rs` 解析 sampling 请求，客户端没有实现作答，对外声明的能力里也没有 sampling。按不支持处理：对 Codex，第 3 档目前等于第 4 档。要在 Codex 上有判官，得靠 Brain 或用户另配一个判官模型。
   - Claude Code 和 pi 是否支持，还没查。
 - **「DeepSeek 的 agent」** 具体指哪个项目，待负责人给链接。
 
 ## 来源
 
 - 本仓库：`src/runtime/loop.ts`、`src/executor/executor.ts`、`src/executor/judge.ts`、`src/cli/mcp.ts`。
-- Codex 源码（本地 `openai/codex`）：`codex-rs/hooks/src/events/pre_tool_use.rs`、`codex-rs/core/src/guardian/`、`codex-rs/ext/guardian-reviewer/src/model.rs`、`codex-rs/rmcp-client/src/tool_input.rs`。
-- codex-cu：`docs/REPORT.md`、`docs/PROTOCOL.md`、`docs/CONFORMANCE.md`、`docs/INSTALL.md`、`skill/codex-cu/SKILL.md`。
+- Codex 源码（本地 `openai/codex`）：`codex-rs/hooks/src/events/pre_tool_use.rs`、`codex-rs/core/src/guardian/`、`codex-rs/ext/guardian-reviewer/src/`、`codex-rs/rmcp-client/src/`、`codex-rs/network-proxy/`、`codex-rs/ext/goal/templates/goals/continuation.md`。
+- codex-cu：`README.md`、`docs/REPORT.md`、`docs/PROTOCOL.md`、`docs/CONFORMANCE.md`、`docs/INSTALL.md`、`docs/REVERSE-ENGINEERING.md`、`docs/COMPATIBILITY.md`、`docs/OPEN-QUESTIONS.md`、`skill/codex-cu/SKILL.md`。
 - 之前的设计：`docs/0.5-plan.md`、`docs/consent-spec.md`；openjev 仓库的 `docs/design/skills-layer-2026-10-18.md`、`docs/research/harness-survey-2026-10-18.md`。
 - 流程图（现状，按代码画）：https://claude.ai/artifact/K9nv8B478qrBf898M6ZoZq
