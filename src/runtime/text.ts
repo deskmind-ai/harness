@@ -6,7 +6,7 @@ export type Lang = "zh" | "en";
 
 const ZH = {
   ok: "可以", okPlan: "可以，就这样做", skipStep: "这一步不要", cancel: "先别做了", delegate: "由你决定", fine: "好的", undo: "撤回",
-  planTitle: "我打算这样做：", planAsk: "可以吗？", modifyYours: "——改你的东西", external: "——往外发，到时候再确认一次",
+  planTitle: "我打算这样做：", planAsk: "可以吗？", modifyYours: "——改你的东西", external: "——往外发，到时候再确认一次", modifyAndExternal: "——改你的东西，也会往外发；发之前再确认一次",
   ambiguity: (point: string) => `「${point}」可以有几种理解，你指的是哪一种？`,
   did: (what: string[]) => `做了：${what.join("；")}`, changedYours: (objs: string[]) => `改动了你的：${objs.join("、")}`, noUndo: (why: string) => `（${why}）`,
   at: (where: string) => `在 ${where} `, click: (l: string) => `点「${l}」`, doubleClick: (l: string) => `双击「${l}」`, set: (l: string, v: string) => `把「${l}」设为「${v}」`, type: (l: string, t: string) => `在「${l}」里输入「${t}」`,
@@ -16,10 +16,12 @@ const ZH = {
   outgoing: (fields: string[], shown: string[]) => `\n要发出去的：${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : "窗口里看不到要发出的内容"}`,
   byRule: (rules: string[]) => `按你以前定的规则做的：${rules.join("、")}`,
   typed: (t: string) => `这次任务打的字：${t}`,
+  mainWindow: (app: string) => `${app} 的主窗口`,
+  foreground: (apps: string[]) => `注意：${apps.join("、")} 只能在前台操作。做这些步骤时，我会把它短暂切到前台；这段时间请先别用电脑。`,
 };
 const EN: typeof ZH = {
   ok: "OK", okPlan: "OK, go ahead", skipStep: "Skip this step", cancel: "Stop here", delegate: "You decide", fine: "Fine", undo: "Undo",
-  planTitle: "Here is what I plan to do:", planAsk: "OK?", modifyYours: " — changes your things", external: " — sends something out; I will confirm then",
+  planTitle: "Here is what I plan to do:", planAsk: "OK?", modifyYours: " — changes your things", external: " — sends something out; I will confirm then", modifyAndExternal: " — changes your things, and sends something out; I will confirm before sending",
   ambiguity: (point: string) => `"${point}" can be read in more than one way. Which do you mean?`,
   did: (what: string[]) => `Done: ${what.join("; ")}`, changedYours: (objs: string[]) => `Changed yours: ${objs.join(", ")}`, noUndo: (why: string) => `(${why})`,
   at: (where: string) => `In ${where}: `, click: (l: string) => `click "${l}"`, doubleClick: (l: string) => `double-click "${l}"`, set: (l: string, v: string) => `set "${l}" to "${v}"`, type: (l: string, t: string) => `type "${t}" into "${l}"`,
@@ -29,5 +31,7 @@ const EN: typeof ZH = {
   outgoing: (fields: string[], shown: string[]) => `\nWhat goes out:${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : " not visible in the window"}`,
   byRule: (rules: string[]) => `Under your standing rule: ${rules.join(", ")}`,
   typed: (t: string) => `typed by this task: ${t}`,
+  mainWindow: (app: string) => `${app}'s main window`,
+  foreground: (apps: string[]) => `Note: ${apps.join(", ")} can only be operated in front. For these steps I will bring it to the front briefly; please leave the Mac alone meanwhile.`,
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);

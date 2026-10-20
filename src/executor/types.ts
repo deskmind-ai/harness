@@ -25,6 +25,8 @@ export interface WindowInfo {
   owner?: Owner;                      // filled by the executor from its ledger; a driver never says
   focused?: boolean; minimized?: boolean;
   url?: string; tabs?: TabInfo[];     // a browser window
+  /** The driver can operate this window only with its app in front (hands): the plan card says so. */
+  needs_foreground?: boolean;
 }
 
 /** The whole computer, every app in one format. Read-only, so nothing is hidden: the user's windows are listed too. */
@@ -34,7 +36,9 @@ export interface Snapshot { epoch: number; locked: boolean; front_app: string; w
   input_watch?: string;
   /** Why the epoch last moved, when the driver says (hands#53): {epoch, at, by: action{kind, window} | input{to: app |
    *  unknown} | windows{app, appeared | vanished | renamed}}. Carried into a stale result's trace; never decides. */
-  epoch_reason?: unknown }
+  epoch_reason?: unknown;
+  /** Apps the driver can operate only in front (hands), when it says so per snapshot rather than per window. */
+  needs_foreground?: string[] }
 
 export interface Element {
   id: string; role: string; label: string; actions: string[];
