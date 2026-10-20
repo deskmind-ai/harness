@@ -493,3 +493,153 @@ describe("outgoing check: re-review of #23", () => {
     expect((await ex.act({ action: a, epoch: (await ex.observe("w")).epoch, consent: yes })).status).toBe("needs_consent");   // once only
   });
 });
+
+describe("outgoing check: third review of #23", () => {
+  it("a card approved for 张三 does not send to 李四: the conversation switched in a window whose title never changes", async () => {
+    const { judge } = judged(() => ({ choice: "sends" }));
+    let who = "张三";
+    const w: FakeWin = { info: { id: "w", app: "微信", title: "微信" }, elements: [], text: "" };
+    const fill = () => { w.elements = [
+      { id: "ocr:0", role: "listitem", label: who, actions: ["click"] },
+      { id: "ocr:1", role: "listitem", label: "输入消息…", actions: ["click", "type"] },
+      { id: "ocr:2", role: "listitem", label: "发送", actions: ["click"] },
+    ]; w.text = `${who}\n输入消息…\n发送`; };
+    fill();
+    const { ex, desk, app } = await setup([w], judge);
+    const mine = app.forObject("window:w", "modify_user", "t1");
+    let o = await ex.observe("w");
+    await ex.act({ action: { kind: "type", window: "w", target: "ocr:1", text: "明天见" }, epoch: o.epoch, consent: mine });
+    o = await ex.observe("w");
+    const send: Action = { kind: "click", window: "w", target: "ocr:2" };
+    const r1 = await ex.act({ action: send, epoch: o.epoch, consent: mine });
+    expect(r1.challenge!.text).toContain("张三");
+    const yes = app.forAction(r1.challenge!);
+    who = "李四"; fill(); desk.epoch += 1;
+    o = await ex.observe("w");
+    const r2 = await ex.act({ action: send, epoch: o.epoch, consent: yes });
+    expect(r2.status).toBe("needs_consent");
+    expect(r2.challenge!.text).toContain("李四");
+    expect(desk.log.filter((a) => a.kind === "click")).toEqual([]);
+    // and the same switch between the consent check and the effect (no new epoch): the last look asks again
+    const r3 = await ex.act({ action: send, epoch: o.epoch, consent: app.forAction(r2.challenge!) });
+    expect(r3.status).toBe("ok");
+    who = "王五"; fill();
+    const o4 = await ex.observe("w");
+    const r4 = await ex.act({ action: send, epoch: o4.epoch, consent: mine });
+    const yes4 = app.forAction(r4.challenge!);
+    who = "赵六"; fill();                                                                   // after the check, before the effect
+    const r5 = await ex.act({ action: send, epoch: o4.epoch, consent: yes4 });
+    expect(r5.status).toBe("needs_consent");
+    expect(desk.log.filter((a) => a.kind === "click").length).toBe(1);
+  });
+
+  it("other keys and menu choices are asked about where something could be sent: a Send control, or text the task typed", async () => {
+    let asked = 0;
+    const { judge } = judged(() => { asked += 1; return { choice: "sends" }; });
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "新邮件" }, elements: [
+      { id: "body", role: "textArea", label: "正文", actions: ["type"] },
+      { id: "when", role: "popUpButton", label: "发送时间", value: "稍后", options: ["稍后", "立即发送"], actions: ["select"] },
+    ], text: "" };
+    const { ex, app } = await setup([w], judge);
+    let o = await ex.observe("w");
+    expect((await ex.classify({ kind: "select", window: "w", target: "when", option: "立即发送" }, o.epoch)).consequence).toBe("modify_user");   // nothing typed, no Send control
+    expect(asked).toBe(0);
+    await ex.act({ action: { kind: "type", window: "w", target: "body", text: "合同见附件" }, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+    o = await ex.observe("w");
+    expect((await ex.classify({ kind: "select", window: "w", target: "when", option: "立即发送" }, o.epoch)).consequence).toBe("external");
+    expect((await ex.classify({ kind: "key", window: "w", chord: "cmd+shift+d" }, o.epoch)).consequence).toBe("external");
+    expect(asked).toBe(2);
+  });
+
+  it("Return after the focus moved from the search box to the message box (no new epoch) is not done on the old decision", async () => {
+    const { judge } = judged(() => ({ choice: "stays" }));
+    const focus = (on: "search" | "msg"): Element[] => [
+      { id: "search", role: "textField", label: "搜索", actions: ["type"], focused: on === "search" },
+      { id: "msg", role: "textArea", label: "消息", actions: ["type"], focused: on === "msg" },
+    ];
+    const w: FakeWin = { info: { id: "w", app: "聊天", title: "聊天" }, elements: focus("search"), text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    const o = await ex.observe("w");
+    w.elements = focus("msg");
+    const r = await ex.act({ action: { kind: "key", window: "w", chord: "return" }, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+    expect(r.status).toBe("stale");
+    expect(desk.log).toEqual([]);
+  });
+
+  it("the target is found again by what it is: text recognition's ids shifted by a new message, the click goes to the same「发送」", async () => {
+    const { judge } = judged(() => ({ choice: "stays" }));
+    const w: FakeWin = { info: { id: "w", app: "聊天", title: "聊天" }, elements: [
+      { id: "ocr:0", role: "listitem", label: "张三：在吗", actions: ["click"] },
+      { id: "ocr:1", role: "listitem", label: "加好友", actions: ["click"] },
+    ], text: "" };
+    const { ex, desk, app } = await setup([w], judge);
+    const o = await ex.observe("w");
+    w.elements = [{ id: "ocr:0", role: "listitem", label: "张三：在吗", actions: ["click"] }, { id: "ocr:1", role: "listitem", label: "张三：？", actions: ["click"] }, { id: "ocr:2", role: "listitem", label: "加好友", actions: ["click"] }];
+    const r = await ex.act({ action: { kind: "click", window: "w", target: "ocr:1" }, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+    expect(r.status).toBe("ok");
+    expect(desk.log).toEqual([{ kind: "click", window: "w", target: "ocr:2" }]);
+  });
+
+  it("the user back at the keyboard during the last look: the action waits for them, and ends blocked when they do not pause", async () => {
+    const { judge } = judged(() => ({ choice: "stays" }));
+    const w: FakeWin = { info: { id: "w", app: "聊天", title: "聊天" }, elements: [{ id: "b", role: "button", label: "收藏", actions: ["click"] }], text: "" };
+    const desk = new FakeDesk([w]), app = ConsentSigner.fresh();
+    let active = false;
+    const snap = desk.snapshot.bind(desk);
+    desk.snapshot = () => ({ ...snap(), user_active: active });
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, judge, raw: "x", userWait: { ms: 30, pollMs: 5 } });
+    await ex.begin(); await ex.plan({ steps: [] });
+    const o = await ex.observe("w");
+    const observe = desk.observe.bind(desk);
+    desk.observe = (id: string) => { active = true; return observe(id); };
+    const r = await ex.act({ action: { kind: "click", window: "w", target: "b" }, epoch: o.epoch, consent: app.forObject("window:w", "modify_user", "t1") });
+    expect(r.status).toBe("blocked");
+    expect(desk.log).toEqual([]);
+  });
+});
+
+describe("outgoing check: the loop after a stale", () => {
+  const run = async (steps: (desk: FakeDesk) => any[], w: FakeWin, outgoing = "sends") => {
+    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { scriptedStream } = await import("../src/runtime/scripted.js");
+    const desk = new FakeDesk([w]), app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });
+    const gw = new Gateway(table);
+    gw.script = Array(80).fill((role: string, _s: string, u: string) => (role === "verify" ? { choice: "pass", reason: "ok" } : isOutgoing(u) ? { choice: outgoing } : { choice: "matches" }));
+    const cards: { kind: string }[] = [];
+    const user = { ask: (c: any) => { cards.push(c); return { option: c.options.findIndex((o: any) => o.kind === "approve") }; } };
+    const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as any };
+    const rt = new FrontierRuntime({ task: "t1", raw: "回张三：明天见", executor: ex, signer: app, user, gateway: gw, model: { ...model, streamFn: scriptedStream(steps(desk)) } });
+    return { r: await rt.run(), cards, desk };
+  };
+  const plan = { calls: [{ name: "plan", args: { steps: [{ purpose: "回复", objects: ["window:w"], consequence: "modify_user" }] } }] };
+  const look = { calls: [{ name: "computer_observe", args: { window: "w" } }] };
+  const click = (target: string) => (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role === "toolResult"); const j = JSON.parse(m.content[0].text.split("\n")[0]); return { calls: [{ name: "computer_act", args: { action: { kind: "click", window: "w", target }, epoch: j.after?.epoch ?? j.epoch, consequence: "modify_user", purpose: "发送" } }] }; };
+
+  it("the user's yes is kept across a stale retry of the same send: one card, then sent", async () => {
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "回复张三" }, elements: [{ id: "body", role: "textArea", label: "正文", value: "明天见", actions: ["type"] }, { id: "b7", role: "button", label: "", actions: ["click"] }], text: "" };
+    let looks = 0;
+    const { r, cards, desk } = await run((desk) => {
+      const observe = desk.observe.bind(desk);
+      // the second look (the last look of the approved send) finds a new name-list control: stale; it stays after that
+      desk.observe = (id: string) => { looks += 1; if (looks === 2) w.elements = [...w.elements, { id: "sf", role: "button", label: "发送文件", actions: ["click"], sends: true }]; return observe(id); };
+      return [plan, look, click("b7"), look, click("b7"), { calls: [{ name: "finish", args: { outcome: "done", summary: "发了" } }] }];
+    }, w);
+    expect(cards.map((c) => c.kind)).toEqual(["plan", "action"]);
+    expect(desk.log).toEqual([{ kind: "click", window: "w", target: "b7" }]);
+    expect(r.status).toBe("succeeded");
+  });
+
+  it("stale results do not count as going round in circles", async () => {
+    const w: FakeWin = { info: { id: "w", app: "邮件", title: "回复" }, elements: [{ id: "b", role: "button", label: "收藏", actions: ["click"] }], text: "" };
+    let flip = false;
+    const { r } = await run((desk) => {
+      const observe = desk.observe.bind(desk);
+      // every look sees the window's name-list control come or go: each last look finds a change
+      desk.observe = (id: string) => { flip = !flip; w.elements = [{ id: "b", role: "button", label: "收藏", actions: ["click"] }, ...(flip ? [{ id: "s", role: "button", label: "发送", actions: ["click"], sends: true }] : [])]; return observe(id); };
+      return [plan, look, click("b"), click("b"), click("b"), click("b"), { calls: [{ name: "finish", args: { outcome: "cannot", summary: "窗口一直在变" } }] }];
+    }, w, "stays");
+    expect(r.reason).not.toContain("no progress");
+    expect(r.reason).toContain("cannot");
+  });
+});

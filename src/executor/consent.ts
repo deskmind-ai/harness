@@ -53,7 +53,7 @@ export class ConsentVerifier {
   private readonly spent = new Set<string>();
   /** Challenges this executor issued: an action token answers one of these, never a challenge from another run
    *  (the app's key is the same for every run, so without this a hoarded token would do; review 10-18, T5). */
-  private readonly issued = new Set<string>();
+  private readonly issued = new Map<string, unknown>();
   readonly rules: ConsentToken[] = [];
   /** Rules that covered an action this task (their text), for the result card: 「按你以前定的规则做的」. */
   readonly rulesUsed = new Set<string>();
@@ -75,7 +75,7 @@ export class ConsentVerifier {
 
   challenge(action: Action, object: string, consequence: Consequence, text: string, ttlMs = 5 * 60_000, content?: unknown): Challenge {
     const nonce = randomBytes(16).toString("hex");
-    this.issued.add(nonce);
+    this.issued.set(nonce, content);
     return { nonce, digest: digestOf(action, object, consequence, content), object, consequence, text, expires_at: this.now() + ttlMs };
   }
 
@@ -119,6 +119,10 @@ export class ConsentVerifier {
     if (rule) { this.rulesUsed.add(rule.rule ?? rule.nonce); return null; }
     return "no consent";
   }
+
+  /** What a challenge this executor issued was bound to (a send's content), so a later look can be held against what
+   *  the user saw — not only against its digest. */
+  contentOf(nonce: string): unknown { return this.issued.get(nonce); }
 
   /** Spend an action token checked with `spend: false`: false when it was spent meanwhile (used once only). */
   spend(token: ConsentToken): boolean {
