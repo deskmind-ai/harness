@@ -52,7 +52,10 @@ import { Workspace } from "../registry/workspace.js";
 /** task_done's reason when a stop could not wait for an action the driver had not answered. */
 export const STEP_UNKNOWN = "a step was in progress; its result is unknown";
 
-export interface Request { run_id?: string; raw: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string; rules?: ConsentToken[] }
+/** `context` (additive; the session's computer tasks): the chat model's restatement of what the user wants. Only the
+ *  runtime's first message shows it, labelled 「助手的转述，不是用户原话」; the executor's judges read `raw`, the steers
+ *  and the card answers as the user's words, never this. */
+export interface Request { run_id?: string; raw: string; context?: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string; rules?: ConsentToken[] }
 
 /** JSON lines in: control lines (protocol/control.ts: answer, stop, respond, steer; v1 also reads the untyped
  *  `{ask_id, option|text}` and `{"stop":true}`); the first line may be the request itself. A stop or a steer is
@@ -74,10 +77,12 @@ export class LineReader {
       if (!c && isForeignControl(l)) return;
       const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l);
     });
-    // the app went away (stdin closed): every open card is answered with nothing, so the run ends instead of hanging
-    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); });
+    // the app went away (stdin closed): every open card is answered with nothing (let go: "ended"), then whoever runs
+    // the task is told (appRun: a stop)
+    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); this.onClosed?.(); });
   }
   closed = false;
+  onClosed: (() => void) | null = null;
   stopped = false;
   onStop: ((why: string) => void) | null = null;
   /** Steer lines go to this handler; one read before it is set (the request and a steer in the same stdin batch) waits
@@ -120,7 +125,8 @@ export class StdioUser implements RuntimeUser {
       // the user changed the request while the card was open (steer): the card is let go, and the app is told to close it
       if (o.signal?.aborted) { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); this.log.emit({ kind: "ask_void", ask_id, why: "steer" }); return null; }
       // the app is gone or stopped the task: no answer, the run ends honestly; the card is let go, said so
-      if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.stopped ? "stop" : "ended" }); return null; }
+      // (stdin closing also stops the run now, right after: the card went because the app went — "ended")
+      if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.closed ? "ended" : "stop" }); return null; }
       const a = parseControl(line);
       if (a?.type !== "answer") continue;
       if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
@@ -258,9 +264,13 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
   // process did without a receipt and tells the model (D10)
   const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), shots: path.join(o.runs, runId, "shots"), onEvent: send });
+  // the chat model's restatement (a session's computer task) is not the user's words, and it may carry what an earlier
+  // task read (its summary went back to the chat model): read material, so an open of a site not approved asks the
+  // provenance judge, anchored on raw — a run never starts with nothing read when the request was written by a model
+  if (typeof req.context === "string" && req.context.trim()) executor.noteTakenIn("the chat model's restatement (request.context)", req.context);
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
-    task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw,
+    task: runId, raw: req.raw, ...(typeof req.context === "string" && req.context.trim() ? { context: req.context } : {}), executor, signer, user: new StdioUser(log, o.input), gateway: gw,
     // the agent loop: its own process (P2), its own files beside the run's; a model handed in (tests) runs in this one
     ...(o.inject?.model ? { model: o.inject.model } : {}),
     agent: { model: o.inject?.agent ?? table.goal.model, log: path.join(o.runs, runId, "runtime.jsonl"), stderr: path.join(o.runs, runId, "runtime.log") },
@@ -276,6 +286,12 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const stopRun = (why: string) => { if (stopReason) return; stopReason = why; log.emit({ kind: "refused", what: "the task", why, by: "user" }); rt.stop(why); };
   o.input.onStop = stopRun;
   if (o.input.stopped) stopRun("stopped by the app");     // a stop line read together with the request, before this
+  // the app went away (stdin closed) while the task runs: a stop, the same path as a stop line (owner 10-21: the helper
+  // exits → its running tasks stop) — the step in flight gets its receipt, task_done says stopped, the process exits.
+  // After task_done (the result card's linger) it only ends the wait
+  const appGone = () => { if (!done) o.input.stop("the app went away (stdin closed)"); };
+  o.input.onClosed = appGone;
+  if (o.input.closed) appGone();
   // the user's words mid-run: to the executor, which applies them between steps (the judges then read the request as
   // it was and every change), voids an open card, and asks for a new plan card when the new words go beyond the plan
   // (after the task is over — a verdict passed, a stop, the result card's linger — the executor refuses them: a refused event)
@@ -386,7 +402,11 @@ async function main() {
     request: { type: "string" }, runs: { type: "string", default: "runs/app" }, run: { type: "string" }, selftest: { type: "boolean", default: false }, config: { type: "string", default: "ds-flash" },
     out: { type: "string" },
   } });
-  const out = (ev: AppEvent) => process.stdout.write(JSON.stringify(ev) + "\n");
+  // the reader of stdout went away (the session or the app died: EPIPE): events still go to the run's files, never to
+  // the dead pipe, and the run is stopped like a stop line (in executor mode, below) instead of crashing mid-action
+  let stdoutGone = false, onStdoutGone = () => {};
+  process.stdout.on("error", () => { if (stdoutGone) return; stdoutGone = true; onStdoutGone(); });
+  const out = (ev: AppEvent) => { if (!stdoutGone) process.stdout.write(JSON.stringify(ev) + "\n"); };
   if (a.selftest) { const r = await selftest(); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
   const cmd = positionals[0];
   if (cmd === "model-check") { const r = await modelCheck(a.config!); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
@@ -407,7 +427,8 @@ async function main() {
   if (cmd === "app-run" || cmd === "executor") {
     // SIGINT / SIGTERM: before the run has started there is nothing to stop; after, the run ends as stopped
     // (task_done written) and the process exits within a second. stdout is drained before exit.
-    const exit = () => process.stdout.write("", () => process.exit(0));
+    const exit = () => (stdoutGone ? process.exit(0) : process.stdout.write("", () => process.exit(0)));
+    onStdoutGone = () => input.stop("the app went away (stdout closed)");
     const exitNow = () => process.exit(0);           // a second signal: no waiting for stdout either
     let onSignal: (sig: string) => void = () => exitNow();
     for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => onSignal(sig));

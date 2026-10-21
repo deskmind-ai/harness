@@ -38,6 +38,9 @@ export type RuntimeResult = TaskResult;
 
 export interface RuntimeOptions {
   task: string; raw: string;
+  /** The chat model's restatement of the request (request.context): the loop's first message only, labelled as not the
+   *  user's words; the executor's service and its judges never get it. */
+  context?: string;
   executor: Executor; signer: ConsentProvider; user: RuntimeUser; gateway: Gateway;
   /** The loop's model as an object: the loop runs in this process (tests). */
   model?: LoopOptions["model"];
@@ -90,7 +93,7 @@ export class FrontierRuntime {
     const { tool_calls, turns } = this.o.budget ?? {};
     const budget = Object.fromEntries(Object.entries({ tool_calls, turns }).filter(([, v]) => v !== undefined));
     const a = this.o.agent;
-    return { raw: this.o.raw, model: a?.model ?? "", budget, ...(a?.log ? { log: a.log } : {}), ...(a?.modelLog ? { modelLog: a.modelLog } : {}) };
+    return { raw: this.o.raw, ...(this.o.context ? { context: this.o.context } : {}), model: a?.model ?? "", budget, ...(a?.log ? { log: a.log } : {}), ...(a?.modelLog ? { modelLog: a.modelLog } : {}) };
   }
 
   /** Where the loop runs: "process" (a child) or "inproc". */
