@@ -120,10 +120,12 @@ describe('PR16 third review probes',()=>{
     const until=async(f:()=>boolean)=>{const end=Date.now()+10000;while(!f()){if(Date.now()>end)throw new Error('wait timeout '+errors);await delay(10);}};
     try{
       send(1,'begin',{raw:'open editor'});await until(()=>replies.has(1));
-      send(2,'act',{action:{kind:'open_window',app:'Editor'},epoch:1});
+      send(2,'act',{action:{kind:'open_window',app:'Editor'},epoch:1,consequence:'create',purpose:'open'});
       await until(()=>fs.existsSync(path.join(root,'snapshot'))&&Number(fs.readFileSync(path.join(root,'snapshot'),'utf8'))>=2);
       send(3,'stop');await until(()=>replies.has(2)&&replies.has(3));
-      expect({act:replies.get(2).result.structuredContent.status,stopped:replies.get(3).result.structuredContent.stopped,effect:fs.existsSync(path.join(root,'effect'))}).toEqual({act:'stopped',stopped:true,effect:false});
+      // the act ends the task as stopped (the executor's reply: done), and nothing was opened
+      const act=replies.get(2).result.structuredContent;
+      expect({act:act.text.includes('stopped'),done:act.done,stopped:replies.get(3).result.structuredContent.stopped,effect:fs.existsSync(path.join(root,'effect'))}).toEqual({act:true,done:true,stopped:true,effect:false});
     }finally{child.stdin.end();child.kill();}
   },20000);
 });

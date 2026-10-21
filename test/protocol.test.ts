@@ -25,20 +25,21 @@ const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "protocol-"));
 const GOLDEN = path.join(import.meta.dirname, "fixtures", "mcp-tools.golden.json");
 
 describe("versions", () => {
-  it("initialize negotiates the MCP revision (2025-06-18 preferred, 2024-11-05 echoed) and names tools/events/control v1 under experimental.deskmind", async () => {
+  it("initialize negotiates the MCP revision (2025-06-18 preferred, 2024-11-05 echoed) and names tools v2, events/control v1 under experimental.deskmind", async () => {
     const s = new McpExecutorServer({ driver: () => new SimComputer(), gateway: new Gateway({} as never), consent: "none" });
     const r = (await s.handle({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } })) as any;
     expect(r.result.protocolVersion).toBe("2025-06-18");
     expect(MCP_PROTOCOL_VERSION).toBe("2025-06-18");
     expect(r.result.capabilities.tools).toEqual({});
-    expect(r.result.capabilities.experimental.deskmind).toEqual({ tools: 1, events: 1, control: 1 });
+    expect(r.result.capabilities.experimental.deskmind).toEqual({ tools: 2, events: 1, control: 1 });
     // negotiation: a revision we speak is echoed; any other gets ours
     const ask = async (v: unknown) => ((await s.handle({ jsonrpc: "2.0", id: 2, method: "initialize", params: { protocolVersion: v } })) as any).result.protocolVersion;
     expect(await ask("2024-11-05")).toBe("2024-11-05");
     expect(await ask("2025-06-18")).toBe("2025-06-18");
     expect(await ask("2099-01-01")).toBe("2025-06-18");
     expect(await ask(undefined)).toBe("2025-06-18");
-    expect(PROTOCOL).toEqual({ tools: 1, events: 1, control: 1 });
+    // tools 2 (P2): the port's tool set — act asks the user and signs itself (no consent argument), verify is finish
+    expect(PROTOCOL).toEqual({ tools: 2, events: 1, control: 1 });
   });
 
   it("the start event carries protocol.events, and a start without it (an older run's log) still reads", () => {

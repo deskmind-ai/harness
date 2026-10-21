@@ -1,24 +1,33 @@
 /**
- * The frontier runtime as it runs today: the agent loop (runtime/loop.ts) in the same process as the executor's service
- * (executor/service.ts), joined only by the `ExecutorPort` (executor split P1, deskmind#90 item 6). This is the one place
- * that knows both sides: the loop gets the port and the model; the service gets the executor, the signer, the card
- * asker, the skills and the files. In P2 the loop moves into a child process speaking MCP, and this pairing becomes the
- * executor process starting it.
+ * The frontier runtime: the agent loop (runtime/loop.ts) and the executor's service (executor/service.ts), joined only
+ * by the `ExecutorPort` (protocol/port.ts). This is the one place that knows both sides: the service gets the
+ * executor, the signer, the card asker, the skills and the files; the loop gets the port and the model.
  *
- * The app's controls go to the executor's side: stop (both sides: the executor refuses every later action, the loop
- * stops calling the model), steer (the executor applies it between steps and voids an open card), and the result
- * card's answer (undo).
+ * Where the loop runs (executor split P2, deskmind#90 item 6):
+ *   - in a child process (`agent` given): `harness.mjs runtime`, served the port over MCP on its stdin/stdout
+ *     (host/agent.ts has the topology). The default for the app and the evaluation;
+ *   - in this process: when the caller hands a model object (`model`: tests), or DESKMIND_EXECUTOR_INPROC=1 (the
+ *     fallback; the app's helper sets it from models.env), as in P1.
+ * Either way the port the loop calls is traced here (host/port-trace.ts): the trace's tool.call / tool.result and the
+ * app's step events come from the executor's side.
+ *
+ * The app's controls go to the executor's side: stop (the executor refuses every later action and lets go of an open
+ * card; the loop is told — in a child, by a notification — and stops calling the model), steer (the executor applies
+ * it between steps and voids an open card; a child is told words are waiting), and the result card's answer (undo).
  */
 import type { Gateway } from "../gateway/index.js";
 import type { Answer, Card, CardAsker } from "../protocol/cards.js";
 import type { ConsentProvider, ConsentToken } from "../protocol/consent.js";
-import type { TaskResult, TaskStatus } from "../protocol/port.js";
+import type { ExecutorPort, TaskResult, TaskStatus } from "../protocol/port.js";
 import type { Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import type { Executor } from "../executor/executor.js";
 import { ExecutorService, type SkillSource } from "../executor/service.js";
 import type { Lang } from "../executor/text.js";
-import { AgentLoop, type LoopOptions } from "../runtime/loop.js";
+import type { AgentLoop, LoopOptions } from "../runtime/loop.js";
+import { serve, McpExecutorServer } from "../cli/mcp.js";
+import { AGENT_EXITED, AgentProcess, inProcess, loopFromSpec, type AgentSpec } from "./agent.js";
+import { tracedPort } from "./port-trace.js";
 
 export type { SkillSource, ConsentProvider };
 export type RuntimeUser = CardAsker;
@@ -28,7 +37,14 @@ export type RuntimeResult = TaskResult;
 export interface RuntimeOptions {
   task: string; raw: string;
   executor: Executor; signer: ConsentProvider; user: RuntimeUser; gateway: Gateway;
-  model: LoopOptions["model"];
+  /** The loop's model as an object: the loop runs in this process (tests). */
+  model?: LoopOptions["model"];
+  /** The loop as its own process (P2): its model (`<provider>|<model>`, or a script), its logs (runtime.jsonl,
+   *  model_calls.jsonl, runtime.log for its stderr), and the command that starts it (default: this harness's
+   *  `runtime`). With DESKMIND_EXECUTOR_INPROC=1 the same loop runs in this process, its logs the same. */
+  agent?: { model: AgentSpec["model"]; log?: string; modelLog?: string; stderr?: string; command?: string[] };
+  /** Where the loop runs, whatever the environment says (the selftest checks both). Default: as described above. */
+  mode?: "process" | "inproc";
   workspace?: Workspace; registry?: Registry; skills?: SkillSource;
   /** The loop's (tool_calls, turns) and the executor's (asks, verify_retries). */
   budget?: Partial<{ tool_calls: number; turns: number; asks: number; verify_retries: number }>;
@@ -42,32 +58,99 @@ export interface RuntimeOptions {
 
 const sum = (a: Record<string, number>, b: Record<string, number>) => { const out = { ...a }; for (const [k, v] of Object.entries(b)) out[k] = (out[k] ?? 0) + v; return out; };
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export class FrontierRuntime {
   private readonly service: ExecutorService;
-  private readonly loop: AgentLoop;
+  /** The port as the loop reaches it, traced. */
+  private readonly port: ExecutorPort;
+  /** The loop, when it runs in this process. */
+  private readonly loop: AgentLoop | null = null;
+  /** The loop's process, once started; its counters as its last call carried them. */
+  private agent: AgentProcess | null = null;
+  private agentCounters: Record<string, number> = {};
+  private stopped: string | null = null;
+  /** The `end` the runtime called (its result, or the executor's failure to end: a crash). */
+  private ended: Promise<TaskResult> | null = null;
+  private onEnded = () => {};
 
   constructor(readonly o: RuntimeOptions) {
     const { tool_calls, turns, asks, verify_retries } = o.budget ?? {};
     const def = <K extends string, V>(x: Record<K, V | undefined>) => Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined)) as Partial<Record<K, V>>;
     this.service = new ExecutorService({ task: o.task, raw: o.raw, executor: o.executor, signer: o.signer, user: o.user, gateway: o.gateway, workspace: o.workspace, registry: o.registry, skills: o.skills, budget: def({ asks, verify_retries }), onEvent: o.onEvent, lang: o.lang, rules: o.rules });
-    this.loop = new AgentLoop({ port: this.service.port, raw: o.raw, model: o.model, budget: def({ tool_calls, turns }), onEvent: o.onEvent });
+    this.port = tracedPort(this.service.port, (k, b) => o.onEvent?.(k, b), (p) => { this.ended = p; this.onEnded(); });
+    if (!o.agent && !o.model) throw new Error("FrontierRuntime needs a model (in process) or an agent spec");
+    if (o.mode === "inproc" || (o.mode !== "process" && (o.model || inProcess()))) this.loop = loopFromSpec(this.spec(), this.port, o.model);
     o.signal?.addEventListener("abort", () => this.stop("the app stopped the task"));
   }
 
-  /** Both sides' counters (model_calls adds the loop's turns and the executor's judges and rewrites). */
-  get counters(): Record<string, number> { return sum(this.service.counters, this.loop.counters); }
-
-  /** The user changed what they want mid-run (the protocol's steer): to the executor, which applies it between steps. */
-  steer(raw: string) { this.service.steer(raw); }
-
-  /** The app's stop: the executor refuses every later action and lets go of an open card; the loop stops. */
-  stop(why = "stopped") { this.service.stop(why); this.loop.stop(); }
-
-  async run(): Promise<TaskResult> {
-    const r = await this.loop.run();
-    return { ...r, counters: sum(r.counters, this.loop.counters) };
+  private spec(): AgentSpec {
+    const { tool_calls, turns } = this.o.budget ?? {};
+    const budget = Object.fromEntries(Object.entries({ tool_calls, turns }).filter(([, v]) => v !== undefined));
+    const a = this.o.agent;
+    return { raw: this.o.raw, model: a?.model ?? "", budget, ...(a?.log ? { log: a.log } : {}), ...(a?.modelLog ? { modelLog: a.modelLog } : {}) };
   }
 
+  /** Where the loop runs: "process" (a child) or "inproc". */
+  get mode(): "process" | "inproc" { return this.loop ? "inproc" : "process"; }
+
+  /** Both sides' counters (model_calls adds the loop's turns and the executor's judges and rewrites). */
+  get counters(): Record<string, number> { return sum(this.service.counters, this.loop ? this.loop.counters : this.agentCounters); }
+
+  /** The user changed what they want mid-run (the protocol's steer): to the executor, which applies it between steps. */
+  steer(raw: string) { this.service.steer(raw); this.agent?.steer(); }
+
+  /** The app's stop: the executor refuses every later action and lets go of an open card; the loop stops. */
+  stop(why = "stopped") {
+    this.service.stop(why);
+    if (this.stopped) return;
+    this.stopped = why;
+    this.loop?.stop(); this.agent?.stop(why);
+  }
+
+  async run(): Promise<TaskResult> {
+    if (this.loop) {
+      const r = await this.loop.run();
+      return { ...r, counters: sum(r.counters, this.loop.counters) };
+    }
+    const r = await this.runProcess();
+    return { ...r, counters: sum(r.counters, this.agentCounters) };
+  }
+
+  /** The loop in its own process: serve it the port until it calls `end`, or until it goes away. */
+  private async runProcess(): Promise<TaskResult> {
+    const emit = (k: string, b: Record<string, unknown>) => this.o.onEvent?.(k, b);
+    const server = new McpExecutorServer({
+      session: { port: this.port, stop: (why) => this.stop(why) },
+      onCall: (c) => emit("mcp.call", c as unknown as Record<string, unknown>),
+      onMeta: (m) => { const c = m["deskmind/counters"]; if (c && typeof c === "object") this.agentCounters = c as Record<string, number>; },
+    });
+    const agent = new AgentProcess(this.spec(), { ...(this.o.agent?.command ? { command: this.o.agent.command } : {}), ...(this.o.agent?.stderr ? { stderr: this.o.agent.stderr } : {}) });
+    this.agent = agent;
+    const served = serve(server, agent.peer, (l) => emit("mcp.error", { text: l }));
+    emit("agent.start", { pid: agent.pid ?? null });
+    if (this.stopped) agent.stop(this.stopped);         // stopped before the process was there
+    const endCalled = new Promise<"end">((r) => { this.onEnded = () => r("end"); if (this.ended) r("end"); });
+    const first = await Promise.race([endCalled, agent.exited.then(() => "gone" as const), agent.peer.closed.then(() => "gone" as const)]);
+    if (first === "end") {
+      try { return await this.ended!; }
+      finally {
+        // the runtime reads the reply and exits; one that does not is not waited for
+        void Promise.race([agent.exited, sleep(2000)]).then(() => agent.kill());
+      }
+    }
+    // the runtime went away without calling end (it crashed, was killed, or its pipe broke): the task fails with that
+    // reason — after the call it may have been in is over (an action out at the driver gets its receipt), an open card
+    // let go
+    const ex = await Promise.race([agent.exited, sleep(300).then(() => null)]);
+    agent.kill();
+    const detail = ex ? (ex.signal ?? `code ${ex.code}`) : "pipe closed";
+    emit("agent.exit", { code: ex?.code ?? null, signal: ex?.signal ?? null, ms: Date.now() - agent.startedAt });
+    this.service.stop(`${AGENT_EXITED} (${detail})`, "failed");
+    await served.idle();
+    if (this.ended) return this.ended;                   // it asked for the end before it went
+    return this.service.port.end({ failure: `${AGENT_EXITED} (${detail})` });
+  }
   resultCard(): Card | null { return this.service.resultCard(); }
   respond(answer: Answer) { return this.service.respond(answer); }
 }
