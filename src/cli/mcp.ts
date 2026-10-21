@@ -143,7 +143,7 @@ export class McpExecutorServer {
       const dm = ((params.capabilities as Json | undefined)?.experimental as Json | undefined)?.deskmind as Json | undefined;
       this.steerPush = dm?.steer === "push";
       const agent = "session" in this.o ? this.o.agent : undefined;
-      return ok({ protocolVersion, capabilities: { tools: {}, experimental: { deskmind: { ...PROTOCOL } } }, serverInfo: { name: "deskmind-executor", version: "0.5" }, ...(agent ? { _meta: { "deskmind/agent": agent } } : {}) });
+      return ok({ protocolVersion, capabilities: { tools: {}, experimental: { deskmind: { tools: PROTOCOL.tools, events: PROTOCOL.events, control: PROTOCOL.control } } }, serverInfo: { name: "deskmind-executor", version: "0.5" }, ...(agent ? { _meta: { "deskmind/agent": agent } } : {}) });
     }
     if (method.startsWith("notifications/")) { this.o.onNotification?.(method, (msg.params ?? {}) as Json); return null; }
     if (method === "ping") return ok({});

@@ -48,6 +48,17 @@ export const PROVIDERS: Record<string, { urlEnv: string; keyEnv: string; url?: s
   // key variable; the server ignores the key. Used by the localization experiments, not a default.
   local: { urlEnv: "LOCAL_URL", keyEnv: "LOCAL_API_KEY", url: "http://127.0.0.1:8089" },
 };
+/** Text that may reach the app or a file (a service's error, a model check's answer) with every key taken out: the
+ *  actual values of the providers' key variables in `env` (a service may echo the key it was sent), then anything
+ *  shaped like one (`sk-…`, `Bearer …`). */
+export function redactKeys(text: string, env: NodeJS.ProcessEnv = process.env): string {
+  let out = text;
+  for (const p of Object.values(PROVIDERS)) {
+    const v = env[p.keyEnv];
+    if (v && v.length >= 6) out = out.split(v).join("…");
+  }
+  return out.replace(/(sk-|Bearer )[A-Za-z0-9_-]{8,}/g, "$1…");
+}
 /** A model configuration by name (CONFIGS) or by spec: `openai:<provider>|<model>` — every role on that model. */
 export function configTable(spec: string): RoleTable | null {
   if (CONFIGS[spec]) return CONFIGS[spec]!;

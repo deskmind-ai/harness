@@ -39,7 +39,7 @@ describe("versions", () => {
     expect(await ask("2099-01-01")).toBe("2025-06-18");
     expect(await ask(undefined)).toBe("2025-06-18");
     // tools 2 (P2): the port's tool set — act asks the user and signs itself (no consent argument), verify is finish
-    expect(PROTOCOL).toEqual({ tools: 2, events: 1, control: 1 });
+    expect(PROTOCOL).toEqual({ tools: 2, events: 1, control: 1, session: 1 });
   });
 
   it("the start event carries protocol.events, and a start without it (an older run's log) still reads", () => {
