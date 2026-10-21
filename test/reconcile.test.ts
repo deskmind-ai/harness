@@ -296,9 +296,9 @@ describe("the app's answer to the reconciliation card (deskmind HarnessEvents.an
 
 describe("paths spelled in another case (macOS volumes are case-insensitive)", () => {
   const insensitive = (root: string) => fs.existsSync(path.join(root, "PLAN.TXT"));
-  async function setup() {
+  async function setup(extra: Record<string, string> = {}) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "case-"));
-    build(root, { "plan.txt": "开头\n", "keep.txt": "留着" });
+    build(root, { "plan.txt": "开头\n", "keep.txt": "留着", ...extra });
     const ws = new Workspace(root), app = ConsentSigner.fresh();
     const ex = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
     await ex.begin(); await ex.plan({ steps: [] });
@@ -327,6 +327,17 @@ describe("paths spelled in another case (macOS volumes are case-insensitive)", (
       expect(fsMove.execute(ws, { source: "keep.txt", destination: "PLAN.txt" }).status).toBe("error");
       expect(fs.readFileSync(path.join(root, "plan.txt"), "utf-8")).toBe("开头\n");
     }
+  });
+
+  it("a case-only rename of a file (readme.md → README.md) is a change to that file: asked like one, then done", async () => {
+    const { root, ex, file } = await setup({ "readme.md": "说明" });
+    const a = { kind: "file", capability: "fs.move", args: { source: "readme.md", destination: "README.md" } } as const;
+    expect(ex.structure(a)).toMatchObject({ consequence: "modify_user", object: "path:readme.md" });
+    expect((await ex.act({ action: a, epoch: ex.currentEpoch })).status).toBe("needs_consent");      // the user's file: asked
+    const r = await file("fs.move", { source: "readme.md", destination: "README.md" });
+    expect(r.status).toBe("ok");
+    expect(fs.readdirSync(root).filter((n) => n.toLowerCase() === "readme.md")).toEqual(["README.md"]);
+    expect(fs.readFileSync(path.join(root, "README.md"), "utf-8")).toBe("说明");
   });
 
   it("the reconciliation guard holds a write spelled in another case", async () => {

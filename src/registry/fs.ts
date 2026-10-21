@@ -48,9 +48,10 @@ export const fsMove = make({
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => {
     const src = norm(a.source!), dst = norm(a.destination!);
-    // rename replaces what is there: a destination that exists under another case or Unicode form (the same file on a
-    // case-insensitive volume, or the source itself) is refused, not replaced
-    if (fs.existsSync(ws.abs(dst))) return { status: "error", why: `${dst} already exists`, output: {}, versions_after: {} };
+    // rename replaces what is there: a destination that exists under another case or Unicode form (another file on a
+    // case-insensitive volume) is refused, not replaced. The source itself under another spelling is a rename of its
+    // name (readme.md → README.md), which the volume does in place
+    if (fs.existsSync(ws.abs(dst)) && !sameFile(ws.abs(src), ws.abs(dst))) return { status: "error", why: `${dst} already exists`, output: {}, versions_after: {} };
     fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]);
   },
   check: (ws, a) => (folderOk(ws, parentOf(norm(a.source!))) ? null : `folder ${parentOf(norm(a.source!))} is gone`),
@@ -61,6 +62,9 @@ export const fsMove = make({
     fs.renameSync(ws.abs(dst), ws.abs(src)); return null;
   },
 });
+
+/** Two paths that open the same file (a case or Unicode variant on an insensitive volume): same device and inode. */
+const sameFile = (a: string, b: string) => { try { const x = fs.lstatSync(a), y = fs.lstatSync(b); return x.dev === y.dev && x.ino === y.ino; } catch { return false; } };
 
 export const fsCopy = make({
   id: "fs.copy", description: "复制一个文件到新路径；目标已存在时失败。", effect: "create",

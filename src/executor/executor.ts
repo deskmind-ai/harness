@@ -501,14 +501,15 @@ export class Executor {
           : { step: String(last.text ?? ""), action, object: typeof last.object === "string" ? last.object : `path:${changed[0]}`, files, decision: null };
       }
     }
-    this.journal("receipt", { recovered: true, finding, external });
-    // kept until the user's answer (a `reconciled` record): a later restart finds it pending and asks again
+    // kept until the user's answer (a `reconciled` record): a later restart finds it pending and asks again. Written
+    // before the recovery receipt: a process that dies between the two still finds it
     if (this.reconciliation) {
       const rc = this.reconciliation;
       this.journal("reconcile_pending", { step: rc.step, action: rc.action, object: rc.object, files: rc.files.map((f) => ({ path: f.path, version_at_step: f.version_at_step, ...(f.text_at_step !== undefined ? { text_at_step: f.text_at_step } : {}) })),
         recovered: this.recovered, external_changes: this.externalChanges.filter((c) => this.recovered!.external.includes(c.path)).map((c) => ({ path: c.path, seen: c.seen, now: c.now })) });
       this.emit("executor.reconcile_needed", { object: rc.object, paths: rc.files.map((f) => f.path) });
     }
+    this.journal("receipt", { recovered: true, finding, external });
     this.emit("executor.recovered", { action, finding, external });
   }
 
@@ -806,6 +807,9 @@ export class Executor {
       const n = norm(v);
       if (!n) continue;
       const d = ws.onDisk(n);
+      // a destination that is the source itself under another spelling (readme.md → README.md): a rename of that file's
+      // name, kept as asked — the source is the file it changes, under its ownership and consent
+      if (k === "destination" && typeof args.source === "string" && d !== n && d === ws.onDisk(norm(args.source))) continue;
       if (d !== n) { args[k] = d; changed = true; }
     }
     // a bare file name beside its folder (create_text's parent + name)
