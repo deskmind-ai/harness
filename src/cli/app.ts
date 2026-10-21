@@ -111,8 +111,9 @@ export class StdioUser implements RuntimeUser {
     for (;;) {
       const line = await this.input.next(o.signal);
       // the user changed the request while the card was open (steer): the card is let go, and the app is told to close it
-      if (o.signal?.aborted) { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); return null; }
-      if (!line && (this.input.closed || this.input.stopped)) return null;     // the app is gone or stopped the task: no answer, the run ends honestly
+      if (o.signal?.aborted) { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); this.log.emit({ kind: "ask_void", ask_id, why: "steer" }); return null; }
+      // the app is gone or stopped the task: no answer, the run ends honestly; the card is let go, said so
+      if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.stopped ? "stop" : "ended" }); return null; }
       const a = parseControl(line);
       if (a?.type !== "answer") continue;
       if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
@@ -140,7 +141,10 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
       ...(body.shot ? { shot: s(body.shot), ...(body.shot_pending ? { shot_pending: true } : {}) } : {}), ...(body.target_frame ? { target_frame: body.target_frame as never } : {}), ...(body.window_frame ? { window_frame: body.window_frame as never } : {}) };
     case "shot.ready": return { kind: "shot_ready", step_id: s(body.step_id), shot: s(body.shot) };
     case "executor.user_wait": return { kind: "waiting" };            // the user is at the keyboard: the app says "paused while you use your Mac"
-    case "executor.user_resumed": return { kind: "resumed" };
+    case "executor.user_resumed": return { kind: "resumed", why: body.stopped ? "stopped" : body.timed_out ? "timed_out" : "" };
+    case "steer.applied": return { kind: "steered", text: s(body.raw) };
+    case "executor.verdict": return { kind: "verify", verdict: body.verdict as never, ...(body.by ? { by: s(body.by) } : {}), reason: s(body.reason ?? "").slice(0, 500), ...(body.missing_kind ? { missing_kind: body.missing_kind as never } : {}), ...(body.judge_id ? { judge_id: s(body.judge_id) } : {}) };
+    case "changes": { const c = body as Record<string, string[]>; return { kind: "changes", created: c.created ?? [], modified: c.modified ?? [], deleted: c.deleted ?? [], external: c.external ?? [], unconfirmed: c.unconfirmed ?? [], ...(c.created_windows?.length ? { created_windows: c.created_windows } : {}) }; }
     // the executor's refusals (stale, stopped, environment, blocked, error) also stand as their own line; an action that
     // went out but could not be read back (unverified) is the step's result, not a refusal
     case "executor.act": return body.status === "ok" || body.status === "needs_consent" || body.status === "unverified" ? null
@@ -307,7 +311,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
       const a = parseControl(line);
       if (a?.type === "respond" && typeof a.option === "number") {
         const u = await rt.respond({ option: a.option });
-        log.emit({ kind: "result_response", picked: card.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted" } as never);
+        log.emit({ kind: "result_response", picked: card.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
       }
     }
   }

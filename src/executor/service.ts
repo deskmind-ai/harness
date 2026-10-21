@@ -428,6 +428,8 @@ export class ExecutorService {
       this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}),
         ...(r?.shot ? { shot: r.shot, ...(r.shot_pending ? { shot_pending: true } : {}) } : {}), ...(r?.target_frame ? { target_frame: r.target_frame } : {}), ...(r?.window_frame ? { window_frame: r.window_frame } : {}) });
       if (r?.shot && r.shot_pending) this.whenShot(step_id, r.shot);
+      // what the task has changed so far, after a step that changed something (the app's 改动和产出 while it runs)
+      if (r && (status === "ok" || status === "unverified") && r.consequence !== "read") this.emit("changes", this.o.executor.changes() as unknown as Record<string, unknown>);
       sp?.set({ "deskmind.step.status": status, "deskmind.executor_status": r?.status, "deskmind.consequence": r?.consequence, "deskmind.object": r?.object });
       if (status === "error") sp?.fail(why || "error");
       return reply;

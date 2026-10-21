@@ -9,7 +9,8 @@ import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { appRun, LineReader } from "../src/cli/app.js";
+import { appRun, LineReader, StdioUser, toProtocol } from "../src/cli/app.js";
+import { EventLog } from "../src/protocol/events.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import { OUTGOING_QUESTION } from "../src/executor/judge.js";
 import { Gateway } from "../src/gateway/index.js";
@@ -22,7 +23,7 @@ const lastJson = (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role
 
 /** app-run in process on a simulated computer, with an app that approves every blocking card by its approve option's
  *  index (naming the card), and a gateway whose judges say "matches" / "stays" and whose verdict passes. */
-export async function run(sim: SimComputer, raw: string, steps: Step[], o: { lang?: "zh" | "en"; linger?: number; respond?: string; runId?: string } = {}) {
+export async function run(sim: SimComputer, raw: string, steps: Step[], o: { lang?: "zh" | "en"; linger?: number; respond?: string; runId?: string; scope?: string } = {}) {
   const gw = new Gateway(Object.fromEntries(roles.map((r) => [r, { backend: "scripted", model: "scripted" }])) as never);
   gw.script = Array(60).fill((role: string, _s: string, u: string) => (role === "verify" ? { choice: "pass", reason: "做完了" } : u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: /"目标名字命中发送词表":\s*true/.test(u) ? "sends" : "stays" } : { choice: "matches" }));
   const input = new PassThrough();
@@ -40,7 +41,7 @@ export async function run(sim: SimComputer, raw: string, steps: Step[], o: { lan
       setTimeout(() => input.write(JSON.stringify({ type: "respond", option: i }) + "\n"), 5);
     }
   };
-  await appRun({ run_id: runId, raw, config: "ds-flash", lang: o.lang ?? "zh" }, {
+  await appRun({ run_id: runId, raw, config: "ds-flash", lang: o.lang ?? "zh", ...(o.scope ? { scope: o.scope } : {}) }, {
     runs, out, input: new LineReader(input), linger: o.linger ?? 0,
     inject: { driver: sim, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } },
   });
@@ -409,5 +410,54 @@ describe("M0 slice E: the hands driver", () => {
       expect(lines[1]).not.toHaveProperty("shot");
       expect(lines[1].action.foreground_ok).toBe(true);
     } finally { await d.end(); }
+  });
+});
+
+describe("M0 slice F: the remaining events the new app needs", () => {
+  it("a verdict, the changes after each step that changed something, and the undo in fields", async () => {
+    const scope = fs.mkdtempSync(path.join(os.tmpdir(), "m0-scope-"));
+    const steps: Step[] = [
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "写了 a.txt" } }] },
+    ];
+    const r = await run(new SimComputer(scope), "在任务目录里新建 a.txt，写 hi", steps, { scope, linger: 5, respond: "undo" });
+    const kinds = r.events.map((e) => e.kind);
+    const changes = r.events.filter((e) => e.kind === "changes") as any[];
+    expect(changes).toHaveLength(1);
+    expect(changes[0].created).toEqual(["a.txt"]);
+    // the file step carries the executor's class, before it is done
+    expect(r.events.find((e) => e.kind === "step")).toMatchObject({ consequence: "create", text: expect.stringContaining("fs.create_text") });
+    expect(kinds.indexOf("changes")).toBeGreaterThan(kinds.indexOf("step_result"));
+    expect(r.events.find((e) => e.kind === "verify")).toMatchObject({ verdict: "pass", by: "frontier" });
+    expect((r.events.find((e) => e.kind === "verify") as any).judge_id).toMatch(/^jd_/);
+    const done = r.events.find((e) => e.kind === "task_done") as any;
+    expect(done.result_card.options.map((x: any) => x.kind)).toContain("undo");
+    expect(r.events.at(-1)).toMatchObject({ kind: "result_response", picked: "undo", undone: 1, total: 1, refused: null });
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
+  });
+
+  it("a card let go says why: the user changed the request, stopped, or the app went away", async () => {
+    const card = { kind: "action" as const, text: "点「发送」", free_text: false, blocking: true, options: [{ kind: "approve" as const, text: "可以" }] };
+    for (const how of ["steer", "stop", "ended"] as const) {
+      const input = new PassThrough();
+      const sent: any[] = [];
+      const reader = new LineReader(input);
+      const u = new StdioUser(new EventLog(path.join(fs.mkdtempSync(path.join(os.tmpdir(), "void-")), "e.jsonl"), "r1", (e) => sent.push(e)), reader);
+      const ctl = new AbortController();
+      const p = u.ask(card, { signal: ctl.signal });
+      await new Promise((res) => setTimeout(res, 5));
+      if (how === "steer") ctl.abort(); else if (how === "stop") reader.stop(); else input.end();
+      expect(await p).toBeNull();
+      const ask = sent.find((e) => e.kind === "ask");
+      expect(sent.filter((e) => e.kind === "ask_void")).toEqual([expect.objectContaining({ ask_id: ask.ask_id, why: how })]);
+    }
+  });
+
+  it("the end of a wait for the user, and a steer applied, are said", () => {
+    expect(toProtocol("executor.user_resumed", {})).toEqual({ kind: "resumed", why: "" });
+    expect(toProtocol("executor.user_resumed", { timed_out: true })).toEqual({ kind: "resumed", why: "timed_out" });
+    expect(toProtocol("executor.user_resumed", { stopped: true })).toEqual({ kind: "resumed", why: "stopped" });
+    expect(toProtocol("steer.applied", { raw: "只整理今天的" })).toEqual({ kind: "steered", text: "只整理今天的" });
+    expect(toProtocol("executor.verdict", { verdict: "unknown", by: "frontier", reason: "看不到", missing_kind: "evidence" })).toEqual({ kind: "verify", verdict: "unknown", by: "frontier", reason: "看不到", missing_kind: "evidence" });
   });
 });
