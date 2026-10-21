@@ -17,6 +17,8 @@ import type { Consequence } from "../protocol/consent.js";
 import type { PlanStepIn } from "../protocol/port.js";
 import { MCP_PROTOCOL_VERSION } from "../protocol/version.js";
 import type { Json, JsonRpcPeer } from "./jsonrpc.js";
+import { current } from "../otel/context.js";
+import { spanMeta } from "./report.js";
 
 export const STEER_NOTIFICATION = "notifications/deskmind/steer";
 export const STOP_NOTIFICATION = "notifications/deskmind/stop";
@@ -42,7 +44,7 @@ export class McpPort implements ExecutorPort {
 
   private async call(tool: string, args: Json = {}): Promise<{ out: Json; text: string; isError: boolean }> {
     const t0 = Date.now(), id = ++this.n;
-    const r = await this.peer.request("tools/call", { name: tool, arguments: args, _meta: { "deskmind/counters": this.counters() } });
+    const r = await this.peer.request("tools/call", { name: tool, arguments: args, _meta: { "deskmind/counters": this.counters(), ...spanMeta(current) } });
     const text = ((r.content as { type: string; text?: string }[] | undefined) ?? []).map((c) => c.text ?? "").join("");
     const isError = r.isError === true;
     this.onCall({ id, tool, ms: Date.now() - t0, isError });

@@ -285,6 +285,10 @@
         "purpose": {
           "type": "string",
           "description": "这一步为了什么，一句话"
+        },
+        "plan_step": {
+          "type": "number",
+          "description": "这一步属于计划里的第几步（从 1 数）；没有计划就不填"
         }
       }
     }

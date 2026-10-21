@@ -28,6 +28,8 @@ import type { AgentLoop, LoopOptions } from "../runtime/loop.js";
 import { serve, McpExecutorServer } from "../cli/mcp.js";
 import { AGENT_EXITED, AgentProcess, inProcess, loopFromSpec, type AgentSpec } from "./agent.js";
 import { tracedPort } from "./port-trace.js";
+import { ReportMirror } from "../transport/report.js";
+import { current as traceContext } from "../otel/context.js";
 
 export type { SkillSource, ConsentProvider };
 export type RuntimeUser = CardAsker;
@@ -123,12 +125,17 @@ export class FrontierRuntime {
   /** The loop in its own process: serve it the port until it calls `end`, or until it goes away. */
   private async runProcess(): Promise<TaskResult> {
     const emit = (k: string, b: Record<string, unknown>) => this.o.onEvent?.(k, b);
+    // the run's records (model calls, the trace) are this side's: the runtime reports its part (transport/report.ts)
+    const mirror = new ReportMirror(traceContext());
+    const report = mirror.spec();
     const server = new McpExecutorServer({
+      onNotification: (m, p) => { mirror.notification(m, p); },
+      around: (meta, fn) => mirror.around(meta, fn),
       session: { port: this.port, stop: (why) => this.stop(why) },
       onCall: (c) => emit("mcp.call", c as unknown as Record<string, unknown>),
       onMeta: (m) => { const c = m["deskmind/counters"]; if (c && typeof c === "object") this.agentCounters = c as Record<string, number>; },
     });
-    const agent = new AgentProcess(this.spec(), { ...(this.o.agent?.command ? { command: this.o.agent.command } : {}), ...(this.o.agent?.stderr ? { stderr: this.o.agent.stderr } : {}) });
+    const agent = new AgentProcess({ ...this.spec(), ...(report ? { report } : {}) }, { ...(this.o.agent?.command ? { command: this.o.agent.command } : {}), ...(this.o.agent?.stderr ? { stderr: this.o.agent.stderr } : {}) });
     this.agent = agent;
     const served = serve(server, agent.peer, (l) => emit("mcp.error", { text: l }));
     emit("agent.start", { pid: agent.pid ?? null });

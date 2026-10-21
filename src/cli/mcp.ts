@@ -55,6 +55,10 @@ export type ServerOptions = (Standalone | Hosted) & {
   onCall?: (c: CallRecord) => void;
   /** The `_meta` a tools/call carried (our runtime sends its counters there). */
   onMeta?: (meta: Json) => void;
+  /** A notification from the caller (our runtime's reports: transport/report.ts). */
+  onNotification?: (method: string, params: Json) => void;
+  /** Runs each tools/call (the run's context, the caller's span in progress as the parent). */
+  around?: <T>(meta: Json | undefined, fn: () => Promise<T>) => Promise<T>;
 };
 
 /** A card asker for the standalone server: approve (and log) under `--consent auto`; otherwise answer nothing. */
@@ -133,7 +137,7 @@ export class McpExecutorServer {
       this.steerPush = dm?.steer === "push";
       return ok({ protocolVersion, capabilities: { tools: {}, experimental: { deskmind: { ...PROTOCOL } } }, serverInfo: { name: "deskmind-executor", version: "0.5" } });
     }
-    if (method.startsWith("notifications/")) return null;
+    if (method.startsWith("notifications/")) { this.o.onNotification?.(method, (msg.params ?? {}) as Json); return null; }
     if (method === "ping") return ok({});
     if (method === "tools/list") return ok({ tools: TOOLS });
     if (method === "tools/call") {
@@ -143,7 +147,8 @@ export class McpExecutorServer {
       const t0 = Date.now();
       let res: Json, isError = true, done: boolean | undefined;
       try {
-        const r = await this.call(name, (p.arguments ?? {}) as Json);
+        const run = () => this.call(name, (p.arguments ?? {}) as Json);
+        const r = this.o.around ? await this.o.around(p._meta as Json | undefined, run) : await run();
         isError = r.isError; done = (r.out as { done?: boolean }).done;
         res = ok({ content: [{ type: "text", text: r.text }], structuredContent: r.out, isError: r.isError });
       } catch (e) {

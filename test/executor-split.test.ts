@@ -75,7 +75,7 @@ function run(steps: JsonStep[], o: { sim?: SimComputer; inproc?: boolean; runId?
   return { done, events, input, sim, dir, trace: () => lines(path.join(dir, "trace.jsonl")), runtime: () => lines(path.join(dir, "runtime.jsonl")) };
 }
 /** The events as the app reads them, without what differs between two runs (time, the card's id). */
-const shape = (es: AppEvent[]) => es.map(({ t: _t, ...e }) => JSON.parse(JSON.stringify(e).replace(/ask_[0-9a-f]{8}/g, "ask_x")));
+const shape = (es: AppEvent[]) => es.map(({ t: _t, ...e }) => JSON.parse(JSON.stringify(e).replace(/\b(ask|mc|st|jd)_[0-9a-f]{8}/g, "$1_x"), (k, v) => (k === "latency_ms" || k === "ms" ? 0 : v)));
 
 const savedInproc = process.env.DESKMIND_EXECUTOR_INPROC;
 afterEach(() => { if (savedInproc === undefined) delete process.env.DESKMIND_EXECUTOR_INPROC; else process.env.DESKMIND_EXECUTOR_INPROC = savedInproc; });
@@ -99,15 +99,47 @@ describe("the runtime as a child process", () => {
     expect(tr.filter((t) => t.kind === "tool.result").every((t) => typeof t.ms === "number")).toBe(true);
     expect(tr.filter((t) => t.kind === "mcp.call").map((t) => t.tool)).toEqual(["begin", "snapshot", "act", "finish", "steers", "end"].filter((x) => x !== "steers"));
     expect(tr.find((t) => t.kind === "agent.start")?.pid).toBeGreaterThan(0);
-    expect(tr.some((t) => t.kind === "model.call")).toBe(false);
+    // every model call is the executor's record (M0): the runtime's turns came over the pipe as role "loop"
+    expect(tr.filter((t) => t.kind === "model.call" && t.role === "loop")).toHaveLength(3);
     // the runtime's own log: its model turns and each call's round trip; model_calls.jsonl has the turns
     const rt = child.runtime();
     expect(rt.filter((t) => t.kind === "model.call")).toHaveLength(3);
     expect(rt.filter((t) => t.kind === "mcp.rtt").map((t) => t.tool)).toEqual(["begin", "snapshot", "act", "finish", "end"]);
-    expect(lines(path.join(child.dir, "model_calls.jsonl"))).toHaveLength(3);
+    const rows = (d: string) => lines(path.join(d, "model_calls.jsonl")).map((r) => `${r.role}:${r.outcome}:${r.tokens_in}:${r.tokens_out}`);
+    expect(rows(child.dir).filter((r) => r.startsWith("loop:"))).toHaveLength(3);
+    expect(rows(child.dir)).toEqual(rows(inproc.dir));
     expect(fs.existsSync(path.join(child.dir, "runtime.log"))).toBe(true);
     // the counters are both sides' (the loop's came with its calls)
     expect(inproc.trace().some((t) => t.kind === "agent.start")).toBe(false);
+  }, 30_000);
+
+  it("across the boundary (M0): the same model_call events and usage, the same span tree, and plan_step on act", async () => {
+    delete process.env.DESKMIND_EXECUTOR_INPROC;
+    const steps: JsonStep[] = OPEN.map((x) => ("calls" in x && x.calls[0]!.name === "computer_act" ? { calls: [{ ...x.calls[0]!, args: { ...x.calls[0]!.args, plan_step: 1 } }] } : x));
+    const child = run(steps); await child.done;
+    const inproc = run(steps, { inproc: true }); await inproc.done;
+    // model calls: the acting model's three turns (role loop) and the judges', as events and in task_done's usage
+    const calls = (r: typeof child) => shape(r.events.filter((e) => e.kind === "model_call"));
+    expect(calls(child).filter((c: any) => c.role === "loop")).toHaveLength(3);
+    expect(calls(child)).toEqual(calls(inproc));
+    const usage = (r: typeof child) => { const u = (r.events.find((e) => e.kind === "task_done") as any).usage; return { calls: u.calls, tokens_in: u.tokens_in, tokens_out: u.tokens_out, roles: Object.fromEntries(Object.entries(u.by_role).map(([k, v]: [string, any]) => [k, v.calls])) }; };
+    expect(usage(child)).toEqual(usage(inproc));
+    expect(usage(child).roles.loop).toBe(3);
+    // plan_step reached the executor over MCP
+    expect(child.events.find((e) => e.kind === "step")).toMatchObject({ plan_step: 1 });
+    // the span tree: every span's name under its parent's names, the same in both; the executor's step spans sit
+    // under the runtime's execute_tool span
+    const tree = (r: typeof child) => {
+      const spans = lines(path.join(r.dir, "trace.otel.jsonl")).flatMap((l) => l.resourceSpans[0].scopeSpans[0].spans) as { spanId: string; parentSpanId?: string; name: string; status: { code: number } }[];
+      const by = new Map(spans.map((x) => [x.spanId, x]));
+      const pathOf = (x: (typeof spans)[number]): string => { const p = x.parentSpanId ? by.get(x.parentSpanId) : undefined; return p ? `${pathOf(p)} > ${x.name}` : x.name; };
+      expect(spans.every((x) => !x.parentSpanId || by.has(x.parentSpanId))).toBe(true);           // no orphans
+      return spans.map(pathOf).sort();
+    };
+    const t = tree(child);
+    expect(t).toEqual(tree(inproc));
+    expect(t.some((p) => /deskmind\.turn > execute_tool computer_act > deskmind\.step/.test(p))).toBe(true);
+    expect(t.filter((p) => /deskmind\.turn > chat scripted$/.test(p))).toHaveLength(3);
   }, 30_000);
 
   it("the app's stop on an open card: the card is let go, the run ends stopped, the runtime exits", async () => {

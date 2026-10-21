@@ -12,6 +12,8 @@ import { SPEC_ENV, jsonl, loopFromSpec, type AgentSpec } from "../host/agent.js"
 import type { AgentLoop } from "../runtime/loop.js";
 import { JsonRpcPeer } from "../transport/jsonrpc.js";
 import { McpPort, STEER_NOTIFICATION, STOP_NOTIFICATION } from "../transport/mcp-port.js";
+import { reportingContext } from "../transport/report.js";
+import { current, within } from "../otel/context.js";
 
 export const EXIT_EXECUTOR_GONE = 3;
 
@@ -38,7 +40,8 @@ export async function runtimeMain(): Promise<number> {
   const l = loop;
   port.counters = () => l.counters;
   if (stopped) l.stop();
-  const r = await l.run();
+  // its model calls and spans go to the executor, which owns the run's records (transport/report.ts)
+  const r = await within(reportingContext(peer, spec.report, current), () => l.run());
   log("runtime.end", { status: r.status, reason: r.reason });
   return 0;
 }

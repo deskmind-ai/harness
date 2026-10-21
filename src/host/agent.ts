@@ -3,10 +3,12 @@
  *
  *   executor process (harness.mjs executor | app-run)             runtime process (harness.mjs runtime)
  *     run dir, events.jsonl, trace.jsonl, journal,                  the agent loop (runtime/loop.ts) and its model;
- *     signing key, judges + gateway (judge_calls.jsonl),            runtime.jsonl (its events), model_calls.jsonl
- *     skills, cards, the driver (hands child)                       (its model turns), runtime.log (its stderr)
+ *     signing key, judges + gateway, the run's records              runtime.jsonl (its events, mcp.rtt), runtime.log
+ *     (model_calls.jsonl, trace.otel.jsonl), skills, cards,         (its stderr); its model calls and spans are
+ *     the driver (hands child)                                      reported to the executor (transport/report.ts)
  *        │  stdin  ─── notifications: deskmind/stop, deskmind/steer ──▶  │
  *        │  stdout ◀── MCP requests: initialize, tools/call (port) ────  │
+ *        │  stdout ◀── notifications: deskmind/model_call, deskmind/span │
  *
  * The executor is the MCP server (cli/mcp.ts) and implements the port; the child is a plain client
  * (transport/mcp-port.ts). What the child needs to start (the request, its model, its budget, its log files) comes in
@@ -26,6 +28,7 @@ import { AgentLoop, RUNTIME_BUDGET, type LoopOptions } from "../runtime/loop.js"
 import { loopModel } from "../runtime/model.js";
 import { scriptedStream, type Step } from "../runtime/scripted.js";
 import { JsonRpcPeer } from "../transport/jsonrpc.js";
+import type { ReportSpec } from "../transport/report.js";
 import { STEER_NOTIFICATION, STOP_NOTIFICATION } from "../transport/mcp-port.js";
 
 /** A scripted step that survives JSON (no functions): tool calls with arguments, or text. */
@@ -39,8 +42,10 @@ export interface AgentSpec {
   budget?: Partial<typeof RUNTIME_BUDGET>;
   /** runtime.jsonl: the loop's events. */
   log?: string;
-  /** model_calls.jsonl: one line per model turn. */
+  /** model_calls.jsonl: one line per model turn (when the executor does not record them: the evaluation). */
   modelLog?: string;
+  /** What to report to the executor (its spans, its model calls): transport/report.ts. */
+  report?: ReportSpec;
 }
 
 export const SPEC_ENV = "DESKMIND_AGENT_SPEC";

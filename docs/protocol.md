@@ -17,13 +17,14 @@ app 的 Swift 小助手启动的是执行层：`harness.mjs executor`（老名�
 | | 执行层（executor） | 运行时（runtime） |
 |---|---|---|
 | 管的东西 | 运行目录、`events.jsonl`、日志 `journal.jsonl`、签名的钥匙、判官和它们的网关、教程、卡片、驱动（hands 子进程） | agent 循环和它的模型 |
-| 写的文件 | `trace.jsonl`（执行层的记录，trace 查看的来源）、`judge_calls.jsonl`（判官和改写的模型调用） | `runtime.jsonl`（循环自己的事件：每一轮模型调用 `model.call`、每次 MCP 调用的往返时间 `mcp.rtt`）、`model_calls.jsonl`（循环的模型调用）、`runtime.log`（它的 stderr） |
+| 写的文件 | `trace.jsonl`（执行层的记录，trace 查看的来源）、`model_calls.jsonl`（这次运行的每一次模型调用，`role` 分开：`loop` 是动手的模型，其余是判官和改写）、`trace.otel.jsonl`（调用链） | `runtime.jsonl`（循环自己的事件：每一轮模型调用 `model.call`、每次 MCP 调用的往返时间 `mcp.rtt`）、`runtime.log`（它的 stderr） |
 | 启动参数 | 和以前一样 | 环境变量 `DESKMIND_AGENT_SPEC`（用户的话、模型、预算、日志路径），不放命令行，`ps` 看不到用户的话 |
 
 - **app 看到的事件不变。** 界面上的「一步」（`step`）以前由循环的 `tool.call` 事件生成，现在由执行层收到的调用生成（`src/host/port-trace.ts`）：两种运行方式下 app 收到的事件流一样。有一处细微差别：`step` 的文字来自按格式检查、转换之后的参数（模型写成字符串的 `"dy":"3"` 显示为 `3`，值为 null 的可选字段不显示），P1 用的是检查之前模型的原文。`trace.jsonl` 里每次端口调用有 `tool.call` / `tool.result`（带执行层用的时间 `ms`），子进程方式下还有每次 MCP 调用的 `mcp.call`（`queued_ms` 排队、`ms` 处理）和 `agent.start` / `agent.exit`。
 - **停止：** app 的 stop 照旧先到执行层（执行层拒绝之后的一切动作，开着的卡不再等），再用通知 `notifications/deskmind/stop` 告诉运行时别再调模型。正在做的那一步照旧等它的回执：运行时最后调的 `end` 排在它后面处理。
 - **运行时死了：** 运行时在调 `end` 之前退出（崩溃、被 kill -9）或管道断了，执行层把任务记为 `failed`，reason 是 `agent exited (<信号或退出码>)`：先让正在处理的调用做完（交给驱动的动作拿到回执），开着的卡不再等，然后照常收尾——`task_done`（带 changes）、结果卡、撤回都和平常一样。
 - **执行层死了：** 运行时的 stdin 一断就退出（退出码 3），hands 也是 stdin 断了就退出：kill -9 执行层不会留下孤儿进程。终端里的 ^C 会发到整个进程组，运行时忽略 SIGINT，等执行层的 stop 通知。
+- **运行时报给执行层的（M0 的记录跨进程）：** 运行记录归执行层：`model_calls.jsonl`、`model_call` 事件和 `task_done.usage`、调用链 `trace.otel.jsonl`。进程内时运行时靠同一进程里的上下文把自己那一份交过来；分进程后改成在同一条管道上报（`src/transport/report.ts`）：每一轮模型调用一条通知 `notifications/deskmind/model_call`（role `loop` 的记录原样）；运行时的 span（一轮 `deskmind.turn`、模型调用 `chat <model>`、一次工具调用 `execute_tool <name>`）开始和结束各一条 `notifications/deskmind/span`，执行层在这次运行的 tracer 上开同样的 span（用自己的 id，对应关系自己记）；`tools/call` 的 `_meta` 里带 `"deskmind/span"`（运行时正在进行的 execute_tool span），执行层这次调用里开的 span（step、classify、judge、perform）就挂在它下面。通知和请求走同一条有序管道，所以 span 的开始总在引用它的调用之前到。运行时死了没结束的 span，执行层收尾时照常补上结束（标成错误）。`act` 的 `plan_step` 是 `tools.ts` 里 `act` 输入格式的一个可选字段，原样过 MCP。
 - **退回同一进程：** 环境变量 `DESKMIND_EXECUTOR_INPROC=1`（小助手从 models.env 填进环境）时循环在执行层进程里跑，不用重新打包；文件和事件一样（没有 `mcp.call` / `agent.*`）。
 - **评测：** `pnpm eval -- --engine runtime` 也按子进程跑（每题一个），同样认 `DESKMIND_EXECUTOR_INPROC=1`；结果行里有 `runtime_mode`。
 
