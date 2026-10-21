@@ -74,19 +74,33 @@ export class LineReader {
   /** The app's stop (a stop line, or a signal): once, whoever asks first; every card waiting for its answer is
    *  answered with nothing. */
   stop(why = "stopped by the app") { if (this.stopped) return; this.stopped = true; this.onStop?.(why); for (const w of this.waiting.splice(0)) w(""); }
-  next(): Promise<string> { const q = this.queued.shift(); return q !== undefined ? Promise.resolve(q) : this.closed ? Promise.resolve("") : new Promise((r) => this.waiting.push(r)); }
+  /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
+   *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
+  next(signal?: AbortSignal): Promise<string> {
+    const q = this.queued.shift();
+    if (q !== undefined) return Promise.resolve(q);
+    if (this.closed || signal?.aborted) return Promise.resolve("");
+    return new Promise((r) => {
+      const w = (l: string) => { signal?.removeEventListener("abort", gone); r(l); };
+      const gone = () => { const i = this.waiting.indexOf(w); if (i >= 0) this.waiting.splice(i, 1); r(""); };
+      this.waiting.push(w);
+      signal?.addEventListener("abort", gone, { once: true });
+    });
+  }
 }
 
 /** Every card is an `ask` event; the run waits (`waiting`) for the matching answer line, then goes on (`resumed`).
  *  An answer for another ask_id is not an answer to this card: it is dropped with a `refused` event. */
 export class StdioUser implements RuntimeUser {
   constructor(private readonly log: EventLog, private readonly input: LineReader) {}
-  async ask(card: Card): Promise<Answer | null> {
+  async ask(card: Card, o: { signal?: AbortSignal } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking } });
     this.log.emit({ kind: "waiting", ask_id });
     for (;;) {
-      const line = await this.input.next();
+      const line = await this.input.next(o.signal);
+      // the user changed the request while the card was open (steer): the card is let go, and the app is told to close it
+      if (o.signal?.aborted) { this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); return null; }
       if (!line && (this.input.closed || this.input.stopped)) return null;     // the app is gone or stopped the task: no answer, the run ends honestly
       const a = parseControl(line);
       if (a?.type !== "answer") continue;
@@ -201,9 +215,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const stopRun = (why: string) => { if (stopReason) return; stopReason = why; log.emit({ kind: "refused", what: "the task", why, by: "user" }); rt.stop(why); };
   o.input.onStop = stopRun;
   if (o.input.stopped) stopRun("stopped by the app");     // a stop line read together with the request, before this
-  // control v1 reads steer lines; the app does not send them yet, and the runtime does not take them from the app
-  // until a steer reaches the judges and lets go of an open card (docs/0.5-decisions.md, later)
-  o.input.onSteer = (text) => trace("control.steer", { text, note: "steer not supported yet" });
+  // the user's words mid-run: to the executor, which applies them between steps (the judges then read the request as
+  // it was and every change), voids an open card, and asks for a new plan card when the new words go beyond the plan
+  o.input.onSteer = (text) => { trace("control.steer", { text }); if (text.trim() && !stopReason) rt.steer(text); };
   // one task_done per run: a signal's deadline may write it before the runtime returns
   let done = false, signals = 0, ended = () => {};
   const whenDone = new Promise<void>((res) => { ended = res; });

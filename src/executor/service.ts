@@ -119,9 +119,15 @@ export class ExecutorService {
   private steeredSincePlan = false;
   private readonly t: ReturnType<typeof T>;
 
-  constructor(readonly o: ServiceOptions) {
-    this.#signer = o.signer;
-    this.#user = o.user;
+  /** The options, without the signer and the card asker: those are private fields, out of reach of anything that
+   *  holds this object. */
+  readonly o: Omit<ServiceOptions, "signer" | "user">;
+
+  constructor(options: ServiceOptions) {
+    const { signer, user, ...o } = options;
+    this.o = o;
+    this.#signer = signer;
+    this.#user = user;
     this.t = T(o.lang);
     o.executor.opts.lang = o.lang ?? "zh";
     if (o.workspace && o.registry && !o.executor.opts.files) o.executor.attachFiles(o.workspace, o.registry);

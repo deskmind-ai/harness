@@ -534,8 +534,9 @@ export class Executor {
   /** The task folder and the file capabilities, when the caller did not give them at construction (before begin). */
   attachFiles(workspace: Workspace, registry: Registry) { this.opts.files = { workspace, registry }; }
 
-  setRequest(raw: string) { if (this.opts.raw) this.earlierRequests.push(this.opts.raw); this.opts.raw = raw; }
-  /** The request as it was before each steer: still the user's words. */
+  /** The request as it stands (the runtime's start, then each steer applied). The same words again change nothing. */
+  setRequest(raw: string) { if (raw === this.opts.raw) return; if (this.opts.raw) this.earlierRequests.push(this.opts.raw); this.opts.raw = raw; }
+  /** The request as it was before each steer: still the user's words, read by every judge (userWords, provenance). */
   private earlierRequests: string[] = [];
 
   /** What the user answered when asked during the task: their words as much as the request, read by every judge
@@ -550,7 +551,10 @@ export class Executor {
   private skillsInUse: { name: string; text: string }[] = [];
   addSkill(name: string, text: string) { if (!this.skillsInUse.some((s) => s.name === name)) this.skillsInUse.push({ name, text: text.slice(0, 4000) }); }
   private userWords(): Record<string, unknown> {
-    return { 用户原文: this.opts.raw ?? "", ...(this.answers.length ? { "用户对提问的回答（和原话一样是用户的话）": this.answers } : {}),
+    // a steer replaced the request: the judges read what it was before too (each earlier version, oldest first), so a
+    // step the user asked for and then changed is judged on both — the latest wins where they disagree
+    return { 用户原文: this.opts.raw ?? "", ...(this.earlierRequests.length ? { "用户中途改要求之前说的（从早到晚；和用户原文不一致时以用户原文为准）": this.earlierRequests } : {}),
+      ...(this.answers.length ? { "用户对提问的回答（和原话一样是用户的话）": this.answers } : {}),
       ...(this.skillsInUse.length ? { "本次在用的教程（用户教过、收下的做法；按它做的步骤是用户要的）": this.skillsInUse } : {}) };
   }
 
@@ -562,7 +566,7 @@ export class Executor {
     const open: Reading[] = [];
     for (const r of p.readings ?? []) {
       if (!r.alternatives.length) continue;
-      const evidence = r.evidence.filter((e) => e.trim() && !(this.opts.raw ?? "").includes(e.trim()));   // the request cannot settle its own ambiguity
+      const evidence = r.evidence.filter((e) => e.trim() && ![this.opts.raw ?? "", ...this.earlierRequests].some((w) => w.includes(e.trim())));   // the request cannot settle its own ambiguity
       if (!evidence.length || !this.opts.judge) { open.push(r); continue; }
       const options = [r.reading, ...r.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
       const ans = await this.opts.judge.choose(P.evidenceQuestion(r.point), { ...this.userWords(), 证据: evidence }, options);

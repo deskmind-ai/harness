@@ -207,9 +207,11 @@ describe("frontier runtime: steer", () => {
     const third = seen[2]!.map((m: any) => (typeof m.content === "string" ? m.content : "")).join("\n");
     expect(third).toContain("用户改了要求");
     expect(third).toContain("会议几点");
-    // the verdict was asked about the new request, not the old one
-    expect(asked[0]).toContain("会议几点");
-    expect(asked[0]).not.toContain("收到，谢谢");
+    // the verdict was asked about the new request; the old one is there too, as what the user said before the change
+    // (docs/0.5-decisions.md, steer prerequisite 1: the judges see the original request and every steer)
+    const words = JSON.parse(asked[0]!.slice(asked[0]!.indexOf("{"), asked[0]!.lastIndexOf("}") + 1));
+    expect(words.用户原文).toContain("会议几点");
+    expect(JSON.stringify(Object.entries(words).find(([k]) => k.startsWith("用户中途改要求之前说的"))?.[1])).toContain("收到，谢谢");
   });
 });
 
