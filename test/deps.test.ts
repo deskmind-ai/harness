@@ -1,7 +1,7 @@
 /**
  * The direction of dependencies before the executor is split into its own process (deskmind#90 item 6): the runtime
  * reaches the executor only through the protocol (tools, events, control), so code under src/runtime/ imports only
- * src/protocol/, src/gateway/ and src/runtime/ (packages and node: builtins are free); code under src/executor/ never
+ * src/protocol/, src/gateway/, src/otel/ (a leaf: the trace context and spans) and src/runtime/ (packages and node: builtins are free); code under src/executor/ never
  * imports src/runtime/. Type-only imports count: they tie the two sides' sources together just the same.
  *
  * P1 removed every violation the P0 list held: the shared types live in src/protocol/ (consent, computer, cards, port),
@@ -45,7 +45,8 @@ function violations(): { edge: string; at: string; kind: "cross" | "other" }[] {
       const edge = `${from} -> ${to}`.split(path.sep).join("/");
       if (side === "runtime" && target === "executor") found.push({ edge, at: `${from}:${line}`, kind: "cross" });
       else if (side === "executor" && (target === "runtime" || target === "host")) found.push({ edge, at: `${from}:${line}`, kind: "cross" });
-      else if (side === "runtime" && !["runtime", "protocol", "gateway"].includes(target)) found.push({ edge, at: `${from}:${line}`, kind: "other" });
+      // otel/ is a leaf (it imports only node builtins and itself, checked below): both sides may record into it
+      else if (side === "runtime" && !["runtime", "protocol", "gateway", "otel"].includes(target)) found.push({ edge, at: `${from}:${line}`, kind: "other" });
     }
   }
   return found;
@@ -71,6 +72,11 @@ describe("dependency direction: runtime ↔ executor", () => {
     const v = violations().filter((x) => x.kind === "other");
     const edges = [...new Set(v.map((x) => x.edge))].sort();
     expect({ new: edges.filter((e) => !KNOWN_OTHER.includes(e)), gone: KNOWN_OTHER.filter((e) => !edges.includes(e)) }).toEqual({ new: [], gone: [] });
+  });
+
+  it("otel/ imports nothing of ours outside itself: both sides can record into it", () => {
+    const bad = files(path.join(SRC, "otel")).flatMap((f) => importsOf(f).filter((x) => top(x.to) !== "otel").map((x) => `${path.relative(SRC, f)}:${x.line} -> ${x.to}`));
+    expect(bad).toEqual([]);
   });
 
   it("protocol/ imports nothing of ours outside itself: both sides can depend on it", () => {

@@ -54,9 +54,19 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("consent"), object: z.string(), consequence: Consequence, scope: z.enum(["action", "object", "rule"]), picked: z.string().nullable() }),
   z.object({ kind: z.literal("refused"), what: z.string(), why: z.string(), by: z.enum(["user", "executor"]) }),
   z.object({ kind: z.literal("answer_given"), text: z.string() }),
+  // one model call (M0): the acting model's turns (role "loop"), the judges' and the rewrites' — tokens, cost (USD, by the
+  // price table when the service says none), latency, and the step and judge question it served
+  z.object({ kind: z.literal("model_call"), call_id: z.string(), role: z.string(), model: z.string(), outcome: z.string(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number(), step_id: z.string().optional(), judge_id: z.string().optional() }),
+  // one judge question (M0): which question (intent, outgoing, provenance, verify, evidence), the answer and the tier
+  // that settled it (null: no tier could), every tier asked and what it said, the shadow comparison when one ran
+  z.object({ kind: z.literal("judge"), judge_id: z.string(), question: z.string(), answer: z.string().nullable(), by: z.string().nullable(), confidence: z.number().optional(),
+    tiers: z.array(z.object({ tier: z.string(), outcome: z.string(), choice: z.string().nullable(), confidence: z.number().optional(), settled: z.boolean() })),
+    shadow: z.object({ tier: z.string(), top: z.string().nullable(), agree: z.boolean().nullable() }).optional(), step_id: z.string().optional(), ms: z.number().optional() }),
   z.object({ kind: z.literal("task_done"), status: z.string(), reason: z.string(), summary: z.string(), result_card: CardEvent.nullable(), answer: z.string().nullable().optional(), changes: z.object({ created: z.array(z.string()), modified: z.array(z.string()), deleted: z.array(z.string()), external: z.array(z.string()),
     // changed during a screen action with no driver receipt: neither the task's nor another program's (the app may show them later)
-    unconfirmed: z.array(z.string()).optional() }).optional().optional() }),
+    unconfirmed: z.array(z.string()).optional() }).optional().optional(),
+    // the run's model calls in sum (M0): every call of every role, the acting model's included
+    usage: z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), by_role: z.record(z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number() })) }).optional() }),
   // the user's response to a result card after the run (respond): recorded; what it does is the runtime's to add
   z.object({ kind: z.literal("result_response"), picked: z.string().nullable(), text: z.string().optional(), effect: z.string() }),
 ]);

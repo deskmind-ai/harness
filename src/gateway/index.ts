@@ -10,6 +10,8 @@
  * prompt (the Python harness learnt that the hard way: Sonnet had it, Luna did not, and Luna renamed the fields).
  */
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { current as traceContext, type ModelCallRecord } from "../otel/context.js";
 import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { ROLES, type Role } from "../protocol/roles.js";
@@ -148,6 +150,13 @@ const PRICES: Record<string, [number, number]> = {
   "volcengine|doubao-seed-evolving": [0.89e-6, 4.45e-6],
 };
 
+/** What a call of `model` cost in USD by the price table, for a reply that carries no cost of its own (the agent
+ *  loop's model is priced here too: pi-ai's model entry says 0). 0 when the model is not in the table. */
+export function costOf(model: string, tokensIn: number, tokensOut: number): number {
+  const priced = PRICES[model] ?? PRICES["openai/" + model.split("|").pop()!];
+  return priced ? tokensIn * priced[0] + tokensOut * priced[1] : 0;
+}
+
 export type Outcome = "answered" | "refusal" | "invalid" | "error" | "timeout";
 
 export interface Reply<T = unknown> {
@@ -164,6 +173,12 @@ export interface Reply<T = unknown> {
 
 export interface CallRecord {
   kind: "model.call";
+  /** This call's id, and when it was sent (ms since the epoch): the run's trace and the app link calls by it. */
+  call_id: string;
+  started_at: number;
+  /** The executor step and the judge question the call served, when it served one (otel/context). */
+  step_id?: string;
+  judge_id?: string;
   /** This call asked again after the previous one ended so (Gateway.ask). */
   retry_of?: Outcome;
   run_id: string;
@@ -266,6 +281,7 @@ export class Gateway {
     const jsonSchema = zodToJsonSchema(schema, { $refStrategy: "none" });
     const sys = `${system}\n\n只输出一个 JSON 对象，不要别的文字。字段名必须和这个 JSON Schema 完全一致（例如判别字段叫 kind 就写 kind）：\n${JSON.stringify(jsonSchema)}`;
     const base = { role, model, tokensIn: 0, tokensOut: 0, costUsd: 0, latencyMs: 0, error: "" };
+    const startedAt = Date.now();
     let rep: Reply<z.infer<S>>;
     if (this.opts.maxCostUsd !== undefined && this.spentUsd >= this.opts.maxCostUsd) {
       rep = { ...base, outcome: "error", error: "budget: gateway cost cap reached" };
@@ -296,11 +312,7 @@ export class Gateway {
           rep.data = undefined;
         }
       }
-      const priced = PRICES[model] ?? PRICES["openai/" + model.split("|").pop()!];
-      if (!rep.costUsd && priced) {
-        const [pi, po] = priced;
-        rep.costUsd = rep.tokensIn * pi + rep.tokensOut * po;
-      }
+      if (!rep.costUsd) rep.costUsd = costOf(model, rep.tokensIn, rep.tokensOut);
     }
     this.spentUsd += rep.costUsd;
     this.calls += 1;
@@ -309,12 +321,16 @@ export class Gateway {
     s.latency_ms.push(Math.round(rep.latencyMs));
     s.outcomes[rep.outcome] = (s.outcomes[rep.outcome] ?? 0) + 1;
     this.byRole.set(role, s);
-    this.opts.log?.({
-      kind: "model.call", run_id: runId, role, backend, model, outcome: rep.outcome, tokens_in: rep.tokensIn,
-      tokens_out: rep.tokensOut, cost_usd: Number(rep.costUsd.toFixed(6)), latency_ms: Math.round(rep.latencyMs),
+    const ctx = traceContext();
+    const record: CallRecord = {
+      kind: "model.call", call_id: `mc_${randomUUID().slice(0, 8)}`, started_at: startedAt, run_id: runId, role, backend, model, outcome: rep.outcome, tokens_in: rep.tokensIn,
+      tokens_out: rep.tokensOut, cost_usd: Number(rep.costUsd.toFixed(9)), latency_ms: Math.round(rep.latencyMs),
       error: rep.error.slice(0, 300), system_chars: sys.length, user_chars: user.length, answer: rep.data,
-      ...(retryOf ? { retry_of: retryOf } : {}),
-    });
+      ...(retryOf ? { retry_of: retryOf } : {}), ...(ctx.step_id ? { step_id: ctx.step_id } : {}), ...(ctx.judge_id ? { judge_id: ctx.judge_id } : {}),
+    };
+    this.opts.log?.(record);
+    // every gateway of the run reports to the run's recorder (a judge tier's has no log of its own)
+    try { ctx.onModelCall?.(record as unknown as ModelCallRecord); } catch { /* recording never fails a call */ }
     return rep;
   }
 
