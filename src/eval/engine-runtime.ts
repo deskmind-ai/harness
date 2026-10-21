@@ -141,7 +141,12 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     clarified: last?.kind === "missing" || last?.kind === "ambiguity", declinedPlan: last?.kind === "plan" && last.picked !== "approve" && last.picked !== "cancel", cancelled: last?.picked === "cancel",
     plans: seen.filter((s) => s.kind === "plan").length,
   };
-  const summ: Summary = { status: STATUS[r.status], reason: r.reason, counters: { ...r.counters, actions: r.counters["actions"] ?? 0 }, ops: Object.fromEntries(r.effects.map((_, i) => [`op_${i + 1}`, "ok"])) };
+  // the reconciliation stop (the user chose to look first, nothing written) is the runtime's cancelled with reason
+  // needs_reconciliation: scored as the orchestrator's needs_reconciliation status, which gold.status names (harness#42)
+  const status = r.status === "cancelled" && r.reason === "needs_reconciliation" ? "needs_reconciliation" : STATUS[r.status];
+  // the verdict the run ended on: its contradicted claims are the false-claim signal (only a succeeded run has a passing one)
+  const claims = r.status === "succeeded" ? r.verdicts.at(-1)?.claims_contradicted ?? null : null;
+  const summ: Summary = { status, reason: r.reason, claims_contradicted: claims, counters: { ...r.counters, actions: r.counters["actions"] ?? 0 }, ops: Object.fromEntries(r.effects.map((_, i) => [`op_${i + 1}`, "ok"])) };
   const bytesAt = (p: string) => { try { return fs.readFileSync(path.join(root, p)); } catch { return null; } };
   const sc = score(task, start, ws.tree(), summ, sim.log, talk, bytesAt);
   const rec = {

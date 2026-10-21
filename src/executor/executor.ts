@@ -1625,7 +1625,7 @@ export class Executor {
    *  the task touched, the receipts, what other programs changed, and the runtime's own account (effects, an answer,
    *  the model's claim) — and says pass / fail / unknown. unknown is not done. The runtime and the MCP service call
    *  the same method, so a run cannot end "done" on any runtime without it. */
-  async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string; missing_kind?: "action" | "evidence" }> {
+  async verdict(summary: string, extra: Record<string, unknown> = {}): Promise<{ verdict: "pass" | "fail" | "unknown"; reason: string; by?: string; missing_kind?: "action" | "evidence"; claims_contradicted?: string[] }> {
     const ev = await this.verify();
     const ws = this.opts.files?.workspace;
     const brief = (o: Observation) => ({ window: o.window, modal: o.modal, text: o.text, elements: o.elements.map((e) => ({ id: e.id, role: e.role, label: e.label, value: e.value })) });
@@ -1669,11 +1669,14 @@ export class Executor {
       模型自称: summary,
     };
     if (!this.opts.judge) return { verdict: "unknown", reason: "no judge to verify with" };
-    const ans = await this.opts.judge.choose(VERIFY_QUESTION, { ...this.userWords(), 证据: evidence }, VERIFY_OPTIONS, "verify");
+    const ans = await this.opts.judge.choose(VERIFY_QUESTION, { ...this.userWords(), 证据: evidence }, VERIFY_OPTIONS, "verify", { claims: true });
     if (!ans) return { verdict: "unknown", reason: "the judge could not answer" };
     const missing = ans.choice === "unknown" && ans.missing_kind ? { missing_kind: ans.missing_kind } : {};
-    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "", ...missing });
-    return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by, ...missing };
+    // the sentences of the run's account the judge found contradicted: recorded with the verdict (not a gate here — an
+    // evaluation counts a pass that names one as a false claim); absent when the judge's answer left the field out
+    const claims = ans.claims_contradicted ? { claims_contradicted: ans.claims_contradicted } : {};
+    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "", ...missing, ...claims });
+    return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by, ...missing, ...claims };
   }
 
   /** The files this task acted on: what its file actions wrote (this process's receipts, files an app saved for it, and

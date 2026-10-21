@@ -72,10 +72,15 @@ export const IntentAnswer = z.object({
 });
 export type IntentAnswer = z.infer<typeof IntentAnswer>;
 
-export const choiceAnswer = (ids: readonly [string, ...string[]]) =>
-  z.object({ choice: z.enum(ids), reason: z.string().optional(), scores: z.record(z.number()).optional(),
+export const choiceAnswer = (ids: readonly [string, ...string[]], o: { claims?: boolean } = {}) => {
+  const base = z.object({ choice: z.enum(ids), reason: z.string().optional(), scores: z.record(z.number()).optional(),
     /** the verdict's unknown: what is missing — an action not done, or only the evidence for what was done */
     missing_kind: z.enum(["action", "evidence"]).optional() });
+  // the finish verdict only (o.claims): every sentence of the run's own account that the evidence contradicts, quoted —
+  // the structured signal an evaluation reads for a false claim (eval/score.ts false_claim); other questions keep
+  // the schema they had, so their prompts are unchanged
+  return o.claims ? base.extend({ claims_contradicted: z.array(z.string()).optional() }) : base;
+};
 
 export const VerifyAnswer = z.object({ verdict: z.enum(["pass", "fail", "unknown"]), reason: z.string().default(""), scores: z.record(z.number()).optional() });
 export type VerifyAnswer = z.infer<typeof VerifyAnswer>;
