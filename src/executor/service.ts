@@ -366,6 +366,8 @@ export class ExecutorService {
   /** The executor's last result inside each step in progress, by step_id (the step's outcome; none when it never
    *  reached the executor). Kept per step, so calls in parallel would not take each other's. */
   private results = new Map<string, ActResult>();
+  /** A step that ended on the user's answer to its consent card (declined, stopped, none, voided): that is its why. */
+  private answered = new Map<string, string>();
 
   /** One action the caller asked for, as the app sees it: `step.start` (an id, the action in words, the element it acts
    *  on, the plan step the caller says it belongs to) and `step.end` (how it ended). Everything inside — the judges, the
@@ -391,11 +393,12 @@ export class ExecutorService {
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
     let reply: ToolReply;
     try { reply = await within({ step_id }, body); }
-    catch (e) { this.results.delete(step_id); this.emit("step.end", { step_id, status: "error", why: String(e instanceof Error ? e.message : e).slice(0, 300) }); throw e; }
+    catch (e) { this.results.delete(step_id); this.answered.delete(step_id); this.emit("step.end", { step_id, status: "error", why: String(e instanceof Error ? e.message : e).slice(0, 300) }); throw e; }
     const r = this.results.get(step_id) ?? null;
-    this.results.delete(step_id);
+    const user = this.answered.get(step_id);
+    this.results.delete(step_id); this.answered.delete(step_id);
     const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
-    const why = r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
+    const why = user ?? r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
     this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}) });
     return reply;
   }
@@ -473,6 +476,9 @@ export class ExecutorService {
         return err(`用户中途改了要求，这一步要碰的东西不在用户同意过的计划里（${r.challenge.text}）：先按新要求交一份新计划（plan），写上它。`);
       }
       const t = await this.consentFor(r.challenge);
+      // the step's outcome is the user's answer, not the reason consent was asked
+      const sid = current().step_id;
+      if (sid && (t === "voided" || t === null || t === "cancel" || t === "declined")) this.answered.set(sid, t === "voided" ? "the card was voided: the user changed the request" : t === null ? "no answer from the user" : t === "cancel" ? "the user stopped the task" : "the user declined this step");
       if (t === "voided") return this.steered() ?? err("这张卡作废了：这一步没有做。");
       if (t === null) return this.endWith("failed", "no answer from the user");
       if (t === "cancel") return this.endWith("cancelled", "the user stopped the task");
