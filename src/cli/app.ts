@@ -137,7 +137,8 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
       return { kind: "step", text: a?.kind === "file" ? `${s(a.capability)} ${s(a.args)}` : s(a), purpose: s(body.purpose ?? ""), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(body.object ? { object: s(body.object) } : {}),
         step_id: s(body.step_id), ...(body.human ? { human: s(body.human) } : {}), ...(body.target ? { target: body.target as never } : {}), ...(typeof body.plan_step === "number" ? { plan_step: body.plan_step } : {}) }; }
     case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}),
-      ...(body.shot ? { shot: s(body.shot) } : {}), ...(body.target_frame ? { target_frame: body.target_frame as never } : {}), ...(body.window_frame ? { window_frame: body.window_frame as never } : {}) };
+      ...(body.shot ? { shot: s(body.shot), ...(body.shot_pending ? { shot_pending: true } : {}) } : {}), ...(body.target_frame ? { target_frame: body.target_frame as never } : {}), ...(body.window_frame ? { window_frame: body.window_frame as never } : {}) };
+    case "shot.ready": return { kind: "shot_ready", step_id: s(body.step_id), shot: s(body.shot) };
     case "executor.user_wait": return { kind: "waiting" };            // the user is at the keyboard: the app says "paused while you use your Mac"
     case "executor.user_resumed": return { kind: "resumed" };
     // the executor's refusals (stale, stopped, environment, blocked, error) also stand as their own line; an action that
@@ -242,7 +243,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // one task_done per run, and it is the last running event: what the runtime or an action still out at the driver says
   // after it (a stop's deadline wrote it) is in the trace only. The words of a steer that came too late are still said
   let done = false;
-  const send = (k: string, b: Record<string, unknown>) => { trace(k, b); const e = toProtocol(k, b); if (e && (!done || k === "steer.refused")) log.emit(e); };
+  const send = (k: string, b: Record<string, unknown>) => { trace(k, b); const e = toProtocol(k, b); if (e && (!done || k === "steer.refused" || k === "shot.ready")) log.emit(e); };
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
   // process did without a receipt and tells the model (D10)
   const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), shots: path.join(o.runs, runId, "shots"), onEvent: send });

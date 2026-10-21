@@ -115,6 +115,8 @@ export interface ActResult {
   /** For the app, never the model: the window after the step as a small picture (a path relative to the run folder,
    *  `shots/<step_id>.png`), and where the window and the element acted on were on screen before acting. */
   shot?: string; target_frame?: Frame; window_frame?: Frame;
+  /** The picture at `shot` is still being written (it appears shortly, or never if the capture failed). */
+  shot_pending?: boolean;
   /** With `refused`: the action writes a file that an interrupted step of an earlier process was writing — whether that
    *  step took effect is unknown — and that file changed since. Nothing is written there until the user settles it (the
    *  reconciliation card); these are the facts the card is built from. */

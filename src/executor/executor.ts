@@ -769,14 +769,15 @@ export class Executor {
 
   async snapshot(): Promise<Snapshot> {
     const raw = this.ledger.stamp(await this.driver.snapshot());
-    const s = { ...raw, windows: raw.windows.map((w) => this.mark(w)) };
+    // a window's screen frame, if a driver ever lists it here, is the app's (see frames), not material for anyone
+    const s = { ...raw, windows: raw.windows.map((w) => this.mark((({ frame: _f, ...x }) => x)(w))) };
     this.epoch = s.epoch;
     this.last = s;
     return s;
   }
 
   async observe(windowId: string, opts?: { screenshot?: boolean }): Promise<Observation> {
-    const o = await this.driver.observe(windowId, opts);
+    const o = this.unframed(windowId, await this.driver.observe(windowId, opts));
     const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
     this.epoch = o.epoch;
     this.lastObs.set(windowId, stamped);
@@ -793,10 +794,20 @@ export class Executor {
   /** The executor's own look at a window (right before an effect): kept as what is on screen now, not as what the
    *  caller was shown — the caller's ids stay those of its own observation. */
   private async look(windowId: string): Promise<Observation> {
-    const o = await this.driver.observe(windowId);
+    const o = this.unframed(windowId, await this.driver.observe(windowId));
     const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
     this.looks.set(windowId, stamped);
     return stamped;
+  }
+
+  /** Where each window was on screen at its last look (hands' observe): for the app's cursor only. It is kept apart from
+   *  the observation, so no judge question, verdict evidence, receipt or caller's reply ever carries it. */
+  private frames = new Map<string, [number, number, number, number]>();
+  frameOf(windowId: string): [number, number, number, number] | undefined { return this.frames.get(windowId); }
+  private unframed(windowId: string, o: Observation): Observation {
+    const { frame, ...window } = o.window;
+    if (frame) this.frames.set(windowId, frame);
+    return frame ? { ...o, window } : o;
   }
 
   /** The caller's last observation of a window (what its element ids refer to), for what a step is said to be. */
@@ -1241,7 +1252,11 @@ export class Executor {
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       const { consent, ...rest } = req;
-      this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: r });
+      // the receipt is evidence for the verdict: what the app alone uses (the step's picture, screen frames, a card's
+      // fields) is not in it
+      const { shot: _s, target_frame: _t, window_frame: _w, ...kept } = r;
+      const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, ...c }) => c)(kept.challenge) } : kept;
+      this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain });
       this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
       return r;
     };
@@ -1439,7 +1454,7 @@ export class Executor {
     // the driver doing it: its own span, with the consent it went on (token kind) and the class it was settled at
     try {
       r = await span("deskmind.perform", { "deskmind.action.kind": act.kind, "deskmind.consequence": consequence, "deskmind.object": base.object, "deskmind.token_kind": req.consent?.scope ?? "none", "deskmind.foreground_ok": foregroundOk }, async (s) => {
-        const x = await this.driver.perform(this.forDriver(act), foregroundOk || shotFile ? { ...(foregroundOk ? { foreground_ok: true } : {}), ...(shotFile ? { shot: shotFile } : {}) } : undefined);
+        const x = await this.driver.perform(this.forDriver(act), foregroundOk || shotFile ? { ...(foregroundOk ? { foreground_ok: true } : {}), ...(shotFile ? { shot: shotFile, frames: true } : {}) } : undefined);
         s?.set({ "deskmind.perform.status": x.status });
         if (x.status === "error" || x.status === "unsupported") s?.fail(x.why ?? x.status);
         return x;
@@ -1472,7 +1487,7 @@ export class Executor {
     const openedId = r.new_window?.id;
     const made = r.new_window && fresh(openedId) && sameApp(r.new_window) ? openedId : undefined;
     // what the app draws (the cursor) and shows (the step's picture): never the model's to read
-    const madeField = { ...(made ? { created_window: made } : {}), ...(r.shot && this.opts.shots ? { shot: path.relative(path.dirname(this.opts.shots), r.shot) } : {}), ...(r.target_frame ? { target_frame: r.target_frame } : {}), ...(r.window_frame ? { window_frame: r.window_frame } : {}) };
+    const madeField = { ...(made ? { created_window: made } : {}), ...(r.shot && this.opts.shots ? { shot: path.relative(path.dirname(this.opts.shots), r.shot), ...(r.shot_pending ? { shot_pending: true } : {}) } : {}), ...(r.target_frame ? { target_frame: r.target_frame } : {}), ...(r.window_frame ? { window_frame: r.window_frame } : {}) };
     if (made) {
       this.ledger.created(`window:${made}`); this.openedWindows.set(this.receipts.length + 1, made);
       if (req.action.kind !== "open_window") this.emit("executor.window_created", { id: made, by: req.action.kind, from: acted?.id });

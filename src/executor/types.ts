@@ -57,6 +57,9 @@ export interface PerformResult {
   /** The picture of the window after the action, written where `perform`'s `shot` said (hands); and where the window
    *  and the element acted on were on screen before acting. For the app only. */
   shot?: string; target_frame?: Frame; window_frame?: Frame;
+  /** The picture is being taken after the reply (hands takes it off the action's path): the file appears at `shot`
+   *  shortly, or never when the capture fails. */
+  shot_pending?: boolean;
 }
 type Maybe<T> = T | Promise<T>;
 /** The raw driver: sees and moves, decides nothing. The simulated one answers at once; a real one talks to a process. */
@@ -65,7 +68,7 @@ export interface Driver {
   observe(windowId: string, opts?: { screenshot?: boolean }): Maybe<Observation>;
   /** `foreground_ok`: the executor allows this one step to bring its app to the front (the task's own window, or one
    *  the user consented to); a driver that can act in the background may ignore it. */
-  perform(action: Action, opts?: { foreground_ok?: boolean; shot?: string }): Maybe<PerformResult>;
+  perform(action: Action, opts?: { foreground_ok?: boolean; shot?: string; frames?: boolean }): Maybe<PerformResult>;
   end?(): Maybe<void>;
   /** What the driver promises about where its actions land. `urlInOwnBrowserWindow`: an open_window with a url in a web
    *  browser (an app whose windows the driver marks `browser: true`) always loads in a browser window of the task's own,

@@ -24,6 +24,8 @@ import type { Begun, ExecutorPort, FileTool, FinishOutcome, PlanStepIn, TaskResu
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Executor, appName, cardText, describeAction, elementName, stepText, windowLabel } from "./executor.js";
 import { current, within } from "../otel/context.js";
 import { span } from "../otel/trace.js";
@@ -412,7 +414,7 @@ export class ExecutorService {
     const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
-      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, obs?.window.frame) } } : {}),
+      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, "window" in a ? this.o.executor.frameOf(a.window) : undefined) } } : {}),
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
     return span("deskmind.step", { "deskmind.step_id": step_id, "deskmind.action.kind": a.kind, "deskmind.consequence.declared": consequence, "deskmind.plan_step": p.plan_step }, async (sp) => {
       let reply: ToolReply;
@@ -424,11 +426,25 @@ export class ExecutorService {
       const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
       const why = user ?? r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
       this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}),
-        ...(r?.shot ? { shot: r.shot } : {}), ...(r?.target_frame ? { target_frame: r.target_frame } : {}), ...(r?.window_frame ? { window_frame: r.window_frame } : {}) });
+        ...(r?.shot ? { shot: r.shot, ...(r.shot_pending ? { shot_pending: true } : {}) } : {}), ...(r?.target_frame ? { target_frame: r.target_frame } : {}), ...(r?.window_frame ? { window_frame: r.window_frame } : {}) });
+      if (r?.shot && r.shot_pending) this.whenShot(step_id, r.shot);
       sp?.set({ "deskmind.step.status": status, "deskmind.executor_status": r?.status, "deskmind.consequence": r?.consequence, "deskmind.object": r?.object });
       if (status === "error") sp?.fail(why || "error");
       return reply;
     });
+  }
+
+  /** A step's picture that the driver writes after its reply (hands takes it off the action's path): `shot.ready` once
+   *  the file is there, looked for every 100 ms for up to 20 s; a capture that failed writes nothing and says nothing. */
+  private whenShot(step_id: string, rel: string) {
+    const dir = this.o.executor.opts.shots;
+    if (!dir) return;
+    const abs = path.join(path.dirname(dir), rel), until = Date.now() + 20_000;
+    const look = () => {
+      if (fs.existsSync(abs)) { this.emit("shot.ready", { step_id, shot: rel }); return; }
+      if (Date.now() < until) setTimeout(look, 100).unref();
+    };
+    look();
   }
 
   // --- acting ----------------------------------------------------------------------------------------------------------
@@ -541,7 +557,7 @@ export class ExecutorService {
     if (r.status === "environment") return this.endWith("environment", r.why ?? "environment");
     if (r.status === "stopped") return this.endWith("stopped", r.why ?? "stopped");
     // the step's picture and where things were on screen are the app's, not the caller's
-    const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, ...rest } = r;
+    const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, shot_pending: _p, ...rest } = r;
     if (a.kind === "file") return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence: r.consequence })) : err(J({ status: r.status, why: r.why, consequence: r.consequence }));
     const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: withoutFrame(after.window), modal: after.modal, elements: after.elements, text: after.text } } : {}) };
     // the step check: a state change with nothing visibly changed is said so, in the result the caller reads

@@ -52,7 +52,11 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("step_result"), step_id: z.string(), status: z.enum(["ok", "unverified", "refused", "stale", "error"]), why: z.string().optional(), executor_status: z.string().optional(), consequence: Consequence.optional(),
     // the window after the step as a small PNG (relative to the run folder; only steps that changed something), and
     // where the window and the element were on screen before acting (hands' receipt)
-    shot: z.string().optional(), target_frame: FrameEv.optional(), window_frame: FrameEv.optional() }),
+    // shot_pending: the picture is still being written there (a shot_ready follows when it is)
+    shot: z.string().optional(), shot_pending: z.boolean().optional(), target_frame: FrameEv.optional(), window_frame: FrameEv.optional() }),
+  // a step's picture is on disk now (M0): it is taken after the step's result was sent, so it may come after later events
+  // — even after task_done, while the process lives; if none comes, the file at step_result.shot is the answer
+  z.object({ kind: z.literal("shot_ready"), step_id: z.string(), shot: z.string() }),
   z.object({ kind: z.literal("ask"), ask_id: z.string(), card: CardEvent }),
   z.object({ kind: z.literal("waiting"), ask_id: z.string().optional() }),
   // `voided`: the card was let go without an answer because the user changed the request (a steer, "steer"): the app
