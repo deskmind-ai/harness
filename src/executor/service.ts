@@ -79,6 +79,16 @@ export function checkAction(a: Action): string | null {
   }
 }
 
+/** Where an element is, for the app's cursor over a picture of its window: `rect_norm` — the element's rect (local to
+ *  the window, from the observation) as fractions of the window's size, 0–1 — and `frame`, the same on screen in
+ *  points. Nothing when the driver gave no rect or no window frame. */
+export function placeOf(rect: [number, number, number, number] | undefined, frame: [number, number, number, number] | undefined): { rect_norm?: [number, number, number, number]; frame?: [number, number, number, number] } {
+  if (!rect || !frame || !(frame[2] > 0) || !(frame[3] > 0)) return {};
+  const c = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 10_000) / 10_000;
+  const [x, y, w, h] = rect, [fx, fy, fw, fh] = frame;
+  return { rect_norm: [c(x / fw), c(y / fh), c(w / fw), c(h / fh)], frame: [fx + x, fy + y, w, h] };
+}
+
 /** A card's outcome: the option picked (or the user's own words), nothing (no answer: stopped, the app went away), or
  *  voided (the user changed the request while it was open). */
 type Got = { option: CardOption | null; text: string } | null | "voided";
@@ -399,7 +409,7 @@ export class ExecutorService {
     const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
-      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role } } : {}),
+      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, obs?.window.frame) } } : {}),
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
     return span("deskmind.step", { "deskmind.step_id": step_id, "deskmind.action.kind": a.kind, "deskmind.consequence.declared": consequence, "deskmind.plan_step": p.plan_step }, async (sp) => {
       let reply: ToolReply;
@@ -410,7 +420,8 @@ export class ExecutorService {
       this.results.delete(step_id); this.answered.delete(step_id);
       const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
       const why = user ?? r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
-      this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}) });
+      this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}),
+        ...(r?.shot ? { shot: r.shot } : {}), ...(r?.target_frame ? { target_frame: r.target_frame } : {}), ...(r?.window_frame ? { window_frame: r.window_frame } : {}) });
       sp?.set({ "deskmind.step.status": status, "deskmind.executor_status": r?.status, "deskmind.consequence": r?.consequence, "deskmind.object": r?.object });
       if (status === "error") sp?.fail(why || "error");
       return reply;
@@ -526,7 +537,8 @@ export class ExecutorService {
 不确定用户想怎么做的，用 ask_user 问清楚（给出几种做法当选项），不要换一种猜法再试。`); }
     if (r.status === "environment") return this.endWith("environment", r.why ?? "environment");
     if (r.status === "stopped") return this.endWith("stopped", r.why ?? "stopped");
-    const { after, challenge: _c, ...rest } = r;
+    // the step's picture and where things were on screen are the app's, not the caller's
+    const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, ...rest } = r;
     if (a.kind === "file") return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence: r.consequence })) : err(J({ status: r.status, why: r.why, consequence: r.consequence }));
     const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: after.window, modal: after.modal, elements: after.elements, text: after.text } } : {}) };
     // the step check: a state change with nothing visibly changed is said so, in the result the caller reads

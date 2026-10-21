@@ -70,8 +70,9 @@ export class HandsDriver implements Driver {
   async snapshot(): Promise<Snapshot> { if (!this.begun) return this.begin(); return this.call<Snapshot>("snapshot"); }
   async observe(windowId: string, o?: { screenshot?: boolean }): Promise<Observation> { if (!this.begun) await this.begin(); return this.call<Observation>("observe", { window: windowId, screenshot: !!o?.screenshot }); }
   /** `foreground_ok` goes inside the action dict, as hands#54 reads it: that app may use the foreground route for this one
-   *  step (the search box's Return path included). Set by the executor only; the model never sees it. */
-  async perform(action: Action, opts?: { foreground_ok?: boolean }): Promise<PerformResult> { if (!this.begun) await this.begin(); return this.call<PerformResult>("perform", { action: opts?.foreground_ok ? { ...action, foreground_ok: true } : action }); }
+   *  step (the search box's Return path included). Set by the executor only; the model never sees it. `shot`: the file
+   *  hands writes the window's picture to after the step (hands M0), beside the action. */
+  async perform(action: Action, opts?: { foreground_ok?: boolean; shot?: string }): Promise<PerformResult> { if (!this.begun) await this.begin(); return this.call<PerformResult>("perform", { action: opts?.foreground_ok ? { ...action, foreground_ok: true } : action, ...(opts?.shot ? { shot: opts.shot } : {}) }); }
   /** Close the executor process. `end` is tidying only, so it is never waited for behind a request still running:
    *  the process answers one request at a time, and an `end` queued after a look the task stopped waiting for took
    *  that look's whole timeout (review of harness #24). With a request in flight the process is killed at once (the

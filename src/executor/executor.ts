@@ -30,6 +30,7 @@ import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, P
 import { T, type Lang } from "./text.js";
 import type { KeyObject } from "node:crypto";
 import { span } from "../otel/trace.js";
+import { current as traceContext } from "../otel/context.js";
 
 export interface ExecutorOptions {
   task: string; publicKey: KeyObject; now?: () => number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
@@ -42,6 +43,9 @@ export interface ExecutorOptions {
   raw?: string;
   /** The language of what the user reads (consent card texts). */
   lang?: Lang;
+  /** A folder for the steps' pictures (the run's `shots/`): a step that changes something asks the driver for a picture
+   *  of the window after it, named by the step (hands writes it, small; the app's timeline shows it). Unset: none. */
+  shots?: string;
   /** A journal (jsonl): every state-changing action is written down before it runs and receipted after, so a process
    *  that died in between is found on restart (an intent without a receipt) and reconciled, never repeated blindly. */
   journal?: string;
@@ -1429,10 +1433,12 @@ export class Executor {
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
+    // a picture after a step that changes something (not of a look or a wait): named by the step, in the run's shots/
+    const shotFile = this.opts.shots && consequence !== "read" && act.kind !== "wait" ? path.join(this.opts.shots, `${(traceContext().step_id ?? `receipt_${this.receipts.length + 1}`).replace(/[^\w.-]/g, "_")}.png`) : undefined;
     // the driver doing it: its own span, with the consent it went on (token kind) and the class it was settled at
     try {
       r = await span("deskmind.perform", { "deskmind.action.kind": act.kind, "deskmind.consequence": consequence, "deskmind.object": base.object, "deskmind.token_kind": req.consent?.scope ?? "none", "deskmind.foreground_ok": foregroundOk }, async (s) => {
-        const x = await this.driver.perform(this.forDriver(act), foregroundOk ? { foreground_ok: true } : undefined);
+        const x = await this.driver.perform(this.forDriver(act), foregroundOk || shotFile ? { ...(foregroundOk ? { foreground_ok: true } : {}), ...(shotFile ? { shot: shotFile } : {}) } : undefined);
         s?.set({ "deskmind.perform.status": x.status });
         if (x.status === "error" || x.status === "unsupported") s?.fail(x.why ?? x.status);
         return x;
@@ -1464,7 +1470,8 @@ export class Executor {
     const sameApp = (w: WindowInfo) => !acted ? req.action.kind === "open_window" : acted.bundle && w.bundle ? acted.bundle.toLowerCase() === w.bundle.toLowerCase() : !!acted.app && acted.app === w.app;
     const openedId = r.new_window?.id;
     const made = r.new_window && fresh(openedId) && sameApp(r.new_window) ? openedId : undefined;
-    const madeField = made ? { created_window: made } : {};
+    // what the app draws (the cursor) and shows (the step's picture): never the model's to read
+    const madeField = { ...(made ? { created_window: made } : {}), ...(r.shot && this.opts.shots ? { shot: path.relative(path.dirname(this.opts.shots), r.shot) } : {}), ...(r.target_frame ? { target_frame: r.target_frame } : {}), ...(r.window_frame ? { window_frame: r.window_frame } : {}) };
     if (made) {
       this.ledger.created(`window:${made}`); this.openedWindows.set(this.receipts.length + 1, made);
       if (req.action.kind !== "open_window") this.emit("executor.window_created", { id: made, by: req.action.kind, from: acted?.id });

@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { z } from "zod";
 
 const Consequence = z.enum(["read", "create", "modify_user", "external"]);
+const FrameEv = z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() });
 const PlanFacts = z.object({
   steps: z.array(z.object({ purpose: z.string(), class: Consequence,
     objects: z.array(z.object({ ref: z.string(), label: z.string(), owner: z.enum(["user", "task"]), marks: z.array(z.enum(["changes", "sends", "opens_pages"])) })),
@@ -42,10 +43,16 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("step"), text: z.string(), consequence: Consequence.optional(), object: z.string().optional(), status: z.string().optional(), purpose: z.string().optional(),
     // additive (events v1, M0): the step's id (its `step_result` and the trace name it), the action in the user's words
     // (the element by its label and role, never its id), the element it acts on, and the plan step the caller says it is for
-    step_id: z.string().optional(), human: z.string().optional(), target: z.object({ id: z.string(), label: z.string(), role: z.string() }).optional(), plan_step: z.number().int().optional() }),
+    step_id: z.string().optional(), human: z.string().optional(), plan_step: z.number().int().optional(),
+    // the element: its id, its name and role; where it is in its window as fractions 0–1 (for the cursor over a picture of
+    // the window) and on screen in points, when the driver says
+    target: z.object({ id: z.string(), label: z.string(), role: z.string(), rect_norm: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional(), frame: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional() }).optional() }),
   // how a step ended (M0): ok, unverified (done, not read back), refused (the executor or the user did not let it — the
   // executor's own status in `executor_status`), stale (the screen moved since the caller looked: not done), error
-  z.object({ kind: z.literal("step_result"), step_id: z.string(), status: z.enum(["ok", "unverified", "refused", "stale", "error"]), why: z.string().optional(), executor_status: z.string().optional(), consequence: Consequence.optional() }),
+  z.object({ kind: z.literal("step_result"), step_id: z.string(), status: z.enum(["ok", "unverified", "refused", "stale", "error"]), why: z.string().optional(), executor_status: z.string().optional(), consequence: Consequence.optional(),
+    // the window after the step as a small PNG (relative to the run folder; only steps that changed something), and
+    // where the window and the element were on screen before acting (hands' receipt)
+    shot: z.string().optional(), target_frame: FrameEv.optional(), window_frame: FrameEv.optional() }),
   z.object({ kind: z.literal("ask"), ask_id: z.string(), card: CardEvent }),
   z.object({ kind: z.literal("waiting"), ask_id: z.string().optional() }),
   // `voided`: the card was let go without an answer because the user changed the request (a steer, "steer"): the app

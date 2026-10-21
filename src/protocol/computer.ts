@@ -24,7 +24,13 @@ export interface WindowInfo {
   opened?: boolean;
   /** The driver can operate this window only with its app in front (hands): the plan card says so. */
   needs_foreground?: boolean;
+  /** Where the window is on screen, [x, y, w, h] in points, top-left origin (hands' observe): an element's `rect` is
+   *  local to it. */
+  frame?: [number, number, number, number];
 }
+
+/** A rectangle on screen, in points, top-left origin. */
+export interface Frame { x: number; y: number; w: number; h: number }
 
 /** The whole computer, every app in one format. Read-only, so nothing is hidden: the user's windows are listed too. */
 export interface Snapshot { epoch: number; locked: boolean; front_app: string; windows: WindowInfo[]; user_active?: boolean;
@@ -106,6 +112,9 @@ export interface ActResult {
    *  Executor.act): steps in it are the task's own. */
   created_window?: string;
   output?: Record<string, unknown>;  // a file capability's output (a read's text, a listing)
+  /** For the app, never the model: the window after the step as a small picture (a path relative to the run folder,
+   *  `shots/<step_id>.png`), and where the window and the element acted on were on screen before acting. */
+  shot?: string; target_frame?: Frame; window_frame?: Frame;
   /** With `refused`: the action writes a file that an interrupted step of an earlier process was writing — whether that
    *  step took effect is unknown — and that file changed since. Nothing is written there until the user settles it (the
    *  reconciliation card); these are the facts the card is built from. */

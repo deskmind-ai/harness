@@ -136,7 +136,8 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
     case "step.start": { const a = body.action as { kind?: string; capability?: unknown; args?: unknown };
       return { kind: "step", text: a?.kind === "file" ? `${s(a.capability)} ${s(a.args)}` : s(a), purpose: s(body.purpose ?? ""), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(body.object ? { object: s(body.object) } : {}),
         step_id: s(body.step_id), ...(body.human ? { human: s(body.human) } : {}), ...(body.target ? { target: body.target as never } : {}), ...(typeof body.plan_step === "number" ? { plan_step: body.plan_step } : {}) }; }
-    case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}) };
+    case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}),
+      ...(body.shot ? { shot: s(body.shot) } : {}), ...(body.target_frame ? { target_frame: body.target_frame as never } : {}), ...(body.window_frame ? { window_frame: body.window_frame as never } : {}) };
     case "executor.user_wait": return { kind: "waiting" };            // the user is at the keyboard: the app says "paused while you use your Mac"
     case "executor.user_resumed": return { kind: "resumed" };
     // the executor's refusals (stale, stopped, environment, blocked, error) also stand as their own line; an action that
@@ -244,7 +245,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const send = (k: string, b: Record<string, unknown>) => { trace(k, b); const e = toProtocol(k, b); if (e && (!done || k === "steer.refused")) log.emit(e); };
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
   // process did without a receipt and tells the model (D10)
-  const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: send });
+  const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), shots: path.join(o.runs, runId, "shots"), onEvent: send });
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: o.inject?.model ?? loopModel(table.goal.model),
