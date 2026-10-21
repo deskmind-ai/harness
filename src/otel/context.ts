@@ -4,8 +4,9 @@
  * gateway calls they make, the executor's own trace events — can name that step without every function passing it
  * on. Outside a step (a look, the plan) the fields are absent.
  *
- * Only this process: the runtime in a child process (executor split P2) does not share it, and does not need to — every
- * step, judge and model call it would name happens on the executor's side.
+ * Only this process: the runtime in a child process (executor split P2) has its own, whose tracer and model-call recorder
+ * report to the executor over the pipe (transport/report.ts); the executor runs each call it serves in the run's
+ * context, under the runtime's span in progress.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 

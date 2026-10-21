@@ -28,7 +28,10 @@ const STATUS: Record<RuntimeStatus, Summary["status"]> = { succeeded: "succeeded
 /** The cards the simulated user saw and what it picked, for talkOf's questions (the runtime has no event log). */
 interface Seen { kind: Card["kind"]; picked: string | null; at: number }
 
-export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<typeof loopModel>, registry: Registry, user: RuntimeUser & { clarifies: number; authorizes: number; asked: string[]; approvals: unknown[]; sim: unknown }, outDir: string, verbose: boolean, rep = 0) {
+/** `loopSpec` (`<provider>|<model>`): the loop runs as its own process, as in the app (executor split P2), its logs
+ *  beside the task's events (runtime.jsonl, model_calls.jsonl, runtime.log); DESKMIND_EXECUTOR_INPROC=1 keeps it in
+ *  this process. Without it, `model` in this process. */
+export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<typeof loopModel>, registry: Registry, user: RuntimeUser & { clarifies: number; authorizes: number; asked: string[]; approvals: unknown[]; sim: unknown }, outDir: string, verbose: boolean, rep = 0, loopSpec?: string) {
   const runDir = path.join(outDir, `rep${rep}`, task.id);
   fs.rmSync(runDir, { recursive: true, force: true });
   fs.mkdirSync(runDir, { recursive: true });
@@ -98,7 +101,8 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   if (store) fs.mkdirSync(store.dir, { recursive: true });
   const fileTypes = [...new Set(Object.keys(task.files).map((p) => (p.includes(".") ? p.slice(p.lastIndexOf(".") + 1).toLowerCase() : "")).filter(Boolean))];
   const skills = store ? store.source({ fileTypes }) : undefined;
-  const makeRuntime = () => new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, model, workspace: ws, registry, onEvent, ...(skills ? { skills } : {}) });
+  const loop = loopSpec ? { agent: { model: loopSpec, log: path.join(runDir, "runtime.jsonl"), modelLog: path.join(runDir, "model_calls.jsonl"), stderr: path.join(runDir, "runtime.log") } } : { model };
+  const makeRuntime = () => new FrontierRuntime({ task: task.id, raw: task.raw, executor: ex, signer: app, user: cardUser, gateway: gw, ...loop, workspace: ws, registry, onEvent, ...(skills ? { skills } : {}) });
   rt = makeRuntime();
   let crashed = false;
   let r: Awaited<ReturnType<FrontierRuntime["run"]>>;
@@ -151,7 +155,7 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   const sc = score(task, start, ws.tree(), summ, sim.log, talk, bytesAt);
   const rec = {
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: `${gw.name}@runtime`, engine: "runtime", status: summ.status, runtime_status: r.status, reason: r.reason,
-    ...sc, crashed, counters: summ.counters, model_calls: gw.calls - calls0 + (r.counters["model_calls"] ?? 0), loop_calls: r.counters["model_calls"] ?? 0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
+    ...sc, crashed, runtime_mode: rt.mode, counters: summ.counters, model_calls: gw.calls - calls0 + (r.counters["model_calls"] ?? 0), loop_calls: r.counters["model_calls"] ?? 0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
     tokens_in: r.counters["tokens_in"] ?? 0, tokens_out: r.counters["tokens_out"] ?? 0,
     category: task.category, policy: {}, skill: null, skills: store ? store.admitted().map((x) => x.name) : null, taught, learned: null, skills_read: r.counters["skills_read"] ?? 0, asked: user.asked, approvals: user.approvals, result_response: null, sim: user.sim,
     ask_decisions: [], consents: r.consents, cards: seen.map((s) => `${s.kind}:${s.picked ?? "-"}`), verdicts: r.verdicts, answer: r.answer, summary: r.summary,

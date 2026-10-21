@@ -3,8 +3,11 @@
  * docs/design/harness-app-integration-2026-10-17.md §2): JSON events out on stdout, one per line, each written to the
  * run's event log first (protocol/events.ts); answers to cards come back on stdin as JSON lines.
  *
- *   app-run [--request <file>] [--runs <dir>]   stdin line 1 (or the file): {run_id?, raw, scope?, config?, engine?, lang?, driver?};
- *                                               then control lines (protocol/control.ts); SIGINT / SIGTERM stop the run
+ *   executor [--request <file>] [--runs <dir>]  stdin line 1 (or the file): {run_id?, raw, scope?, config?, engine?, lang?, driver?};
+ *   (app-run: the same, its old name)           then control lines (protocol/control.ts); SIGINT / SIGTERM stop the run.
+ *                                               The agent loop runs as a child, `runtime` (below); DESKMIND_EXECUTOR_INPROC=1
+ *                                               keeps it in this process (host/frontier.ts)
+ *   runtime                                     the agent loop, started by `executor`: MCP client on stdin/stdout (cli/runtime.ts)
  *   respond --run <id> [--runs <dir>]           stdin line 1: {option} | {text}  — the user's answer to the result card
  *   --selftest                                  no model, no network: the packaged binary's health check
  *   model-check --config <name|openai:prov|model> one tiny question to the configured model: {ok, model, ms} or {ok:false, error} — the app's "test" button
@@ -31,8 +34,9 @@ import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
 import { FrontierRuntime, type RuntimeOptions, type RuntimeUser } from "../host/frontier.js";
-import { loopModel } from "../runtime/model.js";
 import { scriptedStream } from "../runtime/scripted.js";
+import type { AgentSpec } from "../host/agent.js";
+import { runtimeMain } from "./runtime.js";
 import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
 import { isForeignControl, parseControl } from "../protocol/control.js";
 import { PROTOCOL } from "../protocol/version.js";
@@ -216,7 +220,7 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
  *  `inject` (tests): a driver, a gateway, a model in place of the config's. */
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number;
   signals?: { onSignal: (h: (sig: string) => void) => void; exit: () => void; exitNow: () => void; deadlineMs?: number; waitMs?: number };
-  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"] } }) {
+  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"] } }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
@@ -231,7 +235,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // every model call of the run (the run's gateway, a judge tier's, the acting model's turns) reaches the recorder through
   // the run's context (otel/context): model_calls.jsonl, the trace, a model_call event while the run is on, the sum
   const gw = o.inject?.gateway ?? new Gateway(table);
-  const usage = { calls: 0, tokens_in: 0, tokens_out: 0, cost_usd: 0, by_role: {} as Record<string, { calls: number; tokens_in: number; tokens_out: number; cost_usd: number; latency_ms: number }> };
+  const usage = { calls: 0, tokens_in: 0, tokens_out: 0, cost_usd: 0, by_role: Object.create(null) as Record<string, { calls: number; tokens_in: number; tokens_out: number; cost_usd: number; latency_ms: number }> };     // keyed by a record's role: no prototype to reach through it
   const onModelCall = (r: ModelCallRecord) => {
     try { fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n"); } catch { /* recording never stops a run */ }
     const { answer: _a, ...brief } = r;
@@ -253,7 +257,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), shots: path.join(o.runs, runId, "shots"), onEvent: send });
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
-    task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: o.inject?.model ?? loopModel(table.goal.model),
+    task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw,
+    // the agent loop: its own process (P2), its own files beside the run's; a model handed in (tests) runs in this one
+    ...(o.inject?.model ? { model: o.inject.model } : {}),
+    agent: { model: o.inject?.agent ?? table.goal.model, log: path.join(o.runs, runId, "runtime.jsonl"), stderr: path.join(o.runs, runId, "runtime.log") },
     ...(ws ? { workspace: ws, registry: fileRegistry() } : {}),
     skills: skillsFor(req, ws, () => executor.beginSnapshot), lang: req.lang ?? "zh", ...(req.rules ? { rules: req.rules } : {}),
     // a real desktop takes more looks than the check set's folders: a pixel-mode app needs an observation per step
@@ -280,7 +287,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     if (done) return;
     const f = executor.inFlight, c = executor.changes();
     closeTrace("stopped", f ? STEP_UNKNOWN : stopReason || "stopped");
-    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage } as EventBody);
+    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
   };
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
   o.signals?.onSignal((sig) => {
@@ -301,7 +308,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
   if (!done) closeTrace(r.status, r.reason);
   const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
-  taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage } as never);
+  taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
   if (signals) return o.signals!.exit();
   // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
   // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit
@@ -322,7 +329,8 @@ export function respond(runId: string, runs: string, answer: Record<string, unkn
   log.emit({ kind: "result_response", picked: typeof answer.option === "number" ? String(answer.option) : null, ...(typeof answer.text === "string" ? { text: answer.text } : {}), effect: "recorded; undo for the runtime is not built yet, nothing was changed" });
 }
 
-/** No model, no network: the executor on a simulated computer, and one scripted runtime turn that ends as cannot. */
+/** No model, no network: the executor on a simulated computer, and one scripted runtime turn that ends as cannot —
+ *  once with the runtime in this process, once as its own process (`runtime`, served over MCP: executor split P2). */
 export async function selftest(): Promise<Record<string, unknown>> {
   const sim = new SimComputer();
   const w = sim.addEditor("编辑器");
@@ -337,8 +345,15 @@ export async function selftest(): Promise<Record<string, unknown>> {
     model: { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as never, streamFn: scriptedStream([{ calls: [{ name: "computer_snapshot", args: {} }] }, { calls: [{ name: "finish", args: { outcome: "cannot", summary: "selftest" } }] }]) },
   });
   const r = await rt.run();
-  const ok = snap.windows.length === 1 && snap.windows[0]!.owner === "user" && pre.consequence === "modify_user" && pre.needs_consent && r.status === "failed" && r.reason.startsWith("cannot") && (r.counters["tool_calls"] ?? 0) === 2;
-  return { ok, node: process.version, windows: snap.windows.length, floor: pre.consequence, runtime: r.status, tool_calls: r.counters["tool_calls"] ?? 0 };
+  const t0 = Date.now();
+  const child = new FrontierRuntime({
+    task: "selftest-process", raw: "自检", executor: new Executor(new SimComputer(), { task: "selftest-process", publicKey: signer.publicKey }), signer, user: { ask: () => null }, gateway: gw, mode: "process",
+    agent: { model: { scripted: [{ calls: [{ name: "computer_snapshot", args: {} }] }, { calls: [{ name: "finish", args: { outcome: "cannot", summary: "selftest" } }] }] } },
+  });
+  const r2 = await child.run();
+  const ended = (x: typeof r) => x.status === "failed" && x.reason.startsWith("cannot") && (x.counters["tool_calls"] ?? 0) === 2;
+  const ok = snap.windows.length === 1 && snap.windows[0]!.owner === "user" && pre.consequence === "modify_user" && pre.needs_consent && ended(r) && child.mode === "process" && ended(r2);
+  return { ok, node: process.version, windows: snap.windows.length, floor: pre.consequence, runtime: r.status, tool_calls: r.counters["tool_calls"] ?? 0, process: { status: r2.status, tool_calls: r2.counters["tool_calls"] ?? 0, ms: Date.now() - t0 } };
 }
 
 /** Can the configured model be reached with the keys in the environment? One choice question; the key never
@@ -372,8 +387,10 @@ async function main() {
     console.log(JSON.stringify({ ok: true, spans: r.spans, out: path.resolve(a.out) }));
     process.exit(0);
   }
+  // the runtime's stdin is the MCP channel: no control-line reader on it (review of P2)
+  if (cmd === "runtime") { const code = await runtimeMain(); process.stdout.write("", () => process.exit(code)); return; }
   const input = new LineReader(process.stdin);
-  if (cmd === "app-run") {
+  if (cmd === "app-run" || cmd === "executor") {
     // SIGINT / SIGTERM: before the run has started there is nothing to stop; after, the run ends as stopped
     // (task_done written) and the process exits within a second. stdout is drained before exit.
     const exit = () => process.stdout.write("", () => process.exit(0));
@@ -391,7 +408,7 @@ async function main() {
     respond(a.run, path.resolve(a.runs!), JSON.parse(await input.next()), out);
     process.exit(0);
   }
-  console.error("usage: app-run [--request <file>] [--runs <dir>] | respond --run <id> | model-check --config <name> | trace export --run <id> --out <file> | --selftest");
+  console.error("usage: executor|app-run [--request <file>] [--runs <dir>] | runtime | respond --run <id> | model-check --config <name> | trace export --run <id> --out <file> | --selftest");
   process.exit(2);
 }
 

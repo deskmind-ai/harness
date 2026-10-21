@@ -242,7 +242,8 @@ describe("outgoing check: classify over MCP", () => {
     let outgoingAsked = 0;
     gw.script = Array(20).fill((role: string, _s: string, u: string) => (isOutgoing(u) ? (outgoingAsked += 1, { choice: "sends" }) : role === "verify" ? { choice: "pass" } : { choice: "matches" }));
     const desk = new FakeDesk([{ info: { id: "w", app: "邮件", title: "新邮件" }, elements: [{ id: "b7", role: "button", label: "", actions: ["click"] }], text: "" }]);
-    const s = new McpExecutorServer({ driver: () => desk, gateway: gw, consent: "none" });
+    const cards: string[] = [];
+    const s = new McpExecutorServer({ driver: () => desk, gateway: gw, consent: "none", log: (l) => { if (l.includes("card_unanswered")) cards.push(l); } });
     let n = 0;
     const call = async (name: string, args: unknown = {}) => ((await s.handle({ jsonrpc: "2.0", id: ++n, method: "tools/call", params: { name, arguments: args } as never })) as any).result.structuredContent;
     await call("begin", { raw: "把合同发给张三" });
@@ -251,8 +252,11 @@ describe("outgoing check: classify over MCP", () => {
     const action = { kind: "click", window: "w", target: "b7" };
     const c = await call("classify", { action, epoch: o.epoch });
     expect(c).toMatchObject({ consequence: "external", object: "window:w", by: "frontier", needs_consent: true });
-    const r = await call("act", { action, epoch: o.epoch, consequence: "read" });          // a caller's low class changes nothing
-    expect(r).toMatchObject({ status: "needs_consent", consequence: c.consequence, object: c.object });
+    // a caller's low class changes nothing: act asks the user (the executor's card; standalone with --consent none it
+    // goes unanswered, so nothing is done and the task ends)
+    const r = await call("act", { action, epoch: o.epoch, consequence: "read", purpose: "发送" });
+    expect(r).toMatchObject({ done: true });
+    expect(cards).toHaveLength(1);
     expect(outgoingAsked).toBe(1);
     expect(desk.log).toEqual([]);
   });

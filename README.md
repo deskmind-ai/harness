@@ -26,7 +26,7 @@ DeskMind 的「想」：理解要求、计划、调工具、核对，在用户�
 | `src/gateway/` | 模型网关：`openai`（任何 OpenAI 兼容服务，`<provider>|<model>`，key 只从环境变量来）、OpenRouter、本地 mlx、Brain 的 systemone、`claude -p`（只在开发时）、脚本化（测试） |
 | `src/registry/` | 工作目录（资源版本）与文件能力 |
 | `src/protocol/` | 协议对象、各角色回答的 zod schema、给 app 的事件协议；两边共用的类型：同意凭证（`consent.ts`）、电脑和动作（`computer.ts`）、卡片（`cards.ts`）、执行层端口（`port.ts`） |
-| `src/cli/` | `app.ts` app 的入口（见下）；`mcp.ts` 执行层的 MCP 服务——七个工具（begin / snapshot / observe / plan / act / verify / stop / end），Codex、Claude Code 接上就带着三条底线 |
+| `src/cli/` | `app.ts` app 的入口（见下）；`mcp.ts` 执行层的 MCP 服务——工具就是执行层端口的方法（begin / snapshot / observe / classify / act / file / plan / ask_user / answer / read_skill / finish / steers / end，外加 stop），Codex、Claude Code 接上就带着三条底线；app 的 agent 循环也是这样接的，作为执行层的子进程 `runtime`（docs/protocol.md「两个进程」） |
 | `src/eval/` | 检查集 / 考卷的跑分（两个引擎：`--engine orchestrator|runtime`），练习场 `gym.ts`（模拟桌面上的邮件任务，按应用真实状态判分） |
 | `skills/` | 自带的基础技能 `deskmind-computer-use` |
 | `test/` | 守护测试：脚本化的对抗模型，验证每一道保护；`executor.test.ts`、`runtime.test.ts` 专测三条底线 |
@@ -49,7 +49,7 @@ pnpm eval -- --report runs/a/results.jsonl runs/b/results.jsonl                 
 `src/cli/app.ts` 是 DeskMind Hands.app 启动的子进程：事件先写进运行记录（`runs/app/<run_id>/events.jsonl`，带 `seq`，先落盘再发），再以每行一个 JSON 写到 stdout；卡片的回答、停止等控制从 stdin 读回来（`{"type":"answer","ask_id": …, "option": n}`、`{"type":"stop"}` 等；不带 `type` 的旧写法照样认），SIGINT / SIGTERM 等同于停止。三个接口（工具、事件、控制）的格式、版本和兼容规则见 `docs/protocol.md`。事件协议在 `src/protocol/events.ts`（start / preparing / plan / step / ask / waiting / resumed / consent / refused / answer_given / task_done），app 不认识的种类直接忽略。
 
 ```bash
-echo '{"raw":"开一个编辑器窗口，新建文档，写上「你好」","config":"yy-luna"}' | pnpm app app-run     # 事件流在 stdout
+echo '{"raw":"开一个编辑器窗口，新建文档，写上「你好」","config":"yy-luna"}' | pnpm app executor    # 事件流在 stdout（app-run 是老名字）；循环跑在子进程 runtime 里，DESKMIND_EXECUTOR_INPROC=1 留在同一进程
 pnpm app --selftest                                   # 不用模型：执行层 + 一轮脚本化的运行时，输出 {"ok":true,…}
 pnpm bundle && node dist/harness.mjs --selftest       # esbuild 打成单文件（约 1.6 MB），基础教程在打包时嵌入
 DESKMIND_MACTOOLS=/path/to/mactools                   # app 带预编译的 Swift 小工具时指过去，不再在用户机器上现编

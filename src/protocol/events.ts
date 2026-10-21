@@ -94,7 +94,10 @@ export const EventBody = z.discriminatedUnion("kind", [
     // changed during a screen action with no driver receipt: neither the task's nor another program's (the app may show them later)
     unconfirmed: z.array(z.string()).optional() }).optional().optional(),
     // the run's model calls in sum (M0): every call of every role, the acting model's included
-    usage: z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), by_role: z.record(z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number() })) }).optional() }),
+    usage: z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), by_role: z.record(z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number() })) }).optional(),
+    /** Some of the runtime's model-call reports were dropped (its notifications came faster than the executor takes
+     *  them): `usage` is lower than what was spent (executor split P2). */
+    usage_incomplete: z.boolean().optional() }),
   // the user's response to a result card after the run (respond): recorded; what it does is the runtime's to add
   // `undone` / `total` / `refused` (M0): the undo in fields — how many steps were taken back of how many, and why it
   // stopped (null: all of them); absent when nothing was undone
