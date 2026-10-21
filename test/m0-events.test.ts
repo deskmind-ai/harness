@@ -160,3 +160,41 @@ describe("M0 slice A, a real-shaped run: the mail reply", () => {
     expect((r.events.filter((e) => e.kind === "step_result") as any[]).map((x) => x.status)).toEqual(["ok", "ok", "ok", "ok"]);
   });
 });
+
+describe("M0 slice A: what a step may say", () => {
+  it("an element is named only from the look the caller decided on; a file step carries the executor's class", async () => {
+    const sim = new SimComputer();
+    const w = sim.addEditor("编辑器", { title: "笔记.txt", text: "旧的", path: null }).id;
+    let first = 0;
+    const steps: Step[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "改正文", objects: [`window:${w}`], consequence: "modify_user" }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      (m) => { first = lastJson(m).epoch; return { calls: [{ name: "computer_act", args: { action: { kind: "set_value", window: w, target: `${w}:0:textarea`, value: "新的" }, epoch: first, consequence: "modify_user", purpose: "改" } }] }; },
+      // the same id, decided on the look before the edit: the executor's newer look is not what the caller saw
+      () => ({ calls: [{ name: "computer_act", args: { action: { kind: "click", window: w, target: `${w}:0:menu_save` }, epoch: first, consequence: "modify_user", purpose: "存" } }] }),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "改了" } }] },
+    ];
+    const r = await run(sim, "把正文改成「新的」", steps);
+    const s = r.events.filter((e) => e.kind === "step") as any[];
+    expect(s[0].target?.label).toBe("正文");
+    expect(s[1].target).toBeUndefined();
+    expect(s[1].human).toContain("一个元素");
+  });
+});
+
+describe("M0 slice B: a consent card's fields say what its text says", () => {
+  it("every item, in the text's order, however many: what the task typed and who is selected are never cut", async () => {
+    const { outgoing, outgoingItems } = await import("../src/executor/executor.js");
+    const els = [...Array.from({ length: 50 }, (_, i) => ({ id: `l${i}`, role: "staticText", label: `行 ${i}`, actions: [] as string[] })),
+      { id: "to", role: "row", label: "林晓", actions: ["click"], focused: true }, { id: "send", role: "button", label: "发送", actions: ["click"], sends: true }];
+    const obs = { epoch: 1, window: { id: "w", app: "信鸽", title: "写信", url: "https://mail.example.com/c" }, modal: null, elements: els, text: "行 3\n一行窗口里的字" } as never;
+    const items = outgoingItems(obs, ["收到，谢谢"]);
+    const o = outgoing(obs);
+    expect(items).toHaveLength(o.fields.length + 1 + o.shown.length);
+    expect(items[0]).toEqual({ kind: "field", label: "URL", value: "https://mail.example.com/c" });
+    expect(items).toContainEqual({ kind: "selected", label: "林晓", value: "" });
+    expect(items).toContainEqual({ kind: "typed", label: "", value: "收到，谢谢" });
+    expect(items.at(-1)).toEqual({ kind: "text", label: "", value: "一行窗口里的字" });
+    expect(items.filter((x) => x.value === "行 3")).toHaveLength(1);         // a line already in a field is not repeated
+  });
+});

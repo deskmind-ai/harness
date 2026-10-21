@@ -387,10 +387,20 @@ export class Executor {
   /** Every challenge this executor issued, as it issued it: what "consent is for another action" is explained against
    *  in the trace (the token's action, epoch, object and class beside the request's). */
   private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence }>();
+  /** An object as the user knows it, for a card's fields: a window by its app and title (the last snapshot), a tab by
+   *  its title, a file by its path; never a bare window id. */
+  private labelOf(object: string): string {
+    const id = object.slice(object.indexOf(":") + 1);
+    if (object.startsWith("path:")) return id;
+    if (object.startsWith("window:")) { const w = this.last?.windows.find((x) => x.id === id); return w ? windowLabel(w, this.opts.lang) : appName({ app: id.split("#")[0]! }); }
+    if (object.startsWith("tab:")) for (const w of this.last?.windows ?? []) { const t = w.tabs?.find((x) => x.id === id); if (t) return `「${t.title}」`; }
+    return id;
+  }
+
   private issue(action: Action, object: string, consequence: Consequence, text: string, epoch: number, content?: unknown, facts?: ActionCardFacts) {
     const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
       // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
-      facts: facts ?? { action: action.kind, action_text: text, target: null, object, object_label: object.startsWith("path:") ? object.slice(5) : object, consequence, outgoing: [], site: null } };
+      facts: facts ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null } };
     this.challenges.set(c.nonce, { action, epoch, object, consequence });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
@@ -1175,7 +1185,7 @@ export class Executor {
     const object = this.floor(a).object;
     const facts = (text: string, outgoingItems: ActionCardFacts["outgoing"], host: string | null): ActionCardFacts => ({
       action: a.kind, action_text: stepText(act, look, this.opts.lang), target: elementName(el ?? undefined), object,
-      object_label: look ? windowLabel(look.window, this.opts.lang) : "window" in a ? a.window : a.kind === "open_window" ? a.app : object, consequence, outgoing: outgoingItems, site: host });
+      object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host });
     if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!)) : t.openLink(a.app, shortUrl(a.url!)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el, facts: facts(text, sending ? outgoingItems(look, typedLines) : [], null) };
@@ -1570,7 +1580,7 @@ export class Executor {
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
-        const challenge = this.issue(a, object, consequence, text, epoch);
+        const challenge = this.issue(a, object, consequence, text, epoch, undefined, { action: "file", action_text: describeAction(a, undefined, "read", cap, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null });
         this.emit("executor.consent_needed", { why, consequence, object });
         return { ...base, status: "needs_consent", why, challenge };
       }
@@ -1869,18 +1879,15 @@ export function outgoing(obs: Observation | undefined): { fields: string[]; show
  *  shows): the page's address, each filled-in field with its label, labels without actions, the selected item, the
  *  task's typed text the window does not show, and the window's other lines. At most 40. */
 export function outgoingItems(obs: Observation | undefined, typed: string[] = []): ActionCardFacts["outgoing"] {
+  // item for item what `outgoing` and the card's text list, in the same order, none left out
   const els = obs?.elements ?? [];
   const out: ActionCardFacts["outgoing"] = [];
   if (obs?.window.url) out.push({ kind: "field", label: "URL", value: obs.window.url });
-  for (const e of els) {
-    if (e.value) out.push({ kind: "field", label: e.label, value: e.value });
-    else if (!e.actions.length && e.label) out.push({ kind: "text", label: "", value: e.label });
-  }
+  for (const e of els.filter((x) => x.value || (!x.actions.length && x.label))) out.push(e.value ? { kind: "field", label: e.label, value: e.value } : { kind: "text", label: "", value: e.label });
   for (const e of els.filter((x) => x.focused && !x.value && x.actions.length && !x.sends)) out.push({ kind: "selected", label: e.label, value: "" });
   for (const t of typed.map((x) => x.trim()).filter(Boolean)) out.push({ kind: "typed", label: "", value: t });
-  const fields = out.map((o) => (o.label ? `${o.label}：${o.value}` : o.value));
-  for (const l of (obs?.text ?? "").split("\n").map((x) => x.trim()).filter((x) => x && !fields.some((f) => f.includes(x)))) out.push({ kind: "text", label: "", value: l });
-  return out.slice(0, 40);
+  for (const l of outgoing(obs).shown) out.push({ kind: "text", label: "", value: l });
+  return out;
 }
 
 /** The app as the user knows it: hands' localized `app_name`, else what the driver calls it (a bundle id on hands). */
