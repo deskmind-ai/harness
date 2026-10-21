@@ -18,7 +18,10 @@ export interface PlanStepIn { purpose: string; objects: string[]; consequence: C
 
 /** What a tool call gives back: the text the model reads, whether it is an error, and `done` when the task is over (the
  *  executor has settled its status: the caller makes no more calls, only `end`). */
-export interface ToolReply { text: string; isError?: boolean; done?: boolean }
+export interface ToolReply { text: string; isError?: boolean; done?: boolean;
+  /** The user's mid-run words this reply carries (a steer applied at this call), whole: a caller keeps them as the user's
+   *  words (our loop: a user message, which compaction never cuts), not only inside a tool result. */
+  steers?: string[] }
 
 /** A file capability the caller may offer the model as a tool: its tool name, the capability, what it does, its
  *  arguments (all strings, paths relative to the task folder). */

@@ -144,9 +144,10 @@ describe("executor port: steer", () => {
     expect(toolResults.at(-1)).toContain("用户改了要求");
     expect(toolResults.at(-1)).toContain("这一步没有做");
     expect(sim.mailState(w).replies).toEqual([{ to: "m1", body: "好的，周五见" }]);
-    // applied once, between the two steps, and heard once (not again as a steering message)
+    // applied once, between the two steps; the words reach the model once more as a user message of their own (which
+    // compaction never cuts), once
     expect(events.filter((e) => e.kind === "steer.applied")).toHaveLength(1);
-    expect(seen.flat().filter((m: any) => m.role === "user" && typeof m.content === "string" && m.content.includes("用户改了要求"))).toHaveLength(0);
+    expect(seen.at(-1)!.filter((m: any) => m.role === "user" && typeof m.content === "string" && m.content.includes("用户改了要求")).map((m: any) => m.content)).toEqual(["用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：回复内容改成：好的，周五见"]);
     // the send's intent check read the new words and, beside them, what the user asked first
     const send = asked.filter((a) => a.role === "intent" && a.prompt.includes("即将执行的动作")).at(-1)!;
     const words = wordsOf(send.prompt);
@@ -439,5 +440,74 @@ describe("executor port: a steer withdraws the plan's consent", () => {
     expect(r.text).toContain("先按新要求交一份新计划");
     expect(sim.mailState(w).selected).toBe("m1");
     expect(cards).toEqual(["plan"]);
+  });
+});
+
+describe("executor port: review of #41 (Codex)", () => {
+  it("app-run: a steer in the same stdin batch as the request waits for its handler instead of being dropped", async () => {
+    const input = new PassThrough();
+    const reader = new LineReader(input);
+    input.write(JSON.stringify({ raw: "整理下载文件夹" }) + "\n" + JSON.stringify({ type: "steer", text: "只整理今天的" }) + "\n");
+    expect(JSON.parse(await reader.next())).toEqual({ raw: "整理下载文件夹" });
+    await new Promise((r) => setTimeout(r, 10));
+    const got: string[] = [];
+    reader.onSteer = (t) => got.push(t);
+    expect(got).toEqual(["只整理今天的"]);
+    input.write(JSON.stringify({ type: "steer", text: "再加上昨天的" }) + "\n");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(got).toEqual(["只整理今天的", "再加上昨天的"]);
+  });
+
+  it("an answer decided before a steer is not given: it is refused like any other step, and never reaches the result", async () => {
+    const { sim, w } = mail();
+    const signer = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: signer.publicKey });
+    const { gw } = judge();
+    const events: string[] = [];
+    let rt!: FrontierRuntime;
+    const steps: Step[] = [
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      // the user switches to the meeting time while the model is deciding the budget answer
+      () => { rt.steer("不问预算了，告诉我会议几点"); return { calls: [{ name: "answer", args: { text: "预算是 50 万" } }, { name: "finish", args: { outcome: "done", summary: "答了预算" } }] }; },
+      { calls: [{ name: "answer", args: { text: "14:00" } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "答了会议时间" } }] },
+    ];
+    rt = new FrontierRuntime({ task: "t1", raw: "林晓那封 Q3 预算邮件里预算是多少？", executor: ex, signer, user: { ask: approve }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) }, onEvent: (k, b) => { if (k === "answer.given") events.push(String(b.text)); } });
+    const r = await rt.run();
+    expect(r.status).toBe("succeeded");
+    expect(events).toEqual(["14:00"]);
+    expect(r.answer).toBe("14:00");
+  });
+
+  it("a long steer reaches the model whole, as a user message compaction never cuts", async () => {
+    const { sim, w } = mail();
+    const signer = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: signer.publicKey });
+    const { gw } = judge();
+    const long = "改一下要求：" + "这是用户补充的背景说明。".repeat(45) + "最后一条约束：只回复林晓本人，不要抄送任何人。";
+    expect(long.length).toBeGreaterThan(540);
+    let rt!: FrontierRuntime;
+    const seen: Message[][] = [];
+    const look: Step = { calls: [{ name: "computer_observe", args: { window: w } }] };
+    const steps: Step[] = [
+      look,
+      // the steer arrives while the model decides; the step it decided comes back with the words
+      (ms) => { rt.steer(long); return act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "modify_user")(ms); },
+      // many looks after: the old tool results get cut down to stubs
+      ...Array(9).fill(look),
+      { calls: [{ name: "finish", args: { outcome: "cannot", summary: "test" } }] },
+    ];
+    // a small window, so compaction runs
+    rt = new FrontierRuntime({ task: "t1", raw: RAW, executor: ex, signer, user: { ask: approve }, gateway: gw, model: { model: { ...model.model, contextWindow: 9000 }, streamFn: scriptedStream(steps, seen) } });
+    let compactions = 0;
+    await rt.run();
+    compactions = rt.counters["compactions"] ?? 0;
+    expect(compactions).toBeGreaterThan(0);
+    const lastCtx = seen.at(-1)!;
+    // the tool result that carried it was cut; the user message is whole, trailing constraint included
+    expect(lastCtx.some((m: any) => m.role === "toolResult" && m.content[0].text.includes("已省略") && m.content[0].text.startsWith("用户改了要求"))).toBe(true);
+    const user = lastCtx.filter((m: any) => m.role === "user" && typeof m.content === "string" && m.content.includes("用户改了要求"));
+    expect(user).toHaveLength(1);
+    expect((user[0] as any).content).toContain("最后一条约束：只回复林晓本人，不要抄送任何人。");
   });
 });

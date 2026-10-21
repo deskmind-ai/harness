@@ -58,7 +58,7 @@ export class LineReader {
       // it also lets go of a card waiting for its answer: that card is answered with nothing (review of #16)
       const c = parseControl(l);
       if (c?.type === "stop") { this.stop(); return; }
-      if (c?.type === "steer") { this.onSteer?.(c.text); return; }
+      if (c?.type === "steer") { if (this.steerTo) this.steerTo(c.text); else this.earlySteers.push(c.text); return; }
       // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
       // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
       if (!c && isForeignControl(l)) return;
@@ -70,7 +70,12 @@ export class LineReader {
   closed = false;
   stopped = false;
   onStop: ((why: string) => void) | null = null;
-  onSteer: ((text: string) => void) | null = null;
+  /** Steer lines go to this handler; one read before it is set (the request and a steer in the same stdin batch) waits
+   *  and is handed over when it is set, never dropped. */
+  get onSteer(): ((text: string) => void) | null { return this.steerTo; }
+  set onSteer(h: ((text: string) => void) | null) { this.steerTo = h; if (h) for (const t of this.earlySteers.splice(0)) h(t); }
+  private steerTo: ((text: string) => void) | null = null;
+  private earlySteers: string[] = [];
   /** The app's stop (a stop line, or a signal): once, whoever asks first; every card waiting for its answer is
    *  answered with nothing. */
   stop(why = "stopped by the app") { if (this.stopped) return; this.stopped = true; this.onStop?.(why); for (const w of this.waiting.splice(0)) w(""); }

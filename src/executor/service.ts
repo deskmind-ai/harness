@@ -211,7 +211,7 @@ export class ExecutorService {
     const xs = this.applySteers();
     if (!xs.length) return this.reDecide ? err("用户改了要求（见前面的结果）：这一步是在那之前决定的，没有做。按新要求重新决定。") : null;
     this.reDecide = true;
-    return err(`用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：${xs.join("；然后又说：")}\n你刚才要的这一步没有做：按新要求重新决定。`);
+    return { ...err(`用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：${xs.join("；然后又说：")}\n你刚才要的这一步没有做：按新要求重新决定。`), steers: xs };
   }
 
   /** What `f` gives, unless the app stops the task first: then null at once, without waiting for it (a driver's look
@@ -618,6 +618,8 @@ export class ExecutorService {
   }
 
   private async answer(p: { text: string }): Promise<ToolReply> {
+    // an answer decided before the user changed what they asked is not given: it would stand in the result
+    const s = this.steered(); if (s) return s;
     this.answerText = p.text;
     this.emit("answer.given", { text: p.text });
     return text("已记下答案。");

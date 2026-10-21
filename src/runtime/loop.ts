@@ -76,11 +76,16 @@ export class AgentLoop {
   /** The app stopped the task (the executor has been told): no more model turns or tool calls. */
   stop() { this.over = true; this.abort.abort(); }
 
+  /** The user's mid-run words a reply carried this turn: they reach the model again as a user message before its next
+   *  turn, whole — compaction cuts old tool results, never the user's words. */
+  private heard: string[] = [];
+
   private giveUp(reason: string) { if (!this.over) { this.over = true; this.failure = reason; } }
 
   /** A port reply as the model reads it; a reply that ends the task ends the loop. */
   private reply(r: ToolReply): AgentToolResult {
     if (r.done) this.over = true;
+    if (r.steers?.length) this.heard.push(...r.steers);
     return { ...(r.isError ? err(r.text) : text(r.text)), ...(r.done ? { terminate: true } : {}) };
   }
 
@@ -180,7 +185,7 @@ export class AgentLoop {
       },
       afterToolCall: async ({ toolCall, result, isError }) => { this.emit("tool.result", { name: toolCall.name, isError, text: result.content.map((c) => (c.type === "text" ? c.text : "[image]")).join("").slice(0, 2000) }); return undefined; },   // a re-ask on a real Mac is read from the trace: 300 cut every observation (rc.9)
       // the user's mid-run words no reply has carried yet: the executor applies them now, between turns
-      getSteeringMessages: async () => port.steers().map((r) => ({ role: "user" as const, content: `用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：${r}`, timestamp: Date.now() })),
+      getSteeringMessages: async () => [...this.heard.splice(0), ...port.steers()].map((r) => ({ role: "user" as const, content: `用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：${r}`, timestamp: Date.now() })),
       finishTurn: async (turn) => {
         turns += 1; this.count("turns");
         if (this.over) return { action: "end" };
