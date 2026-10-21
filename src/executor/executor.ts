@@ -12,7 +12,8 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
-import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
+import type { ActionCardFacts } from "../protocol/cards.js";
+import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
@@ -386,8 +387,20 @@ export class Executor {
   /** Every challenge this executor issued, as it issued it: what "consent is for another action" is explained against
    *  in the trace (the token's action, epoch, object and class beside the request's). */
   private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence }>();
-  private issue(action: Action, object: string, consequence: Consequence, text: string, epoch: number, content?: unknown) {
-    const c = this.consent.challenge(action, object, consequence, text, undefined, content);
+  /** An object as the user knows it, for a card's fields: a window by its app and title (the last snapshot), a tab by
+   *  its title, a file by its path; never a bare window id. */
+  private labelOf(object: string): string {
+    const id = object.slice(object.indexOf(":") + 1);
+    if (object.startsWith("path:")) return id;
+    if (object.startsWith("window:")) { const w = this.last?.windows.find((x) => x.id === id); return w ? windowLabel(w, this.opts.lang) : appName({ app: id.split("#")[0]! }); }
+    if (object.startsWith("tab:")) for (const w of this.last?.windows ?? []) { const t = w.tabs?.find((x) => x.id === id); if (t) return `「${t.title}」`; }
+    return id;
+  }
+
+  private issue(action: Action, object: string, consequence: Consequence, text: string, epoch: number, content?: unknown, facts?: ActionCardFacts) {
+    const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
+      // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
+      facts: facts ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null } };
     this.challenges.set(c.nonce, { action, epoch, object, consequence });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
@@ -1142,7 +1155,7 @@ export class Executor {
    *  window read from the screen: text recognition may not read the input box back; a chat's history holding the same
    *  words says nothing of the draft, so only the fields count), bound with the consent in every case: changed text is
    *  another send. Nothing for a class below external. */
-  private card(a: Action, decided: Observation | undefined, consequence: Consequence, look: Observation | undefined = decided): { sending: ReturnType<typeof outgoing> | null; typed: string[]; content: SendBinding | undefined; text: string; act: Action; lost: boolean } {
+  private card(a: Action, decided: Observation | undefined, consequence: Consequence, look: Observation | undefined = decided): { sending: ReturnType<typeof outgoing> | null; typed: string[]; content: SendBinding | undefined; text: string; act: Action; lost: boolean; facts: ActionCardFacts } {
     // the target as the caller decided it (its ids are those of `decided`), found in `look` — what is there now
     const id = "target" in a && a.target ? a.target : null;
     const el = id && decided && look ? resolve(decided, id, look) : undefined;
@@ -1169,9 +1182,13 @@ export class Executor {
     const t = T(this.opts.lang);
     // an open the per-site rule makes a send: the card names the site (not the page) and why — nothing on screen goes out
     const site = consequence === "external" ? this.siteRule(a) : null;
-    if (site && a.kind === "open_window") return { sending: null, typed: [], content: undefined, text: site.host ? t.openSite(a.app, site.host, shortUrl(a.url!)) : t.openLink(a.app, shortUrl(a.url!)), act, lost: false };
+    const object = this.floor(a).object;
+    const facts = (text: string, outgoingItems: ActionCardFacts["outgoing"], host: string | null): ActionCardFacts => ({
+      action: a.kind, action_text: stepText(act, look, this.opts.lang), target: elementName(el ?? undefined), object,
+      object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host });
+    if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!)) : t.openLink(a.app, shortUrl(a.url!)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
-    return { sending, typed, content, text, act, lost: !!id && !el };
+    return { sending, typed, content, text, act, lost: !!id && !el, facts: facts(text, sending ? outgoingItems(look, typedLines) : [], null) };
   }
 
   /** classify's cache key: the action, the screen it is decided on — the epoch and which observation of the window —
@@ -1294,7 +1311,7 @@ export class Executor {
       // text is another send, asked again
       // the card is of what is there now (the latest look, the executor's own included), the target found by what it is;
       // consent is asked and checked for the action as the caller sent it, so a retry of that action is covered
-      const { sending, typed, content, text, lost } = this.card(req.action, obs, consequence, (target ? this.looks.get(target) : undefined) ?? obs);
+      const { sending, typed, content, text, lost, facts: cardFacts } = this.card(req.action, obs, consequence, (target ? this.looks.get(target) : undefined) ?? obs);
       if (lost) return done({ ...base, status: "stale", why: `the target is gone from ${target}, or no longer one of a kind; observe it again and decide anew`, epoch: now.epoch });
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
       const judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
@@ -1333,7 +1350,7 @@ export class Executor {
             ...(stored && content ? { binding: bindingDiff(stored, content, this.pixelPolicy) } : {}),
           };
         }
-        const challenge = this.issue(req.action, base.object, consequence, text, now.epoch, content);
+        const challenge = this.issue(req.action, base.object, consequence, text, now.epoch, content, cardFacts);
         this.emit("executor.consent_needed", { why, consequence, object: base.object, ...(diag ? { changed: diag } : {}) });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
@@ -1360,7 +1377,7 @@ export class Executor {
       if (consequence === "external") {
         if (!accepted || !again.content || !within(accepted, again.content, this.pixelPolicy)) {
           diag = { binding: accepted && again.content ? bindingDiff(accepted, again.content, this.pixelPolicy) : null, epoch: fresh.epoch };
-          const challenge = this.issue(req.action, base.object, consequence, again.text, fresh.epoch, again.content);
+          const challenge = this.issue(req.action, base.object, consequence, again.text, fresh.epoch, again.content, again.facts);
           this.emit("executor.consent_needed", { why: "what goes out changed right before sending", consequence, object: base.object, changed: diag });
           return done({ ...base, status: "needs_consent", why: "what goes out changed right before sending; asked again with what is there now", challenge, epoch: fresh.epoch });
         }
@@ -1381,7 +1398,7 @@ export class Executor {
     if (NEEDS_CONSENT.has(consequence) && req.consent?.scope === "action") {
       if (!this.consent.spend(req.consent)) {
         const card = this.card(req.action, this.lastObs.get(target ?? "") ?? obs, consequence);
-        const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content);
+        const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content, card.facts);
         return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
       }
       this.challenges.delete(req.consent.nonce);                 // spent: nothing will be explained against it any more
@@ -1563,7 +1580,7 @@ export class Executor {
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
       const why = this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
-        const challenge = this.issue(a, object, consequence, text, epoch);
+        const challenge = this.issue(a, object, consequence, text, epoch, undefined, { action: "file", action_text: describeAction(a, undefined, "read", cap, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null });
         this.emit("executor.consent_needed", { why, consequence, object });
         return { ...base, status: "needs_consent", why, challenge };
       }
@@ -1859,6 +1876,21 @@ export function outgoing(obs: Observation | undefined): { fields: string[]; show
     elements: els.map((e) => identOf(e)),
   } : null;
   return { fields, shown, bound };
+}
+
+/** What goes out, item by item, for a card that lays it out: the same items as `outgoing` and the typed lines the card's
+ *  text shows, in the text's order — the page's address, each filled-in field with its label, labels without actions,
+ *  the selected item, the task's typed text the window does not show, and the window's other lines. None left out. */
+export function outgoingItems(obs: Observation | undefined, typed: string[] = []): ActionCardFacts["outgoing"] {
+  // item for item what `outgoing` and the card's text list, in the same order, none left out
+  const els = obs?.elements ?? [];
+  const out: ActionCardFacts["outgoing"] = [];
+  if (obs?.window.url) out.push({ kind: "field", label: "URL", value: obs.window.url });
+  for (const e of els.filter((x) => x.value || (!x.actions.length && x.label))) out.push(e.value ? { kind: "field", label: e.label, value: e.value } : { kind: "text", label: "", value: e.label });
+  for (const e of els.filter((x) => x.focused && !x.value && x.actions.length && !x.sends)) out.push({ kind: "selected", label: e.label, value: "" });
+  for (const t of typed.map((x) => x.trim()).filter(Boolean)) out.push({ kind: "typed", label: "", value: t });
+  for (const l of outgoing(obs).shown) out.push({ kind: "text", label: "", value: l });
+  return out;
 }
 
 /** The app as the user knows it: hands' localized `app_name`, else what the driver calls it (a bundle id on hands). */

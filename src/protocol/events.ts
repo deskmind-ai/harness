@@ -14,10 +14,23 @@ import * as path from "node:path";
 import { z } from "zod";
 
 const Consequence = z.enum(["read", "create", "modify_user", "external"]);
+const PlanFacts = z.object({
+  steps: z.array(z.object({ purpose: z.string(), class: Consequence,
+    objects: z.array(z.object({ ref: z.string(), label: z.string(), owner: z.enum(["user", "task"]), marks: z.array(z.enum(["changes", "sends", "opens_pages"])) })),
+    sites: z.array(z.object({ host: z.string(), sends: z.string().nullable(), asks_each: z.boolean() })) })),
+  foreground: z.object({ apps: z.array(z.string()), note: z.string() }).nullable(),
+});
+const ActionFacts = z.object({
+  action: z.string(), action_text: z.string(), target: z.string().nullable(), object: z.string(), object_label: z.string(), consequence: Consequence,
+  outgoing: z.array(z.object({ kind: z.enum(["field", "selected", "typed", "text"]), label: z.string(), value: z.string() })), site: z.string().nullable(),
+});
 export const CardEvent = z.object({
   kind: z.string(), text: z.string(),
   options: z.array(z.object({ kind: z.string(), text: z.string() })),
   free_text: z.boolean(), blocking: z.boolean(),
+  // additive (events v1, M0): the card's facts in fields, for an app that lays them out itself; `text` says all of it.
+  // plan: kind "plan"; consent: kind "action" when it asks consent for one action
+  plan: PlanFacts.optional(), consent: ActionFacts.optional(),
 });
 
 export const EventBody = z.discriminatedUnion("kind", [
