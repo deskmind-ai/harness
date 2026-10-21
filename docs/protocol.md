@@ -20,7 +20,7 @@ app 的 Swift 小助手启动的是执行层：`harness.mjs executor`（老名�
 | 写的文件 | `trace.jsonl`（执行层的记录，trace 查看的来源）、`judge_calls.jsonl`（判官和改写的模型调用） | `runtime.jsonl`（循环自己的事件：每一轮模型调用 `model.call`、每次 MCP 调用的往返时间 `mcp.rtt`）、`model_calls.jsonl`（循环的模型调用）、`runtime.log`（它的 stderr） |
 | 启动参数 | 和以前一样 | 环境变量 `DESKMIND_AGENT_SPEC`（用户的话、模型、预算、日志路径），不放命令行，`ps` 看不到用户的话 |
 
-- **app 看到的事件不变。** 界面上的「一步」（`step`）以前由循环的 `tool.call` 事件生成，现在由执行层收到的调用生成（`src/host/port-trace.ts`）：两种运行方式下 app 收到的事件流一样。`trace.jsonl` 里每次端口调用有 `tool.call` / `tool.result`（带执行层用的时间 `ms`），子进程方式下还有每次 MCP 调用的 `mcp.call`（`queued_ms` 排队、`ms` 处理）和 `agent.start` / `agent.exit`。
+- **app 看到的事件不变。** 界面上的「一步」（`step`）以前由循环的 `tool.call` 事件生成，现在由执行层收到的调用生成（`src/host/port-trace.ts`）：两种运行方式下 app 收到的事件流一样。有一处细微差别：`step` 的文字来自按格式检查、转换之后的参数（模型写成字符串的 `"dy":"3"` 显示为 `3`，值为 null 的可选字段不显示），P1 用的是检查之前模型的原文。`trace.jsonl` 里每次端口调用有 `tool.call` / `tool.result`（带执行层用的时间 `ms`），子进程方式下还有每次 MCP 调用的 `mcp.call`（`queued_ms` 排队、`ms` 处理）和 `agent.start` / `agent.exit`。
 - **停止：** app 的 stop 照旧先到执行层（执行层拒绝之后的一切动作，开着的卡不再等），再用通知 `notifications/deskmind/stop` 告诉运行时别再调模型。正在做的那一步照旧等它的回执：运行时最后调的 `end` 排在它后面处理。
 - **运行时死了：** 运行时在调 `end` 之前退出（崩溃、被 kill -9）或管道断了，执行层把任务记为 `failed`，reason 是 `agent exited (<信号或退出码>)`：先让正在处理的调用做完（交给驱动的动作拿到回执），开着的卡不再等，然后照常收尾——`task_done`（带 changes）、结果卡、撤回都和平常一样。
 - **执行层死了：** 运行时的 stdin 一断就退出（退出码 3），hands 也是 stdin 断了就退出：kill -9 执行层不会留下孤儿进程。终端里的 ^C 会发到整个进程组，运行时忽略 SIGINT，等执行层的 stop 通知。
