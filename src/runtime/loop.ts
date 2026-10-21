@@ -104,8 +104,8 @@ export class AgentLoop {
     }));
     tools.push(tool({
       name: "computer_act", label: "动手", description: "在界面上做一个动作。带上观察时的 epoch 和你判断的后果类别 consequence（read / create / modify_user / external；执行层只会往上调）。改用户的东西、往外发会先征得用户同意。",
-      parameters: Type.Object({ action: ActionSchema, epoch: Type.Number(), consequence: lit(CONSEQUENCES), purpose: Type.String({ description: "这一步为了什么，一句话" }) }),
-      execute: async (_id, p: { action: Static<typeof ActionSchema>; epoch: number; consequence: Consequence; purpose: string }) => this.reply(await port.act({ action: p.action as unknown as Action, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose })),
+      parameters: Type.Object({ action: ActionSchema, epoch: Type.Number(), consequence: lit(CONSEQUENCES), purpose: Type.String({ description: "这一步为了什么，一句话" }), plan_step: Type.Optional(Type.Number({ description: "这一步属于计划里的第几步（从 1 数）；没有计划就不填" })) }),
+      execute: async (_id, p: { action: Static<typeof ActionSchema>; epoch: number; consequence: Consequence; purpose: string; plan_step?: number }) => this.reply(await port.act({ action: p.action as unknown as Action, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, ...(p.plan_step !== undefined ? { plan_step: p.plan_step } : {}) })),
     }));
     tools.push(tool({
       name: "plan", label: "计划", description: "动手前列出步骤：目的、涉及的对象（窗口 id / 标签页 id / 文件路径）、后果类别。要碰用户的东西或往外发，必须先有计划。readings：原话里能有不止一种理解的地方，每处写你选的理解、其他理解、以及区分它们的依据（看到的东西：窗口标题、文件名、文件里的一行、用户的回答；原话本身不算）。依据不够的，程序会先问用户。程序把计划给用户过目，同意后改用户东西的步骤不再逐步打扰。某一步要用 open_window 打开网址的，在这一步的 opens 里写上应用、网址，以及网址会把什么发到那个网站（sends，一句话，比如「搜索『北京天气』」）：计划卡会列出这些网站和发过去的内容。用户同意计划后，网址里只有用户的话、常识和卡上写的内容时就不再逐次打扰；网址里带着读到的文件或窗口内容，仍会单独问。",

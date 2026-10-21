@@ -23,7 +23,9 @@ import { canon, siteOf, type ConsentProvider } from "../protocol/consent.js";
 import type { Begun, ExecutorPort, FileTool, FinishOutcome, PlanStepIn, TaskResult, TaskStatus, ToolReply } from "../protocol/port.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
-import { Executor, appName, cardText, describeAction, windowLabel } from "./executor.js";
+import { randomUUID } from "node:crypto";
+import { Executor, appName, cardText, describeAction, elementName, stepText, windowLabel } from "./executor.js";
+import { within } from "../otel/context.js";
 import { defaultJudge } from "./judge.js";
 import { T, type Lang } from "./text.js";
 import { NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "./types.js";
@@ -144,7 +146,8 @@ export class ExecutorService {
       begin: () => (this.begun ? Promise.reject(new Error("begin was already called for this task")) : this.begin()),
       snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
-      act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.act(p))), file: live((p) => this.file(p)),
+      act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.step(p.action, p, () => this.act(p)))),
+      file: live((p) => this.step({ kind: "file", capability: p.capability, args: p.args }, { purpose: this.o.registry?.get(p.capability)?.description.split("；")[0] ?? p.capability, consequence: "read" }, () => this.file(p))),
       plan: live((p) => this.plan(p.steps, p.readings ?? [])),
       askUser: live((p) => this.askUser(p)), answer: live((p) => this.answer(p)), readSkill: (p) => this.readSkill(p), finish: live((p) => this.finish(p)),
       steers: () => { this.reDecide = false; return this.applySteers(); }, end: (p) => this.end(p),
@@ -359,6 +362,38 @@ export class ExecutorService {
     }));
   }
 
+  // --- steps: one act or file call, from the app's side -------------------------------------------------------------------
+  /** The executor's last result inside the step in progress (the step's outcome; null when it never reached the executor). */
+  private lastResult: ActResult | null = null;
+
+  /** One action the caller asked for, as the app sees it: `step.start` (an id, the action in words, the element it acts
+   *  on, the plan step the caller says it belongs to) and `step.end` (how it ended). Everything inside — the judges, the
+   *  cards, the driver — runs with the step's id in the context, so the trace names it. A step asked for while a steer is
+   *  pending, or one the schema allows but its kind does not, is no step: it is not tried. */
+  /** The executor's act; its result is the step's latest outcome (step.end). */
+  private async exAct(req: Parameters<Executor["act"]>[0]): Promise<ActResult> { const r = await this.o.executor.act(req); this.lastResult = r; return r; }
+
+  private async step(a: Action, p: { purpose: string; consequence: Consequence; plan_step?: number }, body: () => Promise<ToolReply>): Promise<ToolReply> {
+    const s = this.steered(); if (s) return s;
+    if (a.kind !== "file") { const bad = checkAction(a); if (bad) return err(bad); }
+    const step_id = `st_${randomUUID().slice(0, 8)}`;
+    const obs = "window" in a ? this.o.executor.observed(a.window) : undefined;
+    const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
+    const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
+    this.emit("step.start", { step_id, action: a, purpose: p.purpose, consequence: p.consequence, ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
+      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role } } : {}),
+      ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
+    this.lastResult = null;
+    let reply: ToolReply;
+    try { reply = await within({ step_id }, body); }
+    catch (e) { this.emit("step.end", { step_id, status: "error", why: String(e instanceof Error ? e.message : e).slice(0, 300) }); throw e; }
+    const r = this.lastResult as ActResult | null;
+    const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
+    const why = r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
+    this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}) });
+    return reply;
+  }
+
   // --- acting ----------------------------------------------------------------------------------------------------------
   private async file(p: { capability: string; args: Record<string, string> }): Promise<ToolReply> {
     const s = this.steered(); if (s) return s;
@@ -411,7 +446,7 @@ export class ExecutorService {
     const opening = host ? this.siteTokens.filter((t) => t.object === pre.object && t.hosts?.includes(host)).sort((x, y) => rank(y.consequence) - rank(x.consequence))[0] : undefined;
     const consent = this.retryTokens.get(canon(a)) ?? opening ?? this.tokens.get(pre.object);
     let r: ActResult;
-    try { r = await ex.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
+    try { r = await this.exAct({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
     catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
     // the executor holds a write on a file an interrupted step left unknown and someone changed since: the user settles
     // it (the card), and only on their "go on" is the step tried again
@@ -419,7 +454,7 @@ export class ExecutorService {
       const g = await this.reconcile();
       if (g === "voided") return this.steered() ?? err("这张卡作废了：这一步没有做。");
       if (g !== "continue") return g;
-      try { r = await ex.act({ action: a, epoch: ex.currentEpoch, consequence: p.consequence, purpose: p.purpose, consent }); }
+      try { r = await this.exAct({ action: a, epoch: ex.currentEpoch, consequence: p.consequence, purpose: p.purpose, consent }); }
       catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
     }
     if (r.status === "needs_consent" && r.challenge) {
@@ -436,7 +471,7 @@ export class ExecutorService {
       if (t === null) return this.endWith("failed", "no answer from the user");
       if (t === "cancel") return this.endWith("cancelled", "the user stopped the task");
       if (t === "declined") return this.declined(`用户不同意这一步：${r.challenge.text}。换一种不需要它的做法，或者 finish 说明。`);
-      try { r = await ex.act({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t }); }
+      try { r = await this.exAct({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t }); }
       catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
       if (r.status === "stale") this.retryTokens.set(canon(a), t);
     }

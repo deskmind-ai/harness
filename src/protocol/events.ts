@@ -6,7 +6,8 @@
  *
  * Version: `start` carries `protocol: {events: 1}` (protocol/version.ts; the compatibility rule is in docs/protocol.md).
  *
- * Kinds: start, preparing, plan, step, ask, waiting, resumed, consent, refused, answer_given, task_done.
+ * Kinds: start, preparing, plan, step, step_result, ask, waiting, resumed, consent, refused, answer_given, task_done,
+ * result_response.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -25,7 +26,13 @@ export const EventBody = z.discriminatedUnion("kind", [
     protocol: z.object({ events: z.number().int() }).optional() }),
   z.object({ kind: z.literal("preparing") }),
   z.object({ kind: z.literal("plan"), steps: z.array(z.object({ purpose: z.string(), objects: z.array(z.string()), consequence: Consequence })) }),
-  z.object({ kind: z.literal("step"), text: z.string(), consequence: Consequence.optional(), object: z.string().optional(), status: z.string().optional(), purpose: z.string().optional() }),
+  z.object({ kind: z.literal("step"), text: z.string(), consequence: Consequence.optional(), object: z.string().optional(), status: z.string().optional(), purpose: z.string().optional(),
+    // additive (events v1, M0): the step's id (its `step_result` and the trace name it), the action in the user's words
+    // (the element by its label and role, never its id), the element it acts on, and the plan step the caller says it is for
+    step_id: z.string().optional(), human: z.string().optional(), target: z.object({ id: z.string(), label: z.string(), role: z.string() }).optional(), plan_step: z.number().int().optional() }),
+  // how a step ended (M0): ok, unverified (done, not read back), refused (the executor or the user did not let it — the
+  // executor's own status in `executor_status`), stale (the screen moved since the caller looked: not done), error
+  z.object({ kind: z.literal("step_result"), step_id: z.string(), status: z.enum(["ok", "unverified", "refused", "stale", "error"]), why: z.string().optional(), executor_status: z.string().optional(), consequence: Consequence.optional() }),
   z.object({ kind: z.literal("ask"), ask_id: z.string(), card: CardEvent }),
   z.object({ kind: z.literal("waiting"), ask_id: z.string().optional() }),
   // `voided`: the card was let go without an answer because the user changed the request (a steer, "steer"): the app

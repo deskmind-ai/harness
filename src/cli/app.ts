@@ -35,6 +35,7 @@ import { scriptedStream } from "../runtime/scripted.js";
 import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
 import { isForeignControl, parseControl } from "../protocol/control.js";
 import { PROTOCOL } from "../protocol/version.js";
+import { current as traceContext } from "../otel/context.js";
 import type { Answer, Card } from "../orchestrator/index.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
@@ -128,14 +129,17 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
   // a model fills optional fields with "" and 0: the step the app shows is the action without them
   const s = (x: unknown) => (typeof x === "string" ? x : JSON.stringify(x, (_, v) => (v === "" || v === 0 ? undefined : v)));
   switch (kind) {
-    case "tool.call": return body.name === "computer_act" ? { kind: "step", text: s((body.args as any)?.action), purpose: s((body.args as any)?.purpose ?? ""), consequence: (body.args as any)?.consequence, ...((body.args as any)?.action?.window ? { object: `window:${(body.args as any).action.window}` } : {}) } : null;
-    case "fs.act": return { kind: "step", text: `${s(body.cap)} ${s(body.args)}`, status: s(body.status), consequence: body.consequence as never };
-    // an action that went out but could not be read back (hands: "dispatched, unverified") is a step with that status,
-    // not a refusal; the executor's refusals (stale, stopped, environment, blocked, error) are
+    // a step is the executor's (step.start / step.end, ExecutorService.step), so it reaches the app whoever the caller
+    // is; `text` stays the action as before (a file action: its capability and arguments), for the app as shipped
+    case "step.start": { const a = body.action as { kind?: string; capability?: unknown; args?: unknown };
+      return { kind: "step", text: a?.kind === "file" ? `${s(a.capability)} ${s(a.args)}` : s(a), purpose: s(body.purpose ?? ""), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(body.object ? { object: s(body.object) } : {}),
+        step_id: s(body.step_id), ...(body.human ? { human: s(body.human) } : {}), ...(body.target ? { target: body.target as never } : {}), ...(typeof body.plan_step === "number" ? { plan_step: body.plan_step } : {}) }; }
+    case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}) };
     case "executor.user_wait": return { kind: "waiting" };            // the user is at the keyboard: the app says "paused while you use your Mac"
     case "executor.user_resumed": return { kind: "resumed" };
-    case "executor.act": return body.status === "ok" || body.status === "needs_consent" ? null
-      : body.status === "unverified" ? { kind: "step", text: s(body.action), consequence: body.consequence as never, object: s(body.object), status: "unverified" }
+    // the executor's refusals (stale, stopped, environment, blocked, error) also stand as their own line; an action that
+    // went out but could not be read back (unverified) is the step's result, not a refusal
+    case "executor.act": return body.status === "ok" || body.status === "needs_consent" || body.status === "unverified" ? null
       : { kind: "refused", what: s(body.action), why: `${s(body.status)}${body.why ? ": " + s(body.why) : ""}`, by: "executor" };
     case "plan": return { kind: "plan", steps: body.steps as never };
     case "consent.asked": return { kind: "consent", object: s(body.object), consequence: body.consequence as never, scope: "action", picked: (body.picked as string | null) ?? null };
@@ -187,7 +191,9 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
     : Array.isArray(v) ? (v.length > 200 ? [...v.slice(0, 200).map(cut), `…(+${v.length - 200})`] : v.map(cut))
     : v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, cut(x)])) : v;
   return (kind, body) => {
-    try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(cut(body ?? {}) as Record<string, unknown>) }) + "\n"); } catch { /* the trace never stops a run */ }
+    // the step in progress (otel/context): an executor event, a judge's, a model call's — each names the step it served
+    const c = traceContext();
+    try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(c.step_id ? { step_id: c.step_id } : {}), ...(cut(body ?? {}) as Record<string, unknown>) }) + "\n"); } catch { /* the trace never stops a run */ }
   };
 }
 
