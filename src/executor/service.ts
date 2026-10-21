@@ -25,7 +25,7 @@ import { Crash, type Capability, type Registry } from "../registry/capability.js
 import type { Workspace } from "../registry/workspace.js";
 import { randomUUID } from "node:crypto";
 import { Executor, appName, cardText, describeAction, elementName, stepText, windowLabel } from "./executor.js";
-import { within } from "../otel/context.js";
+import { current, within } from "../otel/context.js";
 import { defaultJudge } from "./judge.js";
 import { T, type Lang } from "./text.js";
 import { NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "./types.js";
@@ -147,7 +147,7 @@ export class ExecutorService {
       snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
       act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.step(p.action, p, () => this.act(p)))),
-      file: live((p) => this.step({ kind: "file", capability: p.capability, args: p.args }, { purpose: this.o.registry?.get(p.capability)?.description.split("；")[0] ?? p.capability, consequence: "read" }, () => this.file(p))),
+      file: live((p) => this.step({ kind: "file", capability: p.capability, args: p.args }, { purpose: this.o.registry?.get(p.capability)?.description.split("；")[0] ?? p.capability }, () => this.file(p))),
       plan: live((p) => this.plan(p.steps, p.readings ?? [])),
       askUser: live((p) => this.askUser(p)), answer: live((p) => this.answer(p)), readSkill: (p) => this.readSkill(p), finish: live((p) => this.finish(p)),
       steers: () => { this.reDecide = false; return this.applySteers(); }, end: (p) => this.end(p),
@@ -363,31 +363,37 @@ export class ExecutorService {
   }
 
   // --- steps: one act or file call, from the app's side -------------------------------------------------------------------
-  /** The executor's last result inside the step in progress (the step's outcome; null when it never reached the executor). */
-  private lastResult: ActResult | null = null;
+  /** The executor's last result inside each step in progress, by step_id (the step's outcome; none when it never
+   *  reached the executor). Kept per step, so calls in parallel would not take each other's. */
+  private results = new Map<string, ActResult>();
 
   /** One action the caller asked for, as the app sees it: `step.start` (an id, the action in words, the element it acts
    *  on, the plan step the caller says it belongs to) and `step.end` (how it ended). Everything inside — the judges, the
    *  cards, the driver — runs with the step's id in the context, so the trace names it. A step asked for while a steer is
    *  pending, or one the schema allows but its kind does not, is no step: it is not tried. */
   /** The executor's act; its result is the step's latest outcome (step.end). */
-  private async exAct(req: Parameters<Executor["act"]>[0]): Promise<ActResult> { const r = await this.o.executor.act(req); this.lastResult = r; return r; }
+  private async exAct(req: Parameters<Executor["act"]>[0]): Promise<ActResult> { const r = await this.o.executor.act(req); const id = current().step_id; if (id) this.results.set(id, r); return r; }
 
-  private async step(a: Action, p: { purpose: string; consequence: Consequence; plan_step?: number }, body: () => Promise<ToolReply>): Promise<ToolReply> {
+  private async step(a: Action, p: { purpose: string; consequence?: Consequence; epoch?: number; plan_step?: number }, body: () => Promise<ToolReply>): Promise<ToolReply> {
     const s = this.steered(); if (s) return s;
     if (a.kind !== "file") { const bad = checkAction(a); if (bad) return err(bad); }
     const step_id = `st_${randomUUID().slice(0, 8)}`;
-    const obs = "window" in a ? this.o.executor.observed(a.window) : undefined;
+    // the element as the caller saw it when it decided: its look at that epoch only (ids are reused between looks)
+    const seen = "window" in a ? this.o.executor.observed(a.window) : undefined;
+    const obs = seen && seen.epoch === p.epoch ? seen : undefined;
+    // a file step's class as the executor settles it by structure (the caller declares none); a screen step's as declared
+    let consequence = p.consequence;
+    if (a.kind === "file") { try { consequence = this.o.executor.preview({ action: a, epoch: this.o.executor.currentEpoch, consequence: "read" }).consequence; } catch { consequence = undefined; } }
     const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
-    this.emit("step.start", { step_id, action: a, purpose: p.purpose, consequence: p.consequence, ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
+    this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
       human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role } } : {}),
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
-    this.lastResult = null;
     let reply: ToolReply;
     try { reply = await within({ step_id }, body); }
-    catch (e) { this.emit("step.end", { step_id, status: "error", why: String(e instanceof Error ? e.message : e).slice(0, 300) }); throw e; }
-    const r = this.lastResult as ActResult | null;
+    catch (e) { this.results.delete(step_id); this.emit("step.end", { step_id, status: "error", why: String(e instanceof Error ? e.message : e).slice(0, 300) }); throw e; }
+    const r = this.results.get(step_id) ?? null;
+    this.results.delete(step_id);
     const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
     const why = r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
     this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}) });

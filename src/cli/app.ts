@@ -215,9 +215,13 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const signer = ConsentSigner.fresh();
   const trace = traceWriter(path.join(o.runs, runId, "trace.jsonl"));
   const ws = req.scope ? new Workspace(req.scope) : undefined;
+  // one task_done per run, and it is the last running event: what the runtime or an action still out at the driver says
+  // after it (a stop's deadline wrote it) is in the trace only. The words of a steer that came too late are still said
+  let done = false;
+  const send = (k: string, b: Record<string, unknown>) => { trace(k, b); const e = toProtocol(k, b); if (e && (!done || k === "steer.refused")) log.emit(e); };
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
   // process did without a receipt and tells the model (D10)
-  const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: (k, b) => { trace(k, b); const e = toProtocol(k, b); if (e) log.emit(e); } });
+  const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: send });
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: o.inject?.model ?? loopModel(table.goal.model),
@@ -226,7 +230,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     // a real desktop takes more looks than the check set's folders: a pixel-mode app needs an observation per step
     // and the old engine used ~20 actions on the music sample; the evaluation keeps the default budget
     budget: req.driver === "hands" ? { tool_calls: 90, turns: 60 } : {},
-    onEvent: (k, b) => { trace(k, b); const e = toProtocol(k, b); if (e) log.emit(e); },
+    onEvent: send,
   });
   // one stop for the run, whoever asks (a stop line, a signal): one refused event, the first asker's reason
   let stopReason = "";
@@ -238,7 +242,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // (after the task is over — a verdict passed, a stop, the result card's linger — the executor refuses them: a refused event)
   o.input.onSteer = (text) => { trace("control.steer", { text }); if (text.trim()) rt.steer(text); };
   // one task_done per run: a signal's deadline may write it before the runtime returns
-  let done = false, signals = 0, ended = () => {};
+  let signals = 0, ended = () => {};
   const whenDone = new Promise<void>((res) => { ended = res; });
   const taskDone = (body: EventBody) => { if (done) return; done = true; log.emit(body); ended(); };
   // the run did not end by itself in time: an action still out at the driver may land after this, so the stop is not
