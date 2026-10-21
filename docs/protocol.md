@@ -5,6 +5,7 @@
 用到的词：
 - **执行层：** `src/executor`。管运行目录、事件记录、同意凭证的密钥、判官、技能和 hands，负责归属、后果、同意、核对、停止和撤回。
 - **运行时：** `src/runtime`。理解要求、计划、调工具的那一层（agent 循环）。拆分之后它是执行层启动的子进程。
+- **执行层端口（ExecutorPort）：** `src/protocol/port.ts`。运行时能找执行层做的事情的全部清单，也就是 P2 时 MCP 工具集在 TypeScript 里的样子。P1（现在）运行时和执行层还在同一个进程里，运行时只拿到这个端口，别的都拿不到（`src/host/frontier.ts` 是唯一同时认识两边的地方）。
 - **app：** DeskMind Hands.app 里的 Swift 小助手，它启动 harness，读事件，写回答。
 
 版本号都在 `src/protocol/version.ts`：`{tools: 1, events: 1, control: 1}`。
@@ -17,6 +18,23 @@ MCP（JSON-RPC 2.0，stdio，每行一条）。服务名 `deskmind-executor`，�
 - `tools/list` 列出九个工具：begin、snapshot、observe、plan、classify、act、verify、stop、end。名字和输入格式（inputSchema）固定在 `test/fixtures/mcp-tools.golden.json`，测试 `test/protocol.test.ts` 逐字比对；要改工具集，先想清楚是加还是改（见第四节），再用 `UPDATE_GOLDEN=1 npx vitest run test/protocol.test.ts` 重写这个文件，和改动一起提交。
 - `stop` 一到就处理，不排在前面的请求后面。
 
+**P1 起的执行层端口**（`ExecutorPort`，进程内调用；P2 把运行时挪进子进程后，按同样的名字和参数作为 MCP 工具提供，属于「加工具」，不升版本）：
+
+| 方法 | 做什么 | 执行层在里面管的事 |
+|---|---|---|
+| `begin` | 开始任务，返回整台电脑、任务目录、可能适用的教程、文件工具清单 | 锁屏、读不到电脑时直接结束（environment） |
+| `snapshot` / `observe` | 只读地看 | |
+| `act` | 做一个界面动作 | 定后果类别、意图核对；要同意时自己出卡、等用户回答、签名、再做（act-and-wait）；签名的钥匙只在执行层这边 |
+| `file` | 做一个文件动作 | 同上，外加需要模型改写的内容（transform）在这里生成 |
+| `plan` | 交计划 | 开始闸门（依据不够的理解出歧义卡）和计划卡；同意后按对象、按网站签凭证 |
+| `askUser` / `answer` | 问用户、给答案 | 用户的回答记成「用户的话」，之后每个判官都看得到，不管运行时转述没有 |
+| `readSkill` | 读一份教程 | 读过的教程判官也看 |
+| `finish` | 说任务结束了 | done 只是声明：独立核对通过才算 succeeded |
+| `steers` | 取用户中途说的话（两步之间） | 见第三节 steer |
+| `end` | 收尾，拿结果 | 结果卡、撤回 |
+
+运行时不再持有签名的一方，也传不进同意凭证：`act` 没有这个参数。
+
 同意凭证和挑战的格式（`Challenge`、`ConsentToken`、后果类别和它们的顺序、`canon` / `digestOf`、网址算作哪个站点的 `siteOf`、签同意的一方 `ConsentProvider`）属于这个接口，放在 `src/protocol/consent.ts`；`src/executor/types.ts` 和 `consent.ts` 原样转出，旧的 import 不用改。
 
 ## 二、事件（events，第 1 版）：执行层 → app
@@ -25,6 +43,7 @@ MCP（JSON-RPC 2.0，stdio，每行一条）。服务名 `deskmind-executor`，�
 
 - `start` 带 `protocol: {"events": 1}`。旧版本的运行记录里没有这个字段，读的时候当作第 1 版。
 - 种类：start、preparing、plan、step、ask、waiting、resumed、consent、refused、answer_given、task_done、result_response。app 不认识的种类直接忽略。
+- `resumed` 可以带 `voided: "steer"`（P1 加的可选字段）：这张卡没等到回答就作废了，因为用户中途改了要求。app 收到就把卡关掉；之后再发来这张卡的回答，会被记成一条 `refused`，不算数。
 - 每次运行只有一个 `task_done`，而且是最后一个运行中的事件（之后只可能有对结果卡的 `result_response`）。
 
 ## 三、控制（control，第 1 版）：app → 执行层
@@ -36,7 +55,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `answer` | `{"type":"answer","ask_id":"ask_…","option":n}` 或 `…,"text":"…"}` | 回答一张卡（`ask` 事件）；`ask_id` 不是当前这张卡的，记一条 `refused`，不算回答 |
 | `stop` | `{"type":"stop"}` | 随时：立刻停下，等着回答的卡按「没回答」处理，任务以 stopped 结束 |
 | `respond` | `{"type":"respond","option":n}` | 运行结束后、`--linger` 秒内，回答结果卡（比如撤回） |
-| `steer` | `{"type":"steer","text":"…"}` | 运行中用户改了要求。第 1 版能读，但还不交给运行时，只记进 trace（"steer not supported yet"）。接上之前，改过的要求要先能让判官看到，还开着的卡片要作废（docs/0.5-decisions.md） |
+| `steer` | `{"type":"steer","text":"…"}` | 运行中用户改了要求（P1 起交给执行层）。正在做的那一步照旧做完，新要求在两步之间才生效；运行时在新要求生效前已经决定的下一步不做，回给它的是新要求。判官看得到原来的要求和之后每一次改动。开着的卡片立即作废（`resumed` 带 `voided`），那一步按新要求重新决定，要的话再问一次。新要求要碰的对象或网站超出用户已经同意的计划时，先交新计划、出新的计划卡，不逐步出动作卡 |
 
 第 1 版仍然认识加 `type` 之前的写法，Swift 小助手可以以后再改：`{"stop":true}` 是 stop，`{"respond":n}` 是 respond，其他没有 `type` 的对象（`{ask_id, option}`、`{ask_id, text}`、`{text}`）是 answer。带着不认识的 `type` 的行直接忽略。
 
