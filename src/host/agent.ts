@@ -40,6 +40,9 @@ export type JsonStep = Exclude<Step, (...a: never[]) => unknown>;
 export interface AgentSpec {
   /** The user's request, as the model first hears it. */
   raw: string;
+  /** The chat model's restatement of the request (a computer task the session started: docs/protocol.md 「会话」),
+   *  shown to the loop under its own label — never as the user's words; the executor and its judges never read it. */
+  context?: string;
   /** The loop's model: `<provider>|<model>` (keys from the environment), or a script (tests, the selftest). */
   model: string | { scripted: JsonStep[] };
   budget?: Partial<typeof RUNTIME_BUDGET>;
@@ -88,19 +91,22 @@ export function jsonl(file: string | undefined): (kind: string, body: Record<str
 export function loopFromSpec(spec: AgentSpec, port: ExecutorPort, model?: LoopOptions["model"], onEvent?: (kind: string, body: Record<string, unknown>) => void): AgentLoop {
   const log = jsonl(spec.log), models = jsonl(spec.modelLog);
   return new AgentLoop({
-    port, raw: spec.raw, model: model ?? modelFromSpec(spec.model), budget: spec.budget ?? {},
+    port, raw: spec.raw, ...(typeof spec.context === "string" && spec.context.trim() ? { context: spec.context } : {}), model: model ?? modelFromSpec(spec.model), budget: spec.budget ?? {},
     onEvent: (k, b) => { log(k, b); if (k === "model.call") models(k, b); onEvent?.(k, b); },
   });
 }
 
 /** How to start `harness.mjs runtime` from here: the bundle runs itself; from the sources, app.ts under tsx. */
-export function agentCommand(): string[] {
+export function agentCommand(): string[] { return selfCommand(["runtime"]); }
+
+/** How to run this harness with `args` (`runtime`; the session's `executor`): the bundle (harness.mjs) runs itself; the
+ *  tsc build (dist/src/host/agent.js) its app.js beside; the sources app.ts under tsx. */
+export function selfCommand(args: string[]): string[] {
   const self = fileURLToPath(import.meta.url);
-  // the tsc build (dist/src/host/agent.js): its app.js beside; the bundle (harness.mjs): itself
-  if (path.basename(self) === "agent.js") return [process.execPath, path.resolve(path.dirname(self), "..", "cli", "app.js"), "runtime"];
-  if (!self.endsWith(".ts")) return [process.execPath, self, "runtime"];
+  if (path.basename(self) === "agent.js") return [process.execPath, path.resolve(path.dirname(self), "..", "cli", "app.js"), ...args];
+  if (!self.endsWith(".ts")) return [process.execPath, self, ...args];
   const tsx = pathToFileURL(createRequire(import.meta.url).resolve("tsx")).href;
-  return [process.execPath, "--import", tsx, path.resolve(path.dirname(self), "..", "cli", "app.ts"), "runtime"];
+  return [process.execPath, "--import", tsx, path.resolve(path.dirname(self), "..", "cli", "app.ts"), ...args];
 }
 
 /** The runtime child; whoever holds it serves the port on `peer` (cli/mcp.ts serve) and hands it `spec` in the

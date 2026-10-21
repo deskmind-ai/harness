@@ -38,6 +38,9 @@ export interface LoopOptions {
   port: ExecutorPort;
   /** The user's request, as the model first hears it. */
   raw: string;
+  /** The chat model's restatement (a task the session started): shown after the request under its own label, never
+   *  as the user's words. The executor and its judges do not read it. */
+  context?: string;
   model: { model: Model<any>; apiKey?: string; streamFn: StreamFn };
   budget?: Partial<typeof RUNTIME_BUDGET>;
   onEvent?: (kind: string, body: Record<string, unknown>) => void;
@@ -170,7 +173,7 @@ export class AgentLoop {
     const context: AgentContext = {
       messages: [
         { role: "system", content: this.systemPrompt(b), timestamp: Date.now() },
-        { role: "user", content: `用户的要求：${this.o.raw}\n\n现在整台电脑的状态：${J(b.snapshot)}${recovery}`, timestamp: Date.now() },
+        { role: "user", content: `用户的要求：${this.o.raw}${this.o.context ? `\n\n助手的转述，不是用户原话（以用户的要求为准）：${this.o.context}` : ""}\n\n现在整台电脑的状态：${J(b.snapshot)}${recovery}`, timestamp: Date.now() },
       ],
       tools: this.traced(this.tools(b)),
     };

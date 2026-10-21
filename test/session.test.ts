@@ -87,7 +87,7 @@ describe("session: one reply", () => {
     expect(kinds(evs, "session.message").at(-1).stopped).toBeUndefined();
   });
 
-  it("a say while a reply is coming is refused (busy), not stored; too long is refused; H2 controls answer not_yet", async () => {
+  it("a say while a reply is coming is refused (busy), not stored; too long is refused; task controls with no task are no_task", async () => {
     const { h, evs } = host([{ text: "慢慢说", chunks: ["慢", "慢说"], delayMs: 30 }]);
     h.handle(JSON.stringify({ type: "say", text: "一" }));
     h.handle(JSON.stringify({ type: "say", text: "二" }));
@@ -97,7 +97,8 @@ describe("session: one reply", () => {
     h.handle("not json");
     await h.idle();
     const errs = kinds(evs, "session.error");
-    expect(errs.map((e) => [e.code, e.control])).toEqual([["busy", "say"], ["too_long", "say"], ["not_yet", "cua"], ["not_yet", "steer"], ["not_yet", "answer"], ["not_yet", "respond"], ["not_yet", "queue_add"]]);
+    // H2: a /cua while a reply is coming is busy; steer / answer / respond name no task; an unknown queue_* is ignored
+    expect(errs.map((e) => [e.code, e.control])).toEqual([["busy", "say"], ["too_long", "say"], ["busy", "cua"], ["no_task", "steer"], ["no_task", "answer"], ["no_task", "respond"]]);
     expect(errs.every((e) => e.seq === undefined)).toBe(true);
     expect(kinds(evs, "session.message").map((m) => m.text)).toEqual(["一", "慢慢说"]);
     expect(parseSessionControl(JSON.stringify({ type: "attach", after_seq: -3 }))).toEqual({ type: "attach", after_seq: 0 });

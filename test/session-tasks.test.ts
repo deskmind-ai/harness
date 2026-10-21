@@ -1,0 +1,382 @@
+/**
+ * Computer tasks in a chat session (H2, docs/protocol.md 「会话（第 1 版）」): the session model's computer_task tool
+ * and /cua, the executor's events and controls through the session, typing while a task runs (queue, steer, the open
+ * card), undo and its expiry when another task starts on this Mac, the machine lock, the app going away mid-task,
+ * resume, and retry. No network: a scripted session model, the executor in process (cli/app.ts appRun) on the
+ * simulated computer with a scripted runtime and scripted judges.
+ */
+import { afterEach, describe, expect, it } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { PassThrough } from "node:stream";
+import type { Message } from "@earendil-works/pi-ai";
+import { SessionHost } from "../src/session/host.js";
+import { SessionLog } from "../src/session/log.js";
+import { reasoningBack } from "../src/session/loop.js";
+import { computerLockFile, type ExecutorHandle, type Launcher } from "../src/session/task.js";
+import { appRun, LineReader } from "../src/cli/app.js";
+import { SimComputer } from "../src/executor/sim.js";
+import { OUTGOING_QUESTION } from "../src/executor/judge.js";
+import { Gateway } from "../src/gateway/index.js";
+import { scriptedStream, type Step } from "../src/runtime/scripted.js";
+
+const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "dm-h2-"));
+const MODEL = { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 128_000, maxTokens: 8_000 } as never;
+const roles = ["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"];
+const gateway = () => {
+  const gw = new Gateway(Object.fromEntries(roles.map((r) => [r, { backend: "scripted", model: "scripted" }])) as never);
+  gw.script = Array(80).fill((role: string, _s: string, u: string) => (role === "verify" ? { choice: "pass", reason: "做完了" } : u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: "stays" } : { choice: "matches" }));
+  return gw;
+};
+const lastJson = (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role === "toolResult"); try { return JSON.parse(m.content[0].text.split("\n")[0]); } catch { return {}; } };
+const textOf = (m: any) => (typeof m.content === "string" ? m.content : m.content.map((c: any) => c.text ?? (c.type === "toolCall" ? `[call ${c.name} ${JSON.stringify(c.arguments)}]` : "")).join(""));
+const waitFor = async (cond: () => unknown, ms = 10_000) => { const t0 = Date.now(); while (!cond()) { if (Date.now() - t0 > ms) throw new Error("timed out waiting"); await new Promise((r) => setTimeout(r, 5)); } };
+
+/** Executors in process: each task takes the next runtime script; the runtime's model sees are kept per task. */
+function inproc(scripts: Step[][], sim: (scope?: string) => SimComputer = (s) => new SimComputer(s)) {
+  const requests: any[] = [], seen: Message[][][] = [], handles: ExecutorHandle[] = [];
+  let i = 0;
+  const launch: Launcher = (req, o) => {
+    requests.push(req);
+    const steps = scripts[i++] ?? [];
+    const rt: Message[][] = []; seen.push(rt);
+    const input = new PassThrough();
+    let ended = false, cb: ((l: string) => void) | null = null;
+    const early: string[] = [];
+    const out = (e: unknown) => { const l = JSON.stringify(e); if (cb) cb(l); else early.push(l); };
+    const exited = appRun(req as never, { runs: o.runs, out, input: new LineReader(input), linger: o.linger,
+      inject: { driver: sim(req.scope as string | undefined), gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(steps, rt) } } }).then(() => ({ code: 0, signal: null }));
+    const h: ExecutorHandle = { write: (l) => { if (!ended) input.write(l + "\n"); }, close: () => { if (!ended) { ended = true; input.end(); } }, onLine: (f) => { cb = f; for (const l of early.splice(0)) f(l); }, exited };
+    handles.push(h);
+    return h;
+  };
+  return { launch, requests, seen, handles };
+}
+
+const hosts: SessionHost[] = [];
+afterEach(async () => { for (const h of hosts.splice(0)) h.end(); await new Promise((r) => setTimeout(r, 50)); });
+
+function session(o: { model: Step[]; tasks?: Step[][]; dir?: string; sid?: string; scope?: string; launch?: Launcher; watchMs?: number; exitWaitMs?: number; sim?: (scope?: string) => SimComputer }) {
+  const evs: any[] = [], seen: Message[][] = [];
+  const dir = o.dir ?? tmp();
+  const ex = inproc(o.tasks ?? [], o.sim);
+  let onEvent: ((e: any) => void) | null = null;
+  let exitedFlag = false;
+  const h = new SessionHost({ dir, sessionId: o.sid ?? "ses_t", out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(o.model, seen) },
+    launch: o.launch ?? ex.launch, watchMs: o.watchMs ?? 20, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: () => { exitedFlag = true; } });
+  hosts.push(h);
+  h.start();
+  const send = (c: Record<string, unknown>) => h.handle(JSON.stringify(c));
+  const kinds = (k: string) => evs.filter((e) => e.kind === k);
+  const stored = () => new SessionLog(dir, o.sid ?? "ses_t").events;
+  return { h, evs, seen, dir, ex, send, kinds, stored, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exitedFlag };
+}
+
+const CREATE = (name = "a.txt", text = "hi"): Step[] => [
+  { calls: [{ name: "fs_create_text", args: { parent: ".", name, text } }] },
+  { calls: [{ name: "finish", args: { outcome: "done", summary: `写了 ${name}` } }] },
+];
+/** A task that waits for the user: the plan card for changing a simulated editor's text, then the change. */
+const EDIT = (w: string): Step[] => [
+  { calls: [{ name: "computer_snapshot", args: {} }] },
+  { calls: [{ name: "computer_observe", args: { window: w } }] },
+  { calls: [{ name: "plan", args: { steps: [{ purpose: "把正文改成「新的」", objects: [`window:${w}`], consequence: "modify_user" }] } }] },
+  { calls: [{ name: "computer_observe", args: { window: w } }] },
+  (m) => ({ calls: [{ name: "computer_act", args: { action: { kind: "set_value", window: w, target: `${w}:0:textarea`, value: "新的" }, epoch: lastJson(m).epoch, consequence: "modify_user", purpose: "改正文", plan_step: 1 } }] }),
+  { calls: [{ name: "finish", args: { outcome: "done", summary: "正文改成了「新的」" } }] },
+];
+/** A simulated computer with one editor (the sim names it editor-1). */
+const editorSim = () => { let id = ""; const make = (scope?: string) => { const s = new SimComputer(scope); id = s.addEditor("编辑器", { title: "笔记.txt", text: "旧的 秘密正文XYZ", path: null }).id; return s; }; return { make, id: () => id }; };
+const CALL = (goal: string): Step => ({ calls: [{ name: "computer_task", args: { goal } }] });
+
+describe("session tasks: the request and what the model sees", () => {
+  it("start.raw is the user's own words since the last task, verbatim; the goal goes to context only", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [{ text: "好，你说" }, CALL("在任务目录里新建 a.txt，内容 hi"), { text: "建好了" }], tasks: [CREATE()] });
+    s.send({ type: "say", text: "我有个事" });
+    await s.h.idle();
+    s.send({ type: "say", text: "帮我  新建 a.txt ，写 hi" });
+    await s.h.idle();
+    const start = s.evs.find((e) => e.kind === "start");
+    expect(start.raw).toBe("我有个事\n\n帮我  新建 a.txt ，写 hi");
+    expect(start.session_id).toBe("ses_t");
+    expect(start.run_id).toMatch(/^run_/);
+    expect(s.ex.requests[0]).toMatchObject({ raw: start.raw, context: "在任务目录里新建 a.txt，内容 hi", scope });
+    // the runtime's first message: the user's words, then the restatement under its own label
+    const first = textOf(s.ex.seen[0]![0]![1]);
+    expect(first).toContain("用户的要求：我有个事\n\n帮我  新建 a.txt ，写 hi");
+    expect(first).toContain("助手的转述，不是用户原话（以用户的要求为准）：在任务目录里新建 a.txt，内容 hi");
+    // the judges read raw only: the trace's begin and the executor's start carry no goal
+    expect(JSON.stringify(s.evs.filter((e) => e.run_id && !e.kind.startsWith("session.") && e.kind !== "start"))).not.toContain("内容 hi");
+    expect(s.stored().find((e: any) => e.kind === "session.task")).toMatchObject({ raw: start.raw, goal: "在任务目录里新建 a.txt，内容 hi", by: "model", run_id: start.run_id });
+    expect(fs.readFileSync(path.join(scope, "a.txt"), "utf-8")).toBe("hi");
+    // stored in order: the user's words, the model's, the task, its end, the words after it
+    expect(s.stored().map((e: any) => e.kind === "session.message" ? `${e.role}:${e.text}` : e.kind)).toEqual(["user:我有个事", "assistant:好，你说", "user:帮我  新建 a.txt ，写 hi", "session.task", "session.task_end", "assistant:建好了"]);
+    // a later task carries only the words since this one
+    expect(s.h.log.userWordsSinceTask()).toBe("");
+  });
+
+  it("the model's context never holds observations, screenshots or the trace: only the task's result fields", async () => {
+    const scope = tmp();
+    const ed = editorSim();
+    const s = session({ scope, sim: ed.make, model: [CALL("看一下笔记"), { text: "看过了" }, { text: "嗯" }],
+      tasks: [[{ calls: [{ name: "computer_snapshot", args: {} }] }, (m) => ({ calls: [{ name: "computer_observe", args: { window: JSON.parse(textOf(m.at(-1))).windows?.[0]?.id ?? "" } }] }), ...CREATE()]] });
+    s.send({ type: "say", text: "看看我的笔记，再建个 a.txt" });
+    await s.h.idle();
+    // the runtime did see the window's text
+    expect(JSON.stringify(s.ex.seen[0])).toContain("秘密正文XYZ");
+    s.send({ type: "say", text: "好" });
+    await s.h.idle();
+    for (const ctx of [s.seen[1]!, s.seen[2]!]) {
+      const all = JSON.stringify(ctx);
+      for (const bad of ["秘密正文XYZ", "epoch", "elements", "shots/", ".png", "observe", "snapshot"]) expect(all, bad).not.toContain(bad);
+      const result = ctx.find((m: any) => m.role === "toolResult") as any;
+      expect(Object.keys(JSON.parse(result.content[0].text)).every((k) => ["status", "reason", "summary", "answer", "changes", "undo", "steers"].includes(k))).toBe(true);
+      expect(JSON.parse(result.content[0].text)).toMatchObject({ status: "succeeded", undo: "open", changes: { created: ["a.txt"] } });
+    }
+    expect(fs.readFileSync(path.join(s.dir, "sessions", "ses_t", "session.jsonl"), "utf-8")).not.toContain("秘密正文XYZ");
+    // the system prompt: computer_task, and done only when succeeded
+    expect(textOf(s.seen[0]![0])).toContain("只有 status 是 succeeded 时才能说做成了");
+  });
+});
+
+describe("session tasks: controls into the task", () => {
+  it("an answer by option index reaches the executor: the card is answered, the task goes on", async () => {
+    const ed = editorSim();
+    const s2 = session({ sim: ed.make, model: [CALL("把笔记正文改成「新的」"), { text: "改好了" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+    s2.on((e) => { if (e.kind === "ask") setTimeout(() => s2.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: e.card.options.findIndex((x: any) => x.kind === "approve") }), 5); });
+    s2.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await s2.h.idle();
+    expect(ed.id()).toBe("editor-1");
+    const ask = s2.kinds("ask")[0];
+    expect(ask.card.kind).toBe("plan");
+    expect(s2.evs.find((e) => e.kind === "resumed" && e.ask_id === ask.ask_id)).toBeTruthy();
+    expect(s2.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+  });
+
+  it("say and steer are refused while the task's card is open (card_open); the queue and the steers stay as they were", async () => {
+    const ed = editorSim();
+    const s = session({ sim: ed.make, model: [CALL("改笔记"), { text: "好" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+    let asked: any = null;
+    s.on((e) => { if (e.kind === "ask") asked = e; });
+    s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await waitFor(() => asked);
+    s.send({ type: "say", text: "顺便说一句" });
+    s.send({ type: "steer", text: "改成「更新的」" });
+    expect(s.kinds("session.error").map((e) => [e.code, e.control])).toEqual([["card_open", "say"], ["card_open", "steer"]]);
+    expect(s.kinds("session.queue")).toHaveLength(0);
+    expect(s.stored().some((e: any) => e.kind === "session.steer")).toBe(false);
+    s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: asked.card.options.findIndex((x: any) => x.kind === "approve") });
+    await s.h.idle();
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+  });
+
+  it("a steer is forwarded, acknowledged (steered) and kept: in the history and in what the model is told", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [CALL("新建 a.txt"), { text: "好了" }], tasks: [[{ text: "想想", delayMs: 300 }, ...CREATE()]] });
+    s.send({ type: "say", text: "新建 a.txt 写 hi" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "steer", text: "内容就写 hi 吧" });
+    await s.h.idle();
+    expect(s.evs.find((e) => e.kind === "steered")).toMatchObject({ text: "内容就写 hi 吧", session_id: "ses_t" });
+    expect(s.stored().find((e: any) => e.kind === "session.steer")).toMatchObject({ text: "内容就写 hi 吧" });
+    expect((s.stored().find((e: any) => e.kind === "session.task_end") as any).steers).toEqual(["内容就写 hi 吧"]);
+    expect(JSON.parse((s.seen[1]!.find((m: any) => m.role === "toolResult") as any).content[0].text).steers).toEqual(["内容就写 hi 吧"]);
+  });
+
+  it("typing while a task runs is queued, then sent to the model in order after task_done; after a stop it is held", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [CALL("新建 a.txt"), { text: "建好了" }, { text: "收到一和二" }], tasks: [[{ text: "想想", delayMs: 300 }, ...CREATE()]] });
+    s.send({ type: "say", text: "新建 a.txt 写 hi" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "say", text: "一" });
+    s.send({ type: "say", text: "二" });
+    expect(s.kinds("session.queue").at(-1).items.map((q: any) => q.text)).toEqual(["一", "二"]);
+    await s.h.idle();
+    const msgs = s.stored().filter((e: any) => e.kind === "session.message").map((e: any) => `${e.role}:${e.text}${e.via ? `(${e.via})` : ""}`);
+    expect(msgs).toEqual(["user:新建 a.txt 写 hi", "assistant:建好了", "user:一(queue)", "user:二(queue)", "assistant:收到一和二"]);
+    expect(s.kinds("session.queue").at(-1).items).toEqual([]);
+    expect(textOf(s.seen[2]!.at(-1))).toBe("一\n\n二");
+
+    // a stop: the queued words wait for the user
+    const t = session({ scope: tmp(), model: [CALL("新建 b.txt"), { text: "停下了" }, { text: "好的三" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE("b.txt")]] });
+    t.send({ type: "say", text: "新建 b.txt" });
+    await waitFor(() => t.kinds("start").length);
+    t.send({ type: "say", text: "三" });
+    t.send({ type: "stop" });
+    await t.h.idle();
+    expect(t.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "stopped" });
+    const q = t.kinds("session.queue").at(-1).items;
+    expect(q).toEqual([{ id: expect.any(String), text: "三", held: true, note: "任务已停，要发吗？" }]);
+    expect(t.stored().some((e: any) => e.kind === "session.message" && e.text === "三")).toBe(false);
+    // the user says send: it goes as a message now
+    t.send({ type: "queue_send_now", id: q[0].id });
+    await t.h.idle();
+    expect(t.stored().filter((e: any) => e.kind === "session.message").map((e: any) => e.text)).toEqual(["新建 b.txt", "停下了", "三", "好的三"]);
+  });
+});
+
+describe("session tasks: undo, the machine lock, the app going away", () => {
+  it("undo: respond with the undo option → undone == total; the executor then closes (linger)", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [CALL("新建 a.txt"), { text: "好了" }], tasks: [CREATE()] });
+    s.send({ type: "say", text: "新建 a.txt 写 hi" });
+    await s.h.idle();
+    const done = s.evs.find((e) => e.kind === "task_done");
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(true);
+    s.send({ type: "respond", run_id: done.run_id, option: done.result_card.options.findIndex((x: any) => x.kind === "undo") });
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+    const undo = s.stored().find((e: any) => e.kind === "session.task_undo");
+    expect(undo).toMatchObject({ run_id: done.run_id, undone: 1, total: 1, refused: null });
+    expect(s.evs.find((e) => e.kind === "result_response")).toMatchObject({ undone: 1, total: 1, session_id: "ses_t" });
+    expect(s.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ run_id: done.run_id, why: "linger" });
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    // what the model reads of it afterwards
+    expect(s.h.log.messages().find((m) => m.role === "result")!.text).toContain("\"undo\":\"undone 1/1\"");
+    // a reconnecting app gets the run's events after the last seq it saw, from the run's file
+    const n = s.evs.length;
+    s.send({ type: "attach", run_id: done.run_id, after_seq: done.seq });
+    expect(s.evs.slice(n).map((e) => [e.kind, e.session_id])).toEqual([["result_response", "ses_t"]]);
+    s.send({ type: "attach", run_id: "run_nope", after_seq: 0 });
+    expect(s.evs.at(-1)).toMatchObject({ kind: "session.error", code: "no_task", control: "attach" });
+  });
+
+  it("a new task on this Mac closes another session's lingering executor (task_closed new_task); its undo is gone", async () => {
+    const dir = tmp(), scope = tmp();
+    const a = session({ dir, sid: "ses_a", scope, model: [CALL("新建 a.txt"), { text: "好了" }], tasks: [CREATE("a.txt")] });
+    a.send({ type: "say", text: "新建 a.txt" });
+    await a.h.idle();
+    const runA = a.evs.find((e) => e.kind === "task_done").run_id;
+    const b = session({ dir, sid: "ses_b", scope, model: [{ text: "b 好了" }], tasks: [CREATE("b.txt")] });
+    b.send({ type: "cua", text: "新建 b.txt" });
+    await waitFor(() => a.stored().some((e: any) => e.kind === "session.task_closed"));
+    expect(a.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ run_id: runA, why: "new_task" });
+    await b.h.idle();
+    a.send({ type: "respond", run_id: runA, option: 0 });
+    expect(a.kinds("session.error").at(-1)).toMatchObject({ code: "no_task", control: "respond" });
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(true);
+    // the model of session A is told the undo expired
+    expect(a.h.log.messages().find((m) => m.role === "result")!.text).toContain("\"undo\":\"expired\"");
+    // and A's executor has exited
+    await a.ex.handles[0]!.exited;
+  });
+
+  it("a second session cannot take the computer while a task runs: /cua is computer_busy, the model is told", async () => {
+    const dir = tmp();
+    const ed = editorSim();
+    const a = session({ dir, sid: "ses_a", sim: ed.make, model: [CALL("改笔记"), { text: "好" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+    let asked: any = null;
+    a.on((e) => { if (e.kind === "ask") asked = e; });
+    a.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await waitFor(() => asked);
+    const b = session({ dir, sid: "ses_b", model: [CALL("新建 b.txt"), { text: "电脑在忙" }], tasks: [CREATE("b.txt")] });
+    b.send({ type: "cua", text: "新建 b.txt" });
+    expect(b.kinds("session.error").at(-1)).toMatchObject({ code: "computer_busy", control: "cua" });
+    expect(b.stored()).toEqual([]);                  // nothing stored for a /cua that could not start
+    b.send({ type: "say", text: "新建 b.txt" });
+    await b.h.idle();
+    expect(textOf(b.seen[1]!.find((m: any) => m.role === "toolResult"))).toBe("电脑正被另一个会话使用，等它做完再试。");
+    expect(b.ex.requests).toHaveLength(0);
+    expect(b.stored().some((e: any) => e.kind === "session.task")).toBe(false);
+    a.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: asked.card.options.findIndex((x: any) => x.kind === "approve") });
+    await a.h.idle();
+    expect(fs.existsSync(computerLockFile(dir))).toBe(false);
+  });
+
+  it("stdin EOF mid-task: the task is stopped, its end recorded as stopped, then the process exits", async () => {
+    const ed = editorSim();
+    const s = session({ sim: ed.make, model: [CALL("改笔记"), { text: "不该说这句" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+    s.on((e) => { if (e.kind === "ask") setTimeout(() => s.h.inputClosed(), 5); });
+    s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await waitFor(() => s.exited());
+    expect(s.evs.find((e) => e.kind === "ask_void")).toMatchObject({ why: "stop" });
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "stopped" });
+    expect(s.stored().some((e: any) => e.kind === "session.task_closed")).toBe(true);
+    // no model turn after the app went away
+    expect(s.seen).toHaveLength(1);
+
+    // an executor that never answers the stop: recorded as stopped after the wait all the same
+    const silent: Launcher = () => ({ write: () => {}, close: () => {}, onLine: () => {}, exited: new Promise(() => {}) });
+    const q = session({ model: [CALL("做点事")], launch: silent, exitWaitMs: 100 });
+    q.send({ type: "say", text: "做点事" });
+    await waitFor(() => q.stored().some((e: any) => e.kind === "session.task"));
+    q.h.inputClosed();
+    await waitFor(() => q.exited(), 5000);
+    expect(q.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "stopped", reason: expect.stringContaining("did not confirm") });
+  });
+
+  it("resume: a task with no end gets one from its run's task_done, or `interrupted`; the model then reads both", async () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_r");
+    log.emit({ kind: "session.message", msg_id: "u1", role: "user", text: "新建 a.txt" });
+    log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_done", raw: "新建 a.txt", by: "slash", reply_to: "u1" });
+    log.emit({ kind: "session.message", msg_id: "u2", role: "user", text: "再建个 b" });
+    log.emit({ kind: "session.task", msg_id: "t2", run_id: "run_cut", raw: "再建个 b", goal: "新建 b.txt", by: "model", reply_to: "u2" });
+    const runs = path.join(dir, "sessions", "ses_r", "runs");
+    fs.mkdirSync(path.join(runs, "run_done"), { recursive: true });
+    fs.writeFileSync(path.join(runs, "run_done", "events.jsonl"), [
+      { seq: 1, t: 1, run_id: "run_done", kind: "start", raw: "新建 a.txt" },
+      { seq: 2, t: 2, run_id: "run_done", kind: "steered", text: "写 hi" },
+      { seq: 3, t: 3, run_id: "run_done", kind: "task_done", status: "succeeded", reason: "verified", summary: "写了 a.txt", result_card: { kind: "result", options: [{ kind: "undo" }] }, changes: { created: ["a.txt"], modified: [], deleted: [], external: [] } },
+    ].map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const s = session({ dir, sid: "ses_r", model: [{ text: "接着聊" }] });
+    const ends = s.stored().filter((e: any) => e.kind === "session.task_end");
+    expect(ends).toEqual([
+      expect.objectContaining({ run_id: "run_done", status: "succeeded", summary: "写了 a.txt", undo: "none", steers: ["写 hi"], changes: { created: ["a.txt"], modified: [], deleted: [], external: [] } }),
+      expect.objectContaining({ run_id: "run_cut", status: "interrupted", undo: "none" }),
+    ]);
+    expect(s.stored().filter((e: any) => e.kind === "session.task_closed").map((e: any) => [e.run_id, e.why])).toEqual([["run_done", "session_end"], ["run_cut", "session_end"]]);
+    s.send({ type: "say", text: "怎么样了" });
+    await s.h.idle();
+    const ctx = s.seen[0]!.slice(1).map((m: any) => [m.role, textOf(m)]);
+    expect(ctx.map((c) => c[0])).toEqual(["user", "assistant", "toolResult", "user", "assistant", "toolResult", "user"]);
+    expect(ctx[2]![1]).toContain("\"status\":\"succeeded\"");
+    expect(ctx[5]![1]).toContain("\"status\":\"interrupted\"");
+    expect(ctx[4]![1]).toContain("新建 b.txt");
+    // a second start finds nothing more to do
+    const again = session({ dir, sid: "ses_r2", model: [] });
+    void again;
+    expect(new SessionLog(dir, "ses_r").events.filter((e: any) => e.kind === "session.task_end")).toHaveLength(2);
+  });
+});
+
+describe("session tasks: /cua and retry", () => {
+  it("/cua bypasses the model: raw is the text, no context; the model then speaks once with the call and result in its context", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [{ text: "建好了 a.txt" }], tasks: [CREATE()] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi" });
+    await s.h.idle();
+    expect(s.ex.requests[0].raw).toBe("新建 a.txt 写 hi");
+    expect(s.ex.requests[0]).not.toHaveProperty("context");
+    expect(s.stored().map((e: any) => e.kind === "session.message" ? `${e.role}:${e.text}${e.via ? `(${e.via})` : ""}` : e.kind === "session.task" ? `task:${e.by}` : e.kind))
+      .toEqual(["user:新建 a.txt 写 hi(cua)", "task:slash", "session.task_end", "assistant:建好了 a.txt"]);
+    // the model was not asked before the task: its one call came after, with the pair in its context
+    expect(s.seen).toHaveLength(1);
+    expect(s.seen[0]!.slice(1).map((m: any) => m.role)).toEqual(["user", "assistant", "toolResult"]);
+    expect((s.seen[0]![2] as any).content[0]).toMatchObject({ type: "toolCall", name: "computer_task", arguments: { goal: "新建 a.txt 写 hi" } });
+    expect(fs.readFileSync(path.join(scope, "a.txt"), "utf-8")).toBe("hi");
+  });
+
+  it("DeepSeek: an assistant tool call sent back without reasoning_content gets an empty one; other messages are left alone", () => {
+    const p = { messages: [{ role: "system", content: "s" }, { role: "assistant", content: "x" }, { role: "assistant", tool_calls: [{ id: "a" }] }, { role: "assistant", tool_calls: [{ id: "b" }], reasoning_content: "mine" }] };
+    expect(reasoningBack(p)).toEqual({ messages: [{ role: "system", content: "s" }, { role: "assistant", content: "x" }, { role: "assistant", tool_calls: [{ id: "a" }], reasoning_content: "" }, { role: "assistant", tool_calls: [{ id: "b" }], reasoning_content: "mine" }] });
+    expect(reasoningBack("nope")).toBeUndefined();
+  });
+
+  it("retry answers the last user message again without storing it twice; the old reply leaves the context", async () => {
+    const s = session({ model: [{ error: "500 boom" }, { text: "好的" }, { text: "换个说法" }] });
+    s.send({ type: "say", text: "hi" });
+    await s.h.idle();
+    expect(s.kinds("session.error")[0]).toMatchObject({ code: "network" });
+    s.send({ type: "retry" });
+    await s.h.idle();
+    s.send({ type: "retry" });
+    await s.h.idle();
+    const msgs = s.stored().filter((e: any) => e.kind === "session.message").map((e: any) => `${e.role}:${e.text}`);
+    expect(msgs).toEqual(["user:hi", "assistant:好的", "assistant:换个说法"]);
+    for (const i of [1, 2]) expect(s.seen[i]!.slice(1).map((m: any) => [m.role, textOf(m)])).toEqual([["user", "hi"]]);
+    expect(s.h.log.messages().map((m) => m.text)).toEqual(["hi", "换个说法"]);
+  });
+});

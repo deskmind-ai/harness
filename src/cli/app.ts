@@ -52,7 +52,10 @@ import { Workspace } from "../registry/workspace.js";
 /** task_done's reason when a stop could not wait for an action the driver had not answered. */
 export const STEP_UNKNOWN = "a step was in progress; its result is unknown";
 
-export interface Request { run_id?: string; raw: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string; rules?: ConsentToken[] }
+/** `context` (additive; the session's computer tasks): the chat model's restatement of what the user wants. Only the
+ *  runtime's first message shows it, labelled 「助手的转述，不是用户原话」; the executor's judges read `raw`, the steers
+ *  and the card answers as the user's words, never this. */
+export interface Request { run_id?: string; raw: string; context?: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string; rules?: ConsentToken[] }
 
 /** JSON lines in: control lines (protocol/control.ts: answer, stop, respond, steer; v1 also reads the untyped
  *  `{ask_id, option|text}` and `{"stop":true}`); the first line may be the request itself. A stop or a steer is
@@ -260,7 +263,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), shots: path.join(o.runs, runId, "shots"), onEvent: send });
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
-    task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw,
+    task: runId, raw: req.raw, ...(typeof req.context === "string" && req.context.trim() ? { context: req.context } : {}), executor, signer, user: new StdioUser(log, o.input), gateway: gw,
     // the agent loop: its own process (P2), its own files beside the run's; a model handed in (tests) runs in this one
     ...(o.inject?.model ? { model: o.inject.model } : {}),
     agent: { model: o.inject?.agent ?? table.goal.model, log: path.join(o.runs, runId, "runtime.jsonl"), stderr: path.join(o.runs, runId, "runtime.log") },

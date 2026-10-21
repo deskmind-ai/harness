@@ -1,29 +1,36 @@
 /**
  * One reply of the session model (docs/protocol.md 「会话（第 1 版）」): pi-agent-core's runAgentLoop over the built
- * context, with no tools (H1: the session talks; computer tasks come in H2), streaming the text as it comes.
+ * context, streaming the text as it comes. Its one tool (H2) is computer_task: a turn that calls it waits for the task
+ * (the tool's execute is the host's), then the model speaks again with the result.
  *
  * How it ends: done (the model finished), stopped (the caller's signal: the user's stop, the session's end),
  * truncated (the reply reached MAX_ASSISTANT_CHARS, or the model its output limit), or error — the service's failure
  * mapped to a code the app shows (key_invalid, quota, network, bad_config) by the HTTP status pi-ai reports.
  */
-import { runAgentLoop, type AgentContext, type AgentEvent, type AgentLoopConfig, type StreamFn } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
+import { runAgentLoop, type AgentContext, type AgentEvent, type AgentLoopConfig, type AgentTool, type StreamFn } from "@earendil-works/pi-agent-core";
+import { toToolDeclaration, type AssistantMessage, type Message, type Model, type Tool } from "@earendil-works/pi-ai";
 import { costOf, priceEstimated, redactKeys } from "../gateway/index.js";
 import type { BuiltContext } from "./context.js";
 import type { ErrorCode } from "./log.js";
 
 export interface SessionModel { model: Model<any>; apiKey?: string; streamFn: StreamFn }
 
+/** One model call of a reply (a reply that starts a computer task takes two or more: one per turn). tokens_in is
+ *  everything the model read (the prompt cache's part included, also in cache_read), cost in USD (the price table when
+ *  the service says none), when it was sent and how long it took, and how many characters went with it. */
+export interface CallRecord { started_at: number; latency_ms: number; tokens_in: number; tokens_out: number; cache_read: number; cost_usd: number; cost_estimated?: boolean; sent_chars: number; stop: string; error?: string }
+
 export interface ReplyResult {
+  /** The last turn's text (a turn that called a tool handed its text to `onTurnEnd`). */
   text: string;
   ended: "done" | "stopped" | "truncated" | "error";
   error?: { code: ErrorCode; text: string };
   /** `<provider>|<model>` of the model that answered. */
   model: string;
-  /** The call, as a model_call record wants it: tokens_in is everything the model read (the prompt cache's part
-   *  included, also in cache_read), cost in USD (the price table when the service says none), when it was sent and how
-   *  long it took, and how many characters went with it. */
-  call: { started_at: number; latency_ms: number; tokens_in: number; tokens_out: number; cache_read: number; cost_usd: number; cost_estimated?: boolean; sent_chars: number; stop: string };
+  /** The last model call. */
+  call: CallRecord;
+  /** Every model call of the reply, in order. */
+  calls: CallRecord[];
 }
 
 /** A service's error message as pi-ai formats it ("401 …", "429: {…}") → the code the app shows. */
@@ -40,30 +47,71 @@ export const scrub = (e: string) => redactKeys(e).replace(/\s+/g, " ").trim().sl
 
 const textOf = (m: AssistantMessage) => m.content.map((c) => (c.type === "text" ? c.text : "")).join("");
 
-export async function reply(o: { model: SessionModel; context: BuiltContext; signal: AbortSignal; maxChars: number; onDelta: (text: string) => void }): Promise<ReplyResult> {
+/** The context as pi-ai messages: a task the model started is its tool call (computer_task) and the result. The tools
+ *  are declared on the leading system message (pi-ai's transcript), so none is added mid-conversation. */
+export function toMessages(context: BuiltContext, model: Model<any>, tools: Tool[] = []): Message[] {
+  const now = Date.now();
+  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  return [
+    { role: "system", content: context.system, ...(tools.length ? { toolsAdded: tools.map(toToolDeclaration) } : {}), timestamp: now } as unknown as Message,
+    ...context.messages.map((m): Message => {
+      if (m.role === "user") return { role: "user", content: m.text, timestamp: now };
+      if (m.role === "tool") return { role: "toolResult", toolCallId: m.call_id, toolName: COMPUTER_TASK, content: [{ type: "text", text: m.text }], isError: false, timestamp: now } as Message;
+      const content: AssistantMessage["content"] = [...(m.text ? [{ type: "text" as const, text: m.text }] : []), ...(m.calls ?? []).map((c) => ({ type: "toolCall" as const, id: c.id, name: COMPUTER_TASK, arguments: { goal: c.goal } }))];
+      return { role: "assistant", api: model.api, provider: model.provider, model: model.id, content, stopReason: m.calls?.length ? "toolUse" : "stop", timestamp: now, usage };
+    }),
+  ];
+}
+
+/** DeepSeek in thinking mode refuses an assistant tool call sent back without its `reasoning_content` (HTTP 400). A
+ *  call the session rebuilt from its history, or the call a /cua stands for, has none: it goes with an empty one, which
+ *  the service accepts (a call made in this reply keeps its own). Only for DeepSeek: other services never see the field. */
+export function reasoningBack(payload: unknown): unknown {
+  const p = payload as { messages?: Record<string, unknown>[] } | null;
+  if (!p || !Array.isArray(p.messages)) return undefined;
+  for (const m of p.messages) if (m && m.role === "assistant" && Array.isArray(m.tool_calls) && m.reasoning_content === undefined) m.reasoning_content = "";
+  return p;
+}
+const needsReasoningBack = (m: Model<any>) => m.provider === "deepseek" || /deepseek\.com/.test(m.baseUrl ?? "");
+
+/** The session model's one tool. */
+export const COMPUTER_TASK = "computer_task";
+
+/** `tools`: the tools the model may call (H2: computer_task); a turn that calls one is followed by another turn once the
+ *  tool returns. `onTurnStart(n)`: a model turn begins (n from 0); `onTurnEnd(text, calls)`: a turn's message is done —
+ *  its final text and how many tool calls it made (before they run). The reply's text is the last turn's. `oneTurn`: one
+ *  model turn only (its tool calls still run, so the context stays well formed). */
+export async function reply(o: { model: SessionModel; context: BuiltContext; signal: AbortSignal; maxChars: number; onDelta: (text: string) => void;
+  tools?: AgentTool<any>[]; onTurnStart?: (n: number) => void; onTurnEnd?: (text: string, calls: number) => void; oneTurn?: boolean; endNow?: () => boolean }): Promise<ReplyResult> {
   const { model } = o.model;
   const spec = `${model.provider}|${model.id}`;
-  const now = Date.now();
-  const messages: Message[] = [
-    { role: "system", content: o.context.system, timestamp: now } as unknown as Message,
-    ...o.context.messages.map((m): Message => m.role === "user"
-      ? { role: "user", content: m.text, timestamp: now }
-      : { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "text", text: m.text }], stopReason: "stop", timestamp: now,
-          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } }),
-  ];
-  const context: AgentContext = { messages, tools: [] };
+  const messages = toMessages(o.context, model, o.tools ?? []);
+  const context: AgentContext = { messages, tools: o.tools ?? [] };
   // the caller's stop, or our own cut at maxChars
   const inner = new AbortController();
   const onAbort = () => inner.abort();
   if (o.signal.aborted) inner.abort(); else o.signal.addEventListener("abort", onAbort, { once: true });
-  let text = "", truncated = false, final: AssistantMessage | null = null;
+  let text = "", truncated = false, final: AssistantMessage | null = null, turn = 0;
+  const calls: CallRecord[] = [];
+  let startedAt = Date.now(), sentChars = JSON.stringify(messages).length;
+  const call = (f: AssistantMessage | null): CallRecord => {
+    const u = f?.usage, cacheRead = u?.cacheRead ?? 0, tokensIn = (u?.input ?? 0) + cacheRead, tokensOut = u?.output ?? 0;
+    const cost = Number((u?.cost?.total || costOf(spec, tokensIn, tokensOut, cacheRead)).toFixed(9));
+    return { started_at: startedAt, latency_ms: Date.now() - startedAt, tokens_in: tokensIn, tokens_out: tokensOut, cache_read: cacheRead, cost_usd: cost,
+      ...(!u?.cost?.total && priceEstimated(spec, cacheRead) ? { cost_estimated: true } : {}), sent_chars: sentChars, stop: f?.stopReason ?? "none", ...(f?.errorMessage ? { error: scrub(f.errorMessage) } : {}) };
+  };
   const config: AgentLoopConfig = {
-    model, ...(o.model.apiKey ? { apiKey: o.model.apiKey } : {}), convertToLlm: (m) => m as never,
+    model, ...(o.model.apiKey ? { apiKey: o.model.apiKey } : {}), convertToLlm: (m) => m as never, toolExecution: "sequential",
     // a chat reply should start soon: fewer and shorter retries than the task loop's
     maxRetries: 2, maxRetryDelayMs: 8_000, timeoutMs: 120_000,
-    finishTurn: async () => ({ action: "end" }),
+    transformContext: async (m) => { sentChars = JSON.stringify(m).length; return m; },
+    // a turn that only talked ends the reply; one that called a tool goes on once the tool returned
+    // (`oneTurn`: the model speaks once, whatever it calls)
+    // (`endNow`: the caller is going away — no turn after the tools)
+    finishTurn: async (t) => (!o.oneTurn && !o.endNow?.() && t.message.content.some((c) => c.type === "toolCall") && !truncated ? undefined : { action: "end" }),
   };
   const emit = async (e: AgentEvent) => {
+    if (e.type === "turn_start") { startedAt = Date.now(); text = ""; truncated = false; final = null; o.onTurnStart?.(turn++); }
     if (e.type === "message_update" && e.assistantMessageEvent.type === "text_delta") {
       if (truncated) return;
       let d = e.assistantMessageEvent.delta;
@@ -71,34 +119,38 @@ export async function reply(o: { model: SessionModel; context: BuiltContext; sig
       text += d;
       if (d) o.onDelta(d);
     }
-    if (e.type === "message_end" && e.message.role === "assistant") final = e.message as AssistantMessage;
-  };
-  const startedAt = Date.now();
-  const sentChars = JSON.stringify(messages).length;
-  const call = (f: AssistantMessage | null) => {
-    const u = f?.usage, cacheRead = u?.cacheRead ?? 0, tokensIn = (u?.input ?? 0) + cacheRead, tokensOut = u?.output ?? 0;
-    const cost = Number((u?.cost?.total || costOf(spec, tokensIn, tokensOut, cacheRead)).toFixed(9));
-    return { started_at: startedAt, latency_ms: Date.now() - startedAt, tokens_in: tokensIn, tokens_out: tokensOut, cache_read: cacheRead, cost_usd: cost,
-      ...(!u?.cost?.total && priceEstimated(spec, cacheRead) ? { cost_estimated: true } : {}), sent_chars: sentChars, stop: f?.stopReason ?? "none" };
+    if (e.type === "message_end" && e.message.role === "assistant") {
+      const f = e.message as AssistantMessage;
+      final = f;
+      calls.push(call(f));
+      const n = f.content.filter((c) => c.type === "toolCall").length;
+      if (n && f.stopReason === "toolUse") o.onTurnEnd?.(textOf(f) || text, n);
+    }
   };
   try {
-    await runAgentLoop([], context, config, emit, inner.signal, o.model.streamFn);
+    const streamFn: StreamFn = needsReasoningBack(model)
+      ? (m, c, opts) => o.model.streamFn(m, c, { ...opts, onPayload: async (pl: unknown, mm: Model<any>) => reasoningBack((await opts?.onPayload?.(pl, mm)) ?? pl) } as never)
+      : o.model.streamFn;
+    await runAgentLoop([], context, config, emit, inner.signal, streamFn);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { text, ended: "error", error: { code: classifyError(msg), text: scrub(msg) }, model: spec, call: call(null) };
+    const c = call(null);
+    return { text, ended: "error", error: { code: classifyError(msg), text: scrub(msg) }, model: spec, call: c, calls: [...calls, c] };
   } finally {
     o.signal.removeEventListener("abort", onAbort);
   }
   const f = final as AssistantMessage | null;
-  if (truncated) return { text, ended: "truncated", model: spec, call: call(f) };
+  const last = calls[calls.length - 1] ?? call(f);
+  if (!calls.length) calls.push(last);
+  if (truncated) return { text, ended: "truncated", model: spec, call: last, calls };
   // the model finished: a stop that came after that does not make it a stopped reply
   if (f && f.stopReason !== "error" && f.stopReason !== "aborted") {
     // a service that sent no deltas (or fewer than the whole): the final message is the reply
     const whole = textOf(f) || text;
     const cut = whole.length > o.maxChars ? whole.slice(0, o.maxChars) : whole;
-    return { text: cut, ended: f.stopReason === "length" || cut.length < whole.length ? "truncated" : "done", model: spec, call: call(f) };
+    return { text: cut, ended: f.stopReason === "length" || cut.length < whole.length ? "truncated" : "done", model: spec, call: last, calls };
   }
-  if (o.signal.aborted) return { text, ended: "stopped", model: spec, call: call(f) };
+  if (o.signal.aborted) return { text, ended: "stopped", model: spec, call: last, calls };
   const msg = f?.errorMessage ?? "no answer";
-  return { text, ended: "error", error: { code: classifyError(msg), text: scrub(msg) }, model: spec, call: call(f) };
+  return { text, ended: "error", error: { code: classifyError(msg), text: scrub(msg) }, model: spec, call: last, calls };
 }

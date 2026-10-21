@@ -1,15 +1,18 @@
 /**
  * The chat session's commands (docs/protocol.md 「会话（第 1 版）」):
  *
- *   session [--dir <d>] [--config <c>] [--lang zh|en]    stdin line 1: {session_id?, config?, lang?, driver?}; then
- *                                                        control lines (say, stop, attach, end). A known session_id
- *                                                        resumes it; none starts a new one
+ *   session [--dir <d>] [--config <c>] [--lang zh|en]    stdin line 1: {session_id?, config?, lang?, driver?, scope?};
+ *                                                        then control lines (say, stop, attach, end; H2: cua, steer,
+ *                                                        answer, respond, retry, queue_edit / queue_cancel /
+ *                                                        queue_send_now). A known session_id resumes it; none starts
+ *                                                        a new one. Computer tasks run as `executor` children
  *   session --session <id> [--dir <d>]                   resume <id> at once; a first line without `type` is still
  *                                                        read as the header (config, lang)
  *   sessions list [--dir <d>]                            every session, the newest first, as one JSON array
  *
  * `--dir`: the folder that holds `sessions/` (default ~/Library/Application Support/DeskMind). The process exits when
- * stdin closes or `end` comes and no reply is running; SIGINT / SIGTERM are an `end`.
+ * stdin closes or `end` comes and no reply or task is running (a running task is stopped first, its end waited for up
+ * to 12 s); SIGINT / SIGTERM are an `end`.
  */
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -78,7 +81,7 @@ export async function sessionMain(argv: string[]): Promise<number> {
   }
   let exit!: () => void;
   const exited = new Promise<void>((res) => { exit = res; });
-  const host = new SessionHost({ dir, sessionId: sid, config: header.config ?? a.config, lang: (header.lang ?? a.lang) as never, out, onExit: () => exit() });
+  const host = new SessionHost({ dir, sessionId: sid, config: header.config ?? a.config, lang: (header.lang ?? a.lang) as never, ...(header.driver ? { driver: header.driver } : {}), ...(header.scope ? { scope: header.scope } : {}), out, onExit: () => exit() });
   host.start();
   // resume with --session: the first line, whenever it comes, may still be a header (config, lang); after it, controls
   let first = !!a.session;
