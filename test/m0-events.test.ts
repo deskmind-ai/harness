@@ -338,3 +338,76 @@ describe("M0 slice D: spans left open", () => {
     expect(fs.readFileSync(file, "utf-8").trim().split("\n")).toHaveLength(2);
   });
 });
+
+/** The simulated computer with what hands M0 adds: a window frame and element rects on observe, and on a perform asked
+ *  for a picture, the picture written and the frames in the receipt. */
+class ShotSim extends SimComputer {
+  asked: (string | undefined)[] = [];
+  override observe(id: string) {
+    const ob = super.observe(id) as ReturnType<SimComputer["observe"]> & { window: any; elements: any[] };
+    return { ...ob, window: { ...ob.window, frame: [100, 50, 800, 600] }, elements: ob.elements.map((e: any, i: number) => ({ ...e, rect: [40, 40 + 30 * i, 200, 24] })) } as never;
+  }
+  override perform(a: any, opts?: { foreground_ok?: boolean; shot?: string }) {
+    const r = super.perform(a) as any;
+    this.asked.push(opts?.shot);
+    if (!opts?.shot) return r;
+    fs.mkdirSync(path.dirname(opts.shot), { recursive: true });
+    fs.writeFileSync(opts.shot, "png");
+    return { ...r, shot: opts.shot, window_frame: { x: 100, y: 50, w: 800, h: 600 }, target_frame: { x: 140, y: 120, w: 200, h: 24 } };
+  }
+}
+
+describe("M0 slice E: where the target is, and a picture after the step", () => {
+  it("the step says where its element is; the result names the picture in the run folder; looks and stale steps take none", async () => {
+    const sim = new ShotSim();
+    const w = sim.addEditor("编辑器", { title: "笔记.txt", text: "旧的", path: null }).id;
+    const steps: Step[] = [
+      { calls: [{ name: "computer_snapshot", args: {} }] },
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "改正文", objects: [`window:${w}`], consequence: "modify_user" }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      (m) => ({ calls: [{ name: "computer_act", args: { action: { kind: "set_value", window: w, target: `${w}:0:textarea`, value: "新的" }, epoch: lastJson(m).epoch, consequence: "modify_user", purpose: "改正文", plan_step: 1 } }] }),
+      (m) => ({ calls: [{ name: "computer_act", args: { action: { kind: "wait", ms: 1 }, epoch: lastJson(m).epoch ?? 1, consequence: "read", purpose: "等" } }] }),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "改了" } }] },
+    ];
+    const r = await run(sim, "把正文改成「新的」", steps);
+    const step = r.events.find((e) => e.kind === "step") as any;
+    const results = r.events.filter((e) => e.kind === "step_result") as any[];
+    // the textarea is the 5th element of the editor's observation (index 4 → y 160): placed in its window, and on screen
+    const el = (sim.observe(w) as any).elements.findIndex((e: any) => e.id === `${w}:0:textarea`);
+    expect(step.target.rect_norm).toEqual([0.05, Math.round(((40 + 30 * el) / 600) * 10_000) / 10_000, 0.25, 0.04]);
+    expect(step.target.frame).toEqual([140, 50 + 40 + 30 * el, 200, 24]);
+    expect(results[0]).toMatchObject({ status: "ok", shot: `shots/${step.step_id}.png`, window_frame: { x: 100, y: 50, w: 800, h: 600 }, target_frame: { x: 140, y: 120, w: 200, h: 24 } });
+    expect(fs.existsSync(path.join(r.dir, results[0].shot))).toBe(true);
+    // the wait changed nothing: no picture asked for
+    expect(sim.asked).toEqual([path.join(r.dir, "shots", `${step.step_id}.png`), undefined]);
+    expect(results[1].shot).toBeUndefined();
+    // the model never reads them
+    const shown = r.trace.filter((t: any) => t.kind === "tool.result" && t.name === "computer_act").map((t: any) => t.text).join("\n");
+    expect(shown).not.toContain("shots/");
+    expect(shown).not.toContain("target_frame");
+    const looked = r.trace.filter((t: any) => t.kind === "tool.result" && t.name === "computer_observe").map((t: any) => t.text).join("\n");
+    expect(looked).toContain('"elements"');
+    expect(looked).not.toContain('"frame"');
+  });
+});
+
+describe("M0 slice E: the hands driver", () => {
+  it("names the picture's file beside the action, and leaves the request as before without one", async () => {
+    const { HandsDriver } = await import("../src/executor/hands.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hands-shot-"));
+    const fake = path.join(dir, "fake.mjs"), seen = path.join(dir, "seen.jsonl");
+    fs.writeFileSync(fake, `import * as fs from "node:fs"; import * as rl from "node:readline";
+      rl.createInterface({ input: process.stdin }).on("line", (l) => { fs.appendFileSync(${JSON.stringify(seen)}, l + "\\n"); const m = JSON.parse(l);
+        const result = m.op === "perform" ? { status: "ok", ...(m.shot ? { shot: m.shot } : {}) } : { epoch: 1, locked: false, front_app: "", windows: [] };
+        process.stdout.write(JSON.stringify({ id: m.id, ok: true, result }) + "\\n"); });`);
+    const d = new HandsDriver({ cmd: `${process.execPath} ${fake}`, dir });
+    try {
+      expect(await d.perform({ kind: "wait", ms: 1 }, { shot: "/runs/r/shots/st_1.png" })).toMatchObject({ shot: "/runs/r/shots/st_1.png" });
+      await d.perform({ kind: "wait", ms: 1 }, { foreground_ok: true });
+      const lines = fs.readFileSync(seen, "utf-8").trim().split("\n").map((l) => JSON.parse(l)).filter((m) => m.op === "perform");
+      expect(lines[0]).toMatchObject({ action: { kind: "wait" }, shot: "/runs/r/shots/st_1.png" });
+      expect(lines[1]).not.toHaveProperty("shot");
+      expect(lines[1].action.foreground_ok).toBe(true);
+    } finally { await d.end(); }
+  });
+});

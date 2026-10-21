@@ -24,6 +24,8 @@ import type { Begun, ExecutorPort, FileTool, FinishOutcome, PlanStepIn, TaskResu
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Executor, appName, cardText, describeAction, elementName, stepText, windowLabel } from "./executor.js";
 import { current, within } from "../otel/context.js";
 import { span } from "../otel/trace.js";
@@ -77,6 +79,18 @@ export function checkAction(a: Action): string | null {
     case "file": return need("capability") ?? need("args");
     default: return `unknown action kind ${(a as { kind?: unknown }).kind}`;
   }
+}
+
+const withoutFrame = <W extends { frame?: unknown }>(w: W): Omit<W, "frame"> => { const { frame: _f, ...rest } = w; return rest; };
+
+/** Where an element is, for the app's cursor over a picture of its window: `rect_norm` — the element's rect (local to
+ *  the window, from the observation) as fractions of the window's size, 0–1 — and `frame`, the same on screen in
+ *  points. Nothing when the driver gave no rect or no window frame. */
+export function placeOf(rect: [number, number, number, number] | undefined, frame: [number, number, number, number] | undefined): { rect_norm?: [number, number, number, number]; frame?: [number, number, number, number] } {
+  if (!rect || !frame || !(frame[2] > 0) || !(frame[3] > 0)) return {};
+  const c = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 10_000) / 10_000;
+  const [x, y, w, h] = rect, [fx, fy, fw, fh] = frame;
+  return { rect_norm: [c(x / fw), c(y / fh), c(w / fw), c(h / fh)], frame: [fx + x, fy + y, w, h] };
 }
 
 /** A card's outcome: the option picked (or the user's own words), nothing (no answer: stopped, the app went away), or
@@ -145,7 +159,8 @@ export class ExecutorService {
     const live = <A extends unknown[]>(f: (...a: A) => Promise<ToolReply>) => (...a: A): Promise<ToolReply> => (this.settled() ?? f(...a));
     const port: ExecutorPort = {
       begin: () => (this.begun ? Promise.reject(new Error("begin was already called for this task")) : this.begin()),
-      snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
+      // where a window is on screen is the app's (its cursor), not the caller's
+      snapshot: () => this.o.executor.snapshot(), observe: async (w) => { const o = await this.o.executor.observe(w); return { ...o, window: withoutFrame(o.window) }; },
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
       act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.step(p.action, p, () => this.act(p)))),
       file: live((p) => this.step({ kind: "file", capability: p.capability, args: p.args }, { purpose: this.o.registry?.get(p.capability)?.description.split("；")[0] ?? p.capability }, () => this.file(p))),
@@ -399,7 +414,7 @@ export class ExecutorService {
     const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
-      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role } } : {}),
+      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, "window" in a ? this.o.executor.frameOf(a.window) : undefined) } } : {}),
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
     return span("deskmind.step", { "deskmind.step_id": step_id, "deskmind.action.kind": a.kind, "deskmind.consequence.declared": consequence, "deskmind.plan_step": p.plan_step }, async (sp) => {
       let reply: ToolReply;
@@ -410,11 +425,26 @@ export class ExecutorService {
       this.results.delete(step_id); this.answered.delete(step_id);
       const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
       const why = user ?? r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
-      this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}) });
+      this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}),
+        ...(r?.shot ? { shot: r.shot, ...(r.shot_pending ? { shot_pending: true } : {}) } : {}), ...(r?.target_frame ? { target_frame: r.target_frame } : {}), ...(r?.window_frame ? { window_frame: r.window_frame } : {}) });
+      if (r?.shot && r.shot_pending) this.whenShot(step_id, r.shot);
       sp?.set({ "deskmind.step.status": status, "deskmind.executor_status": r?.status, "deskmind.consequence": r?.consequence, "deskmind.object": r?.object });
       if (status === "error") sp?.fail(why || "error");
       return reply;
     });
+  }
+
+  /** A step's picture that the driver writes after its reply (hands takes it off the action's path): `shot.ready` once
+   *  the file is there, looked for every 100 ms for up to 20 s; a capture that failed writes nothing and says nothing. */
+  private whenShot(step_id: string, rel: string) {
+    const dir = this.o.executor.opts.shots;
+    if (!dir) return;
+    const abs = path.join(path.dirname(dir), rel), until = Date.now() + 20_000;
+    const look = () => {
+      if (fs.existsSync(abs)) { this.emit("shot.ready", { step_id, shot: rel }); return; }
+      if (Date.now() < until) setTimeout(look, 100).unref();
+    };
+    look();
   }
 
   // --- acting ----------------------------------------------------------------------------------------------------------
@@ -526,9 +556,10 @@ export class ExecutorService {
 不确定用户想怎么做的，用 ask_user 问清楚（给出几种做法当选项），不要换一种猜法再试。`); }
     if (r.status === "environment") return this.endWith("environment", r.why ?? "environment");
     if (r.status === "stopped") return this.endWith("stopped", r.why ?? "stopped");
-    const { after, challenge: _c, ...rest } = r;
+    // the step's picture and where things were on screen are the app's, not the caller's
+    const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, shot_pending: _p, ...rest } = r;
     if (a.kind === "file") return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence: r.consequence })) : err(J({ status: r.status, why: r.why, consequence: r.consequence }));
-    const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: after.window, modal: after.modal, elements: after.elements, text: after.text } } : {}) };
+    const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: withoutFrame(after.window), modal: after.modal, elements: after.elements, text: after.text } } : {}) };
     // the step check: a state change with nothing visibly changed is said so, in the result the caller reads
     const noChange = r.status === "ok" && rank(r.consequence) >= rank("create") && r.changed && r.changed.elements === 0 && !r.changed.new_windows?.length;
     // a stale result did nothing: the screen moved under the action, which is not the caller going round in circles

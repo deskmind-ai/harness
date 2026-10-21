@@ -72,8 +72,10 @@ export class McpExecutorServer {
           this.o.log?.(JSON.stringify({ k: "auto_consent", text: r.challenge.text }));
           r = await ex.act({ ...req, epoch: r.epoch, consent: r.challenge.site ? this.signer.forSite(r.challenge.object, [r.challenge.site], ex.opts.task, r.challenge.consequence) : this.signer.forAction(r.challenge) });
         }
-        const { after, ...rest } = r;
-        return { ...rest, ...(after ? { after: { epoch: after.epoch, window: after.window, modal: after.modal, elements: after.elements, text: after.text } } : {}) } as unknown as Json;
+        // the caller is a model: what only the app uses (a step's picture, screen frames, a card's fields) is not its to read
+        const { after, shot: _s, target_frame: _t, window_frame: _w, ...rest } = r;
+        const challenge = rest.challenge ? (({ facts: _f, ...c }) => c)(rest.challenge) : undefined;
+        return { ...rest, ...(challenge ? { challenge } : {}), ...(after ? { after: { epoch: after.epoch, window: (({ frame: _f, ...w }) => w)(after.window), modal: after.modal, elements: after.elements, text: after.text } } : {}) } as unknown as Json;
       }
       case "verify": return (await ex.verdict(String(args.summary ?? ""))) as unknown as Json;
       case "stop": ex.stop(); return { stopped: true };
