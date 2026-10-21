@@ -19,6 +19,7 @@ import type { Gateway } from "../gateway/index.js";
 import type { Answer, Card, CardAsker } from "../protocol/cards.js";
 import type { ConsentProvider, ConsentToken } from "../protocol/consent.js";
 import type { ExecutorPort, TaskResult, TaskStatus } from "../protocol/port.js";
+import type { StopCause } from "../protocol/computer.js";
 import type { Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import type { Executor } from "../executor/executor.js";
@@ -86,7 +87,7 @@ export class FrontierRuntime {
     this.port = tracedPort(this.service.port, (k, b) => o.onEvent?.(k, b), (p) => { this.ended = p; this.onEnded(); });
     if (!o.agent && !o.model) throw new Error("FrontierRuntime needs a model (in process) or an agent spec");
     if (o.mode === "inproc" || (o.mode !== "process" && (o.model || inProcess()))) this.loop = loopFromSpec(this.spec(), this.port, o.model);
-    o.signal?.addEventListener("abort", () => this.stop("the app stopped the task"));
+    o.signal?.addEventListener("abort", () => this.stop("the app stopped the task", "user_stopped"));
   }
 
   private spec(): AgentSpec {
@@ -111,9 +112,10 @@ export class FrontierRuntime {
    *  first turn hears the words, as the loop in process does (its first poll) — review of P2. */
   private steeredEarly = false;
 
-  /** The app's stop: the executor refuses every later action and lets go of an open card; the loop stops. */
-  stop(why = "stopped") {
-    this.service.stop(why);
+  /** The app's stop: the executor refuses every later action and lets go of an open card; the loop stops. `cause`: the
+   *  stop's structured cause when the caller knows it (task_done.cause). */
+  stop(why = "stopped", cause?: StopCause) {
+    this.service.stop(why, "stopped", cause);
     if (this.stopped) return;
     this.stopped = why;
     this.loop?.stop(); this.agent?.stop(why);

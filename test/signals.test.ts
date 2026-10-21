@@ -128,7 +128,7 @@ describe("a signal while an action is out at the driver", () => {
     expect(e!.at - t0).toBeGreaterThanOrEqual(380);                 // the deadline, then the wait for a receipt
     const done = r.events.filter((x) => x.kind === "task_done") as any[];
     expect(done).toHaveLength(1);
-    expect(done[0]).toMatchObject({ status: "stopped", reason: STEP_UNKNOWN });
+    expect(done[0]).toMatchObject({ status: "stopped", reason: STEP_UNKNOWN, cause: "last_step_unknown" });
     expect(done[0].changes.unconfirmed).toHaveLength(1);
     expect(r.events.filter((x) => x.kind === "refused" && (x as any).by === "user").map((x: any) => x.why)).toEqual(["stopped by SIGTERM"]);
   });
@@ -144,6 +144,7 @@ describe("a signal while an action is out at the driver", () => {
     expect(done[0].status).toBe("stopped");
     expect(done[0].reason).not.toBe(STEP_UNKNOWN);
     expect(done[0].reason).toContain("SIGINT");
+    expect(done[0].cause).toBe("user_stopped");                      // the receipt came: every step's result is known
     expect(done[0]).toHaveProperty("answer");                       // written by the runtime's own end, not the deadline
   });
 
@@ -159,7 +160,7 @@ describe("a signal while an action is out at the driver", () => {
     expect(r.exits.map((x) => x.how)).toEqual(["now"]);
     const done = r.events.filter((x) => x.kind === "task_done") as any[];
     expect(done).toHaveLength(1);
-    expect(done[0]).toMatchObject({ status: "stopped", reason: STEP_UNKNOWN });
+    expect(done[0]).toMatchObject({ status: "stopped", reason: STEP_UNKNOWN, cause: "last_step_unknown" });
     expect(r.events.filter((x) => x.kind === "refused" && (x as any).by === "user").map((x: any) => x.why)).toEqual(["stopped by the app"]);
   });
 });

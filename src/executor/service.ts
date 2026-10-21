@@ -32,6 +32,7 @@ import { span } from "../otel/trace.js";
 import { defaultJudge } from "./judge.js";
 import { T, type Lang } from "./text.js";
 import { NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "./types.js";
+import type { StopCause } from "../protocol/computer.js";
 
 /** The tutorials a task may read: candidates by structure (never the request's words), and one read in full. */
 export interface SkillSource { candidates(raw: string): { name: string; description: string }[]; read(name: string): string | null }
@@ -118,6 +119,8 @@ export class ExecutorService {
   private retryTokens = new Map<string, ConsentToken>();
   private status: TaskStatus | null = null;
   private reason = "";
+  /** Why the task stopped, in structure: set with status and reason by the branch that knows it, never parsed from them. */
+  private cause: StopCause | undefined;
   private summary = "";
   private answerText: string | null = null;
   /** What the user answered to the caller's questions: evidence for the verdict, like their words. */
@@ -186,8 +189,9 @@ export class ExecutorService {
   // --- control: the app's stop and steer -----------------------------------------------------------------------------
 
   /** The app's stop: the executor refuses every later action, an open card is left unanswered, the task ends stopped.
-   *  `as`: the status when the stop is not the user's (the runtime process died: "failed"). */
-  stop(why = "stopped", as: TaskStatus = "stopped") { this.o.executor.stop(); if (!this.status) { this.status = as; this.reason = why; } this.stopped.abort(); }
+   *  `as`: the status when the stop is not the user's (the runtime process died: "failed"); `cause`: the stop's cause when
+   *  the caller knows it (the app's stop: user_stopped). */
+  stop(why = "stopped", as: TaskStatus = "stopped", cause?: StopCause) { this.o.executor.stop(); if (!this.status) { this.status = as; this.reason = why; this.cause = cause; } this.stopped.abort(); }
 
   /** The user changed what they want mid-run (the protocol's steer). Nothing changes mid-step: the words wait until the
    *  step in progress is over (`applySteers`). A card open now is voided at once — its answer was for the old words —
@@ -246,9 +250,9 @@ export class ExecutorService {
     return Promise.race([p, new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
   }
 
-  private endWith(status: TaskStatus, reason: string): ToolReply {
+  private endWith(status: TaskStatus, reason: string, cause?: StopCause): ToolReply {
     // a stop is final: the card it cancelled comes back unanswered, and that is not a failure of its own
-    if (this.status !== "stopped") { this.status = status; this.reason = reason; }
+    if (this.status !== "stopped") { this.status = status; this.reason = reason; this.cause = cause; }
     return { text: `结束：${status}（${reason}）`, done: true };
   }
 
@@ -327,7 +331,7 @@ export class ExecutorService {
     // carry it out)
     if (ws?.listing().entries.some((e) => e.preview)) ex.noteTakenIn("the task folder's listing with previews", J(ws.listing()));
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
-    if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await this.endExecutor(); return { ...none, snapshot: snap }; }
+    if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; this.cause = "screen_locked"; await this.endExecutor(); return { ...none, snapshot: snap }; }
     // the restart found a step whose effect is unknown on a file changed since: the user settles it before anything else
     // (the executor refuses writes to that file until then, whoever the caller is). Unanswered because the request
     // changed meanwhile, it is asked again when a write reaches that file
@@ -529,7 +533,7 @@ export class ExecutorService {
       if (sid && (t === "voided" || t === null || t === "cancel" || t === "declined")) this.answered.set(sid, t === "voided" ? "the card was voided: the user changed the request" : t === null ? "no answer from the user" : t === "cancel" ? "the user stopped the task" : "the user declined this step");
       if (t === "voided") return this.steered() ?? err("这张卡作废了：这一步没有做。");
       if (t === null) return this.endWith("failed", "no answer from the user");
-      if (t === "cancel") return this.endWith("cancelled", "the user stopped the task");
+      if (t === "cancel") return this.endWith("cancelled", "the user stopped the task", "user_stopped");
       if (t === "declined") return this.declined(`用户不同意这一步：${r.challenge.text}。换一种不需要它的做法，或者 finish 说明。`);
       try { r = await this.exAct({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t }); }
       catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
@@ -558,7 +562,7 @@ export class ExecutorService {
     // the judge's "not what the user asked": the way out is the user's answer, never another guess
     if (r.status === "refused" && (r.why ?? "").includes("意图核对")) { this.count("refused_by_judge"); return err(`${r.why}
 不确定用户想怎么做的，用 ask_user 问清楚（给出几种做法当选项），不要换一种猜法再试。`); }
-    if (r.status === "environment") return this.endWith("environment", r.why ?? "environment");
+    if (r.status === "environment") return this.endWith("environment", r.why ?? "environment", r.cause);      // the executor's cause, copied as a field
     if (r.status === "stopped") return this.endWith("stopped", r.why ?? "stopped");
     // the step's picture and where things were on screen are the app's, not the caller's
     const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, shot_pending: _p, ...rest } = r;
@@ -599,7 +603,7 @@ export class ExecutorService {
       const got = await this.askCard(card);
       if (got === "voided") { this.count("asks", -1); return this.steered() ?? err("这张卡作废了：计划没有交上。"); }
       if (!got) return this.endWith("failed", "no answer from the user");
-      if (got.option?.kind === "cancel") return this.endWith("cancelled", "the user stopped the task");
+      if (got.option?.kind === "cancel") return this.endWith("cancelled", "the user stopped the task", "user_stopped");
       const chosen = got.option?.kind === "reading" ? got.text : got.option?.kind === "delegate" ? r.reading : null;
       this.emit("reading.settled", { point: r.point, reading: chosen ?? got.text, by: got.option?.kind ?? "words" });
       this.answers.push({ question: this.t.ambiguity(r.point), text: chosen ?? got.text });     // the judges read it like any answer
@@ -715,7 +719,7 @@ export class ExecutorService {
     const got = await this.askCard(card);
     if (got === "voided") return this.steered() ?? err("这张卡作废了：计划没有交上。");
     if (!got) return this.endWith("failed", "no answer from the user");
-    if (got.option?.kind === "cancel") return this.endWith("cancelled", "the user stopped the task");
+    if (got.option?.kind === "cancel") return this.endWith("cancelled", "the user stopped the task", "user_stopped");
     if (!got.option) return text(`用户没有同意，而是说：${got.text}。按这个改计划。`);
     // the user's objects the plan names, by the executor's view: covered up to modify_user (never a send). An object the
     // plan does not name is not covered: an action on it asks on its own card
@@ -779,7 +783,7 @@ export class ExecutorService {
     const got = await this.askCard(card);
     if (got === "voided") { this.count("asks", -1); return this.steered() ?? err("这张卡作废了：问题没有答。"); }
     if (!got) return this.endWith("failed", "no answer from the user");
-    if (got.option?.kind === "cancel") return this.endWith("cancelled", "the user stopped the task");
+    if (got.option?.kind === "cancel") return this.endWith("cancelled", "the user stopped the task", "user_stopped");
     this.emit("answer", { question: p.question, text: got.text });
     this.answers.push({ question: p.question, text: got.option?.kind === "delegate" ? "由你决定" : got.text });
     // only what the user wrote themselves is theirs to send; an option the caller offered is the caller's text
@@ -880,15 +884,15 @@ export class ExecutorService {
     this.emit("result.response", { picked: pick?.kind ?? null });
     if (pick?.kind !== "undo") return null;
     const u = await this.o.executor.undo();
-    if (!u.refused) { this.status = "cancelled"; this.reason = "the user undid the result"; this.effects.push(`撤回了 ${u.undone} 步`); }
+    if (!u.refused) { this.status = "cancelled"; this.reason = "the user undid the result"; this.cause = undefined; this.effects.push(`撤回了 ${u.undone} 步`); }
     else this.emit("note", { text: u.undone ? `撤回了 ${u.undone} 步后停下：${u.refused}` : `没有撤回：${u.refused}` });
     this.emit("result.undo", u);
     return u;
   }
 
   private result(): TaskResult {
-    const r: TaskResult = { status: this.status!, reason: this.reason, summary: this.summary, answer: this.answerText, counters: { ...this.counters }, consents: this.consents, effects: this.effects, verdicts: this.verdicts, result_card: this.resultCard() };
-    this.emit("run.end", { status: r.status, reason: r.reason });
+    const r: TaskResult = { status: this.status!, reason: this.reason, ...(this.cause ? { cause: this.cause } : {}), summary: this.summary, answer: this.answerText, counters: { ...this.counters }, consents: this.consents, effects: this.effects, verdicts: this.verdicts, result_card: this.resultCard() };
+    this.emit("run.end", { status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}) });
     return r;
   }
 }

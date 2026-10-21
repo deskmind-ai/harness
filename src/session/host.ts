@@ -24,6 +24,7 @@ import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loo
 import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, capChanges, sessionDir, taskView, type ErrorCode, type SessionBody, type SessionEvent } from "./log.js";
 import { EXIT_WAIT_MS, LINGER_S, alive, computerLastFile, computerOwner, cutRaw, lastTask, linkLock, setLastTask, spawnExecutor, takeComputer, type ComputerLock, type ExecutorHandle, type Launcher } from "./task.js";
 import type { ModelCallRecord } from "../otel/context.js";
+import { STOP_CAUSES, type StopCause } from "../protocol/computer.js";
 
 /** The first stdin line: which session, and the settings for this process. `driver` and `scope` (H2) go into every
  *  computer task's request: the executor's driver (sim | hands) and the task folder. */
@@ -129,6 +130,8 @@ interface Task {
   ended: Promise<TaskEnd>;
   resolve: (e: TaskEnd) => void;
   exitTimer: NodeJS.Timeout | null;
+  /** The executor could not be started at all: it took no step, so its end has no cause. */
+  notStarted?: true;
 }
 
 export interface QueueItem { id: string; text: string; held?: boolean; note?: string }
@@ -423,11 +426,11 @@ export class SessionHost {
     const request = { run_id: runId, raw: o.raw, ...(o.goal ? { context: o.goal } : {}), config: this.config, lang: this.lang, ...(this.o.driver ? { driver: this.o.driver } : {}), ...(scope ? { scope } : {}) };
     let resolve!: (e: TaskEnd) => void;
     const ended = new Promise<TaskEnd>((res) => { resolve = res; });
-    let handle: ExecutorHandle;
+    let handle: ExecutorHandle, notStarted = false;
     try { handle = (this.o.launch ?? spawnExecutor)(request, { runs: this.runs, runId, linger: this.linger }); }
-    catch (e) { handle = { write: () => {}, close: () => {}, onLine: () => {}, exited: Promise.resolve({ code: null, signal: `spawn: ${e instanceof Error ? e.message : String(e)}` }) }; }
+    catch (e) { notStarted = true; handle = { write: () => {}, close: () => {}, onLine: () => {}, exited: Promise.resolve({ code: null, signal: `spawn: ${e instanceof Error ? e.message : String(e)}` }) }; }
     lock.setExecutor(handle.pid);
-    const task: Task = { runId, handle, lock, undoLock: null, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null };
+    const task: Task = { runId, handle, lock, undoLock: null, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, ...(notStarted ? { notStarted: true as const } : {}) };
     this.current = task;
     this.tasks.set(runId, task);
     handle.onLine((l) => this.onExecutorLine(task, l));
@@ -481,7 +484,8 @@ export class SessionHost {
     task.lock?.release(); task.lock = null;
     task.undoLock?.release(); task.undoLock = null;
     if (!task.end) {
-      this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
+      // no task_done: whether a step it had out took effect is not known (unless it never started)
+      this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...(task.notStarted ? {} : { cause: "last_step_unknown" as const }), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
     }
     if (task.state !== "closed") { task.state = "closed"; this.log.emit({ kind: "session.task_closed", run_id: task.runId, why: "linger" }); }
     this.tasks.delete(task.runId);
@@ -645,7 +649,7 @@ export class SessionHost {
     // with it (its pid is in the lock) until it exits
     t.exitTimer = setTimeout(() => {
       t.exitTimer = null;
-      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", summary: "", undo: "none", ...(t.steers.length ? { steers: t.steers } : {}) });
+      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", cause: "last_step_unknown", summary: "", undo: "none", ...(t.steers.length ? { steers: t.steers } : {}) });
       this.maybeExit();
     }, this.o.exitWaitMs ?? EXIT_WAIT_MS);
   }
@@ -669,13 +673,15 @@ function readRunEvents(file: string): Record<string, unknown>[] {
   try { return fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } }); } catch { return []; }
 }
 
-const interrupted = (runId: string, steers: string[]): TaskEnd => ({ kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", summary: "", undo: "none", ...(steers.length ? { steers } : {}) });
+const interrupted = (runId: string, steers: string[]): TaskEnd => ({ kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", cause: "last_step_unknown", summary: "", undo: "none", ...(steers.length ? { steers } : {}) });
 
-/** session.task_end from the executor's task_done. */
+/** session.task_end from the executor's task_done: its cause is the field copied (one of the known values), never read
+ *  out of its reason. */
 function endFrom(runId: string, ev: Record<string, unknown>, undo: "open" | "none", steers: string[]): TaskEnd {
   const changes = capChanges(ev.changes as Record<string, unknown> | undefined);
+  const cause = (STOP_CAUSES as readonly unknown[]).includes(ev.cause) ? (ev.cause as StopCause) : undefined;
   return { kind: "session.task_end", run_id: runId, status: String(ev.status ?? "failed"), summary: typeof ev.summary === "string" ? ev.summary : "", undo,
-    ...(typeof ev.reason === "string" && ev.reason ? { reason: ev.reason.slice(0, 500) } : {}), ...(typeof ev.answer === "string" ? { answer: ev.answer } : {}),
+    ...(typeof ev.reason === "string" && ev.reason ? { reason: ev.reason.slice(0, 500) } : {}), ...(cause ? { cause } : {}), ...(typeof ev.answer === "string" ? { answer: ev.answer } : {}),
     ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}) };
 }
 

@@ -35,6 +35,7 @@ import type { SkillSource } from "../executor/service.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
+import type { StopCause } from "../protocol/computer.js";
 import { FrontierRuntime, type RuntimeOptions, type RuntimeUser } from "../host/frontier.js";
 import { scriptedStream } from "../runtime/scripted.js";
 import type { AgentSpec } from "../host/agent.js";
@@ -70,7 +71,7 @@ export class LineReader {
       // the app's stop can arrive at any moment, card or no card: it never waits in the answer queue
       // it also lets go of a card waiting for its answer: that card is answered with nothing (review of #16)
       const c = parseControl(l);
-      if (c?.type === "stop") { this.stop(); return; }
+      if (c?.type === "stop") { this.stop("stopped by the app", "user_stopped"); return; }
       if (c?.type === "steer") { if (this.steerTo) this.steerTo(c.text); else this.earlySteers.push(c.text); return; }
       // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
       // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
@@ -84,7 +85,7 @@ export class LineReader {
   closed = false;
   onClosed: (() => void) | null = null;
   stopped = false;
-  onStop: ((why: string) => void) | null = null;
+  onStop: ((why: string, cause?: StopCause) => void) | null = null;
   /** Steer lines go to this handler; one read before it is set (the request and a steer in the same stdin batch) waits
    *  and is handed over when it is set, never dropped. */
   get onSteer(): ((text: string) => void) | null { return this.steerTo; }
@@ -92,8 +93,10 @@ export class LineReader {
   private steerTo: ((text: string) => void) | null = null;
   private earlySteers: string[] = [];
   /** The app's stop (a stop line, or a signal): once, whoever asks first; every card waiting for its answer is
-   *  answered with nothing. */
-  stop(why = "stopped by the app") { if (this.stopped) return; this.stopped = true; this.onStop?.(why); for (const w of this.waiting.splice(0)) w(""); }
+   *  answered with nothing. `cause`: user_stopped for a stop line or a signal; none when the app went away (stdin or
+   *  stdout closed), which is a stop nobody asked for. */
+  stopCause: StopCause | undefined;
+  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); }
   /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
    *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
   next(signal?: AbortSignal): Promise<string> {
@@ -283,9 +286,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   });
   // one stop for the run, whoever asks (a stop line, a signal): one refused event, the first asker's reason
   let stopReason = "";
-  const stopRun = (why: string) => { if (stopReason) return; stopReason = why; log.emit({ kind: "refused", what: "the task", why, by: "user" }); rt.stop(why); };
+  let stopCause: StopCause | undefined;
+  const stopRun = (why: string, cause?: StopCause) => { if (stopReason) return; stopReason = why; stopCause = cause; log.emit({ kind: "refused", what: "the task", why, by: "user" }); rt.stop(why, cause); };
   o.input.onStop = stopRun;
-  if (o.input.stopped) stopRun("stopped by the app");     // a stop line read together with the request, before this
+  if (o.input.stopped) stopRun("stopped by the app", o.input.stopCause);     // a stop line read together with the request, before this
   // the app went away (stdin closed) while the task runs: a stop, the same path as a stop line (owner 10-21: the helper
   // exits → its running tasks stop) — the step in flight gets its receipt, task_done says stopped, the process exits.
   // After task_done (the result card's linger) it only ends the wait
@@ -306,14 +310,15 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     if (done) return;
     const f = executor.inFlight, c = executor.changes();
     closeTrace("stopped", f ? STEP_UNKNOWN : stopReason || "stopped");
-    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
+    const cause: StopCause | undefined = f ? "last_step_unknown" : stopCause;
+    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", ...(cause ? { cause } : {}), summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
   };
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
   o.signals?.onSignal((sig) => {
     const sg = o.signals!;
     if (done) return sg.exit();
     if (++signals > 1) { forceDone(); return sg.exitNow(); }
-    o.input.stop(`stopped by ${sig}`);
+    o.input.stop(`stopped by ${sig}`, "user_stopped");
     void (async () => {
       await sleep(sg.deadlineMs ?? 800);
       if (!done && executor.inFlight) {
@@ -327,7 +332,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
   if (!done) closeTrace(r.status, r.reason);
   const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
-  taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
+  taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
   if (signals) return o.signals!.exit();
   // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
   // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit. Any other line

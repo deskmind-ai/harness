@@ -11,7 +11,7 @@
  */
 import type { Card } from "./cards.js";
 import type { Consequence } from "./consent.js";
-import type { Action, Observation, Reading, Snapshot } from "./computer.js";
+import type { Action, Observation, Reading, Snapshot, StopCause } from "./computer.js";
 
 /** A plan step as the caller writes it; `opens`: the URLs it opens with open_window, in which app, and what the URL sends
  *  to the site in a few words (`sends`, e.g. 搜索「北京天气」; shown on the plan card). */
@@ -50,7 +50,8 @@ export interface Begun {
 export type TaskStatus = "succeeded" | "unconfirmed" | "failed" | "cancelled" | "environment" | "stopped";
 
 export interface TaskResult {
-  status: TaskStatus; reason: string; summary: string; answer: string | null;
+  /** `reason` is display text; `cause` (computer.ts StopCause) says in structure why the task stopped, when known. */
+  status: TaskStatus; reason: string; cause?: StopCause; summary: string; answer: string | null;
   counters: Record<string, number>; consents: { scope: string; object: string; consequence: Consequence }[];
   effects: string[];
   /** The finish verdicts, in order; claims_contradicted: the sentences of the run's account the judge found
