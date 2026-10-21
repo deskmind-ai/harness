@@ -23,7 +23,7 @@ const lastJson = (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role
 
 /** app-run in process on a simulated computer, with an app that approves every blocking card by its approve option's
  *  index (naming the card), and a gateway whose judges say "matches" / "stays" and whose verdict passes. */
-export async function run(sim: SimComputer, raw: string, steps: Step[], o: { lang?: "zh" | "en"; linger?: number; respond?: string; runId?: string; scope?: string } = {}) {
+export async function run(sim: SimComputer, raw: string, steps: Step[], o: { lang?: "zh" | "en"; linger?: number; respond?: string; runId?: string; scope?: string; afterDone?: string[]; endAfterDone?: boolean } = {}) {
   const gw = new Gateway(Object.fromEntries(roles.map((r) => [r, { backend: "scripted", model: "scripted" }])) as never);
   gw.script = Array(60).fill((role: string, _s: string, u: string) => (role === "verify" ? { choice: "pass", reason: "做完了" } : u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: /"目标名字命中发送词表":\s*true/.test(u) ? "sends" : "stays" } : { choice: "matches" }));
   const input = new PassThrough();
@@ -36,9 +36,14 @@ export async function run(sim: SimComputer, raw: string, steps: Step[], o: { lan
       const i = e.card.options.findIndex((x) => x.kind === "approve");
       setTimeout(() => input.write(JSON.stringify({ type: "answer", ask_id: e.ask_id, option: i }) + "\n"), 5);
     }
-    if (e.kind === "task_done" && e.result_card && o.respond) {
-      const i = e.result_card.options.findIndex((x) => x.kind === o.respond);
-      setTimeout(() => input.write(JSON.stringify({ type: "respond", option: i }) + "\n"), 5);
+    // during the linger: other lines first (afterDone), then the respond, or stdin closed (endAfterDone)
+    if (e.kind === "task_done" && e.result_card && (o.respond || o.afterDone || o.endAfterDone)) {
+      const i = o.respond ? e.result_card.options.findIndex((x) => x.kind === o.respond) : -1;
+      setTimeout(() => {
+        for (const l of o.afterDone ?? []) input.write(l + "\n");
+        if (o.respond) input.write(JSON.stringify({ type: "respond", option: i }) + "\n");
+        if (o.endAfterDone) input.end();
+      }, 5);
     }
   };
   await appRun({ run_id: runId, raw, config: "ds-flash", lang: o.lang ?? "zh", ...(o.scope ? { scope: o.scope } : {}) }, {
@@ -434,6 +439,33 @@ describe("M0 slice F: the remaining events the new app needs", () => {
     expect(done.result_card.options.map((x: any) => x.kind)).toContain("undo");
     expect(r.events.at(-1)).toMatchObject({ kind: "result_response", picked: "undo", undone: 1, total: 1, refused: null });
     expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
+  });
+
+  it("the linger reads past lines that are not a respond, and ends on stdin closed or the deadline", async () => {
+    const steps = (): Step[] => [
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "写了 a.txt" } }] },
+    ];
+    // a late answer to a card that is gone, a line that is not JSON, then the undo: the undo is still done
+    const scope = fs.mkdtempSync(path.join(os.tmpdir(), "linger-"));
+    const r = await run(new SimComputer(scope), "在任务目录里新建 a.txt，写 hi", steps(), { scope, linger: 5, respond: "undo",
+      afterDone: [JSON.stringify({ type: "answer", ask_id: "ask_gone", option: 0 }), "not json", JSON.stringify({ ask_id: "ask_gone", text: "好" })] });
+    expect(r.events.at(-1)).toMatchObject({ kind: "result_response", picked: "undo", undone: 1, total: 1 });
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
+    // the app closes stdin: the wait ends at once, nothing is undone
+    const scope2 = fs.mkdtempSync(path.join(os.tmpdir(), "linger-"));
+    let t0 = Date.now();
+    const r2 = await run(new SimComputer(scope2), "在任务目录里新建 a.txt，写 hi", steps(), { scope: scope2, linger: 30, afterDone: ["not json"], endAfterDone: true });
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(r2.events.at(-1)!.kind).toBe("task_done");
+    expect(fs.existsSync(path.join(scope2, "a.txt"))).toBe(true);
+    // no respond and stdin open: the deadline ends it
+    const scope3 = fs.mkdtempSync(path.join(os.tmpdir(), "linger-"));
+    t0 = Date.now();
+    const r3 = await run(new SimComputer(scope3), "在任务目录里新建 a.txt，写 hi", steps(), { scope: scope3, linger: 0.3, afterDone: ["not json"] });
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(r3.events.at(-1)!.kind).toBe("task_done");
+    expect(fs.existsSync(path.join(scope3, "a.txt"))).toBe(true);
   });
 
   it("a card let go says why: the user changed the request, stopped, or the app went away", async () => {
