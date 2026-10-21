@@ -6,9 +6,8 @@
  * It is taken the way a session's own lock is (a file of our own hard-linked to the name, a holder that is gone taken
  * over by renaming it aside first). It holds `{pid, session_id, run_id, executor_pid?, undo?}`: it counts as held while
  * the session's process or the task's executor lives. A session killed mid-task leaves its executor running until it
- * notices: it stops its run when its next event finds stdout's reader gone (EPIPE, cli/app.ts), after the step in
- * flight gets its receipt — but while it waits on a model or a card it writes nothing and may go on a while. Nobody
- * else may start meanwhile. Taken when a task starts, released at its task_done; taken again for the
+ * has stopped: its stdin closes (or its next event finds stdout's reader gone, EPIPE), which stops the run like a stop
+ * line (cli/app.ts) — the step in flight still gets its receipt. Nobody else may start meanwhile. Taken when a task starts, released at its task_done; taken again for the
  * moment an undo runs. Beside it, `computer.last` names the last task that started on this Mac: undo expires when any
  * new computer task starts (owner 10-21), so a session with an executor lingering for its result card watches that file
  * and closes the executor when another run appears there.

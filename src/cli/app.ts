@@ -77,10 +77,12 @@ export class LineReader {
       if (!c && isForeignControl(l)) return;
       const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l);
     });
-    // the app went away (stdin closed): every open card is answered with nothing, so the run ends instead of hanging
-    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); });
+    // the app went away (stdin closed): every open card is answered with nothing (let go: "ended"), then whoever runs
+    // the task is told (appRun: a stop)
+    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); this.onClosed?.(); });
   }
   closed = false;
+  onClosed: (() => void) | null = null;
   stopped = false;
   onStop: ((why: string) => void) | null = null;
   /** Steer lines go to this handler; one read before it is set (the request and a steer in the same stdin batch) waits
@@ -123,7 +125,8 @@ export class StdioUser implements RuntimeUser {
       // the user changed the request while the card was open (steer): the card is let go, and the app is told to close it
       if (o.signal?.aborted) { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); this.log.emit({ kind: "ask_void", ask_id, why: "steer" }); return null; }
       // the app is gone or stopped the task: no answer, the run ends honestly; the card is let go, said so
-      if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.stopped ? "stop" : "ended" }); return null; }
+      // (stdin closing also stops the run now, right after: the card went because the app went — "ended")
+      if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.closed ? "ended" : "stop" }); return null; }
       const a = parseControl(line);
       if (a?.type !== "answer") continue;
       if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
@@ -283,6 +286,12 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const stopRun = (why: string) => { if (stopReason) return; stopReason = why; log.emit({ kind: "refused", what: "the task", why, by: "user" }); rt.stop(why); };
   o.input.onStop = stopRun;
   if (o.input.stopped) stopRun("stopped by the app");     // a stop line read together with the request, before this
+  // the app went away (stdin closed) while the task runs: a stop, the same path as a stop line (owner 10-21: the helper
+  // exits → its running tasks stop) — the step in flight gets its receipt, task_done says stopped, the process exits.
+  // After task_done (the result card's linger) it only ends the wait
+  const appGone = () => { if (!done) o.input.stop("the app went away (stdin closed)"); };
+  o.input.onClosed = appGone;
+  if (o.input.closed) appGone();
   // the user's words mid-run: to the executor, which applies them between steps (the judges then read the request as
   // it was and every change), voids an open card, and asks for a new plan card when the new words go beyond the plan
   // (after the task is over — a verdict passed, a stop, the result card's linger — the executor refuses them: a refused event)

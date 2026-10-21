@@ -508,6 +508,50 @@ describe("review of #54", () => {
     } finally { ex.kill("SIGKILL"); server.closeAllConnections(); server.close(); }
   }, 40_000);
 
+  it("stdin EOF during a run is a stop: a real executor stops calling the model, writes task_done stopped and exits 0", async () => {
+    // the model looks at the screen four times, then finishes; each answer comes after 300 ms
+    let hits = 0;
+    const chunk = (delta: unknown, finish: string | null) => `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+    const server = http.createServer((req, res) => { req.resume(); req.on("end", () => { const n = ++hits;
+      setTimeout(() => { res.writeHead(200, { "content-type": "text/event-stream" });
+        const call = n < 5 ? { name: "computer_snapshot", arguments: "{}" } : { name: "finish", arguments: JSON.stringify({ outcome: "done", summary: "看完了" }) };
+        res.write(chunk({ role: "assistant", tool_calls: [{ index: 0, id: `call_${n}`, type: "function", function: call }] }, null)); res.write(chunk({}, "tool_calls")); res.end("data: [DONE]\n\n"); }, 300); }); });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const runs = tmp();
+    const ex = spawn(process.execPath, ["--import", "tsx", "src/cli/app.ts", "executor", "--runs", runs, "--linger", "30"], {
+      stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, LOCAL_URL: `http://127.0.0.1:${(server.address() as any).port}`, LOCAL_API_KEY: "k", DESKMIND_EXECUTOR_INPROC: "" } });
+    let err = "";
+    ex.stderr.on("data", (d) => (err += d)); ex.stdout.on("data", () => {});
+    const exited = new Promise<number | null>((r) => ex.on("exit", (c) => r(c)));
+    try {
+      ex.stdin.write(JSON.stringify({ run_id: "run_eof", raw: "看看屏幕", config: "openai:local|m", driver: "sim" }) + "\n");
+      await waitFor(() => hits > 0, 20_000);
+      const atEof = hits;
+      ex.stdin.end();                                     // the app (or the session) went away
+      expect(await Promise.race([exited, new Promise((r) => setTimeout(() => r("timeout"), 20_000))])).toBe(0);
+      expect(hits - atEof).toBe(0);                       // the call in progress was the last one
+      const evs = fs.readFileSync(path.join(runs, "run_eof", "events.jsonl"), "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(evs.filter((e) => e.kind === "task_done")).toEqual([expect.objectContaining({ status: "stopped" })]);
+      expect(evs.filter((e) => e.kind === "refused" && e.by === "user")).toEqual([expect.objectContaining({ why: "the app went away (stdin closed)" })]);
+      expect(evs.filter((e) => e.kind === "step")).toHaveLength(0);
+      expect(err).not.toMatch(/Unhandled|Error:/);
+    } finally { ex.kill("SIGKILL"); server.closeAllConnections(); server.close(); }
+  }, 40_000);
+
+  it("stdin EOF with a card open: the card is let go (ended), then the task stops; in process, the same", async () => {
+    const ed = editorSim();
+    const input = new PassThrough();
+    const events: any[] = [];
+    const out = (e: any) => { events.push(e); if (e.kind === "ask") setTimeout(() => input.end(), 5); };
+    await appRun({ run_id: "r1", raw: "把笔记的正文改成「新的」", config: "ds-flash" } as never, { runs: tmp(), out, input: new LineReader(input), linger: 30,
+      inject: { driver: ed.make(), gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(EDIT("editor-1")) } } });
+    const kinds = events.map((e) => e.kind);
+    expect(events.find((e) => e.kind === "ask_void")).toMatchObject({ why: "ended" });
+    expect(events.find((e) => e.kind === "task_done")).toMatchObject({ status: "stopped" });
+    expect(kinds.indexOf("ask_void")).toBeLessThan(kinds.indexOf("task_done"));
+    expect(events.some((e) => e.kind === "step" && e.text.includes("set_value"))).toBe(false);
+  });
+
   it("E2: a task that cannot be recorded leaves the machine lock free", async () => {
     const s = session({ model: [] });
     const orig = s.h.log.emit.bind(s.h.log);
