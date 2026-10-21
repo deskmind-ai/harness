@@ -1,10 +1,14 @@
 /**
  * What the session model reads (docs/protocol.md 「会话（第 1 版）」): the system prompt and the stored conversation.
  *
- * Compaction: when the whole exceeds the budget (60% of the model's window, a character taken as a token, as
- * runtime/compact.ts), the oldest whole exchanges are dropped — an exchange is the user's message(s) and the reply —
- * and the system prompt says how many messages were left out. The newest exchange, the one with the newest user
- * message, is never cut, whatever its size (a user message is at most 32k characters, well under any budget).
+ * Compaction: the budget is 60% of the model's window (a character taken as a token, as runtime/compact.ts). When the
+ * conversation outgrows it, the oldest whole exchanges are dropped — an exchange is the user's message(s) and the
+ * reply — down to about half the budget in one go, and the system prompt says how many messages were left out. So the
+ * cut moves once in a while, not every turn, and what the model reads keeps the same beginning for several turns (the
+ * service's prompt cache). The cut is found by replaying the conversation exchange by exchange (one pass, sizes
+ * computed once), so the same history always gives the same cut and appending to it never moves the cut until the
+ * budget is passed again. The newest exchange, the one with the newest user message, is never cut, whatever its size
+ * (a user message is at most 32k characters, well under any budget).
  *
  * Consecutive user messages (a reply that never came: the process was killed, the service failed) are read as one
  * message, so the model always sees user and assistant taking turns. An empty reply (stopped before any text) is left
@@ -18,6 +22,8 @@ export interface BuiltContext { system: string; messages: ContextMessage[]; drop
 
 /** Share of the model's window the context may fill. */
 export const WINDOW_SHARE = 0.6;
+/** Once over the budget, the conversation is cut down to this share of it. */
+export const CUT_TO = 0.5;
 
 const SYSTEM: Record<Lang, string> = {
   zh: [
@@ -34,7 +40,13 @@ const SYSTEM: Record<Lang, string> = {
   ].join("\n"),
 };
 
-export function systemPrompt(lang: Lang = "zh"): string { return SYSTEM[lang]; }
+/** The local date, YYYY-MM-DD. */
+export const localDate = (d: Date = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/** The session's system prompt, with today's date (local) at the end. */
+export function systemPrompt(lang: Lang = "zh", now: Date = new Date()): string {
+  return SYSTEM[lang] + (lang === "en" ? `\nToday is ${localDate(now)} (local time).` : `\n今天是 ${localDate(now)}（本地时间）。`);
+}
 
 const omitted = (n: number, lang: Lang) => lang === "en" ? `\n\n(${n} earlier messages of this conversation are omitted.)` : `\n\n（更早的 ${n} 条对话已省略）`;
 const stoppedMark = (lang: Lang) => lang === "en" ? "\n\n(The user stopped this reply partway.)" : "\n\n（这条回复被用户中途停下了）";
@@ -66,12 +78,17 @@ function flatten(group: StoredMessage[], lang: Lang): ContextMessage[] {
 export function buildContext(history: StoredMessage[], o: { budgetChars: number; lang?: Lang; system?: string }): BuiltContext {
   const lang = o.lang ?? "zh";
   const base = o.system ?? systemPrompt(lang);
-  const groups = exchanges(history).map((g) => ({ msgs: flatten(g, lang), count: g.length }));
-  const size = (gs: typeof groups) => gs.reduce((a, g) => a + g.msgs.reduce((b, m) => b + m.text.length, 0), 0);
-  let dropped = 0;
-  // the newest exchange always stays
-  while (groups.length > 1 && base.length + size(groups) > o.budgetChars) dropped += groups.shift()!.count;
+  const groups = exchanges(history).map((g) => { const msgs = flatten(g, lang); return { msgs, count: g.length, size: msgs.reduce((b, m) => b + m.text.length, 0) }; });
+  const room = o.budgetChars - base.length;
+  // replay: add the exchanges one by one; whenever the kept ones pass the room, drop the oldest down to CUT_TO of it
+  // (never the one just added)
+  let start = 0, kept = 0;
+  for (let k = 0; k < groups.length; k++) {
+    kept += groups[k]!.size;
+    if (kept <= room) continue;
+    while (start < k && kept > room * CUT_TO) kept -= groups[start++]!.size;
+  }
+  const dropped = groups.slice(0, start).reduce((a, g) => a + g.count, 0);
   const system = dropped ? base + omitted(dropped, lang) : base;
-  const messages = groups.flatMap((g) => g.msgs);
-  return { system, messages, dropped, chars: system.length + size(groups) };
+  return { system, messages: groups.slice(start).flatMap((g) => g.msgs), dropped, chars: system.length + kept };
 }

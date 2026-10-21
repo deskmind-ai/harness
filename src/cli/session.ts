@@ -16,7 +16,7 @@ import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 import { DEFAULT_DIR, SESSION_ID, listSessions, sessionDir } from "../session/log.js";
-import { SessionHost, acquireLock, type SessionHeader } from "../session/host.js";
+import { SessionHost, acquireLock, headerProblem, type SessionHeader } from "../session/host.js";
 import * as fs from "node:fs";
 
 const usage = "usage: session [--session <id>] [--dir <d>] [--config <c>] [--lang zh|en] | sessions list [--dir <d>]";
@@ -49,23 +49,27 @@ export async function sessionMain(argv: string[]): Promise<number> {
     onLine = (x) => { onLine = null; onClose = null; res(x); };
     onClose = () => { onLine = null; onClose = null; res(null); };
   });
-  const asHeader = (l: string): SessionHeader | null => {
-    try { const j = JSON.parse(l); return j && typeof j === "object" && !Array.isArray(j) && typeof j.type !== "string" ? j as SessionHeader : null; } catch { return null; }
+  const asHeader = (l: string): Record<string, unknown> | null => {
+    try { const j = JSON.parse(l); return j && typeof j === "object" && !Array.isArray(j) && typeof j.type !== "string" ? j as Record<string, unknown> : null; } catch { return null; }
   };
+  // a start that cannot go on: said on stdout as the app reads it (bad_config, not stored), and on stderr; exit 2
+  const refuse = (text: string, sessionId?: string) => { out({ t: Date.now() / 1000, ...(sessionId ? { session_id: sessionId } : {}), kind: "session.error", code: "bad_config", text }); console.error(text); return 2; };
 
   let header: SessionHeader = {};
   let sid: string;
   if (a.session) {
     sid = a.session;
-    if (!SESSION_ID.test(sid) || !fs.existsSync(path.join(sessionDir(dir, sid), "session.jsonl"))) { console.error(`no session ${sid} under ${dir}`); return 2; }
+    if (!SESSION_ID.test(sid)) return refuse(`bad session id ${JSON.stringify(sid).slice(0, 80)}`);
+    if (!fs.existsSync(path.join(sessionDir(dir, sid), "session.jsonl"))) return refuse(`no session ${sid} under ${dir}`, sid);
   } else {
     const l = await firstLine();
-    if (l === null) { console.error("no header line on stdin"); return 2; }
+    if (l === null) return refuse("no header line on stdin");
     const h = asHeader(l);
-    if (!h) { console.error(`the first line must be the header {session_id?, config?, lang?, driver?}\n${usage}`); return 2; }
-    header = h;
-    sid = h.session_id ?? `ses_${randomUUID().slice(0, 8)}`;
-    if (!SESSION_ID.test(sid)) { console.error(`bad session id ${JSON.stringify(sid)}`); return 2; }
+    if (!h) return refuse(`the first line must be the header {session_id?, config?, lang?, driver?}; ${usage}`);
+    const bad = headerProblem(h);
+    if (bad) return refuse(bad);
+    header = h as SessionHeader;
+    sid = header.session_id ?? `ses_${randomUUID().slice(0, 8)}`;
   }
   const lock = acquireLock(dir, sid);
   if (!lock.ok) {

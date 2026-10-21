@@ -4,7 +4,8 @@
  *
  * A text turn streams like a real service: start, text_start, one text_delta per chunk (`chunks`, default the whole
  * text), text_end, done. `delayMs` waits before each chunk, and the caller's abort signal is honoured between chunks
- * (the turn then ends "aborted" with the text so far), so a stop mid-reply can be tested. `error` is a turn the
+ * (the turn then ends "aborted" with the text so far), so a stop mid-reply can be tested. `final`: the finished
+ * message says this instead of what was streamed (a service whose final text differs). `error` is a turn the
  * service failed (its message as pi-ai reports one, e.g. "401 Authentication Fails").
  */
 import { createAssistantMessageEventStream, type AssistantMessage, type Message } from "@earendil-works/pi-ai";
@@ -12,7 +13,7 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 
 export type Step =
   | { calls: { name: string; args: Record<string, unknown> }[] }
-  | { text: string; chunks?: string[]; delayMs?: number }
+  | { text: string; chunks?: string[]; delayMs?: number; final?: string }
   | { error: string }
   | ((messages: Message[]) => Step);
 
@@ -42,7 +43,7 @@ export function scriptedStream(steps: Step[], seen: Message[][] = []): StreamFn 
           s.push({ type: "text_delta", contentIndex: 0, delta: p, partial: snap() });
         }
         s.push({ type: "text_end", contentIndex: 0, content: block.text, partial: snap() });
-        const out = snap();
+        const out = step.final !== undefined ? { ...msg, content: [{ type: "text" as const, text: step.final }] } : snap();
         s.push({ type: "done", reason: "stop", message: out }); s.end(out);
       })();
       return s;

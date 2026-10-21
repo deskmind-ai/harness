@@ -24,7 +24,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
-import { configTable, Gateway } from "../gateway/index.js";
+import { configTable, Gateway, redactKeys } from "../gateway/index.js";
 import * as R from "../protocol/roles.js";
 import { ConsentSigner } from "../executor/consent.js";
 import { Executor } from "../executor/executor.js";
@@ -366,7 +366,7 @@ export async function modelCheck(config: string): Promise<{ ok: boolean; model?:
   if (!table) return { ok: false, error: `unknown config ${config}` };
   const t0 = Date.now();
   const rep = await new Gateway(table).ask("choice", "只输出 JSON。", "问题：1+1=2 吗？选项 yes / no。", R.choiceAnswer(["yes", "no"]), "model-check");
-  const scrub = (e: string) => e.replace(/(sk-|Bearer )[A-Za-z0-9_-]{8,}/g, "$1…").slice(0, 200);
+  const scrub = (e: string) => redactKeys(e).slice(0, 200);
   return rep.outcome === "answered" ? { ok: true, model: table.choice.model, ms: Date.now() - t0 } : { ok: false, model: table.choice.model, error: scrub(`${rep.outcome}: ${rep.error ?? ""}`) };
 }
 

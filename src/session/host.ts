@@ -9,12 +9,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import { configTable, PROVIDERS, providerOf } from "../gateway/index.js";
+import { configTable, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
 import { loopModel } from "../runtime/model.js";
 import { PROTOCOL } from "../protocol/version.js";
 import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
-import { reply, type SessionModel } from "./loop.js";
-import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SessionLog, sessionDir, type ErrorCode, type SessionEvent } from "./log.js";
+import { reply, type ReplyResult, type SessionModel } from "./loop.js";
+import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, sessionDir, type ErrorCode, type SessionEvent } from "./log.js";
+import type { ModelCallRecord } from "../otel/context.js";
 
 /** The first stdin line: which session, and the settings for this process. `driver` is read for H2. */
 export interface SessionHeader { session_id?: string; config?: string; lang?: Lang; driver?: string }
@@ -85,14 +86,23 @@ export class SessionHost {
   /** A transient event: no seq, not stored. */
   private send(body: Record<string, unknown>) { this.o.out({ t: Date.now() / 1000, session_id: this.o.sessionId, ...body }); }
 
-  private refuse(code: ErrorCode, text: string, control?: string) { this.send({ kind: "session.error", code, text, ...(control ? { control } : {}) }); }
+  /** Every error's text, stored or not, passes here: no key value from the environment ever reaches the app or the file. */
+  private refuse(code: ErrorCode, text: string, control?: string) { this.send({ kind: "session.error", code, text: redactKeys(text), ...(control ? { control } : {}) }); }
+  private fail(code: ErrorCode, text: string, ids: { msg_id?: string; reply_to: string }) { this.log.emit({ kind: "session.error", code, text: redactKeys(text).slice(0, 300), ...ids }); }
 
+  /** The session interface's version only: this process speaks no other (the run's events and controls are app-run's). */
   start() {
-    this.send({ kind: "session.start", session_id: this.o.sessionId, protocol: { session: PROTOCOL.session, events: PROTOCOL.events, control: PROTOCOL.control }, last_seq: this.log.lastSeq, resumed: this.resumed });
+    this.send({ kind: "session.start", session_id: this.o.sessionId, protocol: { session: PROTOCOL.session }, last_seq: this.log.lastSeq, resumed: this.resumed });
   }
 
-  /** The header's settings, read after the process started (resume with `--session`, then a header line). */
-  configure(h: SessionHeader) { if (h.config) this.config = h.config; if (h.lang === "zh" || h.lang === "en") this.lang = h.lang; }
+  /** The header's settings, read after the process started (resume with `--session`, then a header line). A value of
+   *  the wrong type is refused (bad_config) and changes nothing. */
+  configure(h: Record<string, unknown>) {
+    const bad = headerProblem(h);
+    if (bad) return this.refuse("bad_config", bad);
+    if (typeof h.config === "string") this.config = h.config;
+    if (h.lang === "zh" || h.lang === "en") this.lang = h.lang;
+  }
 
   handle(line: string) {
     if (this.exited || !line.trim()) return;
@@ -128,7 +138,7 @@ export class SessionHost {
     const user = this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text });
     const userId = (user as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
     const model = this.resolveModel();
-    if ("code" in model) { this.log.emit({ kind: "session.error", code: model.code, text: model.text, reply_to: userId }); return; }
+    if ("code" in model) return this.fail(model.code, model.text, { reply_to: userId });
     const context = buildContext(this.log.messages(), { budgetChars: Math.floor((model.model.contextWindow ?? 128_000) * WINDOW_SHARE), lang: this.lang });
     const r: Running = { msgId: newId(), replyTo: userId, abort: new AbortController(), sent: "", buffer: "", timer: null, done: Promise.resolve() };
     this.running = r;
@@ -137,19 +147,35 @@ export class SessionHost {
     const onDelta = (d: string) => { r.buffer += d; if (!r.timer) r.timer = setTimeout(() => this.flush(r), this.o.coalesceMs ?? 50); };
     r.done = reply({ model, context, signal: r.abort.signal, maxChars: MAX_ASSISTANT_CHARS, onDelta }).then((res) => {
       if (r.timer) { clearTimeout(r.timer); r.timer = null; }
+      this.recordCall(r, res);
       if (res.ended === "error") {
         r.buffer = "";
-        this.log.emit({ kind: "session.error", code: res.error!.code, text: res.error!.text, msg_id: r.msgId, reply_to: r.replyTo });
+        this.fail(res.error!.code, res.error!.text, { msg_id: r.msgId, reply_to: r.replyTo });
       } else {
         this.flush(r);
-        // the final text is what the deltas said; a service that sent less than the whole gets the rest as one more delta
+        // the final text is what the deltas said. A service that sent less than the whole: the rest as one more delta;
+        // one whose final text is not what was streamed: the whole text again, at offset 0, so the app's bubble is right
         if (res.text.length > r.sent.length && res.text.startsWith(r.sent)) { r.buffer = res.text.slice(r.sent.length); this.flush(r); }
+        else if (!res.text.startsWith(r.sent)) { r.sent = res.text; this.send({ kind: "session.delta", msg_id: r.msgId, text: res.text, offset: 0 }); }
         this.log.emit({ kind: "session.message", msg_id: r.msgId, role: "assistant", text: res.text, reply_to: r.replyTo, model: res.model,
           ...(res.ended === "stopped" ? { stopped: true } : {}), ...(res.ended === "truncated" ? { truncated: true } : {}) });
       }
     }, (e) => {
-      this.log.emit({ kind: "session.error", code: "network", text: String(e instanceof Error ? e.message : e).slice(0, 300), msg_id: r.msgId, reply_to: r.replyTo });
+      this.fail("network", String(e instanceof Error ? e.message : e), { msg_id: r.msgId, reply_to: r.replyTo });
     }).finally(() => { this.running = null; this.maybeExit(); });
+  }
+
+  /** The reply's model call, one line in the session's model_calls.jsonl (role "session"; as a run's, cli/app.ts). */
+  private recordCall(r: Running, res: ReplyResult) {
+    const c = res.call;
+    const rec: ModelCallRecord = { kind: "model.call", call_id: `mc_${randomUUID().slice(0, 8)}`, started_at: c.started_at, role: "session", backend: "pi-ai", model: res.model,
+      outcome: res.ended === "error" ? "error" : res.ended === "stopped" ? "aborted" : "answered", tokens_in: c.tokens_in, tokens_out: c.tokens_out, cache_read: c.cache_read,
+      cost_usd: c.cost_usd, ...(c.cost_estimated ? { cost_estimated: true } : {}), latency_ms: c.latency_ms, sent_chars: c.sent_chars, msg_id: r.msgId, reply_to: r.replyTo,
+      ...(res.error ? { error: res.error.text } : {}) };
+    try {
+      const fd = fs.openSync(path.join(sessionDir(this.o.dir, this.o.sessionId), "model_calls.jsonl"), "a", 0o600);
+      try { fs.writeSync(fd, JSON.stringify(rec) + "\n"); } finally { fs.closeSync(fd); }
+    } catch { /* recording never stops a reply */ }
   }
 
   private flush(r: Running) {
@@ -186,21 +212,54 @@ export class SessionHost {
   }
 }
 
-/** One process per session: `sessions/<sid>/lock` holds the pid. A lock whose process is gone is taken over. */
+/** Is the process `pid` alive? (Ours counts: this process holds it.) */
+function alive(pid: number): boolean {
+  if (!(pid > 0)) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+const readPid = (file: string): string | null => { try { return fs.readFileSync(file, "utf-8").trim(); } catch { return null; } };
+
+/** One process per session: `sessions/<sid>/lock` holds the pid. It is created whole and at once: the pid is written
+ *  to a file of our own, then hard-linked to the lock's name (link fails if the name exists), so no one ever reads an
+ *  empty lock. A lock whose process is gone is taken over by renaming it aside first: only when the renamed file still
+ *  holds the dead pid was it the stale lock; if a live process's lock was caught instead, it is put back. */
 export function acquireLock(dir: string, sessionId: string): { ok: true; release: () => void } | { ok: false; pid: number } {
   const file = path.join(sessionDir(dir, sessionId), "lock");
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  for (let i = 0; i < 2; i++) {
-    try {
-      fs.writeFileSync(file, String(process.pid), { flag: "wx", mode: 0o600 });
-      return { ok: true, release: () => { try { if (fs.readFileSync(file, "utf-8") === String(process.pid)) fs.unlinkSync(file); } catch { /* gone already */ } } };
-    } catch {
-      const pid = Number(fs.readFileSync(file, "utf-8").trim());
-      let alive = false;
-      try { if (pid > 0 && pid !== process.pid) { process.kill(pid, 0); alive = true; } } catch (e) { alive = (e as NodeJS.ErrnoException).code === "EPERM"; }
-      if (alive) return { ok: false, pid };
-      try { fs.unlinkSync(file); } catch { /* someone else took it over: the next try says */ }
+  const mine = String(process.pid);
+  const tmp = `${file}.${mine}.${randomUUID().slice(0, 8)}`;
+  fs.writeFileSync(tmp, mine, { mode: 0o600 });
+  try {
+    for (let i = 0; i < 5; i++) {
+      try {
+        fs.linkSync(tmp, file);
+        return { ok: true, release: () => { if (readPid(file) === mine) { try { fs.unlinkSync(file); } catch { /* gone already */ } } } };
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      }
+      const held = readPid(file);
+      if (held === null) continue;                                     // released meanwhile: try again
+      if (alive(Number(held))) return { ok: false, pid: Number(held) };
+      const aside = `${file}.stale.${mine}.${randomUUID().slice(0, 8)}`;
+      try { fs.renameSync(file, aside); } catch { continue; }           // someone else moved it: try again
+      const moved = readPid(aside);
+      if (moved === held) { try { fs.unlinkSync(aside); } catch { /* ours to remove */ } continue; }
+      // we caught a lock taken after we looked: give it back (unless yet another one is there now) and step aside
+      try { fs.linkSync(aside, file); } catch { /* another lock is in place */ }
+      try { fs.unlinkSync(aside); } catch { /* ours to remove */ }
+      return { ok: false, pid: Number(moved) || 0 };
     }
+    return { ok: false, pid: Number(readPid(file)) || 0 };
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* gone already */ }
   }
-  return { ok: false, pid: 0 };
+}
+
+/** What is wrong with a header (`{session_id?, config?, lang?, driver?}`), or null. Each field, when present, is a
+ *  string; the session id a folder name; lang zh or en. */
+export function headerProblem(h: Record<string, unknown>): string | null {
+  for (const k of ["session_id", "config", "lang", "driver"]) if (h[k] !== undefined && typeof h[k] !== "string") return `${k} must be a string`;
+  if (typeof h.session_id === "string" && !SESSION_ID.test(h.session_id)) return `bad session id ${JSON.stringify(h.session_id).slice(0, 80)}: letters, digits, _ and - only, at most 64`;
+  if (h.lang !== undefined && h.lang !== "zh" && h.lang !== "en") return `lang must be zh or en`;
+  return null;
 }

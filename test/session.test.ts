@@ -9,10 +9,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as http from "node:http";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { SessionHost, parseSessionControl } from "../src/session/host.js";
+import { SessionHost, acquireLock, parseSessionControl } from "../src/session/host.js";
 import { SessionLog, listSessions, MAX_USER_CHARS } from "../src/session/log.js";
-import { buildContext, exchanges, systemPrompt } from "../src/session/context.js";
-import { classifyError, type SessionModel } from "../src/session/loop.js";
+import { buildContext, exchanges, localDate, systemPrompt } from "../src/session/context.js";
+import { classifyError, reply, type SessionModel } from "../src/session/loop.js";
+import { redactKeys } from "../src/gateway/index.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
 import type { Message } from "@earendil-works/pi-ai";
 
@@ -34,7 +35,8 @@ describe("session: one reply", () => {
   it("starts with the protocol versions; the deltas, joined, are the final message, in order and without gaps", async () => {
     const chunks = ["你好，", "我是 ", "DeskMind。", "有什么", "可以帮你？"];
     const { evs, say } = host([{ text: chunks.join(""), chunks, delayMs: 15 }]);
-    expect(evs[0]).toMatchObject({ kind: "session.start", session_id: "ses_t", protocol: { session: 1, events: 1, control: 1 }, last_seq: 0, resumed: false });
+    expect(evs[0]).toMatchObject({ kind: "session.start", session_id: "ses_t", last_seq: 0, resumed: false });
+    expect(evs[0].protocol).toEqual({ session: 1 });
     expect(evs[0].seq).toBeUndefined();
     await say("你好");
     const deltas = kinds(evs, "session.delta");
@@ -188,10 +190,10 @@ describe("session: attach and resume", () => {
 
 describe("session: context", () => {
   const msg = (role: "user" | "assistant", text: string, i: number) => ({ msg_id: `m${i}`, role, text });
-  it("compaction drops the oldest whole exchanges, says how many messages, and never cuts the newest user message", () => {
+  it("compaction drops the oldest whole exchanges down to about half the budget, says how many messages, never cuts the newest user message", () => {
     const hist = [];
     for (let i = 0; i < 10; i++) { hist.push(msg("user", `问${i} ` + "x".repeat(100), 2 * i)); hist.push(msg("assistant", `答${i} ` + "y".repeat(100), 2 * i + 1)); }
-    hist.push(msg("user", "最新的问题 " + "z".repeat(500), 99));
+    hist.push(msg("user", "最新的问题 " + "z".repeat(200), 99));
     const sys = "S";
     const all = buildContext(hist, { budgetChars: 1e6, system: sys });
     expect(all.dropped).toBe(0);
@@ -201,8 +203,9 @@ describe("session: context", () => {
     expect(c.messages[0]!.role).toBe("user");
     expect(c.messages.length % 2).toBe(1);
     expect(c.dropped).toBe(21 - c.messages.length);
+    expect(c.dropped).toBeGreaterThan(0);
     expect(c.system).toBe(`S\n\n（更早的 ${c.dropped} 条对话已省略）`);
-    expect(c.chars).toBeLessThanOrEqual(1000);
+    expect(c.chars - c.system.length).toBeLessThanOrEqual(999);
     // the kept ones are the newest, whole
     expect(c.messages.slice(0, -1).map((m) => m.text)).toEqual(hist.slice(21 - c.messages.length, -1).map((m) => m.text));
     // a budget smaller than the newest message alone: it is still there, alone
@@ -210,6 +213,28 @@ describe("session: context", () => {
     expect(tiny.messages).toEqual([{ role: "user", text: hist.at(-1)!.text }]);
     expect(tiny.dropped).toBe(20);
     expect(tiny.system).toBe("S\n\n(20 earlier messages of this conversation are omitted.)");
+  });
+
+  it("the cut moves in jumps, not every turn: the context keeps its beginning for several turns", () => {
+    const hist: any[] = [];
+    const cuts: number[] = [];
+    const firsts: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      hist.push(msg("user", `问${i} ` + "x".repeat(100), 2 * i));
+      const c = buildContext(hist, { budgetChars: 3000, system: "S" });
+      cuts.push(c.dropped); firsts.push(c.messages[0]!.text);
+      expect(c.chars - c.system.length).toBeLessThanOrEqual(2999);
+      // the same history gives the same cut
+      expect(buildContext(hist, { budgetChars: 3000, system: "S" })).toEqual(c);
+      hist.push(msg("assistant", `答${i} ` + "y".repeat(100), 2 * i + 1));
+    }
+    // never moves back; moves seldom (each move frees about half the budget: ~7 turns of 208 characters)
+    for (let i = 1; i < cuts.length; i++) expect(cuts[i]).toBeGreaterThanOrEqual(cuts[i - 1]!);
+    const moves = cuts.filter((d, i) => i > 0 && d !== cuts[i - 1]).length;
+    expect(moves).toBeGreaterThan(2);
+    expect(moves).toBeLessThanOrEqual(60 / 5);
+    // between moves the first message the model reads is the same
+    for (let i = 1; i < cuts.length; i++) if (cuts[i] === cuts[i - 1]) expect(firsts[i]).toBe(firsts[i - 1]);
   });
 
   it("a user message with no reply joins the next one; an empty stopped reply is left out, a partial one is marked", () => {
@@ -225,7 +250,7 @@ interface FakeReq { messages: { role: string; content: unknown }[] }
 function fakeService() {
   const requests: FakeReq[] = [];
   /** What each request is answered with: chunks, then finish — or `hang` after the chunks (the stream stays open). */
-  const plan: { chunks: string[]; hang?: boolean; status?: number }[] = [];
+  const plan: { chunks: string[]; hang?: boolean; die?: boolean; status?: number }[] = [];
   const open = new Set<http.ServerResponse>();
   const server = http.createServer((req, res) => {
     let body = "";
@@ -239,6 +264,7 @@ function fakeService() {
       res.write(chunk({ role: "assistant", content: "" }, null));
       for (const c of p.chunks) res.write(chunk({ content: c }, null));
       if (p.hang) { open.add(res); return; }
+      if (p.die) { setTimeout(() => res.destroy(), 30); return; }
       res.write(chunk({}, "stop"));
       res.end("data: [DONE]\n\n");
     });
@@ -276,6 +302,8 @@ describe("session: the process", () => {
     A.send({ type: "say", text: "u1" });
     await A.until(() => A.evs.some((e) => e.kind === "session.message" && e.role === "assistant"));
     expect(A.evs.find((e) => e.kind === "session.message" && e.role === "assistant").text).toBe("你好！");
+    // only the user can read the session's files, the lock included
+    for (const f of ["", "session.jsonl", "lock", "model_calls.jsonl"]) expect(fs.statSync(path.join(dir, "sessions", "ses_kill", f)).mode & 0o777).toBe(f ? 0o600 : 0o700);
     svc.plan.push({ chunks: ["说到一半"], hang: true });
     A.send({ type: "say", text: "u2" });
     await A.until(() => A.evs.some((e) => e.kind === "session.delta" && e.text === "说到一半"));
@@ -340,3 +368,164 @@ describe("session: the process", () => {
     expect(list[0].updated_at).toBeGreaterThanOrEqual(list[1].updated_at);
   }, 60_000);
 });
+
+describe("session: review fixes (#52)", () => {
+  const deadPid = () => { const p = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf-8" }); return Number(p.stdout); };
+
+  it("lock: busy while a live process holds it; a dead holder's lock is taken over; release tolerates a missing file", () => {
+    const dir = tmp();
+    const lockFile = path.join(dir, "sessions", "ses_l", "lock");
+    fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 20000)"]);
+    try {
+      fs.writeFileSync(lockFile, String(holder.pid));
+      expect(acquireLock(dir, "ses_l")).toEqual({ ok: false, pid: holder.pid });
+      expect(fs.readFileSync(lockFile, "utf-8")).toBe(String(holder.pid));
+    } finally { holder.kill("SIGKILL"); }
+    const dead = deadPid();
+    fs.writeFileSync(lockFile, String(dead));
+    const got = acquireLock(dir, "ses_l");
+    expect(got.ok).toBe(true);
+    expect(fs.readFileSync(lockFile, "utf-8")).toBe(String(process.pid));
+    expect(fs.statSync(lockFile).mode & 0o777).toBe(0o600);
+    // this process holds it now: a second acquire is refused
+    expect(acquireLock(dir, "ses_l")).toEqual({ ok: false, pid: process.pid });
+    // no stray files beside the lock (the temp file and the renamed-aside one are removed)
+    expect(fs.readdirSync(path.dirname(lockFile))).toEqual(["lock"]);
+    fs.unlinkSync(lockFile);
+    if (got.ok) expect(() => got.release()).not.toThrow();
+    // an empty lock file (left by an older version) counts as stale
+    fs.writeFileSync(lockFile, "");
+    expect(acquireLock(dir, "ses_l").ok).toBe(true);
+  });
+
+  it("lock: two processes trying at the same moment, 40 times (half on a stale lock): exactly one wins each time", async () => {
+    const dir = tmp();
+    const n = 40, dead = deadPid();
+    for (let i = 0; i < n; i += 2) { fs.mkdirSync(path.join(dir, "sessions", `ses_${i}`), { recursive: true }); fs.writeFileSync(path.join(dir, "sessions", `ses_${i}`, "lock"), String(dead)); }
+    const t0 = Date.now() + 4000, gap = 25, until = t0 + n * gap + 3000;
+    const run = () => new Promise<any[]>((res, rej) => {
+      const c = spawn(process.execPath, ["--import", "tsx", "test/lock-contend.ts", dir, String(n), String(t0), String(gap), String(until)]);
+      let o = "", e = "";
+      c.stdout.on("data", (d) => (o += d)); c.stderr.on("data", (d) => (e += d));
+      c.on("exit", (code) => code === 0 ? res(o.trim().split("\n").map((l) => JSON.parse(l))) : rej(new Error(e)));
+    });
+    const [a, b] = await Promise.all([run(), run()]);
+    for (let i = 0; i < n; i++) expect([a![i].ok, b![i].ok].filter(Boolean).length, `session ${i}`).toBe(1);
+    for (let i = 0; i < n; i++) expect(fs.readdirSync(path.join(dir, "sessions", `ses_${i}`))).toEqual(["lock"]);
+  }, 60_000);
+
+  it("lock: two threads lined up to microseconds, 200 times (half on a stale lock): exactly one wins each time", () => {
+    const dir = tmp();
+    const p = spawnSync(process.execPath, ["--import", "tsx", "test/lock-threads.ts", dir, "200", String(deadPid())], { encoding: "utf-8", timeout: 60_000 });
+    expect(p.status, p.stderr).toBe(0);
+    const rounds: [boolean, boolean][] = JSON.parse(p.stdout);
+    expect(rounds.length).toBe(200);
+    expect(rounds.filter(([a, b]) => a === b)).toEqual([]);
+  }, 60_000);
+
+  it("a bad header is refused as bad_config (no stack trace): non-string id or config, a path as id, an unknown lang", () => {
+    const run = (args: string[], input: string) => spawnSync(process.execPath, ["--import", "tsx", "src/cli/app.ts", "session", "--dir", tmp(), ...args], { input, encoding: "utf-8", timeout: 60_000 });
+    for (const header of [{ session_id: 5 }, { session_id: "../x" }, { config: { a: 1 } }, { lang: "fr" }, { session_id: "ok", driver: 1 }]) {
+      const p = run([], JSON.stringify(header) + "\n");
+      expect(p.status, JSON.stringify(header)).toBe(2);
+      expect(p.stderr).not.toMatch(/at .*\.ts:\d+/);
+      expect(JSON.parse(p.stdout.trim())).toMatchObject({ kind: "session.error", code: "bad_config" });
+    }
+    const p = run(["--session", "../x"], "");
+    expect(p.status).toBe(2);
+    expect(JSON.parse(p.stdout.trim())).toMatchObject({ kind: "session.error", code: "bad_config" });
+    // after start (resume, then a header line): refused, nothing changes
+    const { h, evs } = host([{ text: "好" }]);
+    h.configure({ config: 7 });
+    expect(evs.at(-1)).toMatchObject({ kind: "session.error", code: "bad_config", text: "config must be a string" });
+    expect(h.config).toBe("ds-flash");
+  });
+
+  it("a partial last line (killed inside a write) is skipped on resume; the next event takes its seq", async () => {
+    const dir = tmp();
+    const a = host([{ text: "r1" }], { dir });
+    await a.say("u1");
+    const file = path.join(dir, "sessions", "ses_t", "session.jsonl");
+    fs.appendFileSync(file, '{"seq":3,"t":1,"session_id":"ses_t","kind":"session.mess');
+    const b = host([{ text: "r2" }], { dir });
+    expect(b.evs[0]).toMatchObject({ last_seq: 2, resumed: true });
+    await b.say("u2");
+    const lines = fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.trim());
+    const good = lines.flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } });
+    expect(good.map((e) => [e.seq, e.text])).toEqual([[1, "u1"], [2, "r1"], [3, "u2"], [4, "r2"]]);
+    expect(new SessionLog(dir, "ses_t").messages().map((m) => m.text)).toEqual(["u1", "r1", "u2", "r2"]);
+  });
+
+  it("a stop that comes after the model finished does not mark the reply stopped", async () => {
+    const ac = new AbortController();
+    const r = await reply({ model: scripted([{ text: "ab", chunks: ["a", "b"] }]), context: { system: "S", messages: [{ role: "user", text: "x" }], dropped: 0, chars: 2 }, signal: ac.signal, maxChars: 100,
+      onDelta: (d) => { if (d === "b") ac.abort(); } });
+    expect(ac.signal.aborted).toBe(true);
+    expect(r).toMatchObject({ ended: "done", text: "ab" });
+  });
+
+  it("a final text that is not what was streamed is sent whole at offset 0 before the message", async () => {
+    const { evs, say } = host([{ text: "abc", chunks: ["ab", "c"], final: "xyz" }]);
+    await say("hi");
+    const deltas = kinds(evs, "session.delta");
+    expect(deltas.at(-1)).toMatchObject({ text: "xyz", offset: 0 });
+    const i = evs.indexOf(deltas.at(-1)), m = evs.findIndex((e) => e.kind === "session.message" && e.role === "assistant");
+    expect(i).toBeLessThan(m);
+    expect(evs[m].text).toBe("xyz");
+  });
+
+  it("key values from the environment never reach an error; the session's model calls are recorded; the prompt has today's date", async () => {
+    const saved = process.env.CUSTOM_API_KEY;
+    process.env.CUSTOM_API_KEY = "my-very-secret-value";
+    try {
+      expect(redactKeys("401 bad key my-very-secret-value, Bearer abcdefghijkl")).toBe("401 bad key …, Bearer …");
+      const { evs, dir, say } = host([{ error: "401 your key my-very-secret-value is wrong" }, { text: "好" }]);
+      await say("hi");
+      expect(kinds(evs, "session.error")[0].text).toBe("401 your key … is wrong");
+      expect(fs.readFileSync(path.join(dir, "sessions", "ses_t", "session.jsonl"), "utf-8")).not.toContain("my-very-secret-value");
+      await say("再来");
+      const calls = fs.readFileSync(path.join(dir, "sessions", "ses_t", "model_calls.jsonl"), "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+      expect(calls.map((c) => [c.role, c.outcome, c.model])).toEqual([["session", "error", "test|scripted"], ["session", "answered", "test|scripted"]]);
+      expect(calls[1]).toMatchObject({ kind: "model.call", tokens_in: 1, tokens_out: 1, cache_read: 0, msg_id: kinds(evs, "session.message").at(-1).msg_id });
+      expect(typeof calls[1].latency_ms).toBe("number");
+      expect(calls[0].error).not.toContain("my-very-secret-value");
+      expect(fs.statSync(path.join(dir, "sessions", "ses_t", "model_calls.jsonl")).mode & 0o777).toBe(0o600);
+    } finally { if (saved === undefined) delete process.env.CUSTOM_API_KEY; else process.env.CUSTOM_API_KEY = saved; }
+    expect(systemPrompt("zh", new Date(2026, 9, 22))).toContain("今天是 2026-10-22（本地时间）");
+    expect(systemPrompt("en", new Date(2026, 0, 5))).toContain("Today is 2026-01-05 (local time).");
+    const seen: Message[][] = [];
+    await host([{ text: "x" }], { seen }).say("y");
+    expect((seen[0]![0] as any).content).toContain(localDate());
+  });
+});
+
+describe("session: the process, stop and failures on a real stream", () => {
+  const svc = fakeService();
+  afterAll(() => svc.close());
+
+  it("stop on a real stream stores what came with stopped: true; a stream that dies mid-way voids its deltas", async () => {
+    const url = await svc.ready;
+    const dir = tmp();
+    const P = proc(["session", "--dir", dir, "--config", "openai:local|fake"], { LOCAL_URL: url, LOCAL_API_KEY: "k" });
+    P.send({ session_id: "ses_real" });
+    svc.plan.push({ chunks: ["一半", "的话"], hang: true });
+    P.send({ type: "say", text: "说长点" });
+    await P.until(() => P.evs.filter((e) => e.kind === "session.delta").map((e) => e.text).join("") === "一半的话");
+    P.send({ type: "stop" });
+    await P.until(() => P.evs.some((e) => e.kind === "session.message" && e.role === "assistant"));
+    expect(P.evs.find((e) => e.kind === "session.message" && e.role === "assistant")).toMatchObject({ text: "一半的话", stopped: true, seq: 2 });
+    // the service dies mid-stream: the deltas of that reply are void (the error names it), no reply is stored
+    svc.plan.push({ chunks: ["说了", "一点"], die: true });
+    P.send({ type: "say", text: "再说" });
+    await P.until(() => P.evs.some((e) => e.kind === "session.error"));
+    const err = P.evs.find((e) => e.kind === "session.error");
+    const voided = P.evs.filter((e) => e.kind === "session.delta" && e.msg_id === err.msg_id);
+    expect(voided.length).toBeGreaterThan(0);
+    expect(err).toMatchObject({ code: "network", seq: 4 });
+    expect(new SessionLog(dir, "ses_real").messages().map((m) => [m.role, m.text])).toEqual([["user", "说长点"], ["assistant", "一半的话"], ["user", "再说"]]);
+    P.child.stdin!.end();
+    expect(await P.exited).toBe(0);
+  }, 60_000);
+});
+

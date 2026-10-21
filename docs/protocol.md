@@ -124,8 +124,8 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 **启动：**
 - 新会话或按 id 打开：`harness.mjs session [--dir <d>] [--config <c>] [--lang zh|en]`，stdin 第一行是 `{session_id?, config?, lang?, driver?}`。这个 `session_id` 已经有记录就是接着原来的会话，没有就是新会话；不给就生成一个 `ses_xxxxxxxx`。`config` 默认 `ds-flash`（和 `app-run` 一样），`lang` 默认 `zh`，`driver` 留给 H2，现在只读不用。
 - 恢复：`harness.mjs session --session <id> [--dir <d>]`，立即开始；之后来的第一行如果不带 `type`，仍然当作上面那种头一行（只用它的 `config`、`lang`）。没有这个会话就退出，退出码 2。
-- `session_id` 只能是字母、数字、`_`、`-`，最长 64 个字符（它是文件夹名）。
-- 同一个会话同时只能有一个进程：`sessions/<id>/lock` 里写着进程号。另一个活着的进程占着时，发一条不入库的 `session.error{code:"busy"}` 后退出，退出码 1；占着它的进程已经不在了（被杀掉了），就接过来。
+- `session_id` 只能是字母、数字、`_`、`-`，最长 64 个字符（它是文件夹名）。头一行里的 `session_id`、`config`、`lang`、`driver` 有值就必须是字符串，`lang` 只能是 `zh` 或 `en`。不合格时：启动阶段发一条不入库的 `session.error{code:"bad_config"}` 并退出（退出码 2）；恢复后才来的头一行不合格，只回这条错误，设置不变。
+- 同一个会话同时只能有一个进程：`sessions/<id>/lock` 里写着进程号。锁是一次建好的：先把进程号写进自己的临时文件，再硬链接成 `lock`（名字已存在就失败），所以谁也读不到一个空的锁。另一个活着的进程占着时，发一条不入库的 `session.error{code:"busy"}` 后退出，退出码 1。占着它的进程已经不在了（被杀掉了），就先把旧锁改名挪开，确认挪走的确实是那个死掉的进程的锁再接过来；挪走的如果是别人刚建的锁，就放回去，自己算 busy。
 
 **历史放在哪：** `<--dir，默认 ~/Library/Application Support/DeskMind>/sessions/<session_id>/session.jsonl`。文件夹权限 0700，文件 0600，只在这台 Mac 上。写法和运行的 `events.jsonl` 一样（`src/protocol/events.ts` 的 EventLog）：每条入库的事件带 `seq`（从 1 起，连续）、`t`（秒）、`session_id`，先写盘、fsync，再发到 stdout。
 - **入库：** 用户和助手的最终消息（`session.message`），模型出的错（`session.error` 里的 no_key、key_invalid、network、quota、bad_config）。
@@ -136,9 +136,9 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 
 | kind | 字段 | 入库 | 说明 |
 |---|---|---|---|
-| `session.start` | `session_id, protocol:{session:1, events:1, control:1}, last_seq, resumed` | 否 | 进程一开始发一次。`last_seq` 是盘上最后一条的 `seq`，`resumed` 表示这是已有的会话 |
+| `session.start` | `session_id, protocol:{session:1}, last_seq, resumed` | 否 | 进程一开始发一次。`protocol` 只报会话接口的版本：这个进程不说运行的事件和控制（那是 `app-run` 的）。`last_seq` 是盘上最后一条的 `seq`，`resumed` 表示这是已有的会话 |
 | `session.message` | `msg_id, role: user\|assistant, text, reply_to?, model?, stopped?, truncated?, via?` | 是 | 最终消息。`reply_to` 是助手消息回答的那条用户消息；`model` 是 `<服务>\|<模型>`；`stopped: true` 是用户停下了，`text` 是停下时已经说出的部分（可以是空的）；`truncated: true` 是到了 64k 字被截断（或模型自己到了输出上限）；`via` 留给 H2（这条消息是怎么来的，比如电脑任务） |
-| `session.delta` | `msg_id, text, offset` | 否 | 流式输出，大约每 50 毫秒合并成一条。`offset` 是这段文字在整条回复里的起点，所以 app 能发现重复和缺口。每次回复先发一条 `text:""、offset:0` 的空 delta，表示「开始回复了」（app 显示「思考中」）。同一个 `msg_id` 的所有 delta 按顺序拼起来，就是最后那条 `session.message` 的 `text` |
+| `session.delta` | `msg_id, text, offset` | 否 | 流式输出，大约每 50 毫秒合并成一条。`offset` 是这段文字在整条回复里的起点，所以 app 能发现重复和缺口。每次回复先发一条 `text:""、offset:0` 的空 delta，表示「开始回复了」（app 显示「思考中」）。同一个 `msg_id` 的所有 delta 按 `offset` 拼起来，就是最后那条 `session.message` 的 `text`：服务最后给的全文和流式发出的对不上时，在最终消息之前再发一条 `offset:0` 的 delta，内容是全文，app 用它整个替换 |
 | `session.error` | `code, text, msg_id?, reply_to?, control?` | 见上 | `code` 见下表。`msg_id` 是失败的那次回复：它之前发过的 delta 作废，app 把那个正在长的气泡去掉。`reply_to` 是没得到回答的用户消息。`control` 是被拒绝的那行控制的 `type` |
 
 `session.error` 的 `code`：
@@ -154,14 +154,14 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `busy` | 上一条回复还没完就又来了 `say`（先 `stop` 或等它说完）；或者会话被另一个进程占着 | 否 |
 | `too_long` | 用户消息超过 32k 字（字符数）。这条消息不入库，app 留着输入框里的字 | 否 |
 
-前五个出现时，用户那条消息已经入库了（`reply_to` 指向它）。错误的 `text` 去掉了看起来像 key 的部分，最多 300 字。
+前五个出现时，用户那条消息已经入库了（`reply_to` 指向它）。错误的 `text` 最多 300 字，而且去掉了 key：环境变量里各家服务 key 的实际值（服务可能把收到的 key 原样写进错误里），以及看起来像 key 的 `sk-…`、`Bearer …`。`model-check` 用的是同一个函数（`src/gateway/index.ts` 的 `redactKeys`）。
 
 **控制（app → 进程）：**
 
 | type | 内容 | 说明 |
 |---|---|---|
 | `say` | `{"type":"say","text":"…"}` | 用户发一条消息：先入库，再开始回复。一次只回复一条 |
-| `stop` | `{"type":"stop"}` | 停下正在进行的回复：已经说出的部分作为 `stopped: true` 的消息入库。没有回复在进行时什么也不做 |
+| `stop` | `{"type":"stop"}` | 停下正在进行的回复：已经说出的部分作为 `stopped: true` 的消息入库。没有回复在进行时什么也不做。模型已经说完、只是结果还没处理时到的 stop 不算，那条消息照常入库，不带 `stopped` |
 | `attach` | `{"type":"attach","after_seq":n}` | 补发：把 `seq` 大于 n 的入库事件按顺序重发一遍（不重复、不跳号）。如果正有回复在进行，再发一条 `offset:0` 的 delta，内容是到现在为止说出的全部文字，之后的 delta 接着这个 offset 往下 |
 | `end` | `{"type":"end"}` | 结束：停下正在进行的回复（同 `stop`，部分入库），然后退出 |
 | `cua`、`steer`、`answer`、`respond`、`queue_*` | | H2 的，现在回 `session.error{code:"not_yet"}` |
@@ -170,9 +170,10 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 
 **模型和上下文：**
 - 用配置里 `goal` 角色的模型，经 pi-agent-core 的 `runAgentLoop` 调，流式收 `text_delta`。没有工具。key 和服务地址从环境变量来（和 `app-run` 一样）。
-- 系统提示：DeskMind 是用户 Mac 上的个人助手；它只能通过电脑任务操作电脑，而电脑任务还没接进对话，所以不能说自己在电脑上做了什么、看到了屏幕或文件里的什么；用户要它动手时直说现在做不到。`lang` 决定系统提示用中文还是英文。
-- 上下文 = 系统提示 + 入库的消息。超过模型窗口的 60%（按一个字算一个 token）时，从最早的开始整轮丢掉（一轮 = 用户的话和对它的回复），系统提示末尾加一句「更早的 n 条对话已省略」（n 是丢掉的消息条数）。最新的那一轮（含最新的用户消息）永远不丢。停下前一个字都没说的回复不进上下文；说了一半的进上下文，并注明「这条回复被用户中途停下了」。
+- 系统提示：DeskMind 是用户 Mac 上的个人助手（末尾写着今天的本地日期）；它只能通过电脑任务操作电脑，而电脑任务还没接进对话，所以不能说自己在电脑上做了什么、看到了屏幕或文件里的什么；用户要它动手时直说现在做不到。`lang` 决定系统提示用中文还是英文。
+- 上下文 = 系统提示 + 入库的消息。超过模型窗口的 60%（按一个字算一个 token）时，从最早的开始整轮丢掉（一轮 = 用户的话和对它的回复），一次丢到这个额度的一半左右，系统提示末尾加一句「更早的 n 条对话已省略」（n 是丢掉的消息条数）。这样丢的位置隔好几轮才动一次，模型读到的开头在这几轮里不变，服务的提示缓存用得上。丢到哪里是把对话一轮一轮重放算出来的（每轮的长度只算一次），同样的历史总得到同样的结果。最新的那一轮（含最新的用户消息）永远不丢。停下前一个字都没说的回复不进上下文；说了一半的进上下文，并注明「这条回复被用户中途停下了」。
 - 一条回复最多 64k 字，到了就截断并停止生成，入库时带 `truncated: true`。
+- 每次回复的模型调用记一行到同一个文件夹的 `model_calls.jsonl`（权限 0600），格式和运行的一样，`role` 是 `session`：`tokens_in`（模型读的全部输入，含提示缓存的部分，那部分另记在 `cache_read`）、`tokens_out`、`cost_usd`（服务没给就按价目表算）、`latency_ms`、`sent_chars`、`outcome`，以及 `msg_id`、`reply_to`。
 
 **退出：** stdin 关了（app 走了）或收到 `end`，而且没有回复在进行，进程就退出（退出码 0）。stdin 关的时候正有回复，就等它说完、入库之后再退出。SIGINT / SIGTERM 等同 `end`。
 
