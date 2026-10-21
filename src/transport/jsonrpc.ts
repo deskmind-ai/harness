@@ -25,6 +25,7 @@ export class RpcError extends Error {
  *  JSON-RPC error when the line's id can be read from its start, and otherwise closes. Notifications beyond
  *  `notifyPerSec` (a bucket of `notifyBurst`) are dropped and counted by method. */
 export interface PeerLimits { maxLine?: number; oversize?: "close" | "error"; notifyPerSec?: number; notifyBurst?: number }
+/** The line cap the executor sets for its runtime and the standalone server for its caller: 16 MB, in UTF-8 bytes. */
 export const MAX_LINE = 16 * 1024 * 1024;
 
 /** The top-level `"id"` of a JSON object's beginning (a number or a short string), read without parsing the rest:
@@ -93,14 +94,16 @@ export class JsonRpcPeer {
       for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
         if (skipping) { skipping = false; continue; }
-        if (line.length > max / 4 && Buffer.byteLength(line) > max) { if (!tooLong(line)) return; continue; }
+        // measured in UTF-8 bytes; the character count first, as a cheap filter (a character is at most 4 bytes)
+        if (line.length > max / 4 && Buffer.byteLength(line) > max) { if (!tooLong(line)) { buf = ""; return; } continue; }
         this.read(line.endsWith("\r") ? line.slice(0, -1) : line);
         if (this.violation) return;
       }
       if (!skipping && buf.length > max / 4 && Buffer.byteLength(buf) > max) { if (!tooLong(buf)) { buf = ""; return; } skipping = true; }
       if (skipping) buf = "";
     });
-    input.on("end", () => { if (buf && !skipping) this.read(buf); buf = ""; this.close("the other side closed its stream"); });
+    // after a violation nothing more is read: a request still in the buffer is not served when the stream ends
+    input.on("end", () => { if (buf && !skipping && !this.violation) this.read(buf); buf = ""; this.close("the other side closed its stream"); });
     input.on("close", () => this.close("the other side closed its stream"));
     input.on("error", (e: Error) => this.close(`read: ${e.message}`));
     output.on("error", (e: Error) => { this.broken = true; this.close(`write: ${e.message}`); });
@@ -122,6 +125,7 @@ export class JsonRpcPeer {
   }
 
   private read(line: string) {
+    if (this.violation) return;
     if (!line.trim()) return;
     let msg: Json;
     try { msg = JSON.parse(line); } catch { this.onParseError(line); return; }
