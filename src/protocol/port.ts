@@ -70,7 +70,10 @@ export interface ExecutorPort {
   observe(window: string): Promise<Observation>;
   /** One action on screen. The executor settles its class, asks the user when it needs consent (and waits), signs the
    *  yes, and acts. */
-  act(p: { action: Action; epoch: number; consequence: Consequence; purpose: string }): Promise<ToolReply>;
+  act(p: { action: Action; epoch: number; consequence: Consequence; purpose: string;
+    /** Which step of the plan this action is for (1-based), as the caller says: shown in the app's step list, never used
+     *  for consent or verification. */
+    plan_step?: number }): Promise<ToolReply>;
   /** One file capability on the task folder (a `FileTool`), under the same guard. */
   file(p: { capability: string; args: Record<string, string> }): Promise<ToolReply>;
   /** The plan: the start gate (readings the judge cannot settle are asked of the user), then one plan card for the

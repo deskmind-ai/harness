@@ -781,6 +781,9 @@ export class Executor {
     return stamped;
   }
 
+  /** The caller's last observation of a window (what its element ids refer to), for what a step is said to be. */
+  observed(windowId: string): Observation | undefined { return this.lastObs.get(windowId); }
+
   stop() { this.stopped = true; this.emit("executor.stopped"); }
 
   /** The state-changing screen action handed to the driver and not answered yet (its intent is journaled, its receipt
@@ -1907,6 +1910,35 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
     : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, a.url) : t.openWindow(a.app)) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
   const cls = consequence === "external" ? t.sends : consequence === "modify_user" ? t.modifies : "";
   return `${where ? t.at(where) : ""}${what}${cls ? "（" + cls + "）" : ""}`;
+}
+
+/** An element as the user would name it: its own label; one whose label only names its role (hands' label_from_role)
+ *  or has none goes by its role as the system words it (role_description, 「按钮」), else the role. Never its id. */
+export function elementName(el: Element | undefined): string | null {
+  if (!el) return null;
+  const label = el.label?.trim();
+  if (label && !el.label_from_role) return label;
+  return el.role_description?.trim() || el.role?.trim() || null;
+}
+
+/** A step in a few words, for the live view's line under the picture (「在 邮件「新邮件」 点「发送」」): the action
+ *  kind, the element it acts on by its label and role from the caller's observation, and where. Built from structure
+ *  only; an element id or the action's JSON never shows. Values the task types are cut short. */
+export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, cap?: Capability): string {
+  const t = T(lang);
+  if (a.kind === "file") return `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}${Object.keys(a.args).length ? "：" + Object.values(a.args).map((v) => `「${cardText(v, 40)}」`).join("，") : ""}`;
+  const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
+  const name = elementName(el) ?? t.anElement;
+  const short = (x: string) => cardText(x, 40);
+  const where = obs ? windowLabel(obs.window, lang) : "";
+  const what = a.kind === "click" ? t.click(name) : a.kind === "double_click" ? t.doubleClick(name)
+    : a.kind === "set_value" ? t.set(name, short(a.value))
+    : a.kind === "type" ? t.type(name, short(a.text))
+    : a.kind === "select" ? t.select(name, short(a.option))
+    : a.kind === "key" ? t.key(a.chord)
+    : a.kind === "scroll" ? t.scroll : a.kind === "close_window" ? t.closeWindow : a.kind === "focus_window" ? t.focusWindow
+    : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, shortUrl(a.url)) : t.openWindow(a.app)) : t.wait;
+  return `${where && a.kind !== "open_window" && a.kind !== "wait" ? t.at(where) : ""}${what}`;
 }
 
 export type { WindowInfo };
