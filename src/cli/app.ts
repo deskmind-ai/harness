@@ -3,7 +3,8 @@
  * docs/design/harness-app-integration-2026-10-17.md §2): JSON events out on stdout, one per line, each written to the
  * run's event log first (protocol/events.ts); answers to cards come back on stdin as JSON lines.
  *
- *   app-run [--request <file>] [--runs <dir>]   stdin line 1 (or the file): {run_id?, raw, scope?, config?, engine?, lang?, driver?}
+ *   app-run [--request <file>] [--runs <dir>]   stdin line 1 (or the file): {run_id?, raw, scope?, config?, engine?, lang?, driver?};
+ *                                               then control lines (protocol/control.ts); SIGINT / SIGTERM stop the run
  *   respond --run <id> [--runs <dir>]           stdin line 1: {option} | {text}  — the user's answer to the result card
  *   --selftest                                  no model, no network: the packaged binary's health check
  *   model-check --config <name|openai:prov|model> one tiny question to the configured model: {ok, model, ms} or {ok:false, error} — the app's "test" button
@@ -28,17 +29,24 @@ import type { SkillSource } from "../runtime/loop.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
-import { FrontierRuntime, type RuntimeUser } from "../runtime/loop.js";
+import { FrontierRuntime, type RuntimeOptions, type RuntimeUser } from "../runtime/loop.js";
 import { loopModel } from "../runtime/model.js";
 import { scriptedStream } from "../runtime/scripted.js";
 import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
+import { isForeignControl, parseControl } from "../protocol/control.js";
+import { PROTOCOL } from "../protocol/version.js";
 import type { Answer, Card } from "../orchestrator/index.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
 
+/** task_done's reason when a stop could not wait for an action the driver had not answered. */
+export const STEP_UNKNOWN = "a step was in progress; its result is unknown";
+
 export interface Request { run_id?: string; raw: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string; rules?: ConsentToken[] }
 
-/** JSON lines in: a line is `{ask_id, option}` or `{ask_id, text}`; the first line may be the request itself. */
+/** JSON lines in: control lines (protocol/control.ts: answer, stop, respond, steer; v1 also reads the untyped
+ *  `{ask_id, option|text}` and `{"stop":true}`); the first line may be the request itself. A stop or a steer is
+ *  handled the moment it arrives; answers and responds wait in order for `next()`. */
 export class LineReader {
   private waiting: ((line: string) => void)[] = [];
   private queued: string[] = [];
@@ -48,7 +56,12 @@ export class LineReader {
       if (!l.trim()) return;
       // the app's stop can arrive at any moment, card or no card: it never waits in the answer queue
       // it also lets go of a card waiting for its answer: that card is answered with nothing (review of #16)
-      try { const j = JSON.parse(l); if (j && j.stop === true) { this.stopped = true; this.onStop?.(); for (const w of this.waiting.splice(0)) w(""); return; } } catch { /* an answer line */ }
+      const c = parseControl(l);
+      if (c?.type === "stop") { this.stop(); return; }
+      if (c?.type === "steer") { this.onSteer?.(c.text); return; }
+      // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
+      // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
+      if (!c && isForeignControl(l)) return;
       const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l);
     });
     // the app went away (stdin closed): every open card is answered with nothing, so the run ends instead of hanging
@@ -56,7 +69,11 @@ export class LineReader {
   }
   closed = false;
   stopped = false;
-  onStop: (() => void) | null = null;
+  onStop: ((why: string) => void) | null = null;
+  onSteer: ((text: string) => void) | null = null;
+  /** The app's stop (a stop line, or a signal): once, whoever asks first; every card waiting for its answer is
+   *  answered with nothing. */
+  stop(why = "stopped by the app") { if (this.stopped) return; this.stopped = true; this.onStop?.(why); for (const w of this.waiting.splice(0)) w(""); }
   next(): Promise<string> { const q = this.queued.shift(); return q !== undefined ? Promise.resolve(q) : this.closed ? Promise.resolve("") : new Promise((r) => this.waiting.push(r)); }
 }
 
@@ -69,10 +86,10 @@ export class StdioUser implements RuntimeUser {
     this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking } });
     this.log.emit({ kind: "waiting", ask_id });
     for (;;) {
-      let a: Record<string, unknown>;
       const line = await this.input.next();
       if (!line && (this.input.closed || this.input.stopped)) return null;     // the app is gone or stopped the task: no answer, the run ends honestly
-      try { a = JSON.parse(line); } catch { continue; }
+      const a = parseControl(line);
+      if (a?.type !== "answer") continue;
       if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
       this.log.emit({ kind: "resumed", ask_id });
       if (typeof a.option === "number" && a.option >= 0 && a.option < card.options.length) return { option: a.option };
@@ -148,23 +165,30 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
   };
 }
 
-export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number }) {
+/** `signals` (the CLI only): SIGINT / SIGTERM stop the run through the same one-time stop as a stop line. When the
+ *  run has not ended `deadlineMs` after the signal: if an action is still out at the driver (it may land after a stop),
+ *  wait up to `waitMs` more for its receipt; then write task_done (stopped) — with the action under
+ *  changes.unconfirmed if it never answered — and exit. A second signal writes task_done and exits at once.
+ *  `inject` (tests): a driver, a gateway, a model in place of the config's. */
+export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number;
+  signals?: { onSignal: (h: (sig: string) => void) => void; exit: () => void; exitNow: () => void; deadlineMs?: number; waitMs?: number };
+  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"] } }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
-  log.emit({ kind: "start", raw: req.raw, lang: req.lang ?? "zh", engine: req.engine ?? "runtime", config, ...(req.scope ? { scope: req.scope } : {}) });
+  log.emit({ kind: "start", raw: req.raw, lang: req.lang ?? "zh", engine: req.engine ?? "runtime", config, ...(req.scope ? { scope: req.scope } : {}), protocol: { events: PROTOCOL.events } });
   const table = configTable(config);
   if (!table) { log.emit({ kind: "task_done", status: "failed", reason: `unknown config ${config}`, summary: "", result_card: null }); return; }
-  const gw = new Gateway(table, { log: (r) => fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n") });
+  const gw = o.inject?.gateway ?? new Gateway(table, { log: (r) => fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n") });
   const signer = ConsentSigner.fresh();
   const trace = traceWriter(path.join(o.runs, runId, "trace.jsonl"));
   const ws = req.scope ? new Workspace(req.scope) : undefined;
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
   // process did without a receipt and tells the model (D10)
-  const executor = new Executor(driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: (k, b) => { trace(k, b); const e = toProtocol(k, b); if (e) log.emit(e); } });
+  const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), onEvent: (k, b) => { trace(k, b); const e = toProtocol(k, b); if (e) log.emit(e); } });
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
-    task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: loopModel(table.goal.model),
+    task: runId, raw: req.raw, executor, signer, user: new StdioUser(log, o.input), gateway: gw, model: o.inject?.model ?? loopModel(table.goal.model),
     ...(ws ? { workspace: ws, registry: fileRegistry() } : {}),
     skills: skillsFor(req, ws, () => executor.beginSnapshot), lang: req.lang ?? "zh", ...(req.rules ? { rules: req.rules } : {}),
     // a real desktop takes more looks than the check set's folders: a pixel-mode app needs an observation per step
@@ -172,22 +196,55 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     budget: req.driver === "hands" ? { tool_calls: 90, turns: 60 } : {},
     onEvent: (k, b) => { trace(k, b); const e = toProtocol(k, b); if (e) log.emit(e); },
   });
-  o.input.onStop = () => { log.emit({ kind: "refused", what: "the task", why: "stopped by the app", by: "user" }); rt.stop("stopped by the app"); };
+  // one stop for the run, whoever asks (a stop line, a signal): one refused event, the first asker's reason
+  let stopReason = "";
+  const stopRun = (why: string) => { if (stopReason) return; stopReason = why; log.emit({ kind: "refused", what: "the task", why, by: "user" }); rt.stop(why); };
+  o.input.onStop = stopRun;
+  if (o.input.stopped) stopRun("stopped by the app");     // a stop line read together with the request, before this
+  // control v1 reads steer lines; the app does not send them yet, and the runtime does not take them from the app
+  // until a steer reaches the judges and lets go of an open card (docs/0.5-decisions.md, later)
+  o.input.onSteer = (text) => trace("control.steer", { text, note: "steer not supported yet" });
+  // one task_done per run: a signal's deadline may write it before the runtime returns
+  let done = false, signals = 0, ended = () => {};
+  const whenDone = new Promise<void>((res) => { ended = res; });
+  const taskDone = (body: EventBody) => { if (done) return; done = true; log.emit(body); ended(); };
+  // the run did not end by itself in time: an action still out at the driver may land after this, so the stop is not
+  // called clean — the action is listed as unconfirmed and the reason says its result is unknown
+  const forceDone = () => {
+    if (done) return;
+    const f = executor.inFlight, c = executor.changes();
+    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c } as EventBody);
+  };
+  const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+  o.signals?.onSignal((sig) => {
+    const sg = o.signals!;
+    if (done) return sg.exit();
+    if (++signals > 1) { forceDone(); return sg.exitNow(); }
+    o.input.stop(`stopped by ${sig}`);
+    void (async () => {
+      await sleep(sg.deadlineMs ?? 800);
+      if (!done && executor.inFlight) {
+        await Promise.race([executor.settled(), sleep(sg.waitMs ?? 10_000)]);
+        // the receipt came: the runtime writes its own task_done a moment later
+        if (!executor.inFlight) await Promise.race([whenDone, sleep(500)]);
+      }
+      forceDone(); sg.exit();
+    })();
+  });
   const r = await rt.run();
   const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
-  log.emit({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes() } as never);
+  taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes() } as never);
+  if (signals) return o.signals!.exit();
   // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
-  // seconds for `{ "respond": <option index> }` on stdin, then exit
+  // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit
   if (card && o.linger > 0) {
     const line = await Promise.race([o.input.next(), new Promise<string>((res) => setTimeout(() => res(""), o.linger * 1000))]);
     if (line) {
-      try {
-        const a = JSON.parse(line) as { respond?: number };
-        if (typeof a.respond === "number") {
-          const u = await rt.respond({ option: a.respond });
-          log.emit({ kind: "result_response", picked: card.options[a.respond]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted" } as never);
-        }
-      } catch { /* not an answer */ }
+      const a = parseControl(line);
+      if (a?.type === "respond" && typeof a.option === "number") {
+        const u = await rt.respond({ option: a.option });
+        log.emit({ kind: "result_response", picked: card.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted" } as never);
+      }
     }
   }
 }
@@ -237,10 +294,17 @@ async function main() {
   if (cmd === "model-check") { const r = await modelCheck(a.config!); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
   const input = new LineReader(process.stdin);
   if (cmd === "app-run") {
+    // SIGINT / SIGTERM: before the run has started there is nothing to stop; after, the run ends as stopped
+    // (task_done written) and the process exits within a second. stdout is drained before exit.
+    const exit = () => process.stdout.write("", () => process.exit(0));
+    const exitNow = () => process.exit(0);           // a second signal: no waiting for stdout either
+    let onSignal: (sig: string) => void = () => exitNow();
+    for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => onSignal(sig));
     const req: Request = JSON.parse(a.request ? fs.readFileSync(a.request, "utf-8") : await input.next());
     if (!req.raw) throw new Error("request needs raw");
-    await appRun(req, { runs: path.resolve(a.runs!), out, input, linger: Number(a.linger ?? 0) });
-    process.exit(0);
+    await appRun(req, { runs: path.resolve(a.runs!), out, input, linger: Number(a.linger ?? 0), signals: { onSignal: (h) => { onSignal = h; }, exit, exitNow } });
+    exit();
+    return;
   }
   if (cmd === "respond") {
     if (!a.run) throw new Error("respond needs --run <id>");

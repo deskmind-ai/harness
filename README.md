@@ -45,7 +45,7 @@ pnpm eval -- --report runs/a/results.jsonl runs/b/results.jsonl                 
 
 ## 给 app 用的入口和打包（0.5）
 
-`src/cli/app.ts` 是 DeskMind Hands.app 启动的子进程：事件先写进运行记录（`runs/app/<run_id>/events.jsonl`，带 `seq`，先落盘再发），再以每行一个 JSON 写到 stdout；卡片的回答从 stdin 读回来（`{"ask_id": …, "option": n}` 或 `{"ask_id": …, "text": "…"}`）。事件协议在 `src/protocol/events.ts`（start / preparing / plan / step / ask / waiting / resumed / consent / refused / answer_given / task_done），app 不认识的种类直接忽略。
+`src/cli/app.ts` 是 DeskMind Hands.app 启动的子进程：事件先写进运行记录（`runs/app/<run_id>/events.jsonl`，带 `seq`，先落盘再发），再以每行一个 JSON 写到 stdout；卡片的回答、停止等控制从 stdin 读回来（`{"type":"answer","ask_id": …, "option": n}`、`{"type":"stop"}` 等；不带 `type` 的旧写法照样认），SIGINT / SIGTERM 等同于停止。三个接口（工具、事件、控制）的格式、版本和兼容规则见 `docs/protocol.md`。事件协议在 `src/protocol/events.ts`（start / preparing / plan / step / ask / waiting / resumed / consent / refused / answer_given / task_done），app 不认识的种类直接忽略。
 
 ```bash
 echo '{"raw":"开一个编辑器窗口，新建文档，写上「你好」","config":"yy-luna"}' | pnpm app app-run     # 事件流在 stdout

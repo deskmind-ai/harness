@@ -662,6 +662,14 @@ export class Executor {
 
   stop() { this.stopped = true; this.emit("executor.stopped"); }
 
+  /** The state-changing screen action handed to the driver and not answered yet (its intent is journaled, its receipt
+   *  is not): a stop cannot call the run cleanly stopped while it is out, since it may still land (hands may take up to
+   *  120 s). File capabilities run synchronously, so they are never in flight. */
+  private flight: { action: Action; object: string; text: string; settled: Promise<void> } | null = null;
+  get inFlight(): { action: Action; object: string; text: string } | null { const f = this.flight; return f ? { action: f.action, object: f.object, text: f.text } : null; }
+  /** Resolves when no action is in flight (at once if none is): the moment its receipt is written. */
+  settled(): Promise<void> { return this.flight?.settled ?? Promise.resolve(); }
+
   /** A file action's capability and footprint, or why it cannot be looked at. */
   private fileOf(a: Extract<Action, { kind: "file" }>): { cap: Capability; fp: { reads: string[]; writes: string[] }; ws: Workspace } | { error: string } {
     const f = this.opts.files;
@@ -1227,9 +1235,15 @@ export class Executor {
     const fgWindow = "window" in act ? act.window : null;
     const objectToken = !!fgWindow && req.consent?.scope === "object" && req.consent.object === `window:${fgWindow}` && this.consent.check(act, `window:${fgWindow}`, "modify_user", this.opts.task, req.consent) === null;
     foregroundOk = !!fgWindow && (this.ledger.ownerOf(`window:${fgWindow}`) === "task" || this.taskOpened.has(fgWindow) || objectToken || stepConsented);
-    if (consequence !== "read") this.journal("intent", { action: act, object: base.object, consequence, text: describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence) });
+    let land: (() => void) | null = null;
+    if (consequence !== "read") {
+      const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence);
+      this.journal("intent", { action: act, object: base.object, consequence, text });
+      this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
+    }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
     try { r = await this.driver.perform(this.forDriver(act), foregroundOk ? { foreground_ok: true } : undefined); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    finally { if (land) { this.flight = null; (land as () => void)(); } }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a

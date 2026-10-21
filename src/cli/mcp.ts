@@ -11,6 +11,8 @@
  * the app.
  *
  * Only what MCP needs is implemented here (initialize, tools/list, tools/call, ping); no SDK, no other transport.
+ * `initialize` answers MCP 2025-06-18 (or 2024-11-05 when the client asks for it) and names DeskMind's own interface versions under
+ * `capabilities.experimental.deskmind` ({tools, events, control}; docs/protocol.md).
  */
 import * as readline from "node:readline";
 import { parseArgs } from "node:util";
@@ -23,6 +25,7 @@ import { HandsDriver } from "../executor/hands.js";
 import { NEEDS_CONSENT, type Action, type Consequence, type Driver, type PlanProposal } from "../executor/types.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
+import { MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSIONS, PROTOCOL } from "../protocol/version.js";
 
 type Json = Record<string, unknown>;
 const schema = (properties: Json, required: string[] = []) => ({ type: "object", properties, required });
@@ -85,7 +88,12 @@ export class McpExecutorServer {
     const id = msg.id, method = String(msg.method ?? "");
     const reply = (result: Json) => ({ jsonrpc: "2.0", id, result });
     const fail = (code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
-    if (method === "initialize") return reply({ protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "deskmind-executor", version: "0.5" } });
+    if (method === "initialize") {
+      // version negotiation (MCP lifecycle): echo a revision we speak, else offer ours
+      const asked = (msg.params as Json | undefined)?.protocolVersion;
+      const protocolVersion = typeof asked === "string" && MCP_PROTOCOL_VERSIONS.includes(asked) ? asked : MCP_PROTOCOL_VERSION;
+      return reply({ protocolVersion, capabilities: { tools: {}, experimental: { deskmind: { ...PROTOCOL } } }, serverInfo: { name: "deskmind-executor", version: "0.5" } });
+    }
     if (method.startsWith("notifications/")) return null;
     if (method === "ping") return reply({});
     if (method === "tools/list") return reply({ tools: TOOLS });
