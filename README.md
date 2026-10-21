@@ -50,6 +50,8 @@ pnpm eval -- --report runs/a/results.jsonl runs/b/results.jsonl                 
 
 ```bash
 echo '{"raw":"开一个编辑器窗口，新建文档，写上「你好」","config":"yy-luna"}' | pnpm app executor    # 事件流在 stdout（app-run 是老名字）；循环跑在子进程 runtime 里，DESKMIND_EXECUTOR_INPROC=1 留在同一进程
+printf '%s\n' '{"session_id":"ses_demo"}' '{"type":"say","text":"你好"}' | pnpm app session   # 聊天会话（H1，还没有电脑任务）：历史在 ~/Library/Application Support/DeskMind/sessions/，见 docs/protocol.md「会话（第 1 版）」
+pnpm app sessions list                                # 所有会话，最新的在前
 pnpm app --selftest                                   # 不用模型：执行层 + 一轮脚本化的运行时，输出 {"ok":true,…}
 pnpm bundle && node dist/harness.mjs --selftest       # esbuild 打成单文件（约 1.6 MB），基础教程在打包时嵌入
 DESKMIND_MACTOOLS=/path/to/mactools                   # app 带预编译的 Swift 小工具时指过去，不再在用户机器上现编

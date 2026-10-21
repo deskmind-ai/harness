@@ -12,6 +12,8 @@
  *   --selftest                                  no model, no network: the packaged binary's health check
  *   model-check --config <name|openai:prov|model> one tiny question to the configured model: {ok, model, ms} or {ok:false, error} — the app's "test" button
  *   trace export --run <id> --out <file> [--runs <dir>]   the run's call chain (trace.otel.jsonl) as one OTLP/JSON request
+ *   session [--session <id>] [--dir <d>]        one chat session, long-lived (cli/session.ts; docs/protocol.md 「会话（第 1 版）」)
+ *   sessions list [--dir <d>]                   every chat session, the newest first
  *
  * Consent: the executor verifies Ed25519 tokens with a public key; the private key is the app's (keychain / Secure
  * Enclave, docs/0.5-decisions.md D4). Until the app signs, this process holds a fresh pair per run — the model never
@@ -37,6 +39,7 @@ import { FrontierRuntime, type RuntimeOptions, type RuntimeUser } from "../host/
 import { scriptedStream } from "../runtime/scripted.js";
 import type { AgentSpec } from "../host/agent.js";
 import { runtimeMain } from "./runtime.js";
+import { sessionMain } from "./session.js";
 import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
 import { isForeignControl, parseControl } from "../protocol/control.js";
 import { PROTOCOL } from "../protocol/version.js";
@@ -368,6 +371,9 @@ export async function modelCheck(config: string): Promise<{ ok: boolean; model?:
 }
 
 async function main() {
+  // the chat session has its own options (cli/session.ts): handed over before this command line is parsed
+  const sub = process.argv[2];
+  if (sub === "session" || sub === "sessions") { const code = await sessionMain(process.argv.slice(2)); process.stdout.write("", () => process.exit(code)); return; }
   const { values: a, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true, options: { linger: { type: "string", default: "0" },
     request: { type: "string" }, runs: { type: "string", default: "runs/app" }, run: { type: "string" }, selftest: { type: "boolean", default: false }, config: { type: "string", default: "ds-flash" },
     out: { type: "string" },
@@ -408,7 +414,7 @@ async function main() {
     respond(a.run, path.resolve(a.runs!), JSON.parse(await input.next()), out);
     process.exit(0);
   }
-  console.error("usage: executor|app-run [--request <file>] [--runs <dir>] | runtime | respond --run <id> | model-check --config <name> | trace export --run <id> --out <file> | --selftest");
+  console.error("usage: executor|app-run [--request <file>] [--runs <dir>] | runtime | respond --run <id> | model-check --config <name> | trace export --run <id> --out <file> | session [--session <id>] [--dir <d>] | sessions list [--dir <d>] | --selftest");
   process.exit(2);
 }
 
