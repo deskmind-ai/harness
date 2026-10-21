@@ -136,6 +136,8 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
     case "consent.asked": return { kind: "consent", object: s(body.object), consequence: body.consequence as never, scope: "action", picked: (body.picked as string | null) ?? null };
     case "plan.confirmed": return null;
     case "answer.given": return { kind: "answer_given", text: s(body.text) };
+    // the user's words came after the task was over: said, not dropped
+    case "steer.refused": return { kind: "refused", what: `steer: ${s(body.raw)}`, why: s(body.why), by: "executor" };
     default: return null;
   }
 }
@@ -222,7 +224,8 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   if (o.input.stopped) stopRun("stopped by the app");     // a stop line read together with the request, before this
   // the user's words mid-run: to the executor, which applies them between steps (the judges then read the request as
   // it was and every change), voids an open card, and asks for a new plan card when the new words go beyond the plan
-  o.input.onSteer = (text) => { trace("control.steer", { text }); if (text.trim() && !stopReason) rt.steer(text); };
+  // (after the task is over — a verdict passed, a stop, the result card's linger — the executor refuses them: a refused event)
+  o.input.onSteer = (text) => { trace("control.steer", { text }); if (text.trim()) rt.steer(text); };
   // one task_done per run: a signal's deadline may write it before the runtime returns
   let done = false, signals = 0, ended = () => {};
   const whenDone = new Promise<void>((res) => { ended = res; });

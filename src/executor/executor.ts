@@ -859,6 +859,9 @@ export class Executor {
     return got.hosts;
   }
 
+  /** The user changed the request (steer): the content a plan card approved for its sites goes with that plan. */
+  forgetPlanSites() { if (this.planSites.size) this.emit("executor.plan_sites_void", { hosts: [...this.planSites.keys()] }); this.planSites.clear(); }
+
   /** The per-site rule for an open_window with a URL, when it makes the open a send: once the task has read material,
    *  an http(s) URL to a host not approved yet (`host` is that host; consent is per host for the rest of the task) —
    *  unless the provenance judge cleared this URL on this material — and any other URL, file: included (`host` null:

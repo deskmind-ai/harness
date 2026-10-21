@@ -21,7 +21,7 @@ import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import { FrontierRuntime } from "../src/host/frontier.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
 import { EventLog, type AppEvent } from "../src/protocol/events.js";
-import { LineReader, StdioUser } from "../src/cli/app.js";
+import { LineReader, StdioUser, toProtocol } from "../src/cli/app.js";
 
 const scriptedTable = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
 const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as any };
@@ -56,6 +56,9 @@ function judge() {
   });
   return { gw, asked };
 }
+
+/** A new plan for the mail window: reply and send. */
+const replan = (w: string): Step => ({ calls: [{ name: "plan", args: { steps: [{ purpose: "按新要求回复林晓", objects: [`window:${w}`], consequence: "modify_user" }, { purpose: "发送", objects: [`window:${w}`], consequence: "external" }] } }] });
 
 /** The JSON object a judge prompt carries (the user's words and the evidence). */
 const wordsOf = (prompt: string): Record<string, unknown> => JSON.parse(prompt.slice(prompt.indexOf("{"), prompt.lastIndexOf("}") + 1));
@@ -122,6 +125,10 @@ describe("executor port: steer", () => {
         { name: "computer_act", args: { action: { kind: "set_value", window: w, target: `${w}:0:compose_body`, value: "收到，谢谢" }, epoch: epochOf(ms), consequence: "modify_user", purpose: "写正文" } },
       ] }),
       { calls: [{ name: "computer_observe", args: { window: w } }] },
+      // the plan's consent went with the old words: a new plan first
+      act({ kind: "set_value", window: w, target: `${w}:0:compose_body`, value: "好的，周五见" }, "modify_user"),
+      (ms) => { expect(lastText(ms)).toContain("先按新要求交一份新计划"); return replan(w); },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
       act({ kind: "set_value", window: w, target: `${w}:0:compose_body`, value: "好的，周五见" }, "modify_user"),
       act({ kind: "click", window: w, target: `${w}:0:send` }, "external"),
       { calls: [{ name: "finish", args: { outcome: "done", summary: "已回复：好的，周五见" } }] },
@@ -173,7 +180,8 @@ describe("executor port: steer", () => {
       act({ kind: "set_value", window: w, target: `${w}:0:compose_body`, value: "收到，谢谢" }, "modify_user"),
       act({ kind: "click", window: w, target: `${w}:0:send` }, "external"),
       // the send came back undone with the new words
-      (ms) => { expect(lastText(ms)).toContain("用户改了要求"); return { calls: [{ name: "computer_observe", args: { window: w } }] }; },
+      (ms) => { expect(lastText(ms)).toContain("用户改了要求"); return replan(w); },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
       act({ kind: "set_value", window: w, target: `${w}:0:compose_body`, value: "好的，周五见" }, "modify_user"),
       act({ kind: "click", window: w, target: `${w}:0:send` }, "external"),
       { calls: [{ name: "finish", args: { outcome: "done", summary: "已回复" } }] },
@@ -181,13 +189,15 @@ describe("executor port: steer", () => {
     rt = new FrontierRuntime({ task: "t1", raw: RAW, executor: ex, signer, user, gateway: gw, model: { ...model, streamFn: scriptedStream(steps, seen) }, onEvent: (k) => events.push(k) });
     const r = await rt.run();
     expect(r.status).toBe("succeeded");
-    expect(cards.map((c) => c.kind)).toEqual(["plan", "action", "action"]);
+    // the plan's consent went with the old words: a new plan card, then the send asked again
+    expect(cards.map((c) => c.kind)).toEqual(["plan", "action", "plan", "action"]);
     // the first send card was let go (its asker told through the signal); the second shows the new body
     expect(signals[1]!.aborted).toBe(true);
-    expect(signals[2]!.aborted).toBe(false);
+    expect(signals[3]!.aborted).toBe(false);
     expect(events).toContain("card.voided");
+    expect(events).toContain("plan.void");
     expect(cards[1]!.text).toContain("收到，谢谢");
-    expect(cards[2]!.text).toContain("好的，周五见");
+    expect(cards[3]!.text).toContain("好的，周五见");
     // nothing went out on the voided card: one reply, with the new body
     expect(sim.mailState(w).replies).toEqual([{ to: "m1", body: "好的，周五见" }]);
     expect(r.consents.filter((c) => c.scope === "action")).toHaveLength(1);
@@ -356,5 +366,78 @@ describe("executor port: the runtime cannot sign", () => {
     // the token itself was good: handed to the executor directly, it covers the click
     const again = await ex.observe(w);
     expect((await ex.act({ action: { kind: "click", window: w, target: `${w}:0:row:m1` }, epoch: again.epoch, consequence: "modify_user", consent: forged })).status).toBe("ok");
+  });
+});
+
+describe("executor port: nothing after the end", () => {
+  /** A bare port caller on the mail window with an accepted plan for it. */
+  async function settledOn(how: "done" | "cancel") {
+    const { sim, w } = mail();
+    const signer = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: signer.publicKey });
+    const cards: string[] = [];
+    const events: { kind: string; body: Record<string, unknown> }[] = [];
+    const svc = new ExecutorService({ task: "t1", raw: "把林晓的邮件标上旗标", executor: ex, signer, gateway: judge().gw, onEvent: (kind, body) => events.push({ kind, body }),
+      user: { ask: (c) => { cards.push(c.kind); return c.kind === "plan" ? approve(c) : { option: c.options.findIndex((o) => o.kind === "cancel") }; } } });
+    const port = svc.port;
+    await port.begin();
+    expect((await port.plan({ steps: [{ purpose: "标旗标", objects: [`window:${w}`], consequence: "modify_user" }] })).text).toContain("用户同意了计划");
+    const settle = how === "done" ? await port.finish({ outcome: "done", summary: "done" }) : await port.askUser({ question: "继续吗", options: ["是"] });
+    expect(settle.done).toBe(true);
+    return { sim, w, ex, port, svc, cards, events };
+  }
+
+  for (const how of ["done", "cancel"] as const) {
+    it(`after ${how === "done" ? "a passing verdict" : "the user cancelled"}, no step is done, even one the plan's token covers`, async () => {
+      const { sim, w, ex, port, cards } = await settledOn(how);
+      const o = await port.observe(w);
+      const r = await port.act({ action: { kind: "click", window: w, target: `${w}:0:row:m1` }, epoch: o.epoch, consequence: "modify_user", purpose: "after the end" });
+      expect(r).toMatchObject({ isError: true, done: true });
+      for (const rep of [await port.plan({ steps: [] }), await port.askUser({ question: "?", options: [] }), await port.answer({ text: "x" }), await port.finish({ outcome: "done", summary: "again" }), await port.file({ capability: "fs.write_text", args: {} })]) expect(rep).toMatchObject({ done: true });
+      expect(sim.mailState(w).selected).toBeNull();
+      expect(ex.receipts).toHaveLength(0);
+      expect(cards).toEqual(how === "done" ? ["plan"] : ["plan", "missing"]);
+      expect((await port.end()).status).toBe(how === "done" ? "succeeded" : "cancelled");
+      // and after end, still nothing
+      expect(await port.act({ action: { kind: "wait", ms: 1 }, epoch: 0, consequence: "read", purpose: "x" })).toMatchObject({ done: true });
+    });
+  }
+
+  it("begin is called once", async () => {
+    const { port } = await settledOn("done");
+    await expect(port.begin()).rejects.toThrow(/already/);
+  });
+
+  it("a steer after the task is over is refused, and the app is told", async () => {
+    const { svc, events } = await settledOn("done");
+    svc.steer("算了，换成周会纪要那封");
+    const e = events.find((x) => x.kind === "steer.refused")!;
+    expect(e.body).toMatchObject({ raw: "算了，换成周会纪要那封", why: "the task already finished" });
+    expect(toProtocol(e.kind, e.body)).toEqual({ kind: "refused", what: "steer: 算了，换成周会纪要那封", why: "the task already finished", by: "executor" });
+    expect(events.some((x) => x.kind === "steer")).toBe(false);
+  });
+});
+
+describe("executor port: a steer withdraws the plan's consent", () => {
+  it("「别动这个窗口了」: the window the plan covered asks again (a new plan first), nothing is done on the old yes", async () => {
+    const { sim, w } = mail();
+    const signer = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: signer.publicKey });
+    const cards: string[] = [];
+    const svc = new ExecutorService({ task: "t1", raw: RAW, executor: ex, signer, gateway: judge().gw, user: { ask: (c) => { cards.push(c.kind); return approve(c); } } });
+    const port = svc.port;
+    await port.begin();
+    await port.plan({ steps: [{ purpose: "回复林晓", objects: [`window:${w}`], consequence: "modify_user" }] });
+    let o = await port.observe(w);
+    // covered by the plan: no card
+    expect((await port.act({ action: { kind: "click", window: w, target: `${w}:0:row:m1` }, epoch: o.epoch, consequence: "modify_user", purpose: "选中" })).isError).toBeFalsy();
+    svc.steer("别动这个窗口了");
+    expect(port.steers()).toEqual(["别动这个窗口了"]);
+    o = await port.observe(w);
+    const r = await port.act({ action: { kind: "click", window: w, target: `${w}:0:row:m2` }, epoch: o.epoch, consequence: "modify_user", purpose: "选中另一封" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("先按新要求交一份新计划");
+    expect(sim.mailState(w).selected).toBe("m1");
+    expect(cards).toEqual(["plan"]);
   });
 });

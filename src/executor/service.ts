@@ -137,15 +137,28 @@ export class ExecutorService {
     o.executor.setRequest(o.raw);
     if (!o.executor.opts.judge) o.executor.opts.judge = defaultJudge(o.gateway, (k, b) => this.emit(k, b));
     this.budget = { ...SERVICE_BUDGET, ...(o.budget ?? {}) };
+    // once the task's status is settled (a verdict passed, the user cancelled, a stop) or the executor has ended, nothing
+    // more is done: a step after the verdict would land unverified, one after a cancel unconsented
+    const live = <A extends unknown[]>(f: (...a: A) => Promise<ToolReply>) => (...a: A): Promise<ToolReply> => (this.settled() ?? f(...a));
     const port: ExecutorPort = {
-      begin: () => this.begin(), snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
+      begin: () => (this.begun ? Promise.reject(new Error("begin was already called for this task")) : this.begin()),
+      snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
-      act: (p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.act(p)), file: (p) => this.file(p), plan: (p) => this.plan(p.steps, p.readings ?? []),
-      askUser: (p) => this.askUser(p), answer: (p) => this.answer(p), readSkill: (p) => this.readSkill(p), finish: (p) => this.finish(p),
+      act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.act(p))), file: live((p) => this.file(p)),
+      plan: live((p) => this.plan(p.steps, p.readings ?? [])),
+      askUser: live((p) => this.askUser(p)), answer: live((p) => this.answer(p)), readSkill: (p) => this.readSkill(p), finish: live((p) => this.finish(p)),
       steers: () => { this.reDecide = false; return this.applySteers(); }, end: (p) => this.end(p),
     };
     this.port = Object.freeze(port);
   }
+
+  /** The reply to any step once the task is over: refused, and over. */
+  private settled(): Promise<ToolReply> | null {
+    if (!this.status && !this.executorEnded) return null;
+    this.count("refused_after_end");
+    return Promise.resolve({ text: `任务已经结束（${this.status ?? "ended"}）：不再做任何事`, isError: true, done: true });
+  }
+  private begun = false;
 
   private count(k: string, by = 1) { this.counters[k] = (this.counters[k] ?? 0) + by; }
   private emit(kind: string, b: Record<string, unknown> = {}) { this.o.onEvent?.(kind, b); }
@@ -159,6 +172,8 @@ export class ExecutorService {
    *  step in progress is over (`applySteers`). A card open now is voided at once — its answer was for the old words —
    *  and the step it belonged to comes back undone. */
   steer(raw: string) {
+    // the task is over (a verdict passed, a cancel, a stop, the run ended): the words change nothing, and the app is told
+    if (this.status || this.executorEnded) { this.emit("steer.refused", { raw, why: "the task already finished" }); return; }
     this.pending.push(raw);
     this.count("steers");
     this.emit("steer", { raw });
@@ -175,8 +190,15 @@ export class ExecutorService {
       this.emit("steer.applied", { raw: r });
     }
     if (xs.length) {
-      // what held for the old words does not carry over: a yes to one action the screen then moved under, "only look for
-      // evidence" after a verdict, the no-progress count
+      // what held for the old words does not carry over. The plan's consents (its objects, its sites and what the card
+      // said goes there) were given for the old request: the user may have just said 「别动这个窗口了」, so they are
+      // void, and a step that needs consent asks again — a new plan card first. Hosts the user approved on a card of
+      // their own (a per-action site yes, external) stay. Also: a yes to one action the screen then moved under, "only
+      // look for evidence" after a verdict, the no-progress count
+      if (this.tokens.size || this.siteTokens.some((t) => t.consequence !== "external")) this.emit("plan.void", { objects: [...this.tokens.keys()], sites: this.siteTokens.filter((t) => t.consequence !== "external").map((t) => t.object) });
+      this.tokens.clear();
+      this.siteTokens = this.siteTokens.filter((t) => t.consequence === "external");
+      this.o.executor.forgetPlanSites();
       this.retryTokens.clear();
       this.lookOnly = false;
       this.repeats = 0; this.lastSig = "";
@@ -260,6 +282,7 @@ export class ExecutorService {
 
   // --- begin -----------------------------------------------------------------------------------------------------------
   private async begin(): Promise<Begun> {
+    this.begun = true;
     const ex = this.o.executor, ws = this.o.workspace;
     const none: Begun = { ended: true, snapshot: null, recovered: null, workspace: null, skills: [], skillsOffered: false, files: [] };
     let snap: Snapshot;
