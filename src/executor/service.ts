@@ -298,15 +298,56 @@ export class ExecutorService {
     if (ws?.listing().entries.some((e) => e.preview)) ex.noteTakenIn("the task folder's listing with previews", J(ws.listing()));
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
     if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; await this.endExecutor(); return { ...none, snapshot: snap }; }
+    // the restart found a step whose effect is unknown on a file changed since: the user settles it before anything else
+    // (the executor refuses writes to that file until then, whoever the caller is). Unanswered because the request
+    // changed meanwhile, it is asked again when a write reaches that file
+    if (ex.reconciliation && !ex.reconciliation.decision) {
+      const r = await this.reconcile();
+      if (r !== "continue" && r !== "voided") { await this.endExecutor(); return { ...none, snapshot: snap }; }
+    }
     const rec = ex.recovered;
     return {
       ended: false, snapshot: snap,
-      recovered: rec ? { text: rec.text, finding: rec.finding, external: rec.external } : null,
+      recovered: rec ? { text: rec.text, finding: rec.finding, external: rec.external, ...(ex.reconciliation?.decision ? { reconciled: ex.reconciliation.decision } : {}) } : null,
       workspace: ws ? { root: ws.root, listing: ws.listing() } : null,
       skills: this.o.skills?.candidates(this.o.raw) ?? [],
       skillsOffered: !!this.o.skills,
       files: this.fileTools(),
     };
+  }
+
+  /** The reconciliation card, from the executor's facts only: the interrupted step, that its effect is unknown, each
+   *  file it was writing at that step and now (the lines that differ for a small text file, else the versions). Go on
+   *  from what is there now — the user's explicit answer, recorded for every judge — or stop: the run ends cancelled
+   *  with reason "needs_reconciliation", nothing written. No answer stops the same way. */
+  private async reconcile(): Promise<"continue" | "voided" | ToolReply> {
+    const ex = this.o.executor, rc = ex.reconciliation!;
+    const t = this.t, q = (x: string) => `「${cardText(x.replace(/\s+/g, " ").trim(), 80)}」`;
+    const lines = [t.reconcileHead(cardText(rc.step, 160))];
+    for (const f of rc.files) {
+      lines.push(t.reconcileFile(cardText(f.path, 160)));
+      if (f.version_now === "absent") lines.push(`· ${t.reconcileGone}`);
+      else if (f.removed && f.added) {
+        if (f.removed.length) lines.push(`· ${t.reconcileRemoved(f.removed.slice(0, 5).map(q))}${f.removed.length > 5 ? " …" : ""}`);
+        if (f.added.length) lines.push(`· ${t.reconcileAdded(f.added.slice(0, 5).map(q))}${f.added.length > 5 ? " …" : ""}`);
+        if (!f.removed.length && !f.added.length) lines.push(`· ${t.reconcileSame}`);
+      } else lines.push(`· ${t.reconcileVersions(f.version_at_step.slice(0, 18), f.version_now.slice(0, 18))}`);
+    }
+    lines.push(t.reconcileAsk);
+    // an approval card (kind "action": the app shows Approve / Deny and answers with the approve or the cancel option —
+    // a question card's buttons all answer as approve in the app as shipped, deskmind GoalRunView / answerLine)
+    const card: Card = { kind: "action", text: lines.join("\n"), free_text: false, blocking: true, options: [{ kind: "approve", text: t.reconcileContinue }, { kind: "cancel", text: t.reconcileStop }] };
+    const got = await this.askCard(card);
+    if (got === "voided") return "voided";
+    this.emit("reconcile.asked", { object: rc.object, paths: rc.files.map((f) => f.path), picked: got?.option?.kind ?? null });
+    if (got?.option?.kind === "approve") {
+      ex.resolveReconciliation(card.text, got.text);
+      this.answers.push({ question: card.text, text: got.text });
+      this.consents.push({ scope: "reconcile", object: rc.object, consequence: "modify_user" });
+      return "continue";
+    }
+    this.summary = `${rc.step}：中断后不知道是否生效，${rc.files.map((f) => f.path).join("、")} 在那之后被改过；没有再写，等用户查看。`;
+    return this.endWith("cancelled", "needs_reconciliation");
   }
 
   private fileTools(): FileTool[] {
@@ -372,6 +413,15 @@ export class ExecutorService {
     let r: ActResult;
     try { r = await ex.act({ action: a, epoch: p.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
     catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
+    // the executor holds a write on a file an interrupted step left unknown and someone changed since: the user settles
+    // it (the card), and only on their "go on" is the step tried again
+    if (r.status === "refused" && r.reconcile && !r.reconcile.decision) {
+      const g = await this.reconcile();
+      if (g === "voided") return this.steered() ?? err("这张卡作废了：这一步没有做。");
+      if (g !== "continue") return g;
+      try { r = await ex.act({ action: a, epoch: ex.currentEpoch, consequence: p.consequence, purpose: p.purpose, consent }); }
+      catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
+    }
     if (r.status === "needs_consent" && r.challenge) {
       // the user changed the request since accepting the plan, and this step is on something the plan did not name (no
       // token of it covers the object or the site): the new request goes on a new plan card, not on a card per step

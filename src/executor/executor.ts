@@ -12,11 +12,11 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
-import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
-import { parentOf } from "../registry/spec.js";
+import { norm, parentOf } from "../registry/spec.js";
 import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -82,6 +82,23 @@ const RETURN = /\b(return|enter)\b/i;
  *  shows, and how much of each. The question says the material may be partial, so a URL the user's words cannot explain
  *  is not cleared because the part it came from was left out. */
 const MATERIAL_KEEP = 20_000, MATERIAL_ITEMS = 10, MATERIAL_SHOWN = 1_500;
+/** A small text file (characters): its text is kept with the start tree, the journal and the recovery facts. */
+const SMALL_TEXT = 1000;
+/** What the journal's begin record keeps of the folder's text: at most this many files and characters in all (the
+ *  rest by version only), so a big folder does not make every task's journal big. */
+const BEGIN_TEXT_FILES = 200, BEGIN_TEXT_CHARS = 200_000;
+/** A file's text when it is a small text file, else undefined (absent, a folder, not text, too long, unreadable). */
+function smallText(ws: Workspace, p: string): string | undefined {
+  try { if (ws.exists(p) && !ws.isDir(p) && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= SMALL_TEXT) return t; } } catch { /* the version says it */ }
+  return undefined;
+}
+/** Small texts kept up to the begin record's bounds. */
+function boundedTexts(contents: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  let n = 0, chars = 0;
+  for (const [p, t] of Object.entries(contents)) { if (n >= BEGIN_TEXT_FILES || chars + t.length > BEGIN_TEXT_CHARS) break; out[p] = t; n += 1; chars += t.length; }
+  return out;
+}
 
 /** Container roles: elements that hold others and say nothing of their own (accessibility role names, no language). */
 const CONTAINERS = new Set(["group", "scrollarea", "splitgroup", "layoutarea", "layoutitem", "toolbar", "generic", "unknown", "section"]);
@@ -386,8 +403,18 @@ export class Executor {
   /** What a restart found: an action the previous process started and never receipted, what became of it, and the
    *  files other programs changed while no process was watching (from the journal's versions, so they are facts of
    *  the task, not its new starting point). */
-  recovered: { action: Action; finding: "happened" | "not_happened" | "unknown"; text: string; external: string[] } | null = null;
+  recovered: { action: Action; finding: "happened" | "not_happened" | "unknown"; text: string; external: string[]; writes: string[] } | null = null;
   private crashed = false;
+  /** The recovered step, when its effect is unknown and a file it was writing changed since its intent: until the user
+   *  settles it (`resolveReconciliation`), no action writes that file. The facts are what the reconciliation card and
+   *  the verdict read; the decision is the user's. */
+  reconciliation: Reconciliation | null = null;
+  /** The folder as the task first began, from the journal's first begin record (a resumed task's start is not the
+   *  folder as the restart found it: another program may have changed it while no process ran). */
+  private firstBegin: { versions: Record<string, string>; contents: Record<string, string> } | null = null;
+  /** Paths earlier processes of this task wrote or were writing (every intent in the journal): with this process's
+   *  file receipts, the files this task acted on — what the verdict tells apart from other programs' files. */
+  private journalWrites = new Set<string>();
 
   /** The pixel send-binding policy in force (ExecutorOptions.pixelSendBinding, else the environment). */
   readonly pixelPolicy: PixelSendBinding;
@@ -397,7 +424,7 @@ export class Executor {
     this.pixelPolicy = opts.pixelSendBinding ?? pixelSendBindingFrom(process.env.DESKMIND_PIXEL_SEND_BINDING);
   }
 
-  private journal(kind: "begin" | "intent" | "receipt", body: Record<string, unknown>) {
+  private journal(kind: "begin" | "intent" | "receipt" | "reconcile_pending" | "reconciled", body: Record<string, unknown>) {
     if (!this.opts.journal) return;
     const fd = fs.openSync(this.opts.journal, "a");
     try { fs.writeSync(fd, JSON.stringify({ t: this.opts.now?.() ?? Date.now(), kind, ...body }) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
@@ -415,8 +442,17 @@ export class Executor {
     const raw = fs.readFileSync(p, "utf-8");
     if (raw && !raw.endsWith("\n")) { fs.appendFileSync(p, "\n"); this.emit("executor.journal_torn_tail", { bytes: Buffer.byteLength(raw) - Buffer.byteLength(raw.slice(0, raw.lastIndexOf("\n") + 1)) }); }
     const lines = raw.split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
+    const writesOf = (l: Record<string, unknown>): string[] => (Array.isArray(l.writes) ? (l.writes as string[]) : Object.keys((l.expect_after as Record<string, string> | undefined) ?? {}));
+    const first = lines.find((l) => l.kind === "begin" && l.versions);
+    if (first) this.firstBegin = { versions: { ...(first.versions as Record<string, string>) }, contents: { ...((first.contents as Record<string, string> | undefined) ?? {}) } };
+    for (const l of lines) if (l.kind === "intent") for (const p of writesOf(l)) this.journalWrites.add(p);
+    // a reconciliation an earlier process raised and the user has not settled (the process died with the card open, or
+    // the user chose to stop and the task was started again): it still holds, whatever came after
+    let pending: Record<string, unknown> | null = null;
+    for (const l of lines) { if (l.kind === "reconcile_pending") pending = l; else if (l.kind === "reconciled") pending = null; }
+    if (pending && this.opts.files) this.restorePending(pending);
     const last = lines.at(-1);
-    if (!last || last.kind !== "intent") return;
+    if (!last || last.kind !== "intent") { if (this.reconciliation) this.emit("executor.reconcile_needed", { object: this.reconciliation.object, paths: this.reconciliation.files.map((f) => f.path), still: true }); return; }
     const action = last.action as Action;
     let finding: "happened" | "not_happened" | "unknown" = "unknown";
     const ws = this.opts.files?.workspace;
@@ -440,14 +476,80 @@ export class Executor {
           const now = ws.version(path);
           if (v === now || (v === "file:*" && now !== "absent" && !now.startsWith("dir:")) || (v === "dir:*" && now.startsWith("dir:"))) continue;
           external.push(path);
-          this.externalChanges.push({ path, seen: v, now, at: this.opts.now?.() ?? Date.now() });
+          const c = { path, seen: v, now, at: this.opts.now?.() ?? Date.now() };
+          this.externalChanges.push(c); this.extTick.set(c, 0);
         }
         if (external.length) this.emit("executor.external_change", { paths: external, while: "down" });
       }
     }
-    this.recovered = { action, finding, text: String(last.text ?? ""), external };
+    const writes = action.kind === "file" ? writesOf(last) : [];
+    const earlier = this.recovered;
+    this.recovered = { action, finding, text: String(last.text ?? ""), external: [...new Set([...(earlier?.external ?? []), ...external])], writes: [...new Set([...(earlier?.writes ?? []), ...writes])] };
+    // a file step whose effect is unknown, on a file changed since its intent (by the versions it recorded, or found
+    // changed while no process ran): whether to go on from the file as it is now is the user's to settle. Facts only:
+    // which file, its version (and, small and text, its content) at that step and now
+    if (finding === "unknown" && ws) {
+      const vb = (last.versions_before as Record<string, string> | undefined) ?? {};
+      const atStep = (last.contents_before as Record<string, string> | undefined) ?? {};
+      const changed = writes.filter((p) => external.includes(p) || (p in vb && ws.version(p) !== vb[p]));
+      if (changed.length) {
+        const files = changed.map((p) => this.fileFacts(p, vb[p] ?? "absent", atStep[p] ?? (this.firstBegin && this.firstBegin.versions[p] === vb[p] ? this.firstBegin.contents[p] : undefined)));
+        const old = this.reconciliation;
+        // one still pending from before: both steps are settled on one card
+        this.reconciliation = old
+          ? { ...old, step: `${old.step}；${String(last.text ?? "")}`, files: [...old.files, ...files.filter((f) => !old.files.some((o) => o.path === f.path))] }
+          : { step: String(last.text ?? ""), action, object: typeof last.object === "string" ? last.object : `path:${changed[0]}`, files, decision: null };
+      }
+    }
+    // kept until the user's answer (a `reconciled` record): a later restart finds it pending and asks again. Written
+    // before the recovery receipt: a process that dies between the two still finds it
+    if (this.reconciliation) {
+      const rc = this.reconciliation;
+      this.journal("reconcile_pending", { step: rc.step, action: rc.action, object: rc.object, files: rc.files.map((f) => ({ path: f.path, version_at_step: f.version_at_step, ...(f.text_at_step !== undefined ? { text_at_step: f.text_at_step } : {}) })),
+        recovered: this.recovered, external_changes: this.externalChanges.filter((c) => this.recovered!.external.includes(c.path)).map((c) => ({ path: c.path, seen: c.seen, now: c.now })) });
+      this.emit("executor.reconcile_needed", { object: rc.object, paths: rc.files.map((f) => f.path) });
+    }
     this.journal("receipt", { recovered: true, finding, external });
     this.emit("executor.recovered", { action, finding, external });
+  }
+
+  /** A reconciliation still pending from an earlier process, as that process recorded it: the step, the files at that
+   *  step (read again for now), what it recovered and the files changed while no process ran. */
+  private restorePending(l: Record<string, unknown>) {
+    const files = ((l.files as { path: string; version_at_step: string; text_at_step?: string }[] | undefined) ?? []).map((f) => this.fileFacts(f.path, f.version_at_step, f.text_at_step));
+    if (!files.length) return;
+    this.reconciliation = { step: String(l.step ?? ""), action: l.action as Action, object: String(l.object ?? `path:${files[0]!.path}`), files, decision: null };
+    const r = l.recovered as Executor["recovered"];
+    if (r) this.recovered = { action: r.action, finding: r.finding, text: r.text, external: r.external ?? [], writes: r.writes ?? [] };
+    for (const c of (l.external_changes as { path: string; seen: string; now: string }[] | undefined) ?? []) {
+      if (this.externalChanges.some((x) => x.path === c.path)) continue;
+      const x = { path: c.path, seen: c.seen, now: c.now, at: this.opts.now?.() ?? Date.now() };
+      this.externalChanges.push(x); this.extTick.set(x, 0);
+    }
+  }
+
+  /** A file at an interrupted step and now: versions, and for a small text file its text and the lines that differ. */
+  private fileFacts(p: string, versionAtStep: string, textAtStep: string | undefined): ReconcileFile {
+    const ws = this.opts.files!.workspace;
+    const versionNow = ws.version(p);
+    const textNow = smallText(ws, p);
+    const out: ReconcileFile = { path: p, version_at_step: versionAtStep, version_now: versionNow, ...(textAtStep !== undefined ? { text_at_step: textAtStep } : {}), ...(textNow !== undefined ? { text_now: textNow } : {}) };
+    if (textAtStep !== undefined && textNow !== undefined) {
+      const a = textAtStep.split("\n").filter((l) => l.trim()), b = textNow.split("\n").filter((l) => l.trim());
+      out.removed = a.filter((l) => !b.includes(l)); out.added = b.filter((l) => !a.includes(l));
+    }
+    return out;
+  }
+
+  /** The user settled the reconciliation: go on from the files as they are now. Their answer is kept as their words
+   *  for every judge (the verdict reads it beside the recovery record), and writes to those files are allowed again. */
+  resolveReconciliation(question: string, answer: string) {
+    const rc = this.reconciliation;
+    if (!rc || rc.decision) return;
+    rc.decision = "continue";
+    this.journal("reconciled", { decision: rc.decision, object: rc.object });
+    this.addAnswer(question, answer, { userWrote: true });
+    this.emit("executor.reconciled", { object: rc.object, decision: rc.decision });
   }
 
   /** Another program's change to a file, recorded once per version it made (a write refused again and again on the
@@ -457,8 +559,15 @@ export class Executor {
     // a change of unknown origin found again by a later write is still of unknown origin, not another program's
     if (this.noted.has(`${path}@${now}`) || this.unconfirmed.some((u) => u.path === path && u.now === now)) return;
     this.noted.add(`${path}@${now}`);
-    this.externalChanges.push({ path, seen, now, at: this.opts.now?.() ?? Date.now() });
+    const c = { path, seen, now, at: this.opts.now?.() ?? Date.now() };
+    this.externalChanges.push(c);
+    this.extTick.set(c, ++this.tick);
   }
+  /** Order of this process's file events (a counter, not a clock: two in the same millisecond keep their order): when
+   *  each external change was found, and each path's last write by the task. Changes found at a restart are 0. */
+  private tick = 0;
+  private extTick = new Map<ExternalChange, number>();
+  private lastWrite = new Map<string, number>();
 
   /** The task folder right before a screen action: what `creditFiles` compares against afterwards. */
   private fileVersions(): Record<string, string> | null {
@@ -507,6 +616,7 @@ export class Executor {
         continue;
       }
       wrote.push(c.path);
+      this.lastWrite.set(c.path, ++this.tick);
       if (c.now === "absent") { delete this.seen[c.path]; continue; }
       this.seen[c.path] = c.now;
       this.taskContent.add(`${c.path}@${c.now}`);
@@ -607,13 +717,20 @@ export class Executor {
       const contents: Record<string, string> = {};
       for (const [p, v] of Object.entries(ws.entries())) {
         this.seen[p] = ws.version(p); if (!paths.includes(p)) paths = [...paths, p];
-        if (v !== "dir" && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= 1000) contents[p] = t; }
+        if (v !== "dir") { const t = smallText(ws, p); if (t !== undefined) contents[p] = t; }
       }
       this.startTree = { versions: { ...this.seen }, contents };
     }
     this.ledger.begin(raw, paths);
     this.recover();
-    if (ws && !this.recovered) this.journal("begin", { versions: { ...this.seen } });     // what a restart compares against
+    if (ws && !this.recovered) this.journal("begin", { versions: { ...this.seen }, contents: boundedTexts(this.startTree!.contents) });     // what a restart compares against
+    // a task the journal saw begin before (a restart): its start is the folder as it first began, not as found now. A
+    // journal from before contents were recorded: the text of what is unchanged since is the text it began with
+    if (ws && this.firstBegin) {
+      const contents = { ...this.firstBegin.contents };
+      for (const [p, v] of Object.entries(this.firstBegin.versions)) if (!(p in contents) && this.startTree!.versions[p] === v && p in this.startTree!.contents) contents[p] = this.startTree!.contents[p]!;
+      this.startTree = { versions: { ...this.firstBegin.versions }, contents };
+    }
     this.epoch = raw.epoch;
     const begun = this.ledger.stamp(raw);
     this.last = { ...begun, windows: begun.windows.map((w) => this.mark(w)) };      // seen, and no `opened` the driver claims
@@ -675,9 +792,39 @@ export class Executor {
   settled(): Promise<void> { return this.flight?.settled ?? Promise.resolve(); }
 
   /** A file action's capability and footprint, or why it cannot be looked at. */
-  private fileOf(a: Extract<Action, { kind: "file" }>): { cap: Capability; fp: { reads: string[]; writes: string[] }; ws: Workspace } | { error: string } {
+  /** A file action with each path argument spelled as on disk (Workspace.onDisk): 「PLAN.txt」 names plan.txt on a
+   *  case-insensitive volume, and is that file to ownership, consent, the reconciliation guard and the capability's
+   *  own "already exists" check — never a new file that overwrites it. Other actions as they are. */
+  private onDisk<A extends Action>(a: A): A {
+    if (a.kind !== "file" || !this.opts.files) return a;
+    const cap = this.opts.files.registry.get(a.capability);
+    if (!cap?.pathFields?.length) return a;
+    const ws = this.opts.files.workspace, args = { ...a.args };
+    let changed = false;
+    for (const k of cap.pathFields) {
+      const v = args[k];
+      if (typeof v !== "string") continue;
+      const n = norm(v);
+      if (!n) continue;
+      const d = ws.onDisk(n);
+      // a destination that is the source itself under another spelling (readme.md → README.md): a rename of that file's
+      // name, kept as asked — the source is the file it changes, under its ownership and consent
+      if (k === "destination" && typeof args.source === "string" && d !== n && d === ws.onDisk(norm(args.source))) continue;
+      if (d !== n) { args[k] = d; changed = true; }
+    }
+    // a bare file name beside its folder (create_text's parent + name)
+    if (typeof args.name === "string" && !args.name.includes("/") && cap.pathFields.includes("parent")) {
+      const parent = norm(args.parent ?? ""), d = ws.onDisk(parent ? `${parent}/${args.name}` : args.name);
+      const base = d.slice(d.lastIndexOf("/") + 1);
+      if (base !== args.name) { args.name = base; changed = true; }
+    }
+    return changed ? { ...a, args } : a;
+  }
+
+  private fileOf(a0: Extract<Action, { kind: "file" }>): { cap: Capability; fp: { reads: string[]; writes: string[] }; ws: Workspace } | { error: string } {
     const f = this.opts.files;
     if (!f) return { error: "this executor has no task folder" };
+    const a = this.onDisk(a0);
     const cap = f.registry.get(a.capability);
     if (!cap) return { error: `unknown capability ${a.capability}` };
     const bad = cap.typecheck(a.args);
@@ -1043,7 +1190,9 @@ export class Executor {
     return { consequence, object: f.object, needs_consent: needs, floor_why: f.why, ...(hit ? { by: hit.by } : {}) };
   }
 
-  async act(req: ActRequest): Promise<ActResult> {
+  async act(req0: ActRequest): Promise<ActResult> {
+    // a file action's paths as on disk, for every check, the consent, the journal and the receipt alike
+    const req: ActRequest = req0.action.kind === "file" ? { ...req0, action: this.onDisk(req0.action) } : req0;
     // until the action is classified below (after the checks that it is current), the structural floor stands in
     const f = this.floor(req.action);
     let consequence = higher(f.consequence, req.consequence ?? "read");
@@ -1340,6 +1489,16 @@ export class Executor {
     const f = this.fileOf(a);
     if ("error" in f) return { ...base, status: "error", why: f.error };
     const { cap, fp, ws } = f;
+    // an interrupted step of an earlier process was writing a file, its effect is unknown, and the file changed since:
+    // nothing writes it (or a folder holding it) until the user has settled it. Reads go ahead: they are how to look
+    const rc = this.reconciliation;
+    if (rc && !rc.decision && cap.effect !== "observe") {
+      const hit = rc.files.map((x) => x.path).filter((p) => fp.writes.some((w) => w === p || p.startsWith(w + "/")));
+      if (hit.length) {
+        this.emit("executor.reconcile_refused", { action: a, paths: hit });
+        return { ...base, status: "refused", why: `an interrupted step was writing ${hit.join(", ")}; whether it took effect is unknown and the file changed since. Nothing is written there until the user settles it.`, reconcile: rc };
+      }
+    }
     // Files (not folders: a folder's version moves with its children) that changed since the task last saw them were
     // changed by someone else — a fact, recorded. A write on such a file is refused until the task has read it again;
     // a read is that reading, so it goes ahead (refusing a read with "read it first" went in circles in rc.1). Only
@@ -1416,7 +1575,10 @@ export class Executor {
     // (review of #16: parent/child made by "mkdir parent/child/grandchild"). Kept for undo only, not journaled: a
     // restart compares the journal's versions with the disk, and a folder's version moves with what is in it
     const madeParents = [...new Set(fp.writes.flatMap((p) => { const out: string[] = []; for (let a = parentOf(p); a; a = parentOf(a)) if (!ws.exists(a)) out.push(a); return out; }))];
-    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {} });
+    // the written files' text before (small text files): what a restart shows the user when this step's effect is unknown
+    const contents_before: Record<string, string> = {};
+    for (const p of fp.writes) { const t = smallText(ws, p); if (t !== undefined) contents_before[p] = t; }
+    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {}, writes: fp.writes, contents_before });
     let r: ReturnType<Capability["execute"]>;
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
@@ -1428,6 +1590,7 @@ export class Executor {
     for (const p of fp.writes) {
       const v = ws.version(p);
       this.seen[p] = v;
+      this.lastWrite.set(p, ++this.tick);
       if (ws.exists(p) && !ws.isDir(p)) this.taskContent.add(`${p}@${v}`);
       if (!existed.includes(p) && ws.exists(p)) { if (gone.length) this.ledger.inherits(`path:${p}`, `path:${gone[0]}`); else this.ledger.created(`path:${p}`); }
     }
@@ -1481,10 +1644,27 @@ export class Executor {
       执行层的回执: ev.receipts.map((r) => ({ action: r.request.action, status: r.result.status, consequence: r.result.consequence })),
       // what the task read (file reads, listings): the content it decided on is evidence the judge can quote
       "任务读到过的内容（文件读取的输出，每条最多 1500 字）": ev.receipts.filter((r) => r.request.action.kind === "file" && r.result.output && Object.keys(r.result.output).length).slice(-8).map((r) => ({ action: r.request.action, output: JSON.stringify(r.result.output).slice(0, 1500) })),
-      ...(ev.external_changes.length ? { "任务期间被别的程序改过的文件（这些改动不是本任务造成的，保留它们不算违反需求）": ev.external_changes.map((c) => c.path) } : {}),
+      // another program's changes, split by whether this task acted on the file: keeping a change to a file nobody asked
+      // about violates nothing; a file the task itself was changing is not its start, nor the task's own work
+      ...(() => {
+        const acted = this.actedOn();
+        const paths = [...new Set(ev.external_changes.map((c) => c.path))];
+        // a file the task acted on: changed by another program after the task's last write of it in this process (or
+        // while no process ran) — what is there now is neither the start nor the task's; changed before the task wrote
+        // it again — what is there now holds the task's later write on top of that change
+        const latest = (p: string) => Math.max(...ev.external_changes.filter((c) => c.path === p).map((c) => this.extTick.get(c) ?? 0));
+        const after = (p: string) => !this.lastWrite.has(p) || latest(p) > this.lastWrite.get(p)!;
+        const ours = paths.filter((p) => acted.has(p) && after(p)), rewritten = paths.filter((p) => acted.has(p) && !after(p)), others = paths.filter((p) => !acted.has(p));
+        return {
+          ...(ours.length ? { "本任务要改的文件在任务期间被别的程序改过（改动不是本任务造成的；它现在的内容既不是任务开始时的样子，也不是本任务写的。任务开始时是什么样看「任务开始时的目录」，中断过的看「中断恢复记录」）": ours } : {}),
+          ...(rewritten.length ? { "本任务改过的文件，期间也被别的程序改过（那次改动不是本任务造成的；任务之后又写了它，现在的内容在那次改动之上含本任务写的）": rewritten } : {}),
+          ...(others.length ? { "任务期间被别的程序改过的其他文件（这些改动不是本任务造成的，保留它们不算违反需求）": others } : {}),
+        };
+      })(),
+      ...(this.recovered ? { "中断恢复记录（执行层查到的事实）": this.recoveryRecord() } : {}),
       ...(this.unconfirmed.length ? { "任务做界面操作期间出现或变化、来源未确认的文件（驱动没有说是这次动作写的：可能是任务在应用里的保存，也可能是别的程序；做没做成看它们现在的内容，来源未确认不算没做成）": this.unconfirmed.map((c) => c.path) } : {}),
       ...(ws ? { 任务目录现在的内容: ws.listing(), "任务目录现在的版本（路径 → 版本，和开始时逐条比就知道哪些没动过；文件夹的版本随内容变）": Object.fromEntries(Object.keys(ws.entries()).map((p) => [p, ws.version(p)])) } : {}),
-      ...(this.startTree ? { "任务开始时的目录（路径 → 版本；小文件带内容）": this.startTree } : {}),
+      ...(this.startTree ? { [this.firstBegin ? "任务开始时的目录（路径 → 版本；小文件带内容。任务中断过：这是第一次开始时记下的，不是重新开始时看到的）" : "任务开始时的目录（路径 → 版本；小文件带内容）"]: this.startTree } : {}),
       ...extra,
       模型自称: summary,
     };
@@ -1494,6 +1674,38 @@ export class Executor {
     const missing = ans.choice === "unknown" && ans.missing_kind ? { missing_kind: ans.missing_kind } : {};
     this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "", ...missing });
     return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by, ...missing };
+  }
+
+  /** The files this task acted on: what its file actions wrote (this process's receipts, files an app saved for it, and
+   *  every write an earlier process of the task journaled, the interrupted one included). */
+  private actedOn(): Set<string> {
+    const out = new Set<string>(this.journalWrites);
+    for (const f of this.fileReceipts.values()) for (const p of f.writes) out.add(p);
+    for (const r of this.receipts) for (const p of r.result.files ?? []) out.add(p);
+    for (const p of this.recovered?.writes ?? []) out.add(p);
+    return out;
+  }
+
+  /** What the restart found, for the verdict: the interrupted step, whether it took effect (as far as the executor can
+   *  tell), the files changed while no process ran, and — when its effect is unknown on a changed file — those files at
+   *  that step and now, and what the user decided. */
+  private recoveryRecord(): Record<string, unknown> {
+    const r = this.recovered!, rc = this.reconciliation;
+    return {
+      中断时正在做的一步: r.text,
+      那一步是否生效: r.finding === "happened" ? "生效了（文件版本和那一步做完的样子对得上）" : r.finding === "not_happened" ? "没有生效（文件版本和那一步之前一样）" : "不知道（执行层查不出来：没有回执，现在的样子和那一步之前、之后都对不上）",
+      ...(r.writes.length ? { 那一步要改的文件: r.writes } : {}),
+      ...(r.external.length ? { 中断期间被别的程序改过的文件: r.external } : {}),
+      ...(rc ? {
+        "那一步要改的文件：那一步之前、恢复时、核对时": rc.files.map((f) => {
+          const ws = this.opts.files!.workspace; ws.invalidate();
+          const now = smallText(ws, f.path);
+          return { 路径: f.path, 那一步之前的版本: f.version_at_step, 恢复时的版本: f.version_now, 核对时的版本: ws.version(f.path),
+            ...(f.text_at_step !== undefined ? { 那一步之前的内容: f.text_at_step } : {}), ...(f.text_now !== undefined ? { 恢复时的内容: f.text_now } : {}), ...(now !== undefined ? { 核对时的内容: now } : {}) };
+        }),
+        用户的决定: rc.decision === "continue" ? "用户看过中断前后的样子，选择在现在的内容上继续" : "还没有问到用户：这些文件没有再写",
+      } : {}),
+    };
   }
 
   /** Which of the task's effects can be taken back, newest first, and why not: a file action through its capability's

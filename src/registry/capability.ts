@@ -38,6 +38,8 @@ export interface Capability {
   readonly channel: Channel;
   /** Consequential: the user approves the exact action before it runs. */
   readonly requiresConfirmation: boolean;
+  /** The arguments that are paths in the task folder (the executor spells them as on disk before any check). */
+  readonly pathFields?: readonly string[];
   /** A wrong run of this action can be undone without loss (create, move, copy, append). Replacing a whole file,
    *  deleting or sending cannot. Decides whether an action taken on the model's reading of an ambiguous request may
    *  go ahead and be reported, or must be shown to the user first (docs/ask-policy.md). */
@@ -96,6 +98,7 @@ export function renamed(c: Capability, map: Record<string, string>, suffix = ".a
   const inv = (a: Args) => Object.fromEntries(Object.entries(a).map(([k, v]) => [map[k] ?? k, v]));
   return {
     id: c.id + suffix, version: c.version, description: c.description, schema, effect: c.effect, channel: c.channel, requiresConfirmation: c.requiresConfirmation, reversible: c.reversible, discards: c.discards, rename: map,
+    pathFields: Object.entries(map).filter(([, old]) => (c.pathFields ?? []).includes(old)).map(([nu]) => nu),
     typecheck: (a) => schemaCheck(schema, a) ?? base.typecheck(inv(a)),
     footprint: (ws, a) => base.footprint(ws, inv(a)),
     preconditions: (ws, a) => base.preconditions(ws, inv(a)),

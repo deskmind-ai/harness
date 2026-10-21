@@ -18,7 +18,7 @@ export const NEEDS_CONSENT: ReadonlySet<Consequence> = new Set(["modify_user", "
 
 /** The computer's shapes, the actions and their results are the protocol's (protocol/computer.ts): re-exported here. */
 import type { Action, ActResult, Observation, Snapshot, WindowInfo } from "../protocol/computer.js";
-export type { Owner, TabInfo, WindowInfo, Snapshot, Element, Observation, Action, ActionKind, ActStatus, Reading, PlanStep, PlanProposal, PlanVerdict, ActResult } from "../protocol/computer.js";
+export type { Owner, TabInfo, WindowInfo, Snapshot, Element, Observation, Action, ActionKind, ActStatus, Reading, PlanStep, PlanProposal, PlanVerdict, ActResult, Reconciliation, ReconcileFile } from "../protocol/computer.js";
 
 /** A file another program changed while the task ran: a fact for the verdict, never something to "correct". */
 export interface ExternalChange { path: string; seen: string; now: string; at: number }
