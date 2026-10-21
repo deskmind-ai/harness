@@ -1,0 +1,131 @@
+[
+  {
+    "name": "begin",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "raw": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "raw"
+      ]
+    }
+  },
+  {
+    "name": "snapshot",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "observe",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "window": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "window"
+      ]
+    }
+  },
+  {
+    "name": "plan",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "steps": {
+          "type": "array"
+        },
+        "readings": {
+          "type": "array"
+        }
+      },
+      "required": [
+        "steps"
+      ]
+    }
+  },
+  {
+    "name": "classify",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "object"
+        },
+        "epoch": {
+          "type": "number"
+        },
+        "consequence": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "act",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "object"
+        },
+        "epoch": {
+          "type": "number"
+        },
+        "consequence": {
+          "type": "string"
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "consent": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    }
+  },
+  {
+    "name": "verify",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary"
+      ]
+    }
+  },
+  {
+    "name": "stop",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "end",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  }
+]

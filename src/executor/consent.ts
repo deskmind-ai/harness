@@ -8,14 +8,13 @@
  * up to the class signed), site (opening pages of these hosts, this task), rule (a durable permission the executor
  * keeps).
  */
-import { createHash, generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from "node:crypto";
+import { generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from "node:crypto";
 import type { Action, Challenge, Consequence, ConsentToken } from "./types.js";
 import { rank } from "./types.js";
 
-export const canon = (x: unknown): string => JSON.stringify(x, (_, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v as object).sort()) : v));
-/** `content`: what a send sends (the window's filled-in fields), so a "yes" to body A does not send body B — a click on
- *  Send is the same action whatever the draft says (review of #16). Left out of the digest when there is none. */
-export const digestOf = (action: Action, object: string, consequence: Consequence, content?: unknown) => "sha256:" + createHash("sha256").update(canon({ action, object, consequence, ...(content !== undefined ? { content } : {}) })).digest("hex").slice(0, 32);
+/** The canonical form and the digest are the protocol's (protocol/consent.ts): re-exported here. */
+export { canon, digestOf } from "../protocol/consent.js";
+import { canon, digestOf } from "../protocol/consent.js";
 
 const unsigned = (t: ConsentToken) => { const { sig: _s, ...rest } = t; return canon(rest); };
 

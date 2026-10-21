@@ -11,11 +11,10 @@
 
 export type Owner = "user" | "task";
 
-/** Ordered: a guard compares classes, so the order is the law. */
-export const CONSEQUENCES = ["read", "create", "modify_user", "external"] as const;
-export type Consequence = (typeof CONSEQUENCES)[number];
-export const rank = (c: Consequence) => CONSEQUENCES.indexOf(c);
-export const higher = (a: Consequence, b: Consequence): Consequence => (rank(a) >= rank(b) ? a : b);
+/** The classes, their order, the challenge and the token are the protocol's (protocol/consent.ts): re-exported here. */
+import type { Challenge, Consequence, ConsentToken } from "../protocol/consent.js";
+export { CONSEQUENCES, rank, higher } from "../protocol/consent.js";
+export type { Consequence, ConsentToken, Challenge } from "../protocol/consent.js";
 /** Classes that need the user's consent before the action runs. */
 export const NEEDS_CONSENT: ReadonlySet<Consequence> = new Set(["modify_user", "external"]);
 
@@ -92,25 +91,6 @@ export type ActionKind = Action["kind"];
 
 /** A file another program changed while the task ran: a fact for the verdict, never something to "correct". */
 export interface ExternalChange { path: string; seen: string; now: string; at: number }
-
-/** The consent an action carries: a token the app signed for a challenge the executor issued (consent.ts). */
-export interface ConsentToken {
-  nonce: string;                     // the challenge it answers (action scope), or a fresh one (object / rule scope)
-  scope: "action" | "object" | "rule" | "site";
-  digest?: string;                   // action scope: the exact action
-  object?: string;                   // object scope: the window / tab / path it covers
-  consequence: Consequence;          // the highest class it allows
-  task?: string;                     // object scope: only this task
-  rule?: string;                     // rule scope: a durable permission, in the executor's rule store
-  hosts?: string[];                  // site scope: opening http(s) pages of these hosts (open_window; the URL's full hostname) in `object`, nothing else
-  sends?: Record<string, string[]>;  // site scope, a plan's: host → what the plan card said goes there (given to the provenance judge)
-  expires_at: number;                // ms since epoch
-  sig: string;                       // base64 Ed25519 over canon(token without sig)
-}
-
-/** `site`: the host a yes approves for the rest of the task (an open_window to a host not yet approved, after the task
- *  read material): the app answers it with a site token for that host, not a one-time action token. */
-export interface Challenge { nonce: string; digest: string; object: string; consequence: Consequence; text: string; expires_at: number; site?: string }
 
 export interface ActRequest {
   action: Action;

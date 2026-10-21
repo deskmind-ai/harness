@@ -4,6 +4,8 @@
  * app that reconnects says the last `seq` it saw and gets the rest (`EventLog.since`). The app ignores kinds it does
  * not know, so adding one never breaks an older app.
  *
+ * Version: `start` carries `protocol: {events: 1}` (protocol/version.ts; the compatibility rule is in docs/protocol.md).
+ *
  * Kinds: start, preparing, plan, step, ask, waiting, resumed, consent, refused, answer_given, task_done.
  */
 import * as fs from "node:fs";
@@ -18,7 +20,9 @@ export const CardEvent = z.object({
 });
 
 export const EventBody = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("start"), raw: z.string(), lang: z.enum(["zh", "en"]).default("zh"), engine: z.string().default("runtime"), config: z.string().optional(), scope: z.string().optional() }),
+  z.object({ kind: z.literal("start"), raw: z.string(), lang: z.enum(["zh", "en"]).default("zh"), engine: z.string().default("runtime"), config: z.string().optional(), scope: z.string().optional(),
+    // the event stream's version (protocol/version.ts, docs/protocol.md): absent in runs from before it was sent
+    protocol: z.object({ events: z.number().int() }).optional() }),
   z.object({ kind: z.literal("preparing") }),
   z.object({ kind: z.literal("plan"), steps: z.array(z.object({ purpose: z.string(), objects: z.array(z.string()), consequence: Consequence })) }),
   z.object({ kind: z.literal("step"), text: z.string(), consequence: Consequence.optional(), object: z.string().optional(), status: z.string().optional(), purpose: z.string().optional() }),
