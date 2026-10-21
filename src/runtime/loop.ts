@@ -10,7 +10,7 @@
  */
 import { Type, type Static, type TSchema, type Message } from "@earendil-works/pi-ai";
 import { compact } from "./compact.js";
-import { T, type Lang } from "./text.js";
+import { T, type Lang } from "../executor/text.js";
 import type { Model } from "@earendil-works/pi-ai";
 import { runAgentLoop, type AgentContext, type AgentEvent, type AgentLoopConfig, type AgentTool, type AgentToolResult, type StreamFn } from "@earendil-works/pi-agent-core";
 import * as fs from "node:fs";

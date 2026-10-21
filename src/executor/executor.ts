@@ -26,7 +26,7 @@ import { NEEDS_CONSENT, higher, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
-import { T, type Lang } from "../runtime/text.js";
+import { T, type Lang } from "./text.js";
 import type { KeyObject } from "node:crypto";
 
 export interface ExecutorOptions {

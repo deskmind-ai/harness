@@ -25,22 +25,10 @@ import { Crash } from "../registry/capability.js";
 import { Log, State, type NodeState, type Settled } from "./log.js";
 import * as P from "./prompts.js";
 
-/** A user's answer: a picked option (index into the options shown) or free text. */
-export type Answer = { option: number } | { text: string };
-
-/** What an option means. The runtime acts on this, never on the option's words (design notes
- *  docs/design/interaction-cards-2026-10-09.md). */
-export type OptionKind = "approve" | "reading" | "value" | "proposal" | "skip_step" | "delegate" | "undo" | "undo_and_reading" | "other" | "cancel" | "never_ask_this";
-export interface CardOption {
-  kind: OptionKind; text: string;
-  node_id?: string;                                   // skip_step: which step
-  point?: string; readings?: string[]; reading_index?: number;   // reading / undo_and_reading: which reading of which point
-}
+/** The card types are the protocol's (protocol/cards.ts): re-exported here, so older imports keep working. */
+import type { Answer, Card, CardKind, CardOption, OptionKind } from "../protocol/cards.js";
+export type { Answer, OptionKind, CardOption, CardKind, Card } from "../protocol/cards.js";
 type Verdict = { kind: "reading"; k: number } | { kind: "cant_tell" | "proceed" | "unclear" | "other" | "refuse" | "not_about" };
-export type CardKind = "missing" | "ambiguity" | "plan" | "action" | "result_check" | "cannot" | "result";
-/** Every interaction with the user is a card: the situation, options that cover what can happen next, and free text
- *  (「其他」). Blocking cards stop the run until answered; the result card is shown with the result. */
-export interface Card { kind: CardKind; text: string; options: CardOption[]; free_text: boolean; blocking: boolean }
 export interface CardUser { ask(card: Card): Answer | null }
 /** The older two-method user (tests, scripts): answers questions and says yes / no to confirmations. */
 export interface LegacyUser {
