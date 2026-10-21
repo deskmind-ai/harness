@@ -7,7 +7,8 @@
  * isolated reviewer beside the acting model, with a budget and a cache (ours keeps the cache, no budget by default); ours sits in the executor so it goes wherever
  * the executor goes (docs/0.5-decisions.md 结论 3).
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { current, within } from "../otel/context.js";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Gateway, type Reply, type RoleTable } from "../gateway/index.js";
@@ -20,7 +21,9 @@ import * as R from "../protocol/roles.js";
  *  it is the top tier (the provenance question's「没有」, executor.ts). */
 export interface JudgeTier { name: string; gateway: Gateway; role?: Role; floor?: number; local?: boolean }
 export interface JudgeOption { id: string; text: string }
-export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean; missing_kind?: "action" | "evidence"; claims_contradicted?: string[] }
+export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean; missing_kind?: "action" | "evidence"; claims_contradicted?: string[];
+  /** The question's id (protocol `judge.judge_id`): its tiers' model calls and the events about it name it. */
+  judge_id?: string }
 /** How one question is routed (all optional; leaving them out keeps the behaviour every question had before):
  *  - `settle`: the option a lower tier may settle on its own above its floor; the default is the first option (the
  *    direction a later check still covers). The outgoing check's safe direction is「会发出去」, so it names that.
@@ -98,11 +101,22 @@ export class Judge {
     /** training material for the fast tier: every question both tiers answered (an escalation, or a shadow
      *  comparison) is emitted as a `judge.sample` with the prompt, the options and both answers */ samples?: boolean } = {}) {}
 
-  /** One choice question. The same question (same words, same facts, same options) is answered once per task. */
+  /** One choice question. The same question (same words, same facts, same options) is answered once per task. Each
+   *  question asked gets an id (`judge_id`), in the context while its tiers are asked, so their model calls name it;
+   *  its outcome is one `judge.answer` event: which tier answered what, who settled it, and the shadow comparison. */
   async choose(question: string, context: unknown, options: JudgeOption[], role?: Role, how: ChooseOptions = {}): Promise<JudgeAnswer | null> {
     const key = createHash("sha256").update(JSON.stringify({ question, context, options })).digest("hex").slice(0, 24);
     const hit = this.cache.get(key);
     if (hit) return { ...hit, cached: true };
+    const judge_id = `jd_${randomUUID().slice(0, 8)}`;
+    return within({ judge_id }, () => this.ask(judge_id, key, question, context, options, role, how));
+  }
+
+  private async ask(judge_id: string, key: string, question: string, context: unknown, options: JudgeOption[], role: Role | undefined, how: ChooseOptions): Promise<JudgeAnswer | null> {
+    const t0 = Date.now();
+    // every tier asked and what it said, for the judge.answer event
+    const asked: { tier: string; outcome: string; choice: string | null; confidence?: number; settled: boolean }[] = [];
+    let shadowed: { tier: string; top: string | null; agree: boolean | null } | null = null;
     // no cap by default (owner 10-20: a count cap only turned finished tasks into "not done" when it ran out; the loop's
     // own limits already bound how many questions a task can raise, and the cache stops repeats). Evaluations may set one.
     if (this.opts.budget !== undefined && this.calls >= this.opts.budget) { this.opts.onEvent?.("judge.budget", {}); return null; }
@@ -129,11 +143,12 @@ export class Judge {
       if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
       const rep = final && raced?.promise ? await raced.promise : await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema);
-      if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
+      if (rep.outcome !== "answered") { asked.push({ tier: tier.name, outcome: rep.outcome, choice: null, settled: false }); this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
       const claims = (rep.data as { claims_contradicted?: string[] }).claims_contradicted;
-      last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason, ...(rep.data!.missing_kind ? { missing_kind: rep.data!.missing_kind } : {}), ...(how.claims && Array.isArray(claims) ? { claims_contradicted: claims } : {}) };
+      last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason, ...(rep.data!.missing_kind ? { missing_kind: rep.data!.missing_kind } : {}), ...(how.claims && Array.isArray(claims) ? { claims_contradicted: claims } : {}), judge_id };
+      asked.push({ tier: tier.name, outcome: rep.outcome, choice: last.choice, ...(confidence !== undefined ? { confidence } : {}), settled: final || (last.choice === settleOn && confidence !== undefined && confidence >= (tier.floor ?? 0)) });
       if (final) {
         settled = true; sample(last.choice);
         // every lower answer that was passed up now has the top's answer beside it: counted per lower choice
@@ -155,15 +170,23 @@ export class Judge {
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
       if (agree !== null) this.opts.stats?.noteAgreement(settledBy.name, kind, agree);
       if (rep.outcome === "answered") sample(rep.data!.choice);
+      shadowed = { tier: settledBy.name, top: rep.outcome === "answered" ? rep.data!.choice : null, agree };
       this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, question_kind: kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree });
     }
     // every tier above a lower tier's refusal failed: that refusal does not become final by default — the caller takes
     // the conservative branch (the user decides), the same as when no tier answered
     if (last && !settled) { this.opts.onEvent?.("judge.unsettled", { by: last.by, choice: last.choice }); last = null; }
     if (last) this.cache.set(key, last);
-    this.opts.onEvent?.("judge.answer", { question: question.slice(0, 80), answer: last });
+    const step = current().step_id;
+    this.opts.onEvent?.("judge.answer", { judge_id, name: questionName(question), question: question.slice(0, 80), question_kind: kind, answer: last, tiers: asked, ...(shadowed ? { shadow: shadowed } : {}), ...(step ? { step_id: step } : {}), started_at: t0, ms: Date.now() - t0 });
     return last;
   }
+}
+
+/** Which of the executor's questions this is, by the question itself (the constants below; the evidence questions are
+ *  made per reading): for the app and the trace, never for routing. */
+export function questionName(q: string): "intent" | "outgoing" | "provenance" | "verify" | "evidence" | "other" {
+  return q === INTENT_QUESTION ? "intent" : q === OUTGOING_QUESTION ? "outgoing" : q === PROVENANCE_QUESTION ? "provenance" : q === VERIFY_QUESTION ? "verify" : q.startsWith(P.evidenceQuestion("").slice(0, 7)) ? "evidence" : "other";
 }
 
 /** The intent question, as the orchestrator's intent role asks it: is this action what the user asked for? */

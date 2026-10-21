@@ -35,7 +35,7 @@ import { scriptedStream } from "../runtime/scripted.js";
 import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
 import { isForeignControl, parseControl } from "../protocol/control.js";
 import { PROTOCOL } from "../protocol/version.js";
-import { current as traceContext } from "../otel/context.js";
+import { current as traceContext, within, type ModelCallRecord } from "../otel/context.js";
 import type { Answer, Card } from "../orchestrator/index.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
@@ -145,6 +145,9 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
     case "consent.asked": return { kind: "consent", object: s(body.object), consequence: body.consequence as never, scope: "action", picked: (body.picked as string | null) ?? null };
     case "plan.confirmed": return null;
     case "answer.given": return { kind: "answer_given", text: s(body.text) };
+    case "judge.answer": { const a = body.answer as { choice: string; by: string; confidence?: number } | null;
+      return { kind: "judge", judge_id: s(body.judge_id), question: s(body.name ?? "other"), answer: a?.choice ?? null, by: a?.by ?? null, ...(typeof a?.confidence === "number" ? { confidence: a.confidence } : {}),
+        tiers: (body.tiers as never) ?? [], ...(body.shadow ? { shadow: body.shadow as never } : {}), ...(body.step_id ? { step_id: s(body.step_id) } : {}), ...(typeof body.ms === "number" ? { ms: body.ms } : {}) }; }
     // the user's words came after the task was over: said, not dropped
     case "steer.refused": return { kind: "refused", what: `steer: ${s(body.raw)}`, why: s(body.why), by: "executor" };
     default: return null;
@@ -208,12 +211,25 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
+  const trace = traceWriter(path.join(o.runs, runId, "trace.jsonl"));
   log.emit({ kind: "start", raw: req.raw, lang: req.lang ?? "zh", engine: req.engine ?? "runtime", config, ...(req.scope ? { scope: req.scope } : {}), protocol: { events: PROTOCOL.events } });
   const table = configTable(config);
   if (!table) { log.emit({ kind: "task_done", status: "failed", reason: `unknown config ${config}`, summary: "", result_card: null }); return; }
-  const gw = o.inject?.gateway ?? new Gateway(table, { log: (r) => fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n") });
+  // every model call of the run (the run's gateway, a judge tier's, the acting model's turns) reaches the recorder through
+  // the run's context (otel/context): model_calls.jsonl, the trace, a model_call event while the run is on, the sum
+  const gw = o.inject?.gateway ?? new Gateway(table);
+  const usage = { calls: 0, tokens_in: 0, tokens_out: 0, cost_usd: 0, by_role: {} as Record<string, { calls: number; tokens_in: number; tokens_out: number; cost_usd: number; latency_ms: number }> };
+  const onModelCall = (r: ModelCallRecord) => {
+    try { fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n"); } catch { /* recording never stops a run */ }
+    const { answer: _a, ...brief } = r;
+    trace("model.call", brief);
+    const b = (usage.by_role[r.role] ??= { calls: 0, tokens_in: 0, tokens_out: 0, cost_usd: 0, latency_ms: 0 });
+    for (const x of [usage, b]) { x.calls += 1; x.tokens_in += r.tokens_in; x.tokens_out += r.tokens_out; x.cost_usd = Number((x.cost_usd + r.cost_usd).toFixed(9)); }
+    b.latency_ms += r.latency_ms;
+    // a raced judge call can answer after the run: on disk and in the trace, never after task_done
+    if (!done) log.emit({ kind: "model_call", call_id: r.call_id, role: r.role, model: r.model, outcome: r.outcome, tokens_in: r.tokens_in, tokens_out: r.tokens_out, cost_usd: r.cost_usd, latency_ms: r.latency_ms, ...(r.step_id ? { step_id: r.step_id } : {}), ...(typeof r.cache_read === "number" ? { cache_read: r.cache_read } : {}), ...(r.cost_estimated ? { cost_estimated: true } : {}), ...(r.judge_id ? { judge_id: r.judge_id } : {}) });
+  };
   const signer = ConsentSigner.fresh();
-  const trace = traceWriter(path.join(o.runs, runId, "trace.jsonl"));
   const ws = req.scope ? new Workspace(req.scope) : undefined;
   // one task_done per run, and it is the last running event: what the runtime or an action still out at the driver says
   // after it (a stop's deadline wrote it) is in the trace only. The words of a steer that came too late are still said
@@ -250,7 +266,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const forceDone = () => {
     if (done) return;
     const f = executor.inFlight, c = executor.changes();
-    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c } as EventBody);
+    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage } as EventBody);
   };
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
   o.signals?.onSignal((sig) => {
@@ -268,9 +284,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
       forceDone(); sg.exit();
     })();
   });
-  const r = await rt.run();
+  const r = await within({ onModelCall }, () => rt.run());
   const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
-  taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes() } as never);
+  taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage } as never);
   if (signals) return o.signals!.exit();
   // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
   // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit

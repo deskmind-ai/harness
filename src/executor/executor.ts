@@ -713,7 +713,7 @@ export class Executor {
     const ctx = { ...this.userWords(), 即将执行的动作: text, 后果类别: consequence, 对象: object, 证据: evidence };
     const ans = await j.choose(INTENT_QUESTION, ctx, INTENT_OPTIONS);
     if (!ans) return { verdict: "unavailable", reason: "the judge could not answer" };
-    this.emit("executor.intent", { action: a, verdict: ans.choice, by: ans.by, confidence: ans.confidence, reason: ans.reason ?? "" });
+    this.emit("executor.intent", { action: a, verdict: ans.choice, by: ans.by, confidence: ans.confidence, reason: ans.reason ?? "", ...(ans.judge_id ? { judge_id: ans.judge_id } : {}) });
     return { verdict: ans.choice as "matches" | "mismatch" | "insufficient", reason: ans.reason ?? "", by: ans.by };
   }
 
@@ -1695,7 +1695,7 @@ export class Executor {
     // the sentences of the run's account the judge found contradicted: recorded with the verdict (not a gate here — an
     // evaluation counts a pass that names one as a false claim); absent when the judge's answer left the field out
     const claims = ans.claims_contradicted ? { claims_contradicted: ans.claims_contradicted } : {};
-    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "", ...missing, ...claims });
+    this.emit("executor.verdict", { verdict: ans.choice, by: ans.by, reason: ans.reason ?? "", ...missing, ...claims, ...(ans.judge_id ? { judge_id: ans.judge_id } : {}) });
     return { verdict: ans.choice as "pass" | "fail" | "unknown", reason: ans.reason ?? "", by: ans.by, ...missing, ...claims };
   }
 

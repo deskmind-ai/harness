@@ -198,3 +198,54 @@ describe("M0 slice B: a consent card's fields say what its text says", () => {
     expect(items.filter((x) => x.value === "行 3")).toHaveLength(1);         // a line already in a field is not repeated
   });
 });
+
+describe("M0 slice C: cost and timing", () => {
+  it("every model call is recorded and sent: the acting model's turns, the judges' — with the step and judge question", async () => {
+    const r = await editorRun();
+    const calls = r.events.filter((e) => e.kind === "model_call") as any[];
+    const loop = calls.filter((c) => c.role === "loop");
+    expect(loop).toHaveLength(7);                                   // one per turn of the script
+    expect(loop[0]).toMatchObject({ model: "deepseek|deepseek-flash", tokens_in: 1, tokens_out: 1, outcome: "answered" });
+    expect(loop[0].cost_usd).toBeCloseTo(1.5e-6, 9);                 // by the price table: pi-ai's entry says 0
+    expect(loop.every((c) => c.latency_ms >= 0 && c.call_id.startsWith("mc_"))).toBe(true);
+    // the judges: the intent check inside the set_value step, the verdict at the end — each names its question
+    const judges = r.events.filter((e) => e.kind === "judge") as any[];
+    const steps = r.events.filter((e) => e.kind === "step") as any[];
+    const intent = judges.find((j) => j.question === "intent");
+    expect(intent).toMatchObject({ answer: "matches", by: "frontier", step_id: steps[0].step_id, tiers: [{ tier: "frontier", outcome: "answered", choice: "matches", settled: true }] });
+    expect(judges.find((j) => j.question === "verify")).toMatchObject({ answer: "pass", by: "frontier" });
+    expect(judges.find((j) => j.question === "verify").step_id).toBeUndefined();
+    const judged = calls.filter((c) => c.judge_id === intent.judge_id);
+    expect(judged).toHaveLength(1);
+    expect(judged[0]).toMatchObject({ role: "intent", step_id: steps[0].step_id });
+    // on disk: every call, with its id and start; and the trace's intent event names the judge question
+    expect(r.calls.map((c: any) => c.call_id)).toEqual(calls.map((c) => c.call_id));
+    expect(r.calls.every((c: any) => typeof c.started_at === "number")).toBe(true);
+    expect(r.trace.find((t: any) => t.kind === "executor.intent").judge_id).toBe(intent.judge_id);
+    // the sum on task_done
+    const done = r.events.find((e) => e.kind === "task_done") as any;
+    expect(done.usage.calls).toBe(calls.length);
+    expect(done.usage.by_role.loop.calls).toBe(7);
+    expect(done.usage.cost_usd).toBeCloseTo(7 * 1.5e-6, 8);
+    // nothing after task_done
+    expect(r.events.at(-1)!.kind).toBe("task_done");
+  });
+
+  it("a judge question says every tier asked and the shadow comparison", async () => {
+    const { Judge } = await import("../src/executor/judge.js");
+    const fast = new Gateway(Object.fromEntries(roles.map((x) => [x, { backend: "scripted", model: "scripted" }])) as never);
+    const slow = new Gateway(Object.fromEntries(roles.map((x) => [x, { backend: "scripted", model: "scripted" }])) as never);
+    fast.script = [() => ({ choice: "a", scores: { a: 0.95, b: 0.05 } })];
+    slow.script = [() => ({ choice: "b" })];
+    const events: [string, any][] = [];
+    const j = new Judge([{ name: "brain", gateway: fast, floor: 0.9 }, { name: "frontier", gateway: slow }], { shadow: true, onEvent: (k, b) => events.push([k, b]) });
+    const ans = await j.choose("问题", {}, [{ id: "a", text: "A" }, { id: "b", text: "B" }]);
+    expect(ans).toMatchObject({ choice: "a", by: "brain" });
+    expect(ans!.judge_id).toMatch(/^jd_/);
+    const [, a] = events.find(([k]) => k === "judge.answer")!;
+    expect(a).toMatchObject({ judge_id: ans!.judge_id, name: "other", tiers: [{ tier: "brain", choice: "a", confidence: 0.95, settled: true }], shadow: { tier: "brain", top: "b", agree: false } });
+    // the same question again is answered from the cache: no new question, no event
+    expect((await j.choose("问题", {}, [{ id: "a", text: "A" }, { id: "b", text: "B" }]))!.cached).toBe(true);
+    expect(events.filter(([k]) => k === "judge.answer")).toHaveLength(1);
+  });
+});

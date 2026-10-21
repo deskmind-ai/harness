@@ -15,7 +15,10 @@ import { runAgentLoop, type AgentContext, type AgentEvent, type AgentLoopConfig,
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { compact } from "./compact.js";
+import { costOf, priceEstimated } from "../gateway/index.js";
+import { current as traceContext } from "../otel/context.js";
 import { CONSEQUENCES, type Consequence } from "../protocol/consent.js";
 import type { Action, Reading } from "../protocol/computer.js";
 import type { Begun, ExecutorPort, FinishOutcome, PlanStepIn, TaskResult, TaskStatus, ToolReply } from "../protocol/port.js";
@@ -166,12 +169,15 @@ export class AgentLoop {
       tools: this.tools(b),
     };
     let turns = 0, calls = 0, nudge = false;
+    // one model call per turn: when it was sent (the turn's start) and how much went with it, for its record
+    let turnAt = Date.now(), sentChars = 0;
     const config: AgentLoopConfig = {
       model: this.o.model.model, apiKey: this.o.model.apiKey, convertToLlm: (m) => m as never, toolExecution: "sequential",
       // what the model is sent is cut to its window; the transcript keeps everything, the cut is an event
       transformContext: async (messages) => {
         const budget = Math.floor((this.o.model.model.contextWindow ?? 128_000) * 0.6);
         const { messages: out, compaction } = compact(messages as Message[], budget);
+        sentChars = JSON.stringify(out).length;
         if (compaction) { this.count("compactions"); this.emit("compaction", compaction as unknown as Record<string, unknown>); }
         return out as typeof messages;
       },
@@ -201,7 +207,25 @@ export class AgentLoop {
         return { messages: [{ role: "user", content: "请继续：用工具动手，或者用 finish 结束（done 会被核对；确认不了就 unconfirmed）。不要只说话。", timestamp: Date.now() }] };
       },
     };
-    const emit = async (e: AgentEvent) => { if (e.type === "message_end" && e.message.role === "assistant") { this.count("model_calls"); const u = e.message.usage; this.count("tokens_in", u.input); this.count("tokens_out", u.output); } };
+    const spec = `${this.o.model.model.provider}|${this.o.model.model.id}`;
+    const emit = async (e: AgentEvent) => {
+      if (e.type === "turn_start") turnAt = Date.now();
+      if (e.type === "message_end" && e.message.role === "assistant") {
+        this.count("model_calls"); const u = e.message.usage; this.count("tokens_in", u.input + (u.cacheRead ?? 0)); this.count("tokens_out", u.output);
+        // the acting model's call, recorded like the gateway's (role "loop"): tokens, cost by the price table when pi-ai
+        // says none, latency from the turn's start, and how much was sent. Input tokens are everything the model read:
+        // pi-ai's `input` leaves out what came from the prompt cache, so it is added (the gateway's definition)
+        const m = e.message;
+        const cacheRead = u.cacheRead ?? 0, tokensIn = u.input + cacheRead;
+        const priced = !u.cost?.total;
+        try {
+          traceContext().onModelCall?.({ kind: "model.call", call_id: `mc_${randomUUID().slice(0, 8)}`, started_at: turnAt, role: "loop", backend: "pi-ai", model: spec,
+            outcome: m.stopReason === "error" ? "error" : m.stopReason === "aborted" ? "aborted" : "answered", tokens_in: tokensIn, tokens_out: u.output, cache_read: cacheRead,
+            cost_usd: Number((u.cost?.total || costOf(spec, tokensIn, u.output, cacheRead)).toFixed(9)), ...(priced && priceEstimated(spec, cacheRead) ? { cost_estimated: true } : {}), latency_ms: Date.now() - turnAt, sent_chars: sentChars,
+            tool_calls: m.content.filter((c) => c.type === "toolCall").length, ...(m.errorMessage ? { error: m.errorMessage.slice(0, 300) } : {}) });
+        } catch { /* recording never stops the loop */ }
+      }
+    };
     try {
       await runAgentLoop([], context, config, emit, this.abort.signal, this.o.model.streamFn);
     } catch (e) {
