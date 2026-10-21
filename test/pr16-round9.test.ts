@@ -40,7 +40,7 @@ describe('PR16 ninth review probes',()=>{
     const ex=new Executor(driver,{task:'t',publicKey:signer.publicKey,files:{workspace:ws,registry:fileRegistry()}});
     await ex.begin();await ex.plan({steps:[]});const obs=await ex.observe('w');
     const r=await ex.act({action:{kind:'click',window:'w',target:'save'},epoch:obs.epoch,consent:signer.forObject('window:w','modify_user','t')});
-    expect({status:r.status,files:r.files,mine:ex.ledger.ownerOf('path:hello.txt'),theirs:ex.ledger.ownerOf('path:synced.txt'),changes:ex.changes()}).toEqual({status:'ok',files:['hello.txt'],mine:'task',theirs:'user',changes:{created:['hello.txt'],modified:[],deleted:[],external:['synced.txt'],unconfirmed:[]}});
+    expect({status:r.status,files:r.files,mine:ex.ledger.ownerOf('path:hello.txt'),theirs:ex.ledger.ownerOf('path:synced.txt'),changes:ex.changes()}).toEqual({status:'ok',files:['hello.txt'],mine:'task',theirs:'user',changes:{created:['hello.txt'],modified:[],deleted:[],external:['synced.txt'],unconfirmed:[],created_windows:[]}});
   });
 
   it('matches a receipt in resolved form when the task folder is given through a link (/tmp is /private/tmp)',async()=>{

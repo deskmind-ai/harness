@@ -142,6 +142,9 @@ export interface ActResult {
   /** What changed, in structure: the window's elements before / after, for the step check. */
   changed?: { elements: number; focus?: string; modal?: string | null; new_windows?: string[] };
   after?: Observation;               // the window after the action (re-observed)
+  /** A window this action made, credited to the task in the ledger (the driver's `new_window`, accepted by
+   *  Executor.act): steps in it are the task's own. */
+  created_window?: string;
   output?: Record<string, unknown>;  // a file capability's output (a read's text, a listing)
 }
 
@@ -149,6 +152,9 @@ export interface PerformResult {
   status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo;
   /** A window that appeared when the task launched an app, without proof the task made it (hands#54): the user's. */
   opened_window?: WindowInfo;
+  /** Windows of the acted app that came on screen during the action and that the driver does not claim as made, with
+   *  why (hands: shows a file, holds content, could not be read…). For the trace only: never credits anything. */
+  appeared?: { id: string; why: string }[];
   /** The files this action wrote, as far as the driver can vouch for it: relative to the task folder, or absolute. Only
    *  writes it is sure of — one it made itself (a save-as it carried out), or the app's own save, seen as the window's
    *  document going from unsaved to saved during the action. A document that merely changed while the action ran is
