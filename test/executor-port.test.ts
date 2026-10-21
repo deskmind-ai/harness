@@ -302,7 +302,8 @@ describe("executor port: steer", () => {
     const first = (sent.find((e) => e.kind === "ask") as Extract<AppEvent, { kind: "ask" }>).ask_id;
     voids.abort();
     expect(await p1).toBeNull();
-    expect(sent.at(-1)).toMatchObject({ kind: "resumed", ask_id: first, voided: "steer" });
+    expect(sent.at(-2)).toMatchObject({ kind: "resumed", ask_id: first, voided: "steer" });
+    expect(sent.at(-1)).toMatchObject({ kind: "ask_void", ask_id: first, why: "steer" });      // M0: the card's own ending
     // the next card: the answer the user gave the voided one arrives first and is refused; then the real answer
     const p2 = u.ask(card);
     await new Promise((r) => setTimeout(r, 10));

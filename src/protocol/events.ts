@@ -6,7 +6,8 @@
  *
  * Version: `start` carries `protocol: {events: 1}` (protocol/version.ts; the compatibility rule is in docs/protocol.md).
  *
- * Kinds: start, preparing, plan, step, step_result, ask, waiting, resumed, consent, refused, answer_given, task_done,
+ * Kinds: start, preparing, plan, step, step_result, ask, ask_void, waiting, resumed, consent, refused, steered, verify,
+ * changes, model_call, judge, shot_ready, answer_given, task_done,
  * result_response.
  */
 import * as fs from "node:fs";
@@ -61,7 +62,20 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("waiting"), ask_id: z.string().optional() }),
   // `voided`: the card was let go without an answer because the user changed the request (a steer, "steer"): the app
   // closes it; an answer sent for it later is refused (additive field, events v1)
-  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional() }),
+  // `why` (M0, without ask_id): how the wait for the user to stop typing ended — "" they paused, "stopped" the app stopped
+  // the task, "timed_out" they kept on (the step is refused, the task goes on)
+  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional(), why: z.enum(["", "stopped", "timed_out"]).optional() }),
+  // an open card let go without an answer (M0): the user changed the request (steer), stopped the task (stop), or the app
+  // went away (ended). An answer sent for it later is refused
+  z.object({ kind: z.literal("ask_void"), ask_id: z.string(), why: z.enum(["steer", "stop", "ended"]) }),
+  // the user's mid-run words reached the task (M0): applied between two steps; from here the judges read them
+  z.object({ kind: z.literal("steered"), text: z.string() }),
+  // a verdict on a "done" claim (M0): pass ends the task succeeded; unknown with missing_kind "evidence" means only looking
+  // is allowed from here (the app says "checking the result"), and refusals of actions meanwhile are expected
+  z.object({ kind: z.literal("verify"), verdict: z.enum(["pass", "fail", "unknown"]), by: z.string().optional(), reason: z.string(), missing_kind: z.enum(["action", "evidence"]).optional(), judge_id: z.string().optional() }),
+  // the task's changes so far (M0), after each step that changed something: the same shape as task_done.changes, plus the
+  // windows the task made
+  z.object({ kind: z.literal("changes"), created: z.array(z.string()), modified: z.array(z.string()), deleted: z.array(z.string()), external: z.array(z.string()), unconfirmed: z.array(z.string()), created_windows: z.array(z.string()).optional() }),
   z.object({ kind: z.literal("consent"), object: z.string(), consequence: Consequence, scope: z.enum(["action", "object", "rule"]), picked: z.string().nullable() }),
   z.object({ kind: z.literal("refused"), what: z.string(), why: z.string(), by: z.enum(["user", "executor"]) }),
   z.object({ kind: z.literal("answer_given"), text: z.string() }),
@@ -82,7 +96,9 @@ export const EventBody = z.discriminatedUnion("kind", [
     // the run's model calls in sum (M0): every call of every role, the acting model's included
     usage: z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), by_role: z.record(z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number() })) }).optional() }),
   // the user's response to a result card after the run (respond): recorded; what it does is the runtime's to add
-  z.object({ kind: z.literal("result_response"), picked: z.string().nullable(), text: z.string().optional(), effect: z.string() }),
+  // `undone` / `total` / `refused` (M0): the undo in fields — how many steps were taken back of how many, and why it
+  // stopped (null: all of them); absent when nothing was undone
+  z.object({ kind: z.literal("result_response"), picked: z.string().nullable(), text: z.string().optional(), effect: z.string(), undone: z.number().int().optional(), total: z.number().int().optional(), refused: z.string().nullable().optional() }),
 ]);
 export type EventBody = z.infer<typeof EventBody>;
 
