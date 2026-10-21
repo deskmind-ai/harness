@@ -79,6 +79,8 @@ export function checkAction(a: Action): string | null {
   }
 }
 
+const withoutFrame = <W extends { frame?: unknown }>(w: W): Omit<W, "frame"> => { const { frame: _f, ...rest } = w; return rest; };
+
 /** Where an element is, for the app's cursor over a picture of its window: `rect_norm` — the element's rect (local to
  *  the window, from the observation) as fractions of the window's size, 0–1 — and `frame`, the same on screen in
  *  points. Nothing when the driver gave no rect or no window frame. */
@@ -155,7 +157,8 @@ export class ExecutorService {
     const live = <A extends unknown[]>(f: (...a: A) => Promise<ToolReply>) => (...a: A): Promise<ToolReply> => (this.settled() ?? f(...a));
     const port: ExecutorPort = {
       begin: () => (this.begun ? Promise.reject(new Error("begin was already called for this task")) : this.begin()),
-      snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
+      // where a window is on screen is the app's (its cursor), not the caller's
+      snapshot: () => this.o.executor.snapshot(), observe: async (w) => { const o = await this.o.executor.observe(w); return { ...o, window: withoutFrame(o.window) }; },
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
       act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.step(p.action, p, () => this.act(p)))),
       file: live((p) => this.step({ kind: "file", capability: p.capability, args: p.args }, { purpose: this.o.registry?.get(p.capability)?.description.split("；")[0] ?? p.capability }, () => this.file(p))),
@@ -540,7 +543,7 @@ export class ExecutorService {
     // the step's picture and where things were on screen are the app's, not the caller's
     const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, ...rest } = r;
     if (a.kind === "file") return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence: r.consequence })) : err(J({ status: r.status, why: r.why, consequence: r.consequence }));
-    const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: after.window, modal: after.modal, elements: after.elements, text: after.text } } : {}) };
+    const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: withoutFrame(after.window), modal: after.modal, elements: after.elements, text: after.text } } : {}) };
     // the step check: a state change with nothing visibly changed is said so, in the result the caller reads
     const noChange = r.status === "ok" && rank(r.consequence) >= rank("create") && r.changed && r.changed.elements === 0 && !r.changed.new_windows?.length;
     // a stale result did nothing: the screen moved under the action, which is not the caller going round in circles

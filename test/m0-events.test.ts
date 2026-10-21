@@ -385,6 +385,9 @@ describe("M0 slice E: where the target is, and a picture after the step", () => 
     const shown = r.trace.filter((t: any) => t.kind === "tool.result" && t.name === "computer_act").map((t: any) => t.text).join("\n");
     expect(shown).not.toContain("shots/");
     expect(shown).not.toContain("target_frame");
+    const looked = r.trace.filter((t: any) => t.kind === "tool.result" && t.name === "computer_observe").map((t: any) => t.text).join("\n");
+    expect(looked).toContain('"elements"');
+    expect(looked).not.toContain('"frame"');
   });
 });
 

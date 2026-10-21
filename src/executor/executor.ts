@@ -1433,8 +1433,9 @@ export class Executor {
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
-    // a picture after a step that changes something (not of a look or a wait): named by the step, in the run's shots/
-    const shotFile = this.opts.shots && consequence !== "read" && act.kind !== "wait" ? path.join(this.opts.shots, `${(traceContext().step_id ?? `receipt_${this.receipts.length + 1}`).replace(/[^\w.-]/g, "_")}.png`) : undefined;
+    // a picture after a step that changes something (not of a look, a wait, or a window it closes): named by the step, in
+    // the run's shots/
+    const shotFile = this.opts.shots && consequence !== "read" && act.kind !== "wait" && act.kind !== "close_window" ? path.join(this.opts.shots, `${(traceContext().step_id ?? `receipt_${this.receipts.length + 1}`).replace(/[^\w.-]/g, "_")}.png`) : undefined;
     // the driver doing it: its own span, with the consent it went on (token kind) and the class it was settled at
     try {
       r = await span("deskmind.perform", { "deskmind.action.kind": act.kind, "deskmind.consequence": consequence, "deskmind.object": base.object, "deskmind.token_kind": req.consent?.scope ?? "none", "deskmind.foreground_ok": foregroundOk }, async (s) => {
