@@ -77,9 +77,10 @@ export class LineReader {
   /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
    *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
   next(signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted) return Promise.resolve("");          // a line waiting in the queue stays for the next reader
     const q = this.queued.shift();
     if (q !== undefined) return Promise.resolve(q);
-    if (this.closed || signal?.aborted) return Promise.resolve("");
+    if (this.closed) return Promise.resolve("");
     return new Promise((r) => {
       const w = (l: string) => { signal?.removeEventListener("abort", gone); r(l); };
       const gone = () => { const i = this.waiting.indexOf(w); if (i >= 0) this.waiting.splice(i, 1); r(""); };
