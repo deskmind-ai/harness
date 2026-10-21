@@ -391,9 +391,9 @@ describe("the boundary does not trust the runtime (review of #50)", () => {
 
   it("the executor reading its child: an oversize line is a protocol violation — pending requests rejected, the peer closed", async () => {
     const input = new PassThrough(), output = new PassThrough();
-    const peer = new JsonRpcPeer(input, output, { maxLine: 16 * 1024 * 1024, oversize: "close" });
+    const peer = new JsonRpcPeer(input, output, { maxLine: 1024 * 1024, oversize: "close" });       // the cap scaled down: 16 MB in the app
     const p = peer.request("x", {});
-    feed(input, bigLine(17));
+    feed(input, bigLine(2));
     await expect(Promise.race([p.then(() => "answered", (e) => `rejected: ${e.message}`), sleep(5000).then(() => "hung")])).resolves.toMatch(/^rejected: .*line too long/);
     expect(peer.violation).toBe("line too long");
     expect(await peer.closed).toBe("protocol: line too long");
