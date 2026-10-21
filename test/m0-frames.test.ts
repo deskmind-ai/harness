@@ -100,11 +100,15 @@ describe("M0 slice E review: the app's fields stay the app's", () => {
     const s = new McpExecutorServer({ driver: () => sim, gateway: gw, consent: "auto" });
     await s.call("begin", { raw: "改正文" });
     await s.call("plan", { steps: [{ purpose: "改正文", objects: [`window:${w}`], consequence: "modify_user" }] });
-    const obs = await s.call("observe", { window: w }) as any;
-    expect(JSON.stringify(obs)).not.toMatch(UI_ONLY);
-    const r = await s.call("act", { action: { kind: "set_value", window: w, target: `${w}:0:textarea`, value: "新的" }, epoch: obs.epoch, consequence: "modify_user" }) as any;
-    expect(r.status).toBe("ok");
-    expect(r.after).toBeDefined();
+    // tools v2 (executor split P2): the server is the port, whose replies are what the model reads
+    const o = await s.call("observe", { window: w });
+    expect(JSON.stringify(o)).not.toMatch(UI_ONLY);
+    const obs = o.out as any;
+    const r = await s.call("act", { action: { kind: "set_value", window: w, target: `${w}:0:textarea`, value: "新的" }, epoch: obs.epoch, consequence: "modify_user", purpose: "改正文" });
+    expect(r.isError).toBe(false);
+    const view = JSON.parse(r.text.split("\n")[0]!);
+    expect(view.status).toBe("ok");
+    expect(view.after).toBeDefined();
     expect(JSON.stringify(r)).not.toMatch(UI_ONLY);
   });
 });
