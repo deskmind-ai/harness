@@ -1875,9 +1875,9 @@ export function outgoing(obs: Observation | undefined): { fields: string[]; show
   return { fields, shown, bound };
 }
 
-/** What goes out, item by item, for a card that lays it out (the same as `outgoing` and the typed lines the card's text
- *  shows): the page's address, each filled-in field with its label, labels without actions, the selected item, the
- *  task's typed text the window does not show, and the window's other lines. At most 40. */
+/** What goes out, item by item, for a card that lays it out: the same items as `outgoing` and the typed lines the card's
+ *  text shows, in the text's order — the page's address, each filled-in field with its label, labels without actions,
+ *  the selected item, the task's typed text the window does not show, and the window's other lines. None left out. */
 export function outgoingItems(obs: Observation | undefined, typed: string[] = []): ActionCardFacts["outgoing"] {
   // item for item what `outgoing` and the card's text list, in the same order, none left out
   const els = obs?.elements ?? [];
