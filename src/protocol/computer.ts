@@ -106,4 +106,16 @@ export interface ActResult {
    *  Executor.act): steps in it are the task's own. */
   created_window?: string;
   output?: Record<string, unknown>;  // a file capability's output (a read's text, a listing)
+  /** With `refused`: the action writes a file that an interrupted step of an earlier process was writing — whether that
+   *  step took effect is unknown — and that file changed since. Nothing is written there until the user settles it (the
+   *  reconciliation card); these are the facts the card is built from. */
+  reconcile?: Reconciliation;
 }
+
+/** One file an interrupted step was writing, at that step and now: versions always; for small text files the text and
+ *  the lines that differ (`removed`: at the step, not now; `added`: now, not at the step). */
+export interface ReconcileFile { path: string; version_at_step: string; version_now: string; text_at_step?: string; text_now?: string; removed?: string[]; added?: string[] }
+/** A step an earlier process started and never receipted (the journal has its intent, no receipt), whose effect is
+ *  unknown, on files that changed since that step's intent. `decision`: null until the user answers; "continue" once
+ *  they chose to go on from the files as they are now. */
+export interface Reconciliation { step: string; action: Action; object: string; files: ReconcileFile[]; decision: null | "continue" }

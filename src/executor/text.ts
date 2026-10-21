@@ -29,6 +29,12 @@ const ZH = {
   undoKeepsOpen: (apps: string[]) => `撤回不会关掉：${apps.join("、")}`,
   checkYourself: (what: string) => `该做的都做了，但我没法确认结果，请你看一下：${what}`,
   foreground: (apps: string[]) => `注意：${apps.join("、")} 只能在前台操作。做这些步骤时，我会把它短暂切到前台；这段时间请先别用电脑。`,
+  reconcileHead: (step: string) => `上次运行在做「${step}」时中断了。那一步是否生效：不知道。`,
+  reconcileFile: (path: string) => `${path} 在那一步之后被改过：`,
+  reconcileGone: "现在：文件不在了", reconcileVersions: (a: string, b: string) => `那一步之前的版本 ${a}，现在 ${b}`,
+  reconcileRemoved: (ls: string[]) => `少了：${ls.join("、")}`, reconcileAdded: (ls: string[]) => `多了：${ls.join("、")}`, reconcileSame: "内容的行没有增减（顺序或空白变了）",
+  reconcileAsk: "要在现在的内容上继续，还是先停下，由你来看？",
+  reconcileContinue: "在现在的内容上继续", reconcileStop: "先停下，我来看看",
 };
 const EN: typeof ZH = {
   ok: "OK", okPlan: "OK, go ahead", skipStep: "Skip this step", cancel: "Stop here", delegate: "You decide", fine: "Fine", undo: "Undo",
@@ -54,5 +60,11 @@ const EN: typeof ZH = {
   undoKeepsOpen: (apps: string[]) => `Undo will not close: ${apps.join(", ")}`,
   checkYourself: (what: string) => `Everything was done, but I could not confirm the result; please check: ${what}`,
   foreground: (apps: string[]) => `Note: ${apps.join(", ")} can only be operated in front. For these steps I will bring it to the front briefly; please leave the Mac alone meanwhile.`,
+  reconcileHead: (step: string) => `The last run was interrupted while doing "${step}". Whether that step took effect: unknown.`,
+  reconcileFile: (path: string) => `${path} has changed since that step:`,
+  reconcileGone: "now: the file is gone", reconcileVersions: (a: string, b: string) => `version before that step ${a}, now ${b}`,
+  reconcileRemoved: (ls: string[]) => `lines gone: ${ls.join(", ")}`, reconcileAdded: (ls: string[]) => `lines added: ${ls.join(", ")}`, reconcileSame: "no lines added or removed (order or spacing changed)",
+  reconcileAsk: "Go on from the content as it is now, or stop here so you can check?",
+  reconcileContinue: "Go on from what is there now", reconcileStop: "Stop; I'll check",
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);

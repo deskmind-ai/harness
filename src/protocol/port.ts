@@ -33,7 +33,10 @@ export interface Begun {
   ended: boolean;
   snapshot: Snapshot | null;
   /** An action an earlier process started and never receipted, what became of it, and the files changed meanwhile. */
-  recovered: { text: string; finding: "happened" | "not_happened" | "unknown"; external: string[] } | null;
+  recovered: { text: string; finding: "happened" | "not_happened" | "unknown"; external: string[];
+    /** The step's effect is unknown and a file it was writing changed since: the user was asked (the reconciliation
+     *  card) and chose to go on from the files as they are now. Absent when nothing needed settling. */
+    reconciled?: "continue" } | null;
   /** The task folder: its absolute path and its listing (with the first lines of small files). */
   workspace: { root: string; listing: unknown } | null;
   /** Tutorials that may apply (by structure: the apps on screen, the folder's file types); `readSkill` reads one. */
