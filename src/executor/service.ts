@@ -334,7 +334,9 @@ export class ExecutorService {
       } else lines.push(`· ${t.reconcileVersions(f.version_at_step.slice(0, 18), f.version_now.slice(0, 18))}`);
     }
     lines.push(t.reconcileAsk);
-    const card: Card = { kind: "reconcile", text: lines.join("\n"), free_text: false, blocking: true, options: [{ kind: "approve", text: t.reconcileContinue }, { kind: "cancel", text: t.reconcileStop }] };
+    // an approval card (kind "action": the app shows Approve / Deny and answers with the approve or the cancel option —
+    // a question card's buttons all answer as approve in the app as shipped, deskmind GoalRunView / answerLine)
+    const card: Card = { kind: "action", text: lines.join("\n"), free_text: false, blocking: true, options: [{ kind: "approve", text: t.reconcileContinue }, { kind: "cancel", text: t.reconcileStop }] };
     const got = await this.askCard(card);
     if (got === "voided") return "voided";
     this.emit("reconcile.asked", { object: rc.object, paths: rc.files.map((f) => f.path), picked: got?.option?.kind ?? null });

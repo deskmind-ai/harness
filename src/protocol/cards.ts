@@ -15,9 +15,7 @@ export interface CardOption {
   node_id?: string;                                   // skip_step: which step
   point?: string; readings?: string[]; reading_index?: number;   // reading / undo_and_reading: which reading of which point
 }
-/** `reconcile`: a restart found a step whose effect is unknown on a file changed since; options `approve` (go on from
- *  the file as it is now) and `cancel` (stop: the run ends cancelled, reason "needs_reconciliation"). */
-export type CardKind = "missing" | "ambiguity" | "plan" | "action" | "result_check" | "cannot" | "result" | "reconcile";
+export type CardKind = "missing" | "ambiguity" | "plan" | "action" | "result_check" | "cannot" | "result";
 /** Every interaction with the user is a card: the situation, options that cover what can happen next, and free text
  *  (「其他」). Blocking cards stop the run until answered; the result card is shown with the result. */
 export interface Card { kind: CardKind; text: string; options: CardOption[]; free_text: boolean; blocking: boolean }

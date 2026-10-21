@@ -46,7 +46,7 @@ export interface Spec {
 export function make(sp: Spec): Capability {
   const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
   return {
-    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, discards: !!sp.discards, reversible: sp.effect === "observe" || !!sp.undo,
+    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, pathFields: sp.pathFields ?? [], discards: !!sp.discards, reversible: sp.effect === "observe" || !!sp.undo,
     typecheck(a) {
       if (sp.derive) a = Object.fromEntries(Object.entries(a).filter(([k]) => !sp.derive!.fields.includes(k)));
       const err = schemaCheck(schema, a);

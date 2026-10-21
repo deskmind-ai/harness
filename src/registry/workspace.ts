@@ -65,6 +65,27 @@ export class Workspace {
     }
   }
 
+  /** A path as it is spelled on disk: each part that exists under another case or Unicode form (macOS volumes are
+   *  usually case- and normalisation-insensitive: 「PLAN.txt」 opens plan.txt) is replaced by the name in its folder;
+   *  an exact name always wins, and from the first part that is not there on, the rest is kept as given. So ownership,
+   *  consent and every guard see the file a write would really reach. */
+  onDisk(p: string): string {
+    const parts = p.split("/").filter(Boolean);
+    const fold = (x: string) => x.normalize("NFC").toLowerCase();
+    let dir = this.root;
+    const out: string[] = [];
+    for (let i = 0; i < parts.length; i += 1) {
+      let names: string[];
+      try { names = fs.readdirSync(dir); } catch { return [...out, ...parts.slice(i)].join("/"); }
+      const part = parts[i]!;
+      const hit = names.includes(part) ? part : names.find((n) => fold(n) === fold(part));
+      if (hit === undefined) return [...out, ...parts.slice(i)].join("/");
+      out.push(hit);
+      dir = path.join(dir, hit);
+    }
+    return out.join("/");
+  }
+
   /** Forget the cached snapshot (after our own effect or a known external change). */
   invalidate() {
     this.cache = null;

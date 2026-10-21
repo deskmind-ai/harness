@@ -33,7 +33,7 @@ const ZH = {
   reconcileFile: (path: string) => `${path} 在那一步之后被改过：`,
   reconcileGone: "现在：文件不在了", reconcileVersions: (a: string, b: string) => `那一步之前的版本 ${a}，现在 ${b}`,
   reconcileRemoved: (ls: string[]) => `少了：${ls.join("、")}`, reconcileAdded: (ls: string[]) => `多了：${ls.join("、")}`, reconcileSame: "内容的行没有增减（顺序或空白变了）",
-  reconcileAsk: "要在现在的内容上继续，还是先停下，由你来看？",
+  reconcileAsk: "同意：在现在的内容上继续。不同意：先停下，由你来看。",
   reconcileContinue: "在现在的内容上继续", reconcileStop: "先停下，我来看看",
 };
 const EN: typeof ZH = {
@@ -64,7 +64,7 @@ const EN: typeof ZH = {
   reconcileFile: (path: string) => `${path} has changed since that step:`,
   reconcileGone: "now: the file is gone", reconcileVersions: (a: string, b: string) => `version before that step ${a}, now ${b}`,
   reconcileRemoved: (ls: string[]) => `lines gone: ${ls.join(", ")}`, reconcileAdded: (ls: string[]) => `lines added: ${ls.join(", ")}`, reconcileSame: "no lines added or removed (order or spacing changed)",
-  reconcileAsk: "Go on from the content as it is now, or stop here so you can check?",
+  reconcileAsk: "Approve: go on from the content as it is now. Deny: stop here so you can check.",
   reconcileContinue: "Go on from what is there now", reconcileStop: "Stop; I'll check",
 };
 export const T = (lang?: string) => (lang === "en" ? EN : ZH);
