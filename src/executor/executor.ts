@@ -1224,8 +1224,23 @@ export class Executor {
     // never a window already there: not in the snapshot just before, nor anything the task saw since it began (a
     // minimised window of the user's that the launch brought back — review of #32)
     const fresh = (id: string | undefined): id is string => !!id && !now.windows.some((w) => w.id === id) && !this.seenWindows.has(id);
+    // from any action, not only open_window: a 「新建」 button in the user's open panel makes an empty untitled window
+    // that is as much the task's as one open_window made (rc.11 run_69ec2a5a: four cards for the steps in it). The
+    // driver claims it only on its proof (hands: appeared during this action, never listed, no file and no content,
+    // the acted app's); here it is taken only when, besides never seen, it is a window of the app acted in — another
+    // app's window is no proof of this action's (docs/0.5-decisions.md「动作新建的窗口」)
+    const acted = "window" in req.action ? now.windows.find((w) => w.id === (req.action as { window: string }).window) : undefined;
+    const sameApp = (w: WindowInfo) => !acted ? req.action.kind === "open_window" : acted.bundle && w.bundle ? acted.bundle.toLowerCase() === w.bundle.toLowerCase() : !!acted.app && acted.app === w.app;
     const openedId = r.new_window?.id;
-    if (fresh(openedId)) { this.ledger.created(`window:${openedId}`); this.openedWindows.set(this.receipts.length + 1, openedId); }
+    const made = r.new_window && fresh(openedId) && sameApp(r.new_window) ? openedId : undefined;
+    const madeField = made ? { created_window: made } : {};
+    if (made) {
+      this.ledger.created(`window:${made}`); this.openedWindows.set(this.receipts.length + 1, made);
+      if (req.action.kind !== "open_window") this.emit("executor.window_created", { id: made, by: req.action.kind, from: acted?.id });
+    } else if (r.new_window && req.action.kind !== "open_window") {
+      this.emit("executor.window_not_created", { id: openedId, why: !fresh(openedId) ? "seen before in this task" : "a window of another app than the one acted in" });
+    }
+    if (r.appeared?.length) this.emit("executor.window_appeared", { windows: r.appeared });
     // a window the launch brought up without proof the task made it (hands#54 `opened_window`): the user's, and known
     // as opened by DeskMind; undo leaves it open (it may hold the user's state)
     const broughtUp = req.action.kind === "open_window" ? r.opened_window?.id : undefined;       // only a launch brings one up
@@ -1235,11 +1250,11 @@ export class Executor {
     // another program" (rc.1 end-to-end: hello.txt, 10-18)
     const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles(this.fileChanges(filesBefore), r.files) : [];
     let after: Snapshot;
-    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch }); }
+    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
     this.epoch = after.epoch;
-    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch });
+    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch, ...madeField });
     const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
-    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}) };
+    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}), ...madeField };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id ?? r.opened_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
       try {
@@ -1505,10 +1520,12 @@ export class Executor {
 
   /** What changed in the task folder since begin, for the result: paths made, changed and gone (external changes
    *  are listed apart, as what another program did). */
-  changes(): { created: string[]; modified: string[]; deleted: string[]; external: string[]; unconfirmed: string[] } {
+  changes(): { created: string[]; modified: string[]; deleted: string[]; external: string[]; unconfirmed: string[]; created_windows: string[] } {
     const ws = this.opts.files?.workspace, start = this.startTree?.versions ?? {};
     const unconfirmed = new Set(this.unconfirmed.map((c) => c.path));
-    if (!ws) return { created: [], modified: [], deleted: [], external: this.externalChanges.map((c) => c.path), unconfirmed: [...unconfirmed] };
+    // the windows the task made (open_window, or any action whose driver proved it made one), in order
+    const created_windows = [...new Set(this.openedWindows.values())];
+    if (!ws) return { created: [], modified: [], deleted: [], external: this.externalChanges.map((c) => c.path), unconfirmed: [...unconfirmed], created_windows };
     const now = ws.entries();
     const external = new Set(this.externalChanges.map((c) => c.path));
     // a change of unknown origin (unconfirmed) is listed apart, like another program's: not under created / modified
@@ -1519,6 +1536,7 @@ export class Executor {
       deleted: Object.keys(start).filter((p) => !(p in now)),
       external: [...external],
       unconfirmed: [...unconfirmed].filter((p) => !external.has(p)),
+      created_windows,
     };
   }
 

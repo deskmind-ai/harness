@@ -6,7 +6,9 @@
  * Apps:
  *   mail      the gym's mail app (hands tools/gym/mail.py): an inbox whose rows a word-matcher confuses, Reply /
  *             Delete (with a confirm dialog) / Flag (a toggle), a compose box whose Send is marked `sends`
- *   editor    a text editor: new document, body, save sheet (name, folder), writes into a workspace folder
+ *   editor    a text editor: new document, body, save sheet (name, folder), writes into a workspace folder; with
+ *             `newWindow`, also a 「新建纯文本文稿」 button that opens an empty untitled document in a window of its own
+ *             (an open panel's: rc.11), reported as `new_window` the way hands proves it (the acted app's, no file, no text)
  *   browser   tabs with urls and page text; an address bar; navigation changes the active tab's url
  *   settings  a few toggles and a dropdown
  *
@@ -55,8 +57,8 @@ export class SimComputer implements Driver {
       state: { selected: null, composing: null, dialog: null, replies: [], deleted: [], ...state } as MailState };
     this.wins.push(w); this.bump(); return w;
   }
-  addEditor(app = "编辑器", doc: { title: string; text: string; path: string | null } | null = null): Win {
-    const w: Win = { id: this.nextId("editor"), app, kind: "editor", title: doc?.title ?? app, focused: this.wins.length === 0, minimized: false, modal: null, gen: 0, state: { doc, sheet: null } };
+  addEditor(app = "编辑器", doc: { title: string; text: string; path: string | null } | null = null, opts: { newWindow?: boolean; bundle?: string } = {}): Win {
+    const w: Win = { id: this.nextId("editor"), app, ...(opts.bundle ? { bundle: opts.bundle } : {}), kind: "editor", title: doc?.title ?? app, focused: this.wins.length === 0, minimized: false, modal: null, gen: 0, state: { doc, sheet: null, newWindow: !!opts.newWindow } };
     this.wins.push(w); this.bump(); return w;
   }
   addBrowser(app: string, tabs: { title: string; url: string; text?: string }[]): Win {
@@ -116,6 +118,7 @@ export class SimComputer implements Driver {
     if (w.kind === "editor") {
       const s = w.state;
       el("menu_new", "menuItem", "新建文档", { actions: ["click"] });
+      if (s.newWindow) el("new_window_doc", "button", "新建纯文本文稿", { actions: ["click"] });
       el("menu_save", "menuItem", "保存", { actions: ["click"], enabled: !!s.doc });
       el("menu_saveas", "menuItem", "另存为…", { actions: ["click"], enabled: !!s.doc });
       if (s.doc) { el("textarea", "textArea", "正文", { actions: ["set_value", "type"], value: s.doc.text, focused: !s.sheet }); text = s.doc.text; }
@@ -216,9 +219,16 @@ export class SimComputer implements Driver {
 
   private editorPress(w: Win, key: string): ReturnType<Driver["perform"]> { const r = this.editorAct(w, key, { kind: "click", window: w.id, target: key }); this.bump(); return { window: w.id, ...r }; }
 
-  private editorAct(w: Win, key: string, a: Action): { status: "ok" | "error" | "unverified"; why?: string } {
+  private editorAct(w: Win, key: string, a: Action): { status: "ok" | "error" | "unverified"; why?: string; new_window?: WindowInfo } {
     const s = w.state;
     if (key === "menu_new") { s.doc = { title: "未命名", text: "", path: null }; w.title = "未命名"; return { status: "ok" }; }
+    if (key === "new_window_doc") {
+      // a window of the same app, untitled, no file, no text: what hands reports as made by this action
+      const n = this.wins.filter((x) => x.kind === "editor" && x.app === w.app && x.state.doc?.path === null && /^未命名-\d+$/.test(x.title)).length + 1;
+      const made = this.addEditor(w.app, { title: `未命名-${n}`, text: "", path: null }, w.bundle ? { bundle: w.bundle } : {});
+      this.log.push({ opened: made.id, from: w.id });
+      return { status: "ok", why: `opened a new plain-text document '未命名-${n}'`, new_window: this.info(made) };
+    }
     if (key === "menu_save" || key === "menu_saveas") {
       if (key === "menu_save" && s.doc.path) { this.write(w, s.doc.path); return { status: "ok" }; }
       s.sheet = { name: s.doc.path ? path.basename(s.doc.path) : s.doc.title + ".txt", folder: "." }; return { status: "ok" };

@@ -64,7 +64,7 @@ describe('PR16 sixth review probes',()=>{
     const ex=new Executor(driver,{task:'t',publicKey:signer.publicKey,files:{workspace:ws,registry:fileRegistry()}});
     await ex.begin();
     const opened=await ex.act({action:{kind:'open_window',app:'Editor'},epoch:ex.currentEpoch});
-    expect({files:opened.files,entries:ws.entries(),external:ex.externalChanges,changes:ex.changes()}).toEqual({files:undefined,entries:{},external:[],changes:{created:[],modified:[],deleted:[],external:[],unconfirmed:[]}});
+    expect({files:opened.files,entries:ws.entries(),external:ex.externalChanges,changes:ex.changes()}).toEqual({files:undefined,entries:{},external:[],changes:{created:[],modified:[],deleted:[],external:[],unconfirmed:[],created_windows:['editor-1']}});
   });
 
   it('can undo a file rename followed by its parent directory rename',async()=>{
