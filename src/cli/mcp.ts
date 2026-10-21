@@ -49,7 +49,10 @@ export interface McpSession { port: ExecutorPort; stop(why: string): void }
 export interface CallRecord { id: unknown; tool: string; queued_ms: number; ms: number; isError: boolean; done?: boolean }
 
 type Standalone = { driver: () => Driver; gateway: Gateway; workspace?: Workspace; consent: "auto" | "none"; log?: (line: string) => void };
-type Hosted = { session: McpSession; log?: (line: string) => void };
+type Hosted = { session: McpSession; log?: (line: string) => void;
+  /** What our runtime child needs to start (host/agent.ts AgentSpec), handed over in the initialize result's `_meta`
+   *  ("deskmind/agent") — not in its environment or on its command line. */
+  agent?: Json };
 export type ServerOptions = (Standalone | Hosted) & {
   /** Every tools/call, after it is answered (the trace's per-call timing). */
   onCall?: (c: CallRecord) => void;
@@ -118,7 +121,11 @@ export class McpExecutorServer {
       case "finish": return reply(await port.finish(a as { outcome: FinishOutcome; summary: string; missing?: string[] }));
       case "steers": return obj({ steers: await port.steers() });
       case "end": return obj(await port.end(typeof a.failure === "string" ? { failure: a.failure } : {}));
-      case "stop": s.stop("stopped by the caller"); return obj({ stopped: true });
+      case "stop":
+        // the executor's own runtime does not stop the task: the user does (the app's stop). It ends by finish / end,
+        // or by exiting (review of #50: a stop from the child read like the user's, with no refused event)
+        if ("session" in this.o) return { text: "stop is the user's: end the task with finish or end", out: { error: "stop is refused for the executor's runtime" }, isError: true };
+        s.stop("stopped by the caller"); return obj({ stopped: true });
     }
     return { text: `unknown tool ${name}`, out: { error: `unknown tool ${name}` }, isError: true };
   }
@@ -135,7 +142,8 @@ export class McpExecutorServer {
       const protocolVersion = typeof asked === "string" && MCP_PROTOCOL_VERSIONS.includes(asked) ? asked : MCP_PROTOCOL_VERSION;
       const dm = ((params.capabilities as Json | undefined)?.experimental as Json | undefined)?.deskmind as Json | undefined;
       this.steerPush = dm?.steer === "push";
-      return ok({ protocolVersion, capabilities: { tools: {}, experimental: { deskmind: { ...PROTOCOL } } }, serverInfo: { name: "deskmind-executor", version: "0.5" } });
+      const agent = "session" in this.o ? this.o.agent : undefined;
+      return ok({ protocolVersion, capabilities: { tools: {}, experimental: { deskmind: { ...PROTOCOL } } }, serverInfo: { name: "deskmind-executor", version: "0.5" }, ...(agent ? { _meta: { "deskmind/agent": agent } } : {}) });
     }
     if (method.startsWith("notifications/")) { this.o.onNotification?.(method, (msg.params ?? {}) as Json); return null; }
     if (method === "ping") return ok({});

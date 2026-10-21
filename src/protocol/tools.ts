@@ -5,7 +5,8 @@
  * MCP list is them serialised (the golden file test/fixtures/mcp-tools.golden.json pins it).
  *
  * MCP tool names are the port's methods in snake_case (askUser → ask_user). `stop` is not a port method: it is the
- * caller's own stop switch on the standalone server (the app's stop reaches the executor through the control lines).
+ * caller's own stop switch on the standalone server (`pnpm mcp`). The executor's own runtime child is refused it — the
+ * stop is the user's and reaches the executor through the app's control lines; the child ends by finish / end.
  */
 import { Type, type Static, type TSchema } from "@earendil-works/pi-ai";
 import { CONSEQUENCES } from "./consent.js";

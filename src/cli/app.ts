@@ -235,7 +235,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // every model call of the run (the run's gateway, a judge tier's, the acting model's turns) reaches the recorder through
   // the run's context (otel/context): model_calls.jsonl, the trace, a model_call event while the run is on, the sum
   const gw = o.inject?.gateway ?? new Gateway(table);
-  const usage = { calls: 0, tokens_in: 0, tokens_out: 0, cost_usd: 0, by_role: {} as Record<string, { calls: number; tokens_in: number; tokens_out: number; cost_usd: number; latency_ms: number }> };
+  const usage = { calls: 0, tokens_in: 0, tokens_out: 0, cost_usd: 0, by_role: Object.create(null) as Record<string, { calls: number; tokens_in: number; tokens_out: number; cost_usd: number; latency_ms: number }> };     // keyed by a record's role: no prototype to reach through it
   const onModelCall = (r: ModelCallRecord) => {
     try { fs.appendFileSync(path.join(o.runs, runId, "model_calls.jsonl"), JSON.stringify(r) + "\n"); } catch { /* recording never stops a run */ }
     const { answer: _a, ...brief } = r;

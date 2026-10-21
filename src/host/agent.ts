@@ -12,7 +12,9 @@
  *
  * The executor is the MCP server (cli/mcp.ts) and implements the port; the child is a plain client
  * (transport/mcp-port.ts). What the child needs to start (the request, its model, its budget, its log files) comes in
- * the environment variable DESKMIND_AGENT_SPEC, not on the command line, so `ps` does not show the user's words.
+ * the initialize result's `_meta` over the pipe — not on its command line or in its environment, which `ps eww` shows
+ * to the same user. Its environment is an allowlist (agentEnv): no DeskMind secrets, only its own provider's key.
+ * Not a sandbox: the child runs as the same user and could read the user's files; see docs/protocol.md.
  *
  * Lifetimes: the child exits when its stdin ends (the executor is gone, even by kill -9), so it is never left behind;
  * the executor treats the child exiting before it called `end`, or its pipe breaking, as "agent exited": the task
@@ -26,8 +28,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { ExecutorPort } from "../protocol/port.js";
 import { AgentLoop, RUNTIME_BUDGET, type LoopOptions } from "../runtime/loop.js";
 import { loopModel } from "../runtime/model.js";
+import { PROVIDERS } from "../gateway/index.js";
 import { scriptedStream, type Step } from "../runtime/scripted.js";
-import { JsonRpcPeer } from "../transport/jsonrpc.js";
+import { JsonRpcPeer, MAX_LINE } from "../transport/jsonrpc.js";
 import type { ReportSpec } from "../transport/report.js";
 import { STEER_NOTIFICATION, STOP_NOTIFICATION } from "../transport/mcp-port.js";
 
@@ -48,7 +51,19 @@ export interface AgentSpec {
   report?: ReportSpec;
 }
 
-export const SPEC_ENV = "DESKMIND_AGENT_SPEC";
+/** Where the spec travels: the initialize result's `_meta` (review of #50: an environment variable is readable by the
+ *  same user's other processes and shares the ~1 MB argument/environment limit with a long pasted request). */
+export const SPEC_META = "deskmind/agent";
+
+/** What the runtime child's environment holds (review of #50: it used to inherit everything, the Brain token and other
+ *  providers' keys included): the system's basics, Node's own settings, proxies, and the one provider its model is on —
+ *  that provider's key and URL. Nothing of DeskMind's own (hands, Brain, the in-process switch). */
+export function agentEnv(model: AgentSpec["model"], env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const keep = new Set(["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "USER", "LOGNAME", "TZ", "LANG", "LANGUAGE", "NODE_OPTIONS", "NODE_PATH", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy"]);
+  if (typeof model === "string") { const p = PROVIDERS[model.split("|")[0]!]; if (p) { keep.add(p.keyEnv); keep.add(p.urlEnv); } }
+  return Object.fromEntries(Object.entries(env).filter(([k, v]) => v !== undefined && (keep.has(k) || k.startsWith("LC_"))));
+}
 /** Why a task ended when its runtime process went away before calling `end`. */
 export const AGENT_EXITED = "agent exited";
 
@@ -88,23 +103,30 @@ export function agentCommand(): string[] {
   return [process.execPath, "--import", tsx, path.resolve(path.dirname(self), "..", "cli", "app.ts"), "runtime"];
 }
 
-/** The runtime child; whoever holds it serves the port on `peer` (cli/mcp.ts serve). */
+/** The runtime child; whoever holds it serves the port on `peer` (cli/mcp.ts serve) and hands it `spec` in the
+ *  initialize result. What it writes to stdout that is not JSON goes to its log (runtime.log), not dropped unseen; a line
+ *  over 16 MB is dropped, notifications beyond 500 a second (bursts of 2000) too. */
 export class AgentProcess {
   readonly peer: JsonRpcPeer;
   readonly exited: Promise<{ code: number | null; signal: string | null }>;
   private readonly proc: ChildProcess;
   readonly startedAt = Date.now();
 
-  constructor(spec: AgentSpec, o: { command?: string[]; stderr?: string } = {}) {
+  constructor(readonly spec: AgentSpec, o: { command?: string[]; stderr?: string } = {}) {
     const [cmd, ...args] = o.command ?? agentCommand();
     const err = o.stderr ? fs.openSync(o.stderr, "a") : "inherit";
-    this.proc = spawn(cmd!, args, { stdio: ["pipe", "pipe", err], env: { ...process.env, [SPEC_ENV]: JSON.stringify(spec) } });
+    this.proc = spawn(cmd!, args, { stdio: ["pipe", "pipe", err], env: agentEnv(spec.model) });
     if (typeof err === "number") fs.closeSync(err);
     this.exited = new Promise((res) => {
       this.proc.on("exit", (code, signal) => res({ code, signal }));
       this.proc.on("error", (e) => res({ code: null, signal: `spawn: ${e.message}` }));     // could not start at all
     });
-    this.peer = new JsonRpcPeer(this.proc.stdout!, this.proc.stdin!);
+    this.peer = new JsonRpcPeer(this.proc.stdout!, this.proc.stdin!, { maxLine: MAX_LINE, notifyPerSec: 500, notifyBurst: 2000 });
+    const stderrFile = o.stderr;
+    this.peer.onParseError = (line) => {
+      const note = `[runtime stdout, not JSON-RPC] ${line.slice(0, 2000)}\n`;
+      try { if (stderrFile) fs.appendFileSync(stderrFile, note); else process.stderr.write(note); } catch { /* the log never stops a run */ }
+    };
   }
 
   get pid() { return this.proc.pid; }

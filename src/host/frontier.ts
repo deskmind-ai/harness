@@ -28,7 +28,7 @@ import type { AgentLoop, LoopOptions } from "../runtime/loop.js";
 import { serve, McpExecutorServer } from "../cli/mcp.js";
 import { AGENT_EXITED, AgentProcess, inProcess, loopFromSpec, type AgentSpec } from "./agent.js";
 import { tracedPort } from "./port-trace.js";
-import { ReportMirror } from "../transport/report.js";
+import { ReportMirror, checkedCounters } from "../transport/report.js";
 import { current as traceContext } from "../otel/context.js";
 
 export type { SkillSource, ConsentProvider };
@@ -128,14 +128,17 @@ export class FrontierRuntime {
     // the run's records (model calls, the trace) are this side's: the runtime reports its part (transport/report.ts)
     const mirror = new ReportMirror(traceContext());
     const report = mirror.spec();
+    const spec: AgentSpec = { ...this.spec(), ...(report ? { report } : {}) };
     const server = new McpExecutorServer({
+      agent: spec as unknown as Record<string, unknown>,
       onNotification: (m, p) => { mirror.notification(m, p); },
       around: (meta, fn) => mirror.around(meta, fn),
       session: { port: this.port, stop: (why) => this.stop(why) },
       onCall: (c) => emit("mcp.call", c as unknown as Record<string, unknown>),
-      onMeta: (m) => { const c = m["deskmind/counters"]; if (c && typeof c === "object") this.agentCounters = c as Record<string, number>; },
+      // the runtime's counters, checked: names, finite non-negative capped numbers, never going down (review of #50)
+      onMeta: (m) => { this.agentCounters = checkedCounters(this.agentCounters, m["deskmind/counters"]); },
     });
-    const agent = new AgentProcess({ ...this.spec(), ...(report ? { report } : {}) }, { ...(this.o.agent?.command ? { command: this.o.agent.command } : {}), ...(this.o.agent?.stderr ? { stderr: this.o.agent.stderr } : {}) });
+    const agent = new AgentProcess(spec, { ...(this.o.agent?.command ? { command: this.o.agent.command } : {}), ...(this.o.agent?.stderr ? { stderr: this.o.agent.stderr } : {}) });
     this.agent = agent;
     const served = serve(server, agent.peer, (l) => emit("mcp.error", { text: l }));
     emit("agent.start", { pid: agent.pid ?? null });
@@ -143,9 +146,12 @@ export class FrontierRuntime {
     if (this.steeredEarly) agent.steer();
     const endCalled = new Promise<"end">((r) => { this.onEnded = () => r("end"); if (this.ended) r("end"); });
     const first = await Promise.race([endCalled, agent.exited.then(() => "gone" as const), agent.peer.closed.then(() => "gone" as const)]);
+    // what the executor did not take from it (a forged span name, a record that is not one, a flood): in the trace
+    const drops = () => { const d = { ...mirror.dropped, ...Object.fromEntries(Object.entries(agent.peer.dropped).filter(([, n]) => n > 0)) }; if (Object.keys(d).length) emit("agent.dropped", d); };
     if (first === "end") {
       try { return await this.ended!; }
       finally {
+        drops();
         // the runtime reads the reply and exits; one that does not is not waited for
         void Promise.race([agent.exited, sleep(2000)]).then(() => agent.kill());
       }
@@ -157,10 +163,11 @@ export class FrontierRuntime {
     agent.kill();
     const detail = ex ? (ex.signal ?? `code ${ex.code}`) : "pipe closed";
     emit("agent.exit", { code: ex?.code ?? null, signal: ex?.signal ?? null, ms: Date.now() - agent.startedAt });
-    // a line it wrote before it went and that is read only now is not served: the run is ending (review of P2)
+    // a line it wrote before it went and that is read only now is not served: the run is ending (review of #50)
     served.refuse(AGENT_EXITED);
     this.service.stop(`${AGENT_EXITED} (${detail})`, "failed");
     await served.idle();
+    drops();
     if (this.ended) return this.ended;                   // it asked for the end before it went
     return this.service.port.end({ failure: `${AGENT_EXITED} (${detail})` });
   }

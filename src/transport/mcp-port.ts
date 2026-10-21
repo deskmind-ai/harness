@@ -31,7 +31,8 @@ export class McpPort implements ExecutorPort {
   private mustPull = false;
   private n = 0;
 
-  constructor(private readonly peer: JsonRpcPeer, private readonly raw: string) {}
+  /** The user's request, as begin hands it over (set once the spec has come). */
+  constructor(private readonly peer: JsonRpcPeer, public raw: string) {}
 
   /** The executor said the user's words are waiting: the next `steers()` asks for them. */
   steerWaiting() { this.mustPull = true; }

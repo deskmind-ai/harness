@@ -18,13 +18,16 @@ app 的 Swift 小助手启动的是执行层：`harness.mjs executor`（老名�
 |---|---|---|
 | 管的东西 | 运行目录、`events.jsonl`、日志 `journal.jsonl`、签名的钥匙、判官和它们的网关、教程、卡片、驱动（hands 子进程） | agent 循环和它的模型 |
 | 写的文件 | `trace.jsonl`（执行层的记录，trace 查看的来源）、`model_calls.jsonl`（这次运行的每一次模型调用，`role` 分开：`loop` 是动手的模型，其余是判官和改写）、`trace.otel.jsonl`（调用链） | `runtime.jsonl`（循环自己的事件：每一轮模型调用 `model.call`、每次 MCP 调用的往返时间 `mcp.rtt`）、`runtime.log`（它的 stderr） |
-| 启动参数 | 和以前一样 | 环境变量 `DESKMIND_AGENT_SPEC`（用户的话、模型、预算、日志路径），不放命令行，`ps` 看不到用户的话 |
+| 启动参数 | 和以前一样 | 没有。用户的话、模型、预算、日志路径在 `initialize` 回复的 `_meta`（`"deskmind/agent"`）里经管道交过去：不放命令行和环境变量（同一用户的进程用 `ps eww` 看得到环境变量，而且命令行加环境变量一共只有约 1 MB，长的粘贴会超） |
+| 环境变量 | 和以前一样 | 白名单：PATH、HOME、TMPDIR、LANG / LC_*、TZ、Node 自己的设置、代理，加上它的模型所在那一家服务的 key 和 URL。DeskMind 自己的东西（Brain 的 token、别家服务的 key、hands 的路径、同一进程的开关）一概不给 |
 
 - **app 看到的事件不变。** 界面上的「一步」（`step`）以前由循环的 `tool.call` 事件生成，现在由执行层收到的调用生成（`src/host/port-trace.ts`）：两种运行方式下 app 收到的事件流一样。有一处细微差别：`step` 的文字来自按格式检查、转换之后的参数（模型写成字符串的 `"dy":"3"` 显示为 `3`，值为 null 的可选字段不显示），P1 用的是检查之前模型的原文。`trace.jsonl` 里每次端口调用有 `tool.call` / `tool.result`（带执行层用的时间 `ms`），子进程方式下还有每次 MCP 调用的 `mcp.call`（`queued_ms` 排队、`ms` 处理）和 `agent.start` / `agent.exit`。
 - **停止：** app 的 stop 照旧先到执行层（执行层拒绝之后的一切动作，开着的卡不再等），再用通知 `notifications/deskmind/stop` 告诉运行时别再调模型。正在做的那一步照旧等它的回执：运行时最后调的 `end` 排在它后面处理。
 - **运行时死了：** 运行时在调 `end` 之前退出（崩溃、被 kill -9）或管道断了，执行层把任务记为 `failed`，reason 是 `agent exited (<信号或退出码>)`：先让正在处理的调用做完（交给驱动的动作拿到回执），开着的卡不再等，然后照常收尾——`task_done`（带 changes）、结果卡、撤回都和平常一样。
 - **执行层死了：** 运行时的 stdin 一断就退出（退出码 3），hands 也是 stdin 断了就退出：kill -9 执行层不会留下孤儿进程。终端里的 ^C 会发到整个进程组，运行时忽略 SIGINT，等执行层的 stop 通知。
 - **运行时报给执行层的（M0 的记录跨进程）：** 运行记录归执行层：`model_calls.jsonl`、`model_call` 事件和 `task_done.usage`、调用链 `trace.otel.jsonl`。进程内时运行时靠同一进程里的上下文把自己那一份交过来；分进程后改成在同一条管道上报（`src/transport/report.ts`）：每一轮模型调用一条通知 `notifications/deskmind/model_call`（role `loop` 的记录原样）；运行时的 span（一轮 `deskmind.turn`、模型调用 `chat <model>`、一次工具调用 `execute_tool <name>`）开始和结束各一条 `notifications/deskmind/span`，执行层在这次运行的 tracer 上开同样的 span（用自己的 id，对应关系自己记）；`tools/call` 的 `_meta` 里带 `"deskmind/span"`（运行时正在进行的 execute_tool span），执行层这次调用里开的 span（step、classify、judge、perform）就挂在它下面。通知和请求走同一条有序管道，所以 span 的开始总在引用它的调用之前到。运行时死了没结束的 span，执行层收尾时照常补上结束（标成错误）。`act` 的 `plan_step` 是 `tools.ts` 里 `act` 输入格式的一个可选字段，原样过 MCP。
+- **执行层不全信运行时报来的东西：** 模型调用的记录一律当作 role `loop`，不带 step_id / judge_id，数字限成有限的非负数并封顶，字符串截短；span 只认 `deskmind.turn`、`chat <模型>`、`execute_tool <工具>` 三种名字，属性最多 8 KB，时间限在这次运行之内，同一个 id 只认一次，最多 2 万个；`_meta` 里的计数只认像样的名字、有限的非负数，而且只增不减；一行超过 16 MB 整行丢掉，通知每秒超过 500 条（突发 2000）也丢；丢了多少记在 trace 的 `agent.dropped`。运行时 stdout 上不是 JSON-RPC 的行写进 `runtime.log`。运行时不能调 `stop`（停止是用户的，经 app 的控制行来）：它用 `finish` / `end` 结束，或者退出。
+- **没有隔离：** 运行时和执行层是同一个用户的两个进程，没有操作系统级的沙箱。上面这些只保证它碰不到签名的钥匙、卡片和执行层的判断，也伪造不了执行层的记录；它自己读得到这个用户能读的文件。给外来的运行时（Codex 之类）一个真正的沙箱是以后的事。
 - **退回同一进程：** 环境变量 `DESKMIND_EXECUTOR_INPROC=1`（小助手从 models.env 填进环境）时循环在执行层进程里跑，不用重新打包；文件和事件一样（没有 `mcp.call` / `agent.*`）。
 - **评测：** `pnpm eval -- --engine runtime` 也按子进程跑（每题一个），同样认 `DESKMIND_EXECUTOR_INPROC=1`；结果行里有 `runtime_mode`。
 
@@ -33,7 +36,7 @@ app 的 Swift 小助手启动的是执行层：`harness.mjs executor`（老名�
 MCP（JSON-RPC 2.0，stdio，每行一条）。服务名 `deskmind-executor`，实现在 `src/cli/mcp.ts`。我们自己的运行时是执行层的子进程；外来的调用方（Codex 之类）用 `pnpm mcp -- --driver sim|hands [--consent auto|none]` 单独起一个服务，`begin {raw}` 开始任务。单独起的服务没有 app：`--consent none`（默认）时没有人回答卡片，要用户同意的步骤不做、任务结束；`--consent auto` 时有「同意」选项的卡一律同意并记日志，只用于开发。
 
 - `initialize` 按 MCP 的规矩商量版本：客户端要的是我们会说的（`2025-06-18` 或 `2024-11-05`）就照它回，否则回我们的 `2025-06-18`；同时在 `capabilities.experimental.deskmind` 里给出三个接口的版本：`{"tools":2,"events":1,"control":1}`。接入方据此判断自己认不认识。客户端在自己的 `capabilities.experimental.deskmind.steer` 写 `"push"`，表示要执行层推送「有新的要求在等」（见下面「改要求」）。
-- `tools/list` 列出端口的方法（名字是方法名的 snake_case）：begin、snapshot、observe、classify、act、file、plan、ask_user、answer、read_skill、finish、steers、end，外加调用方自己的停止开关 stop。名字和输入格式（inputSchema）固定在 `test/fixtures/mcp-tools.golden.json`，测试 `test/protocol.test.ts` 逐字比对；要改工具集，先想清楚是加还是改（见第四节），再用 `UPDATE_GOLDEN=1 npx vitest run test/protocol.test.ts` 重写这个文件，和改动一起提交。输入先按格式检查，不对的直接回错误（`isError`），不进执行层。
+- `tools/list` 列出端口的方法（名字是方法名的 snake_case）：begin、snapshot、observe、classify、act、file、plan、ask_user、answer、read_skill、finish、steers、end，外加单独起的服务上调用方自己的停止开关 stop（执行层自己的运行时调 stop 会被拒绝）。名字和输入格式（inputSchema）固定在 `test/fixtures/mcp-tools.golden.json`，测试 `test/protocol.test.ts` 逐字比对；要改工具集，先想清楚是加还是改（见第四节），再用 `UPDATE_GOLDEN=1 npx vitest run test/protocol.test.ts` 重写这个文件，和改动一起提交。输入先按格式检查，不对的直接回错误（`isError`），不进执行层。
 - 请求按到达的顺序一个一个处理；`stop` 和 `ping` 一到就处理，不排在前面的请求后面。
 - 回复：`content` 是给模型看的文字，`structuredContent` 是端口返回的对象原样（`{text, isError?, done?, steers?}` 或 begin / snapshot / observe / classify / end 的对象；`steers` 回 `{steers: [...]}`），`isError` 同端口。
 - 调用的 `_meta` 里可以带 `"deskmind/counters"`：我们的运行时每次调用都带上自己的计数（模型调用、token、轮数），执行层据此算整次运行的计数，不用另外问。

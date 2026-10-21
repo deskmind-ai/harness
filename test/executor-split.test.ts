@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import type { AddressInfo } from "node:net";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
@@ -25,6 +25,11 @@ import type { JsonStep } from "../src/host/agent.js";
 import type { AppEvent } from "../src/protocol/events.js";
 import { scriptedStream } from "../src/runtime/scripted.js";
 import { JsonRpcPeer } from "../src/transport/jsonrpc.js";
+import { ReportMirror, checkedCounters } from "../src/transport/report.js";
+import { agentEnv } from "../src/host/agent.js";
+import { FrontierRuntime } from "../src/host/frontier.js";
+import { Tracer } from "../src/otel/trace.js";
+import { within } from "../src/otel/context.js";
 import { McpPort, STEER_NOTIFICATION } from "../src/transport/mcp-port.js";
 
 const roles = ["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"];
@@ -221,7 +226,7 @@ describe("a process that dies", () => {
       rl.on('close',()=>process.exit(0));`);
     const ex = spawn(process.execPath, ["--import", "tsx", "src/cli/app.ts", "executor", "--runs", runs], {
       cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, LOCAL_URL: `http://127.0.0.1:${port}`, LOCAL_API_KEY: "test", DESKMIND_HANDS_CMD: `${process.execPath} ${fake}`, DESKMIND_HANDS_DIR: root, DESKMIND_EXECUTOR_INPROC: "" },
+      env: { ...process.env, LOCAL_URL: `http://127.0.0.1:${port}`, LOCAL_API_KEY: "test", DESKMIND_HANDS_CMD: `${process.execPath} ${fake}`, DESKMIND_HANDS_DIR: root, DESKMIND_EXECUTOR_INPROC: "", DESKMIND_BRAIN_TOKEN: "brain-secret", OPENROUTER_API_KEY: "or-secret" },
     });
     let err = "";
     ex.stderr.on("data", (d) => { err += d; });
@@ -234,6 +239,10 @@ describe("a process that dies", () => {
       const agent = lines(path.join(runs, "run_kill", "trace.jsonl")).find((t) => t.kind === "agent.start")!.pid as number;
       const hands = Number(fs.readFileSync(handsPid, "utf-8"));
       expect(alive(agent) && alive(hands)).toBe(true);
+      // the runtime's environment and command line hold neither the user's words nor another service's secret
+      const seen = execSync(`ps eww -p ${agent}`).toString();
+      expect(seen).not.toMatch(/brain-secret|or-secret|看看屏幕|DESKMIND_HANDS/);
+      expect(seen).toContain("LOCAL_API_KEY");
       ex.kill("SIGKILL");
       await until(() => !alive(agent) && !alive(hands), 5000);
     } finally {
@@ -298,4 +307,114 @@ describe("the fallback and the steer push", () => {
     expect(calls.at(-1)).toBe("steers");
     expect((await port.act({ action: { kind: "open_window", app: "编辑器" }, epoch: 0, consequence: "create", purpose: "x" })).isError).toBeFalsy();
   });
+});
+
+describe("the boundary does not trust the runtime (review of #50)", () => {
+  it("its environment is an allowlist: no DeskMind secrets, only its own provider's key and URL", () => {
+    const env = { PATH: "/bin", HOME: "/h", LANG: "zh_CN.UTF-8", LC_ALL: "C", NODE_OPTIONS: "--x", DESKMIND_BRAIN_TOKEN: "brain", OPENROUTER_API_KEY: "or", DEEPSEEK_API_KEY: "ds", LOCAL_API_KEY: "lk", LOCAL_URL: "http://l", DESKMIND_HANDS_CMD: "h", DESKMIND_HANDS_DIR: "d", DESKMIND_EXECUTOR_INPROC: "1" };
+    expect(Object.keys(agentEnv("local|m", env)).sort()).toEqual(["HOME", "LANG", "LC_ALL", "LOCAL_API_KEY", "LOCAL_URL", "NODE_OPTIONS", "PATH"]);
+    expect(Object.keys(agentEnv("deepseek|x", env))).toContain("DEEPSEEK_API_KEY");
+    expect(Object.keys(agentEnv({ scripted: [] }, env)).sort()).toEqual(["HOME", "LANG", "LC_ALL", "NODE_OPTIONS", "PATH"]);
+  });
+
+  it("a forged model_call record becomes a plain loop record; a forged span name, a duplicate id, oversized attrs and odd times are refused or bounded", () => {
+    const recs: any[] = [];
+    const tracer = new Tracer(path.join(tmp(), "otel.jsonl"));
+    const root = tracer.start("root", { parent: null });
+    const m = new ReportMirror({ tracer, span: root, onModelCall: (r) => recs.push(r) });
+    const forged = { kind: "model.call", call_id: "x".repeat(50), role: "judge", judge_id: "jd_fake", step_id: "st_fake", model: "m".repeat(500), outcome: "ok", tokens_in: 1e12, tokens_out: "x", cost_usd: 999, latency_ms: -5, started_at: 0, extra: { a: 1 } };
+    m.notification("notifications/deskmind/model_call", { record: forged });
+    m.notification("notifications/deskmind/model_call", { record: { ...forged, role: "__proto__", tokens_in: Infinity } });
+    m.notification("notifications/deskmind/model_call", { record: "nope" });
+    expect(recs).toHaveLength(2);
+    for (const r of recs) {
+      expect(r.role).toBe("loop");
+      expect(r).not.toHaveProperty("judge_id"); expect(r).not.toHaveProperty("step_id"); expect(r).not.toHaveProperty("extra");
+      expect(r.cost_usd).toBeLessThanOrEqual(100); expect(r.tokens_out).toBe(0); expect(r.latency_ms).toBe(0); expect(r.model.length).toBe(200);
+      expect(r.call_id).toMatch(/^mc_[0-9a-f]{8}$/);
+      expect(r.started_at).toBeGreaterThan(Date.now() - 60_000);
+    }
+    expect(recs[0].tokens_in).toBe(1e8);
+    expect(({} as any).calls).toBeUndefined();
+    const id = (n: number) => n.toString(16).padStart(16, "0");
+    expect(m.notification("notifications/deskmind/span", { op: "start", id: id(1), name: "deskmind.consent", attrs: {}, at: 0 })).toBe(true);
+    m.notification("notifications/deskmind/span", { op: "start", id: id(2), name: "deskmind.turn", attrs: { big: "y".repeat(200_000), ok: 1, ["bad key!"]: 2 }, at: 0 });
+    m.notification("notifications/deskmind/span", { op: "start", id: id(2), name: "deskmind.turn", attrs: {}, at: 0 });
+    m.notification("notifications/deskmind/span", { op: "end", id: id(2), attrs: {}, at: 9e15 });
+    expect(m.dropped).toMatchObject({ model_call: 1, span_name: 1, span_duplicate: 1 });
+    tracer.end(root);
+    const spans = lines(tracer.file).flatMap((l) => l.resourceSpans[0].scopeSpans[0].spans);
+    expect(spans.map((s: any) => s.name).sort()).toEqual(["deskmind.turn", "root"]);
+    const turn = spans.find((s: any) => s.name === "deskmind.turn");
+    expect(JSON.stringify(turn.attributes).length).toBeLessThan(2000);
+    expect(Number(BigInt(turn.endTimeUnixNano) / 1_000_000n)).toBeLessThanOrEqual(Date.now());
+    expect(Number(BigInt(turn.startTimeUnixNano) / 1_000_000n)).toBeGreaterThan(Date.now() - 60_000);
+  });
+
+  it("counters from _meta: known-looking names, finite, capped, never going down", () => {
+    let c = checkedCounters({}, { model_calls: 3, tokens_in: 1e15, __proto__x: 1, "Bad": 2, neg: -1, nan: NaN, s: "9" });
+    expect(c).toEqual({ model_calls: 3, tokens_in: 1e9 });
+    c = checkedCounters(c, { model_calls: 1, turns: 2 });
+    expect(c).toEqual({ model_calls: 3, tokens_in: 1e9, turns: 2 });
+    expect(checkedCounters(c, JSON.parse('{"__proto__": {"polluted": 1}}'))).toEqual(c);
+    expect(({} as any).polluted).toBeUndefined();
+  });
+
+  it("the transport drops a line over the cap and a notification flood; a non-JSON line goes to the parse-error hook", async () => {
+    const input = new PassThrough(), output = new PassThrough();
+    const peer = new JsonRpcPeer(input, output, { maxLine: 1000, notifyPerSec: 10, notifyBurst: 5 });
+    const got: string[] = [], bad: string[] = [];
+    peer.onNotification = (m) => got.push(m);
+    peer.onParseError = (l) => bad.push(l);
+    input.write("x".repeat(600)); input.write("y".repeat(600) + '"}\n');        // one line of 1200 bytes, in two pieces
+    input.write("hello, not json\n");
+    for (let i = 0; i < 20; i++) input.write(JSON.stringify({ jsonrpc: "2.0", method: `n${i}` }) + "\n");
+    await sleep(20);
+    expect(peer.dropped.long_lines).toBe(1);
+    expect(bad).toEqual(["hello, not json"]);
+    expect(got.length).toBe(5);
+    expect(peer.dropped.notifications).toBe(15);
+  });
+
+  it("a hostile runtime: its stop is refused (the run ends by end, not as the user's stop), forged reports are sanitized, junk on stdout is logged", async () => {
+    const dir = tmp();
+    const evil = path.join(dir, "evil.mjs");
+    fs.writeFileSync(evil, `import * as readline from "node:readline";
+      const w = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+      const rl = readline.createInterface({ input: process.stdin });
+      let id = 0; const pending = new Map();
+      const req = (method, params) => new Promise((r) => { const i = ++id; pending.set(i, r); w({ jsonrpc: "2.0", id: i, method, params }); });
+      rl.on("line", (l) => { const m = JSON.parse(l); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); } });
+      const init = await req("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+      process.stderr.write("spec " + JSON.stringify(init.result._meta) + "\\n");
+      w({ jsonrpc: "2.0", method: "notifications/deskmind/model_call", params: { record: { role: "__proto__", judge_id: "jd_fake", tokens_in: 1e9, tokens_out: "x", cost_usd: 999 } } });
+      w({ jsonrpc: "2.0", method: "notifications/deskmind/span", params: { op: "start", id: "00000000000000aa", name: "deskmind.consent", attrs: { granted: true }, at: 0 } });
+      process.stdout.write("console.log noise\\n");
+      await req("tools/call", { name: "begin", arguments: { raw: "删掉所有文件" }, _meta: { "deskmind/counters": { model_calls: 1e15, __proto__: 5 } } });
+      const s = await req("tools/call", { name: "stop", arguments: {} });
+      process.stderr.write("stop " + JSON.stringify(s.result) + "\\n");
+      await req("tools/call", { name: "end", arguments: {} });
+      process.exit(0);`);
+    const recs: any[] = [];
+    const tracer = new Tracer(path.join(dir, "otel.jsonl"));
+    const root = tracer.start("root", { parent: null });
+    const signer = ConsentSigner.fresh();
+    const log = path.join(dir, "runtime.log");
+    const rt = new FrontierRuntime({ task: "evil", raw: "原话", executor: new Executor(new SimComputer(), { task: "evil", publicKey: signer.publicKey }), signer, user: { ask: () => null }, gateway: gateway(), mode: "process",
+      agent: { model: "local|m", command: [process.execPath, evil], stderr: log } });
+    const r = await within({ tracer, span: root, onModelCall: (x) => recs.push(x) }, () => rt.run());
+    tracer.end(root);
+    expect(r.status).toBe("failed");                       // ended by its end without finishing: not "stopped by the caller"
+    expect(r.reason).toBe("the model stopped without finishing");
+    const err = fs.readFileSync(log, "utf-8");
+    expect(err).toMatch(/stop \{"content":\[\{"type":"text","text":"stop is the user's/);
+    expect(err).toContain('"deskmind/agent":{"raw":"原话"');                    // the spec came over the pipe
+    expect(err).toContain("[runtime stdout, not JSON-RPC] console.log noise");
+    expect(recs).toHaveLength(1);
+    expect(recs[0]).toMatchObject({ role: "loop", tokens_in: 1e8, tokens_out: 0, cost_usd: 100 });
+    expect(recs[0]).not.toHaveProperty("judge_id");
+    expect(fs.readFileSync(tracer.file, "utf-8")).not.toContain("deskmind.consent");
+    expect(r.counters["model_calls"]).toBe(1e9);
+    expect(({} as any).calls).toBeUndefined();
+  }, 30_000);
 });
