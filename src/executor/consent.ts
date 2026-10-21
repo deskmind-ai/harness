@@ -12,9 +12,11 @@ import { generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from "
 import type { Action, Challenge, Consequence, ConsentToken } from "./types.js";
 import { rank } from "./types.js";
 
-/** The canonical form and the digest are the protocol's (protocol/consent.ts): re-exported here. */
-export { canon, digestOf } from "../protocol/consent.js";
-import { canon, digestOf } from "../protocol/consent.js";
+/** The canonical form and the digest are the protocol's (protocol/consent.ts); the digest takes an Action here. */
+import { canon, digestOf as digestAny, siteOf } from "../protocol/consent.js";
+export { canon, siteOf } from "../protocol/consent.js";
+/** The same function as the protocol's, typed with the executor's Action so a call site cannot digest something else. */
+export const digestOf: (action: Action, object: string, consequence: Consequence, content?: unknown) => string = digestAny;
 
 const unsigned = (t: ConsentToken) => { const { sig: _s, ...rest } = t; return canon(rest); };
 
@@ -164,11 +166,6 @@ export class ConsentVerifier {
   }
 }
 
-/** The site a URL opens, as a site consent binds it: the full hostname (lower-cased and punycoded by URL), for http
- *  and https only; null for anything else (file:, mailto:, view-source:, an app's own scheme are never covered). */
-export function siteOf(url: string): string | null {
-  try { const u = new URL(url); return (u.protocol === "http:" || u.protocol === "https:") && u.hostname ? u.hostname : null; } catch { return null; }
-}
 
 /** `app:*`, `window:*`, an exact id, or `*`. */
 export function matchesPattern(pattern: string, object: string): boolean {

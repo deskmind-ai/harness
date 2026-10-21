@@ -22,16 +22,15 @@ import type { Capability, Registry } from "../registry/capability.js";
 import * as P from "../orchestrator/prompts.js";
 import * as R from "../protocol/roles.js";
 import type { Workspace } from "../registry/workspace.js";
-import { canon, siteOf } from "../executor/consent.js";
-import type { ConsentSigner } from "../executor/consent.js";
+import { canon, siteOf, type ConsentProvider } from "../protocol/consent.js";
 import { Executor, appName, cardText, describeAction, windowLabel } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
 import { defaultJudge } from "../executor/judge.js";
 import { CONSEQUENCES, NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "../executor/types.js";
 
 export interface RuntimeUser { ask(card: Card): Promise<Answer | null> | Answer | null }
-/** What signs consent: the app (keychain) in production, a ConsentSigner in tests and the CLI. */
-export type ConsentProvider = Pick<ConsentSigner, "forAction" | "forObject" | "forSite">;
+/** What signs consent (protocol/consent.ts): the app (keychain) in production, a ConsentSigner in tests and the CLI. */
+export type { ConsentProvider };
 const LOOK_ONLY = "the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed";
 /** A URL on a card: readable (decoded), without the scheme, cut at 120 characters (the query stays visible up to there). */
 

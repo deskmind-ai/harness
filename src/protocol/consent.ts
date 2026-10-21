@@ -35,5 +35,20 @@ export interface Challenge { nonce: string; digest: string; object: string; cons
 export const canon = (x: unknown): string => JSON.stringify(x, (_, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v as object).sort()) : v));
 /** `content`: what a send sends (the window's filled-in fields), so a "yes" to body A does not send body B — a click on
  *  Send is the same action whatever the draft says (review of #16). Left out of the digest when there is none.
- *  `action` is the executor's Action; it is only canonicalised here, so the protocol does not need its shape. */
+ *  `action` is the executor's Action (executor/consent.ts re-exports this typed with it); it is only canonicalised
+ *  here, so the protocol does not need its shape. */
 export const digestOf = (action: unknown, object: string, consequence: Consequence, content?: unknown) => "sha256:" + createHash("sha256").update(canon({ action, object, consequence, ...(content !== undefined ? { content } : {}) })).digest("hex").slice(0, 32);
+
+/** The site a URL opens, as a site consent binds it: the full hostname (lower-cased and punycoded by URL), for http
+ *  and https only; null for anything else (file:, mailto:, view-source:, an app's own scheme are never covered). */
+export function siteOf(url: string): string | null {
+  try { const u = new URL(url); return (u.protocol === "http:" || u.protocol === "https:") && u.hostname ? u.hostname : null; } catch { return null; }
+}
+
+/** What signs consent, as the runtime sees it: the app (keychain) in production, executor/consent.ts's ConsentSigner in
+ *  tests and the CLI. The private key never leaves it. */
+export interface ConsentProvider {
+  forAction(c: Challenge, ttlMs?: number): ConsentToken;
+  forObject(object: string, consequence: Consequence, task: string, ttlMs?: number): ConsentToken;
+  forSite(object: string, hosts: string[], task: string, consequence?: Consequence, ttlMs?: number, sends?: Record<string, string[]>): ConsentToken;
+}

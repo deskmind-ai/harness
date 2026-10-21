@@ -25,13 +25,19 @@ const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "protocol-"));
 const GOLDEN = path.join(import.meta.dirname, "fixtures", "mcp-tools.golden.json");
 
 describe("versions", () => {
-  it("initialize answers MCP 2025-06-18 and names tools/events/control v1 under experimental.deskmind", async () => {
+  it("initialize negotiates the MCP revision (2025-06-18 preferred, 2024-11-05 echoed) and names tools/events/control v1 under experimental.deskmind", async () => {
     const s = new McpExecutorServer({ driver: () => new SimComputer(), gateway: new Gateway({} as never), consent: "none" });
     const r = (await s.handle({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } })) as any;
     expect(r.result.protocolVersion).toBe("2025-06-18");
     expect(MCP_PROTOCOL_VERSION).toBe("2025-06-18");
     expect(r.result.capabilities.tools).toEqual({});
     expect(r.result.capabilities.experimental.deskmind).toEqual({ tools: 1, events: 1, control: 1 });
+    // negotiation: a revision we speak is echoed; any other gets ours
+    const ask = async (v: unknown) => ((await s.handle({ jsonrpc: "2.0", id: 2, method: "initialize", params: { protocolVersion: v } })) as any).result.protocolVersion;
+    expect(await ask("2024-11-05")).toBe("2024-11-05");
+    expect(await ask("2025-06-18")).toBe("2025-06-18");
+    expect(await ask("2099-01-01")).toBe("2025-06-18");
+    expect(await ask(undefined)).toBe("2025-06-18");
     expect(PROTOCOL).toEqual({ tools: 1, events: 1, control: 1 });
   });
 
@@ -108,11 +114,15 @@ describe("the MCP tool set", () => {
 describe("consent types live in protocol/", () => {
   it("the executor's names are the protocol's, not copies", () => {
     expect(EC.canon).toBe(PC.canon);
+    expect(EC.siteOf).toBe(PC.siteOf);
+    const signer: PC.ConsentProvider = EC.ConsentSigner.fresh();      // the executor's signer is a protocol ConsentProvider
+    expect(typeof signer.forAction).toBe("function");
     expect(EC.digestOf).toBe(PC.digestOf);
     expect(ET.CONSEQUENCES).toBe(PC.CONSEQUENCES);
     expect(ET.rank).toBe(PC.rank);
     expect(ET.higher).toBe(PC.higher);
     expect(PC.canon({ b: 1, a: { d: 2, c: 3 } })).toBe('{"a":{"c":3,"d":2},"b":1}');
+    expect(EC.digestOf({ kind: "wait", ms: 1 }, "window:w", "external")).toBe(PC.digestOf({ kind: "wait", ms: 1 }, "window:w", "external"));
     expect(PC.digestOf({ kind: "click" }, "window:w", "external")).toMatch(/^sha256:[0-9a-f]{32}$/);
   });
 });

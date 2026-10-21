@@ -5,5 +5,7 @@
  * something means bumps it, and the previous version is still accepted for one release cycle.
  */
 export const PROTOCOL = { tools: 1, events: 1, control: 1 } as const;
-/** The MCP revision the executor's server speaks (initialize). */
+/** The MCP revision the executor's server prefers (initialize), and every one it answers in: a client that asks for
+ *  one of these gets it back; any other gets ours. */
 export const MCP_PROTOCOL_VERSION = "2025-06-18";
+export const MCP_PROTOCOL_VERSIONS: readonly string[] = ["2025-06-18", "2024-11-05"];

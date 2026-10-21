@@ -16,7 +16,6 @@ const SRC = path.resolve(import.meta.dirname, "..", "src");
 
 /** Runtime ↔ executor: to be removed in P1. */
 const KNOWN_CROSS = [
-  "runtime/loop.ts -> executor/consent.ts",
   "runtime/loop.ts -> executor/executor.ts",
   "runtime/loop.ts -> executor/judge.ts",
   "runtime/loop.ts -> executor/types.ts",
