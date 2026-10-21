@@ -18,7 +18,7 @@
 import * as R from "../protocol/roles.js";
 import * as P from "../orchestrator/prompts.js";
 import type { Gateway } from "../gateway/index.js";
-import type { Answer, Card, CardAsker, CardOption } from "../protocol/cards.js";
+import type { Answer, Card, CardAsker, CardOption, PlanCardFacts } from "../protocol/cards.js";
 import { canon, siteOf, type ConsentProvider } from "../protocol/consent.js";
 import type { Begun, ExecutorPort, FileTool, FinishOutcome, PlanStepIn, TaskResult, TaskStatus, ToolReply } from "../protocol/port.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
@@ -261,7 +261,7 @@ export class ExecutorService {
 
   /** The user is asked for this one action; a yes becomes a signed, single-use token. */
   private async consentFor(c: Challenge): Promise<ConsentToken | "declined" | "cancel" | "voided" | null> {
-    const card: Card = { kind: "action", text: c.text, free_text: false, blocking: true, options: [{ kind: "approve", text: this.t.ok }, { kind: "skip_step", text: this.t.skipStep }, { kind: "cancel", text: this.t.cancel }] };
+    const card: Card = { kind: "action", text: c.text, free_text: false, blocking: true, options: [{ kind: "approve", text: this.t.ok }, { kind: "skip_step", text: this.t.skipStep }, { kind: "cancel", text: this.t.cancel }], ...(c.facts ? { consent: c.facts } : {}) };
     const got = await this.askCard(card);
     if (got === "voided") return "voided";
     this.emit("consent.asked", { object: c.object, consequence: c.consequence, picked: got?.option?.kind ?? null });
@@ -638,7 +638,27 @@ export class ExecutorService {
       const label = classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : "";
       return `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${label}${sitesOf[i]!.length ? this.t.sendsTo(siteList(i), !!label) : ""}`;
     });
-    const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }] };
+    // the same card in fields (M0), for an app that lays it out: only what the text says, by the same rules
+    const owner = (o: string): "user" | "task" | null => (theirs(o) ? "user" : there.has(o) && ex.ledger.ownerOf(o) === "task" ? "task" : null);
+    const facts: PlanCardFacts = {
+      steps: steps.map((s, i) => {
+        const objects: PlanCardFacts["steps"][number]["objects"] = [];
+        const changes = classes[i] === "modify_user" || classes[i] === "external";
+        for (const o of objectsOf[i]!) {
+          const label = shown(o), who = owner(o);
+          if (label === null || !who) continue;
+          objects.push({ ref: o, label, owner: who, marks: [...(who === "user" && changes ? ["changes" as const] : []), ...(classes[i] === "external" ? ["sends" as const] : []), ...(opensInto[i]!.has(o) ? ["opens_pages" as const] : [])] });
+        }
+        for (const w of opensInto[i]!.keys()) {
+          if (!theirs(w) || objects.some((x) => x.ref === w)) continue;
+          const win = snap.windows.find((x) => `window:${x.id}` === w)!;
+          objects.push({ ref: w, label: windowLabel(win, this.o.lang), owner: "user", marks: ["opens_pages"] });
+        }
+        return { purpose: s.purpose, class: classes[i]!, objects, sites: [...new Map(sitesOf[i]!.map((d) => [d.host, { host: d.host, sends: d.what, asks_each: d.sends }])).values()] };
+      }),
+      foreground: fgApps.length ? { apps: fgApps, note: this.t.foreground(fgApps) } : null,
+    };
+    const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }], plan: facts };
     const got = await this.askCard(card);
     if (got === "voided") return this.steered() ?? err("这张卡作废了：计划没有交上。");
     if (!got) return this.endWith("failed", "no answer from the user");

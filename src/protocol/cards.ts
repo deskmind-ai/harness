@@ -17,8 +17,44 @@ export interface CardOption {
 }
 export type CardKind = "missing" | "ambiguity" | "plan" | "action" | "result_check" | "cannot" | "result";
 /** Every interaction with the user is a card: the situation, options that cover what can happen next, and free text
- *  (「其他」). Blocking cards stop the run until answered; the result card is shown with the result. */
-export interface Card { kind: CardKind; text: string; options: CardOption[]; free_text: boolean; blocking: boolean }
+ *  (「其他」). Blocking cards stop the run until answered; the result card is shown with the result. `plan` / `consent`:
+ *  the same card's facts in fields (M0, additive), for an app that lays them out itself; `text` says all of it. */
+export interface Card { kind: CardKind; text: string; options: CardOption[]; free_text: boolean; blocking: boolean; plan?: PlanCardFacts; consent?: ActionCardFacts }
+
+type Consequence = "read" | "create" | "modify_user" | "external";
+
+/** A plan card in fields: per step its purpose and settled class, the objects it touches as the user knows them, and
+ *  the sites it opens pages of with what goes there; and the apps that can only be operated in front. Only what the
+ *  card's text says: an object that resolves to nothing on screen or in the folder is not listed (and not signed). */
+export interface PlanCardFacts {
+  steps: {
+    purpose: string;
+    /** The class the executor settled for the step (never lower than the caller's). */
+    class: Consequence;
+    /** `ref`: window:<id> / tab:<id> / path:<p>; `owner`: whose it is (the ledger's word); `marks`: what the step does
+     *  to it — changes it (the user's thing), sends from it, opens web pages in it. */
+    objects: { ref: string; label: string; owner: "user" | "task"; marks: ("changes" | "sends" | "opens_pages")[] }[];
+    /** Every http(s) site the step opens pages of: the host, what the caller says goes there (null: not said), and
+     *  whether the executor will still ask before each open there (the task read material: a send). */
+    sites: { host: string; sends: string | null; asks_each: boolean }[];
+  }[];
+  /** Apps the driver can operate only in front, among the plan's objects, and the card's sentence about it. */
+  foreground: { apps: string[]; note: string } | null;
+}
+
+/** A consent card for one action in fields: the action in words, the element and the window it acts on, its class,
+ *  what goes out (a send: the fields filled in, the selected item, what the task typed, other text in the window) and
+ *  the site an open asks about. */
+export interface ActionCardFacts {
+  action: string;
+  action_text: string;
+  target: string | null;
+  object: string;
+  object_label: string;
+  consequence: Consequence;
+  outgoing: { kind: "field" | "selected" | "typed" | "text"; label: string; value: string }[];
+  site: string | null;
+}
 
 /** Who answers the executor's cards: the app (stdio: an `ask` event, then the answer line), the evaluation's simulated
  *  user, a test. `signal`: the card is voided when it fires (the user changed the request — a steer — or the task was
