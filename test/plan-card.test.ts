@@ -12,7 +12,7 @@ import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor } from "../src/executor/executor.js";
 import { OUTGOING_QUESTION } from "../src/executor/judge.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
-import { FrontierRuntime } from "../src/runtime/loop.js";
+import { FrontierRuntime } from "../src/host/frontier.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
 
 const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;

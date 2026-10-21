@@ -15,7 +15,7 @@ import { Executor } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
 import { SimComputer } from "../executor/sim.js";
 import type { Answer, Card } from "../orchestrator/index.js";
-import { FrontierRuntime, type RuntimeStatus, type RuntimeUser } from "../runtime/loop.js";
+import { FrontierRuntime, type RuntimeStatus, type RuntimeUser } from "../host/frontier.js";
 import type { loopModel } from "../runtime/model.js";
 import type { Registry } from "../registry/capability.js";
 import { Workspace, build } from "../registry/workspace.js";

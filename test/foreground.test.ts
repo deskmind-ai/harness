@@ -115,7 +115,7 @@ describe("app_name for what the user reads", () => {
 describe("app_name on the plan card", () => {
   it("an untitled window of the user's music app is 「网易云音乐 的主窗口」, and the foreground note names it so", async () => {
     const { Gateway } = await import("../src/gateway/index.js");
-    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
     const desk = new Desk([{ info: music("com.netease.163music#1"), elements: els }]);
@@ -190,7 +190,7 @@ describe("a window the launch brought up (hands#54 opened_window)", () => {
 
   it("the plan card names it as the window DeskMind opened, still 「改你的东西」", async () => {
     const { Gateway } = await import("../src/gateway/index.js");
-    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
     const desk = new LaunchDesk([]);
@@ -277,7 +277,7 @@ describe("review of #32", () => {
 
   it("the result card names the launched app undo will leave open", async () => {
     const { Gateway } = await import("../src/gateway/index.js");
-    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
     const desk = new Desk([]);

@@ -142,7 +142,7 @@ describe("re-ask diagnostics", () => {
 
 describe("the runtime's trace of tool results", () => {
   it("keeps up to 2000 characters of a tool result (300 cut every observation on rc.9)", async () => {
-    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const many: Element[] = Array.from({ length: 80 }, (_, i) => ({ id: `elem_${i}`, role: "statictext", label: `第 ${i} 行邮件标题`, actions: [], rect: [0, i * 20, 200, 20] }));
     const desk = new Desk({ info: { id: "w", app: "com.apple.Safari", title: "Mailora" }, elements: many, text: "" });

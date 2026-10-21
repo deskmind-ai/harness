@@ -10,7 +10,7 @@ import { Executor, anonymous } from "../src/executor/executor.js";
 import { OUTGOING_QUESTION, Judge } from "../src/executor/judge.js";
 import { provenanceJudge, scripted } from "./helpers/provenance-judge.js";
 import { SimComputer } from "../src/executor/sim.js";
-import { FrontierRuntime } from "../src/runtime/loop.js";
+import { FrontierRuntime } from "../src/host/frontier.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
 import type { Action, ConsentToken, Driver, Element, WindowInfo } from "../src/executor/types.js";
 
