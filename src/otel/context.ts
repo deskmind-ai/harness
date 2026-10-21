@@ -17,7 +17,17 @@ export interface TraceContext {
   /** Where every model call made in this run goes, whichever gateway made it (the run's own, a judge tier's, the agent
    *  loop's model): app-run records it (model_calls.jsonl, the trace, a `model_call` event). */
   onModelCall?: (r: ModelCallRecord) => void;
+  /** The judge tier being asked (Judge), for the model call's span. */
+  tier?: string;
+  /** The run's tracer and the span in progress (otel/trace.ts): a span started now is its child. */
+  tracer?: TracerLike;
+  span?: SpanLike;
 }
+
+/** What the context holds of a tracer and a span (otel/trace.ts implements them; declared here so this file stays the
+ *  leaf everything imports). */
+export interface SpanLike { readonly spanId: string; set(attrs: Record<string, unknown>): void; fail(message: string): void }
+export interface TracerLike { start(name: string, o?: { kind?: "internal" | "client"; attrs?: Record<string, unknown>; parent?: SpanLike | null; at?: number }): SpanLike; end(span: SpanLike, at?: number): void }
 
 /** One model call, as recorded (gateway/index.ts CallRecord, and the agent loop's own turns as role "loop"). */
 export interface ModelCallRecord {

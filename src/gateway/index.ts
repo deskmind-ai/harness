@@ -12,6 +12,7 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { current as traceContext, type ModelCallRecord } from "../otel/context.js";
+import { chatAttrs } from "../otel/trace.js";
 import type { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { ROLES, type Role } from "../protocol/roles.js";
@@ -309,6 +310,9 @@ export class Gateway {
     const base = { role, model, tokensIn: 0, tokensOut: 0, costUsd: 0, latencyMs: 0, error: "" };
     const startedAt = Date.now();
     let estimated = false;
+    // the call's span (otel/trace.ts): a child of the judge question or the step that asked, when the run is traced
+    const traced = traceContext();
+    const sp = traced.tracer?.start(`chat ${model.includes("|") ? model.split("|").slice(1).join("|") : model}`, { kind: "client" });
     let rep: Reply<z.infer<S>>;
     if (this.opts.maxCostUsd !== undefined && this.spentUsd >= this.opts.maxCostUsd) {
       rep = { ...base, outcome: "error", error: "budget: gateway cost cap reached" };
@@ -356,6 +360,11 @@ export class Gateway {
       ...(retryOf ? { retry_of: retryOf } : {}), ...(ctx.step_id ? { step_id: ctx.step_id } : {}), ...(ctx.judge_id ? { judge_id: ctx.judge_id } : {}),
     };
     this.opts.log?.(record);
+    if (sp && traced.tracer) {
+      sp.set(chatAttrs({ ...record, tier: traced.tier }));
+      if (rep.outcome !== "answered") sp.fail(`${rep.outcome}: ${rep.error}`);
+      traced.tracer.end(sp);
+    }
     // every gateway of the run reports to the run's recorder (a judge tier's has no log of its own)
     try { ctx.onModelCall?.(record as unknown as ModelCallRecord); } catch { /* recording never fails a call */ }
     return rep;

@@ -29,6 +29,7 @@ import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import { T, type Lang } from "./text.js";
 import type { KeyObject } from "node:crypto";
+import { span } from "../otel/trace.js";
 
 export interface ExecutorOptions {
   task: string; publicKey: KeyObject; now?: () => number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
@@ -1085,6 +1086,16 @@ export class Executor {
    *  something out?" — which only raises: 会 / 拿不准 / no answer → external, 不会 → unchanged. Without a judge the old
    *  send hints decide (floor). Answered once per action per screen (epoch); `act` always calls it itself. */
   async classify(a: Action, epoch: number, declared?: Consequence): Promise<Classification> {
+    // a span only when something is asked (an answer kept for this screen is not a decision)
+    if (this.classified.has(this.classifyKey(a, epoch, declared))) return this.classifyNow(a, epoch, declared);
+    return span("deskmind.classify", { "deskmind.action.kind": a.kind, "deskmind.consequence.declared": declared }, async (s) => {
+      const c = await this.classifyNow(a, epoch, declared);
+      s?.set({ "deskmind.consequence": c.consequence, "deskmind.classified_by": c.by, "deskmind.object": c.object });
+      return c;
+    });
+  }
+
+  private async classifyNow(a: Action, epoch: number, declared?: Consequence): Promise<Classification> {
     let key = this.classifyKey(a, epoch, declared);
     const hit = this.classified.get(key);
     if (hit) return hit;
@@ -1418,7 +1429,15 @@ export class Executor {
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
-    try { r = await this.driver.perform(this.forDriver(act), foregroundOk ? { foreground_ok: true } : undefined); } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    // the driver doing it: its own span, with the consent it went on (token kind) and the class it was settled at
+    try {
+      r = await span("deskmind.perform", { "deskmind.action.kind": act.kind, "deskmind.consequence": consequence, "deskmind.object": base.object, "deskmind.token_kind": req.consent?.scope ?? "none", "deskmind.foreground_ok": foregroundOk }, async (s) => {
+        const x = await this.driver.perform(this.forDriver(act), foregroundOk ? { foreground_ok: true } : undefined);
+        s?.set({ "deskmind.perform.status": x.status });
+        if (x.status === "error" || x.status === "unsupported") s?.fail(x.why ?? x.status);
+        return x;
+      });
+    } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     finally { if (land) { this.flight = null; (land as () => void)(); } }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
@@ -1483,7 +1502,15 @@ export class Executor {
 
   /** The user is at the keyboard: wait for them to pause (polling, up to a limit). Returns the computer as it is after,
    *  and why the action ends instead when they did not pause or the app stopped the task. */
-  private async waitForUser(now: Snapshot, object: string): Promise<{ now: Snapshot; end?: { status: "blocked" | "stopped"; why: string } }> {
+  private waitForUser(now: Snapshot, object: string): Promise<{ now: Snapshot; end?: { status: "blocked" | "stopped"; why: string } }> {
+    return span("deskmind.user_busy", { "deskmind.object": object }, async (s) => {
+      const w = await this.waitForUserNow(now, object);
+      s?.set({ "deskmind.wait.end": w.end?.status ?? "resumed" });
+      return w;
+    });
+  }
+
+  private async waitForUserNow(now: Snapshot, object: string): Promise<{ now: Snapshot; end?: { status: "blocked" | "stopped"; why: string } }> {
     const wait = this.opts.userWait ?? { ms: 120_000, pollMs: 2_000 };
     const until = (this.opts.now?.() ?? Date.now()) + wait.ms;
     this.emit("executor.user_wait", { object });

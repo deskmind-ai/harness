@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
+import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { appRun, LineReader } from "../src/cli/app.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
@@ -247,5 +248,93 @@ describe("M0 slice C: cost and timing", () => {
     // the same question again is answered from the cache: no new question, no event
     expect((await j.choose("问题", {}, [{ id: "a", text: "A" }, { id: "b", text: "B" }]))!.cached).toBe(true);
     expect(events.filter(([k]) => k === "judge.answer")).toHaveLength(1);
+  });
+});
+
+describe("M0 slice D: the run as an OpenTelemetry trace", () => {
+  const spansOf = (r: { read: (f: string) => any[] }) => r.read("trace.otel.jsonl").flatMap((l: any) => l.resourceSpans.flatMap((rs: any) => rs.scopeSpans.flatMap((ss: any) => ss.spans)));
+  const attr = (s: any, k: string) => { const a = s.attributes.find((x: any) => x.key === k); return a ? Object.values(a.value)[0] : undefined; };
+
+  it("run → turn → model call / tool call → step → classify, judge → model call, perform; plan → ask_user; verify → judge", async () => {
+    const r = await editorRun();
+    const spans = spansOf(r);
+    const by = new Map(spans.map((s: any) => [s.spanId, s]));
+    const parent = (s: any) => by.get(s.parentSpanId);
+    const named = (n: string) => spans.filter((s: any) => s.name === n);
+    // one trace, one root, no span without its parent, every span ended after it began, all OK
+    expect(new Set(spans.map((s: any) => s.traceId)).size).toBe(1);
+    const roots = spans.filter((s: any) => !s.parentSpanId);
+    expect(roots.map((s: any) => s.name)).toEqual(["invoke_agent deskmind"]);
+    expect(attr(roots[0], "gen_ai.operation.name")).toBe("invoke_agent");
+    expect(attr(roots[0], "deskmind.status")).toBe("succeeded");
+    expect(spans.filter((s: any) => s.parentSpanId && !by.has(s.parentSpanId))).toEqual([]);
+    expect(spans.every((s: any) => BigInt(s.endTimeUnixNano) >= BigInt(s.startTimeUnixNano) && s.status.code === 1)).toBe(true);
+    // turns under the run; the acting model's call in each, with the GenAI attributes
+    const turns = named("deskmind.turn");
+    expect(turns).toHaveLength(7);
+    expect(turns.every((t: any) => parent(t) === roots[0])).toBe(true);
+    const loopChats = named("chat deepseek-flash");
+    expect(loopChats).toHaveLength(7);
+    expect(loopChats.every((c: any) => parent(c).name === "deskmind.turn" && c.kind === 3)).toBe(true);
+    expect(attr(loopChats[0], "gen_ai.operation.name")).toBe("chat");
+    expect(attr(loopChats[0], "gen_ai.provider.name")).toBe("deepseek");
+    expect(attr(loopChats[0], "gen_ai.request.model")).toBe("deepseek-flash");
+    expect(attr(loopChats[0], "gen_ai.usage.input_tokens")).toBe("1");
+    expect(attr(loopChats[0], "deskmind.role")).toBe("loop");
+    // the set_value step: under its tool call, the class settled, the intent judge (its tier's call below it), the driver
+    const steps = named("deskmind.step");
+    expect(steps.map((s: any) => attr(s, "deskmind.step.status"))).toEqual(["ok", "stale"]);
+    expect(parent(steps[0]).name).toBe("execute_tool computer_act");
+    expect(attr(parent(steps[0]), "gen_ai.tool.name")).toBe("computer_act");
+    const stepEvents = r.events.filter((e) => e.kind === "step") as any[];
+    expect(attr(steps[0], "deskmind.step_id")).toBe(stepEvents[0].step_id);
+    const under = (p: any) => spans.filter((s: any) => s.parentSpanId === p.spanId).map((s: any) => s.name);
+    expect(under(steps[0])).toEqual(expect.arrayContaining(["deskmind.classify", "deskmind.judge intent", "deskmind.perform"]));
+    const judge = named("deskmind.judge intent")[0];
+    expect(attr(judge, "deskmind.tier")).toBe("frontier");
+    expect(attr(judge, "deskmind.judge_id")).toBe((r.events.find((e) => e.kind === "judge") as any).judge_id);
+    expect(under(judge)).toEqual(["chat scripted"]);
+    expect(attr(spans.find((s: any) => s.parentSpanId === judge.spanId), "deskmind.tier")).toBe("frontier");
+    const perform = named("deskmind.perform")[0];
+    expect(attr(perform, "deskmind.token_kind")).toBe("object");           // the plan's consent for the user's window
+    expect(attr(perform, "deskmind.consequence")).toBe("modify_user");
+    // the plan card's wait under the plan; the verdict's judge under verify, under finish
+    expect(parent(named("deskmind.ask_user")[0]).name).toBe("deskmind.plan");
+    expect(parent(named("deskmind.verify")[0]).name).toBe("execute_tool finish");
+    expect(parent(named("deskmind.judge verify")[0]).name).toBe("deskmind.verify");
+    // the trace's lines say where in the chain they were written
+    const act = r.trace.find((t: any) => t.kind === "executor.act");
+    expect(by.has(act.span_id)).toBe(true);
+  });
+
+  it("harness.mjs trace export writes one OTLP/JSON request with every span", async () => {
+    const r = await editorRun();
+    const out = path.join(r.runs, "export.json");
+    const p = spawnSync(process.execPath, ["--import", "tsx", "src/cli/app.ts", "trace", "export", "--run", "run_m0", "--runs", r.runs, "--out", out], { encoding: "utf-8", timeout: 60_000 });
+    expect(p.status, p.stderr).toBe(0);
+    expect(JSON.parse(p.stdout.trim())).toMatchObject({ ok: true, spans: spansOf(r).length });
+    const req = JSON.parse(fs.readFileSync(out, "utf-8"));
+    expect(req.resourceSpans).toHaveLength(1);
+    expect(req.resourceSpans[0].resource.attributes).toContainEqual({ key: "service.name", value: { stringValue: "deskmind-harness" } });
+    expect(req.resourceSpans[0].scopeSpans[0].spans).toHaveLength(spansOf(r).length);
+  }, 60_000);
+});
+
+describe("M0 slice D: spans left open", () => {
+  it("a run that ends with a span still open (a stop that did not wait) closes it as an error, the tree whole", async () => {
+    const { Tracer, span } = await import("../src/otel/trace.js");
+    const { within } = await import("../src/otel/context.js");
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "otel-")), "t.jsonl");
+    const t = new Tracer(file);
+    const root = t.start("invoke_agent deskmind", { parent: null });
+    let hang!: () => void;
+    void within({ tracer: t, span: root }, () => span("deskmind.perform", {}, () => new Promise<void>((r) => { hang = r; })));
+    t.closeAll("stopped", root); t.end(root);
+    const spans = fs.readFileSync(file, "utf-8").trim().split("\n").map((l) => JSON.parse(l).resourceSpans[0].scopeSpans[0].spans[0]);
+    expect(spans.map((s) => [s.name, s.status.code])).toEqual([["deskmind.perform", 2], ["invoke_agent deskmind", 1]]);
+    expect(spans[0].parentSpanId).toBe(spans[1].spanId);
+    hang();                                                        // the late end writes nothing more
+    await new Promise((r) => setTimeout(r, 10));
+    expect(fs.readFileSync(file, "utf-8").trim().split("\n")).toHaveLength(2);
   });
 });

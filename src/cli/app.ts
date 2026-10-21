@@ -8,6 +8,7 @@
  *   respond --run <id> [--runs <dir>]           stdin line 1: {option} | {text}  — the user's answer to the result card
  *   --selftest                                  no model, no network: the packaged binary's health check
  *   model-check --config <name|openai:prov|model> one tiny question to the configured model: {ok, model, ms} or {ok:false, error} — the app's "test" button
+ *   trace export --run <id> --out <file> [--runs <dir>]   the run's call chain (trace.otel.jsonl) as one OTLP/JSON request
  *
  * Consent: the executor verifies Ed25519 tokens with a public key; the private key is the app's (keychain / Secure
  * Enclave, docs/0.5-decisions.md D4). Until the app signs, this process holds a fresh pair per run — the model never
@@ -36,6 +37,7 @@ import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
 import { isForeignControl, parseControl } from "../protocol/control.js";
 import { PROTOCOL } from "../protocol/version.js";
 import { current as traceContext, within, type ModelCallRecord } from "../otel/context.js";
+import { Tracer, exportTrace } from "../otel/trace.js";
 import type { Answer, Card } from "../orchestrator/index.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
@@ -195,8 +197,9 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
     : v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, cut(x)])) : v;
   return (kind, body) => {
     // the step in progress (otel/context): an executor event, a judge's, a model call's — each names the step it served
+    // and the span in progress (otel/trace.ts): the line's place in the call chain of trace.otel.jsonl
     const c = traceContext();
-    try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(c.step_id ? { step_id: c.step_id } : {}), ...(cut(body ?? {}) as Record<string, unknown>) }) + "\n"); } catch { /* the trace never stops a run */ }
+    try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(c.step_id ? { step_id: c.step_id } : {}), ...(c.span ? { span_id: c.span.spanId } : {}), ...(cut(body ?? {}) as Record<string, unknown>) }) + "\n"); } catch { /* the trace never stops a run */ }
   };
 }
 
@@ -212,9 +215,13 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
   const trace = traceWriter(path.join(o.runs, runId, "trace.jsonl"));
+  // the run as an OpenTelemetry trace (otel/trace.ts): trace.otel.jsonl beside the events, on this Mac only
+  const tracer = new Tracer(path.join(o.runs, runId, "trace.otel.jsonl"), { "deskmind.run_id": runId });
+  const root = tracer.start("invoke_agent deskmind", { parent: null, attrs: { "gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "deskmind", "gen_ai.conversation.id": runId, "deskmind.run_id": runId, "deskmind.config": config, "deskmind.lang": req.lang ?? "zh", "deskmind.driver": req.driver ?? "sim" } });
+  const closeTrace = (status: string, reason: string) => { root.set({ "deskmind.status": status, "deskmind.reason": reason.slice(0, 300) }); tracer.closeAll(undefined, root); tracer.end(root); };
   log.emit({ kind: "start", raw: req.raw, lang: req.lang ?? "zh", engine: req.engine ?? "runtime", config, ...(req.scope ? { scope: req.scope } : {}), protocol: { events: PROTOCOL.events } });
   const table = configTable(config);
-  if (!table) { log.emit({ kind: "task_done", status: "failed", reason: `unknown config ${config}`, summary: "", result_card: null }); return; }
+  if (!table) { log.emit({ kind: "task_done", status: "failed", reason: `unknown config ${config}`, summary: "", result_card: null }); closeTrace("failed", `unknown config ${config}`); return; }
   // every model call of the run (the run's gateway, a judge tier's, the acting model's turns) reaches the recorder through
   // the run's context (otel/context): model_calls.jsonl, the trace, a model_call event while the run is on, the sum
   const gw = o.inject?.gateway ?? new Gateway(table);
@@ -266,6 +273,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const forceDone = () => {
     if (done) return;
     const f = executor.inFlight, c = executor.changes();
+    closeTrace("stopped", f ? STEP_UNKNOWN : stopReason || "stopped");
     taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage } as EventBody);
   };
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
@@ -284,7 +292,8 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
       forceDone(); sg.exit();
     })();
   });
-  const r = await within({ onModelCall }, () => rt.run());
+  const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
+  if (!done) closeTrace(r.status, r.reason);
   const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
   taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage } as never);
   if (signals) return o.signals!.exit();
@@ -340,11 +349,23 @@ export async function modelCheck(config: string): Promise<{ ok: boolean; model?:
 async function main() {
   const { values: a, positionals } = parseArgs({ args: process.argv.slice(2), allowPositionals: true, options: { linger: { type: "string", default: "0" },
     request: { type: "string" }, runs: { type: "string", default: "runs/app" }, run: { type: "string" }, selftest: { type: "boolean", default: false }, config: { type: "string", default: "ds-flash" },
+    out: { type: "string" },
   } });
   const out = (ev: AppEvent) => process.stdout.write(JSON.stringify(ev) + "\n");
   if (a.selftest) { const r = await selftest(); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
   const cmd = positionals[0];
   if (cmd === "model-check") { const r = await modelCheck(a.config!); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
+  if (cmd === "trace" && positionals[1] === "export") {
+    // a run's call chain as one OTLP/JSON request, for Jaeger, Phoenix or Langfuse (POST it to their /v1/traces);
+    // read from this Mac's run folder, written where --out says, sent nowhere
+    if (!a.run || !a.out) { console.error("usage: trace export --run <id> --out <file> [--runs <dir>]"); process.exit(2); }
+    const file = path.join(path.resolve(a.runs!), a.run, "trace.otel.jsonl");
+    if (!fs.existsSync(file)) { console.error(`no trace for ${a.run}: ${file}`); process.exit(1); }
+    const r = exportTrace(file);
+    fs.writeFileSync(a.out, JSON.stringify(r.request));
+    console.log(JSON.stringify({ ok: true, spans: r.spans, out: path.resolve(a.out) }));
+    process.exit(0);
+  }
   const input = new LineReader(process.stdin);
   if (cmd === "app-run") {
     // SIGINT / SIGTERM: before the run has started there is nothing to stop; after, the run ends as stopped
@@ -364,7 +385,7 @@ async function main() {
     respond(a.run, path.resolve(a.runs!), JSON.parse(await input.next()), out);
     process.exit(0);
   }
-  console.error("usage: app-run [--request <file>] [--runs <dir>] | respond --run <id> | model-check --config <name> | --selftest");
+  console.error("usage: app-run [--request <file>] [--runs <dir>] | respond --run <id> | model-check --config <name> | trace export --run <id> --out <file> | --selftest");
   process.exit(2);
 }
 

@@ -9,6 +9,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { current, within } from "../otel/context.js";
+import { span } from "../otel/trace.js";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Gateway, type Reply, type RoleTable } from "../gateway/index.js";
@@ -89,6 +90,8 @@ export class TierStats {
 
 export class Judge {
   private readonly cache = new Map<string, JudgeAnswer>();
+  /** The shadow comparison of each question in progress (by judge_id), for its span. */
+  private shadows = new Map<string, { tier: string; top: string | null; agree: boolean | null }>();
   calls = 0;
   constructor(readonly tiers: JudgeTier[], readonly opts: { /** a cap on model calls per task; none unless set */ budget?: number; onEvent?: (kind: string, body: Record<string, unknown>) => void;
     /** adaptive routing: skip a lower tier on question kinds it never settles */ stats?: TierStats;
@@ -109,7 +112,13 @@ export class Judge {
     const hit = this.cache.get(key);
     if (hit) return { ...hit, cached: true };
     const judge_id = `jd_${randomUUID().slice(0, 8)}`;
-    return within({ judge_id }, () => this.ask(judge_id, key, question, context, options, role, how));
+    const name = questionName(question);
+    return span(`deskmind.judge ${name}`, { "deskmind.judge_id": judge_id, "deskmind.question": name }, (s) => within({ judge_id }, async () => {
+      const a = await this.ask(judge_id, key, question, context, options, role, how);
+      const sh = this.shadows.get(judge_id); this.shadows.delete(judge_id);
+      s?.set({ "deskmind.tier": a?.by ?? "none", "deskmind.answer": a?.choice ?? "none", ...(a?.confidence !== undefined ? { "deskmind.confidence": a.confidence } : {}), ...(sh ? { "deskmind.shadow.agree": sh.agree ?? "none", "deskmind.shadow.top": sh.top ?? "none" } : {}) });
+      return a;
+    }));
   }
 
   private async ask(judge_id: string, key: string, question: string, context: unknown, options: JudgeOption[], role: Role | undefined, how: ChooseOptions): Promise<JudgeAnswer | null> {
@@ -137,12 +146,12 @@ export class Judge {
     // the race: the top tier starts now, alongside the lower tiers; abortable
     type Answer = Reply<z.infer<typeof schema>>;
     const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
-    if (raced) raced.promise = topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", raced.controller.signal);
+    if (raced) raced.promise = within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", raced.controller.signal));
     for (const tier of this.tiers) {
       const final = tier === topTier;
       if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
-      const rep = final && raced?.promise ? await raced.promise : await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema);
+      const rep = final && raced?.promise ? await raced.promise : await within({ tier: tier.name }, () => tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema));
       if (rep.outcome !== "answered") { asked.push({ tier: tier.name, outcome: rep.outcome, choice: null, settled: false }); this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
@@ -166,11 +175,12 @@ export class Judge {
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
     if (settled && settledBy && shadowNow) {
-      const rep = raced?.promise ? await raced.promise : await topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema);
+      const rep = raced?.promise ? await raced.promise : await within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema));
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
       if (agree !== null) this.opts.stats?.noteAgreement(settledBy.name, kind, agree);
       if (rep.outcome === "answered") sample(rep.data!.choice);
       shadowed = { tier: settledBy.name, top: rep.outcome === "answered" ? rep.data!.choice : null, agree };
+      this.shadows.set(judge_id, shadowed);
       this.opts.onEvent?.("judge.shadow", { tier: settledBy.name, question_kind: kind, choice: last!.choice, top: rep.outcome === "answered" ? rep.data!.choice : null, agree });
     }
     // every tier above a lower tier's refusal failed: that refusal does not become final by default — the caller takes
