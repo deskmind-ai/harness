@@ -399,6 +399,29 @@ describe("the boundary does not trust the runtime (review of #50)", () => {
     expect(await peer.closed).toBe("protocol: line too long");
   });
 
+  it("after a violation nothing more is served: a request behind the oversize line is not dispatched, not even when the stream ends", async () => {
+    const max = 1000;
+    const input = new PassThrough(), out = new PassThrough();
+    const peer = new JsonRpcPeer(input, out, { maxLine: max, oversize: "close" });
+    const served: unknown[] = [];
+    peer.onRequest = (m) => served.push(m.id);
+    const longLine = JSON.stringify({ jsonrpc: "2.0", method: "notifications/x", params: { a: "y".repeat(max) } });
+    input.write(longLine.slice(0, 900));                                   // under the cap so far: kept
+    input.write(longLine.slice(900) + "\n" + JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "act" } }) + "\n");
+    // the same request without its newline, read only at the end of the stream
+    input.write(JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "act" } }));
+    expect(peer.violation).toBe("line too long");
+    input.end();
+    await sleep(50);
+    expect(served).toEqual([]);
+    // the cap is in UTF-8 bytes: 400 three-byte characters are over a 1000-byte cap
+    const in2 = new PassThrough();
+    const p2 = new JsonRpcPeer(in2, new PassThrough(), { maxLine: max, oversize: "close" });
+    in2.write(JSON.stringify({ jsonrpc: "2.0", method: "n", params: { t: "字".repeat(400) } }) + "\n");
+    await sleep(10);
+    expect(p2.violation).toBe("line too long");
+  });
+
   it("the standalone server reading a foreign caller: an oversize request is answered with an error (its id read from the line's start), else the connection is closed", async () => {
     const input = new PassThrough(), output = new PassThrough();
     const peer = new JsonRpcPeer(input, output, { maxLine: 1024, oversize: "error" });
