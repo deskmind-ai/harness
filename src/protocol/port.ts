@@ -76,7 +76,9 @@ export interface ExecutorPort {
    *  that passes. */
   finish(p: { outcome: FinishOutcome; summary: string; missing?: string[] }): Promise<ToolReply>;
   /** What the user said mid-run (steer) that no reply has carried yet, applied now — between two steps, never during
-   *  one. A step the caller asks for while one is pending is not done: its reply carries the new words instead. */
+   *  one. A step the caller asks for while one is pending is not done: its reply carries the new words instead, and
+   *  every further step is refused the same way until the caller calls this again (at its next turn: the steps it had
+   *  decided before hearing the words are not done). */
   steers(): string[];
   /** Close the task and give its result. `failure`: why the caller is giving up (a budget, a model error), used only
    *  when the executor has not settled the status itself. */

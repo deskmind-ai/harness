@@ -232,6 +232,52 @@ describe("executor port: steer", () => {
     expect(steered.text).toBe("周五开会");
   });
 
+  it("the rest of a turn decided before the words came is not done either; the next turn goes on as usual", async () => {
+    const { sim, w } = mail();
+    const signer = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: signer.publicKey });
+    const { gw } = judge();
+    let rt!: FrontierRuntime;
+    const cards: Card[] = [];
+    // the send's card is voided by the steer; the model had already decided a second step in the same turn
+    const user: CardAsker = { ask: (c) => { cards.push(c); if (c.kind === "action") { setTimeout(() => rt.steer("先别发，只选中那封邮件"), 5); return new Promise<Answer | null>(() => {}); } return approve(c); } };
+    const seen: Message[][] = [];
+    const steps: Step[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "回复林晓", objects: [`window:${w}`], consequence: "modify_user" }, { purpose: "发送", objects: [`window:${w}`], consequence: "external" }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },
+      act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "modify_user"),
+      act({ kind: "click", window: w, target: `${w}:0:reply` }, "modify_user"),
+      act({ kind: "set_value", window: w, target: `${w}:0:compose_body`, value: "收到，谢谢" }, "modify_user"),
+      (ms) => ({ calls: [
+        { name: "computer_act", args: { action: { kind: "click", window: w, target: `${w}:0:send` }, epoch: epochOf(ms), consequence: "external", purpose: "发送" } },
+        { name: "computer_act", args: { action: { kind: "click", window: w, target: `${w}:0:row:m2` }, epoch: epochOf(ms), consequence: "modify_user", purpose: "再看下一封" } },
+        { name: "finish", args: { outcome: "done", summary: "已回复" } },
+      ] }),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "选中了那封邮件，没有发" } }] },
+    ];
+    rt = new FrontierRuntime({ task: "t1", raw: RAW, executor: ex, signer, user, gateway: gw, model: { ...model, streamFn: scriptedStream(steps, seen) } });
+    const r = await rt.run();
+    expect(r.status).toBe("succeeded");
+    const results = seen[6]!.filter((m) => m.role === "toolResult").slice(-3).map((m: any) => m.content[0].text as string);
+    expect(results[0]).toContain("用户改了要求");
+    expect(results[1]).toContain("在那之前决定的，没有做");
+    expect(results[2]).toContain("在那之前决定的，没有做");
+    expect(sim.mailState(w).selected).toBe("m1");
+    expect(sim.mailState(w).replies).toEqual([]);
+    expect(r.verdicts).toHaveLength(1);
+  });
+
+  it("act takes no file action: a file goes through `file`, which makes what the capability derives itself", async () => {
+    const { sim } = mail();
+    const signer = ConsentSigner.fresh();
+    const ex = new Executor(sim, { task: "t1", publicKey: signer.publicKey });
+    const svc = new ExecutorService({ task: "t1", raw: RAW, executor: ex, signer, user: { ask: () => null }, gateway: judge().gw });
+    await svc.port.begin();
+    const rep = await svc.port.act({ action: { kind: "file", capability: "fs.transform_text", args: { path: "a.txt", text: "mine" } }, epoch: 0, consequence: "read", purpose: "x" });
+    expect(rep).toMatchObject({ isError: true });
+    expect(ex.receipts).toHaveLength(0);
+  });
+
   it("app-run: a voided card is closed for the app (resumed, voided) and a late answer to it answers nothing", async () => {
     const input = new PassThrough();
     const sent: AppEvent[] = [];
@@ -254,6 +300,14 @@ describe("executor port: steer", () => {
     input.write(JSON.stringify({ type: "answer", ask_id: second, option: 1 }) + "\n");
     expect(await p2).toEqual({ option: 1 });
     expect(sent.some((e) => e.kind === "refused" && e.what === `answer for ${first}`)).toBe(true);
+    // after a void, an answer that names no card (the old untyped form) may be the voided card's: it answers nothing
+    const p3 = u.ask(card);
+    await new Promise((r) => setTimeout(r, 10));
+    const third = (sent.filter((e) => e.kind === "ask").at(-1) as Extract<AppEvent, { kind: "ask" }>).ask_id;
+    input.write(JSON.stringify({ option: 0 }) + "\n");
+    input.write(JSON.stringify({ type: "answer", ask_id: third, option: 1 }) + "\n");
+    expect(await p3).toEqual({ option: 1 });
+    expect(sent.some((e) => e.kind === "refused" && e.what === "an answer without ask_id")).toBe(true);
   });
 });
 

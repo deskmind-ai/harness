@@ -94,6 +94,8 @@ export class LineReader {
  *  An answer for another ask_id is not an answer to this card: it is dropped with a `refused` event. */
 export class StdioUser implements RuntimeUser {
   constructor(private readonly log: EventLog, private readonly input: LineReader) {}
+  /** A card of this run was voided (steer): from then on an answer must name its card (ask_id). */
+  private voided = false;
   async ask(card: Card, o: { signal?: AbortSignal } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking } });
@@ -101,11 +103,13 @@ export class StdioUser implements RuntimeUser {
     for (;;) {
       const line = await this.input.next(o.signal);
       // the user changed the request while the card was open (steer): the card is let go, and the app is told to close it
-      if (o.signal?.aborted) { this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); return null; }
+      if (o.signal?.aborted) { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); return null; }
       if (!line && (this.input.closed || this.input.stopped)) return null;     // the app is gone or stopped the task: no answer, the run ends honestly
       const a = parseControl(line);
       if (a?.type !== "answer") continue;
       if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
+      // once a card was voided, an answer that names no card may be the late answer to that one: it answers nothing
+      if (a.ask_id === undefined && this.voided) { this.log.emit({ kind: "refused", what: "an answer without ask_id", why: `a card was voided; the open card is ${ask_id}`, by: "executor" }); continue; }
       this.log.emit({ kind: "resumed", ask_id });
       if (typeof a.option === "number" && a.option >= 0 && a.option < card.options.length) return { option: a.option };
       if (typeof a.text === "string" && a.text.trim()) return { text: a.text };

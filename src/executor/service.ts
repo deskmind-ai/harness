@@ -117,6 +117,9 @@ export class ExecutorService {
   private openCard: AbortController | null = null;
   /** The request changed since the user accepted a plan: a step beyond that plan asks for a new one. */
   private steeredSincePlan = false;
+  /** A reply carried a steer: every further step the caller decided before hearing it (the rest of the model's turn)
+   *  comes back undone too, until the caller asks for steers again (`steers`, between turns). */
+  private reDecide = false;
   private readonly t: ReturnType<typeof T>;
 
   /** The options, without the signer and the card asker: those are private fields, out of reach of anything that
@@ -136,9 +139,10 @@ export class ExecutorService {
     this.budget = { ...SERVICE_BUDGET, ...(o.budget ?? {}) };
     const port: ExecutorPort = {
       begin: () => this.begin(), snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
-      act: (p) => this.act(p), file: (p) => this.file(p), plan: (p) => this.plan(p.steps, p.readings ?? []),
+      // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
+      act: (p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.act(p)), file: (p) => this.file(p), plan: (p) => this.plan(p.steps, p.readings ?? []),
       askUser: (p) => this.askUser(p), answer: (p) => this.answer(p), readSkill: (p) => this.readSkill(p), finish: (p) => this.finish(p),
-      steers: () => this.applySteers(), end: (p) => this.end(p),
+      steers: () => { this.reDecide = false; return this.applySteers(); }, end: (p) => this.end(p),
     };
     this.port = Object.freeze(port);
   }
@@ -170,13 +174,21 @@ export class ExecutorService {
       if (this.o.executor.hasPlan) this.steeredSincePlan = true;
       this.emit("steer.applied", { raw: r });
     }
+    if (xs.length) {
+      // what held for the old words does not carry over: a yes to one action the screen then moved under, "only look for
+      // evidence" after a verdict, the no-progress count
+      this.retryTokens.clear();
+      this.lookOnly = false;
+      this.repeats = 0; this.lastSig = "";
+    }
     return xs;
   }
 
   /** A step asked for while a steer is pending is not done: the reply carries the new words instead. */
   private steered(): ToolReply | null {
     const xs = this.applySteers();
-    if (!xs.length) return null;
+    if (!xs.length) return this.reDecide ? err("用户改了要求（见前面的结果）：这一步是在那之前决定的，没有做。按新要求重新决定。") : null;
+    this.reDecide = true;
     return err(`用户改了要求，以这句为准（之前做过的不会消失，按新要求接着做或撤回）：${xs.join("；然后又说：")}\n你刚才要的这一步没有做：按新要求重新决定。`);
   }
 
@@ -340,7 +352,8 @@ export class ExecutorService {
     if (r.status === "needs_consent" && r.challenge) {
       // the user changed the request since accepting the plan, and this step is on something the plan did not name (no
       // token of it covers the object or the site): the new request goes on a new plan card, not on a card per step
-      if (this.steeredSincePlan && !consent) {
+      const covered = host ? !!(opening ?? this.retryTokens.get(canon(a))) : !!consent;
+      if (this.steeredSincePlan && !covered) {
         this.count("needs_plan"); this.count("needs_plan:steer");
         this.emit("plan.beyond", { object: r.challenge.object, consequence: r.challenge.consequence });
         return err(`用户中途改了要求，这一步要碰的东西不在用户同意过的计划里（${r.challenge.text}）：先按新要求交一份新计划（plan），写上它。`);
@@ -426,7 +439,7 @@ export class ExecutorService {
     // music app's window the executor counted as the user's, so no plan card was shown and every step asked on its own
     // card — 「打开网易云播放安溥的宝贝」, 10-20). A declared external stays external; sending still asks per action
     // only looks: nothing to ask, nothing to resolve
-    if (steps.every((s) => s.consequence === "read" && !s.opens?.length)) return text("计划记下了；这些步骤不需要用户同意，直接做。");
+    if (steps.every((s) => s.consequence === "read" && !s.opens?.length)) { this.steeredSincePlan = false; return text("计划记下了；这些步骤不需要用户同意，直接做。"); }
     const snap = await ex.snapshot();           // one look for the whole plan
     // a URL a step opens lands where the executor's floor for that open_window says: in the user's browser window when
     // the app has one (「搜索今天北京天气」, rc.10: nine cards for nine pages in the user's Chrome). That window is one
@@ -477,7 +490,8 @@ export class ExecutorService {
     if (fgApps.length) this.emit("plan.foreground", { apps: fgApps });
     this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor, opens: intoYours });
     const toSites = sitesOf.map((ds) => ds.some((d) => d.sends));
-    if (!classes.some((c) => NEEDS_CONSENT.has(c)) && !toSites.some(Boolean)) return text("计划记下了；这些步骤不需要用户同意，直接做。");
+    // a plan that needs no card covers the request as it stands too: a step beyond it then asks on its own card again
+    if (!classes.some((c) => NEEDS_CONSENT.has(c)) && !toSites.some(Boolean)) { this.steeredSincePlan = false; return text("计划记下了；这些步骤不需要用户同意，直接做。"); }
     // a step that sends from the user's window also changes the user's things on the way (the row picked, the reply
     // opened, the body filled): the card says both, and only what the card says changes the user's things is signed
     // (review of #31: 「回复并发送」 signed the mail window under a line that said only 「会发出去」)
@@ -605,9 +619,9 @@ export class ExecutorService {
     if (p.outcome === "unconfirmed") return this.endWith("unconfirmed", (p.missing ?? []).join("; ") || p.summary.slice(0, 200));
     // "done" is a claim: the verdict comes from an independent judge reading the final state the executor hands over
     const v = await this.verify(p.summary);
-    this.verdicts.push(v);
-    // the user changed the request while the judge read: its verdict was on the old words
+    // the user changed the request while the judge read: its verdict was on the old words, and is not kept
     const late = this.steered(); if (late) return late;
+    this.verdicts.push(v);
     // a judge tier that answers without words (DeskMind Brain's system one) still gets named, so the app's history
     // never shows an empty "verified:"
     if (v.verdict === "pass") return this.endWith("succeeded", "verified: " + (v.reason.trim() || `by ${v.by ?? "judge"}`).slice(0, 200));
