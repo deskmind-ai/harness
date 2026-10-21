@@ -64,6 +64,8 @@ describe("app-run under a signal", () => {
       expect(done, r.err).toHaveLength(1);
       expect(done[0]).toMatchObject({ status: "stopped" });
       expect(done[0].reason).toContain(sig);
+      // ^C is the user's stop; SIGTERM is the helper (or a new session process) ending it: nobody's request
+      if (sig === "SIGINT") expect(done[0].cause).toBe("user_stopped"); else expect(done[0]).not.toHaveProperty("cause");
       expect(r.events.at(-1).kind).toBe("task_done");
       expect(r.onDisk.at(-1)).toMatchObject({ kind: "task_done", status: "stopped" });
       expect(r.code).toBe(0);

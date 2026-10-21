@@ -57,8 +57,8 @@ export const SessionBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.task"), msg_id: z.string(), run_id: z.string(), raw: z.string(), goal: z.string().optional(), by: z.enum(["slash", "model"]), reply_to: z.string().optional() }),
   // H2: how it ended — what the model was told (status, reason, summary, answer, changes, steers) and whether the result
   // card's undo was open then. `interrupted`: no task_done (the session process went away mid-task)
-  // `cause` (additive): task_done's cause as a field, or the session's own when it ends the task without one —
-  // last_step_unknown for an executor gone before its task_done, a stop not confirmed in time, a session process gone
+  // `cause` (additive): task_done's cause as a field, or the session's own when it ends the task with no task_done —
+  // last_step_unknown when a step had begun (`step`) and not ended (`step_result`)
   z.object({ kind: z.literal("session.task_end"), run_id: z.string(), status: z.string(), summary: z.string(), undo: z.enum(["open", "none"]), reason: z.string().optional(), cause: z.enum(STOP_CAUSES).optional(),
     answer: z.string().nullable().optional(), changes: Changes.optional(), steers: z.array(z.string()).optional() }),
   // H2: the session closed the run's executor (its stdin): the result card can no longer be answered. linger: it ended by

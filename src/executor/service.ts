@@ -250,9 +250,14 @@ export class ExecutorService {
     return Promise.race([p, new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true }))]);
   }
 
-  private endWith(status: TaskStatus, reason: string, cause?: StopCause): ToolReply {
-    // a stop is final: the card it cancelled comes back unanswered, and that is not a failure of its own
+  /** The task's end, all three together: a stop is final (the card it cancelled comes back unanswered, a begin it
+   *  interrupted finds the screen locked — neither is the end of its own), and a cause never outlives its status. */
+  private settle(status: TaskStatus, reason: string, cause?: StopCause) {
     if (this.status !== "stopped") { this.status = status; this.reason = reason; this.cause = cause; }
+  }
+
+  private endWith(status: TaskStatus, reason: string, cause?: StopCause): ToolReply {
+    this.settle(status, reason, cause);
     return { text: `结束：${status}（${reason}）`, done: true };
   }
 
@@ -323,7 +328,7 @@ export class ExecutorService {
     try { snap = await ex.begin(ws ? Object.keys(ws.entries()) : [], this.o.rules ?? []); }
     catch (e) {
       // the computer could not be read at all (hands missing, no permission): an environment stop, said as such
-      this.status = "environment"; this.reason = `cannot read the computer: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200);
+      this.settle("environment", `cannot read the computer: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
       await this.endExecutor();
       return none;
     }
@@ -331,7 +336,7 @@ export class ExecutorService {
     // carry it out)
     if (ws?.listing().entries.some((e) => e.preview)) ex.noteTakenIn("the task folder's listing with previews", J(ws.listing()));
     this.emit("run.start", { task: this.o.task, raw: this.o.raw, windows: snap.windows.length });
-    if (snap.locked) { this.status = "environment"; this.reason = "the screen is locked"; this.cause = "screen_locked"; await this.endExecutor(); return { ...none, snapshot: snap }; }
+    if (snap.locked) { this.settle("environment", "the screen is locked", "screen_locked"); await this.endExecutor(); return { ...none, snapshot: snap }; }
     // the restart found a step whose effect is unknown on a file changed since: the user settles it before anything else
     // (the executor refuses writes to that file until then, whoever the caller is). Unanswered because the request
     // changed meanwhile, it is asked again when a write reaches that file
@@ -813,8 +818,9 @@ export class ExecutorService {
     this.emit("finish.claimed", { outcome: p.outcome, summary: p.summary, missing: p.missing ?? [] });
     if (p.outcome === "cannot") return this.endWith("failed", "cannot: " + p.summary.slice(0, 200));
     // the user said stop in their own words (a card's free text): the run is cancelled like a picked "先别做了" — not a
-    // success, so there is nothing to verify and nothing to gain by claiming it (doubao ended three such runs "done")
-    if (p.outcome === "stopped") return this.endWith("cancelled", "the user stopped the task: " + p.summary.slice(0, 200));
+    // success, so there is nothing to verify and nothing to gain by claiming it (doubao ended three such runs "done").
+    // The caller's outcome field says so (a role's structured answer, not text read here): the user's stop
+    if (p.outcome === "stopped") return this.endWith("cancelled", "the user stopped the task: " + p.summary.slice(0, 200), "user_stopped");
     if (p.outcome === "unconfirmed") return this.endWith("unconfirmed", (p.missing ?? []).join("; ") || p.summary.slice(0, 200));
     // "done" is a claim: the verdict comes from an independent judge reading the final state the executor hands over
     const v = await this.verify(p.summary);
@@ -884,7 +890,7 @@ export class ExecutorService {
     this.emit("result.response", { picked: pick?.kind ?? null });
     if (pick?.kind !== "undo") return null;
     const u = await this.o.executor.undo();
-    if (!u.refused) { this.status = "cancelled"; this.reason = "the user undid the result"; this.cause = undefined; this.effects.push(`撤回了 ${u.undone} 步`); }
+    if (!u.refused) { this.settle("cancelled", "the user undid the result"); this.effects.push(`撤回了 ${u.undone} 步`); }
     else this.emit("note", { text: u.undone ? `撤回了 ${u.undone} 步后停下：${u.refused}` : `没有撤回：${u.refused}` });
     this.emit("result.undo", u);
     return u;

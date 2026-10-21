@@ -92,11 +92,12 @@ export type ActStatus = "ok" | "unverified" | "stale" | "needs_consent" | "needs
 /** Why a task stopped, in structure (a closed set; `reason` is display text only and is never matched): set only where
  *  the code that ends the task knows it, never read back out of a text. Absent: a plain error or a normal end.
  *  - `screen_locked`: the screen was found locked;
- *  - `last_step_unknown`: the task ended while a step may have been in progress and whether it took effect is not known
- *    (a stop that could not wait for the driver's receipt, the executor gone before its task_done, the session process
- *    gone mid-task); its object is in `changes.unconfirmed` when the executor knows it;
- *  - `user_stopped`: the app's stop (a stop line: the user's stop, or the session stopping its task as the app ends or
- *    leaves it; a SIGINT / SIGTERM to app-run), or the user's cancel option on a card. Every step's result is known. */
+ *  - `last_step_unknown`: the task ended while a step was in progress and whether it took effect is not known (a stop
+ *    that could not wait for the driver's receipt; the executor or the session process gone before task_done with a
+ *    step begun and not ended); its object is in `changes.unconfirmed` when the executor knows it;
+ *  - `user_stopped`: the user's stop — a stop line (not one marked app_gone), a SIGINT to app-run, the cancel option on
+ *    a card, or the caller's finish with outcome "stopped". Every step's result is known.
+ *  The app going away (stdin / stdout closed, a stop line with app_gone, SIGTERM) gives no cause: nobody asked. */
 export const STOP_CAUSES = ["screen_locked", "last_step_unknown", "user_stopped"] as const;
 export type StopCause = (typeof STOP_CAUSES)[number];
 

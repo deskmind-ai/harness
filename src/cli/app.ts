@@ -71,7 +71,8 @@ export class LineReader {
       // the app's stop can arrive at any moment, card or no card: it never waits in the answer queue
       // it also lets go of a card waiting for its answer: that card is answered with nothing (review of #16)
       const c = parseControl(l);
-      if (c?.type === "stop") { this.stop("stopped by the app", "user_stopped"); return; }
+      // the session's stop as the app ends or leaves (app_gone) is nobody's request: no cause, as for stdin closing
+      if (c?.type === "stop") { if (c.app_gone) this.stop("the app went away (the session stopped its task)"); else this.stop("stopped by the app", "user_stopped"); return; }
       if (c?.type === "steer") { if (this.steerTo) this.steerTo(c.text); else this.earlySteers.push(c.text); return; }
       // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
       // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
@@ -93,10 +94,12 @@ export class LineReader {
   private steerTo: ((text: string) => void) | null = null;
   private earlySteers: string[] = [];
   /** The app's stop (a stop line, or a signal): once, whoever asks first; every card waiting for its answer is
-   *  answered with nothing. `cause`: user_stopped for a stop line or a signal; none when the app went away (stdin or
-   *  stdout closed), which is a stop nobody asked for. */
+   *  answered with nothing. `cause`: user_stopped for a stop line or SIGINT (the user's ^C); none when the app went
+   *  away (stdin or stdout closed, a stop line with app_gone, SIGTERM: the helper or a new session process ending it),
+   *  which is a stop nobody asked for. */
   stopCause: StopCause | undefined;
-  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); }
+  stopWhy = "";
+  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopWhy = why; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); }
   /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
    *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
   next(signal?: AbortSignal): Promise<string> {
@@ -289,7 +292,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   let stopCause: StopCause | undefined;
   const stopRun = (why: string, cause?: StopCause) => { if (stopReason) return; stopReason = why; stopCause = cause; log.emit({ kind: "refused", what: "the task", why, by: "user" }); rt.stop(why, cause); };
   o.input.onStop = stopRun;
-  if (o.input.stopped) stopRun("stopped by the app", o.input.stopCause);     // a stop line read together with the request, before this
+  if (o.input.stopped) stopRun(o.input.stopWhy, o.input.stopCause);     // a stop line read together with the request, before this
   // the app went away (stdin closed) while the task runs: a stop, the same path as a stop line (owner 10-21: the helper
   // exits → its running tasks stop) — the step in flight gets its receipt, task_done says stopped, the process exits.
   // After task_done (the result card's linger) it only ends the wait
@@ -318,7 +321,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     const sg = o.signals!;
     if (done) return sg.exit();
     if (++signals > 1) { forceDone(); return sg.exitNow(); }
-    o.input.stop(`stopped by ${sig}`, "user_stopped");
+    o.input.stop(`stopped by ${sig}`, sig === "SIGINT" ? "user_stopped" : undefined);
     void (async () => {
       await sleep(sg.deadlineMs ?? 800);
       if (!done && executor.inFlight) {
