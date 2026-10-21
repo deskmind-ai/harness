@@ -311,16 +311,24 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   taskDone({ kind: "task_done", status: r.status, reason: r.reason, summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
   if (signals) return o.signals!.exit();
   // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
-  // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit
+  // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit. Any other line
+  // in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the wait goes on:
+  // only a respond, the app closing stdin (or stopping), or the deadline ends it (deskmind S0: undo was dead when the
+  // first line after task_done was not the respond)
   if (card && o.linger > 0) {
-    const line = await Promise.race([o.input.next(), new Promise<string>((res) => setTimeout(() => res(""), o.linger * 1000))]);
-    if (line) {
-      const a = parseControl(line);
-      if (a?.type === "respond" && typeof a.option === "number") {
+    const deadline = new AbortController();
+    const timer = setTimeout(() => deadline.abort(), o.linger * 1000);
+    try {
+      for (;;) {
+        const line = await o.input.next(deadline.signal);
+        if (deadline.signal.aborted || (!line && (o.input.closed || o.input.stopped))) break;
+        const a = parseControl(line);
+        if (a?.type !== "respond" || typeof a.option !== "number") continue;
         const u = await rt.respond({ option: a.option });
         log.emit({ kind: "result_response", picked: card.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
+        break;
       }
-    }
+    } finally { clearTimeout(timer); }
   }
 }
 
