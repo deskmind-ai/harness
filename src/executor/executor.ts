@@ -1262,7 +1262,7 @@ export class Executor {
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
     let now = await this.driver.snapshot();
-    if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+    if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
     if (req.action.kind === "file") return done(await this.actFile(req.action, req.consent, consequence, f.object, now.epoch));
     // the user is at the keyboard: a window action now would fight them for it, whoever owns the window (D20). Read-only
     // looks are fine. The executor itself waits for them to pause (polling, up to a limit) rather than bouncing the
@@ -1326,7 +1326,7 @@ export class Executor {
       // a judge answered over the network and nothing below waits again: the computer is looked at once more, as after
       // the intent check (an action with consent is looked at again there)
       now = await this.driver.snapshot();
-      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, c.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
@@ -1349,7 +1349,7 @@ export class Executor {
       // the judge answers over the network: the user may have selected another row meanwhile, and the action would land
       // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
       now = await this.driver.snapshot();
-      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       // the user came back to the keyboard meanwhile, before anything on screen moved: wait for them, as at the top
       if (now.user_active) {
         const w = await this.waitForUser(now, base.object);
@@ -1414,7 +1414,7 @@ export class Executor {
       }
       // the user may have come back to the keyboard during the look: wait for them, or stop, as at the top
       now = await this.driver.snapshot();
-      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", epoch: now.epoch });
+      if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
     }
@@ -1506,7 +1506,7 @@ export class Executor {
     let after: Snapshot;
     try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
     this.epoch = after.epoch;
-    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), epoch: after.epoch, ...madeField });
+    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), cause: "screen_locked", epoch: after.epoch, ...madeField });
     const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
     const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}), ...madeField };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id ?? r.opened_window?.id);
@@ -1611,7 +1611,7 @@ export class Executor {
       // wait: from the versions read below to the write there is none, or another program's edit made during it
       // would be overwritten unchecked (review of #16: the lock look, put after the checks, opened just that gap)
       const screen = await this.driver.snapshot();
-      if (screen.locked) return { ...base, status: "environment", why: "the screen is locked", epoch: screen.epoch };
+      if (screen.locked) return { ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: screen.epoch };
       // the judge answers over the network: a file the user changed meanwhile is not the one it judged, and writing
       // now would overwrite their edit (review of #16) — read the versions again, as at the top
       ws.invalidate();

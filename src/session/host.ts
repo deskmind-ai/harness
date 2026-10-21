@@ -24,6 +24,7 @@ import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loo
 import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, capChanges, sessionDir, taskView, type ErrorCode, type SessionBody, type SessionEvent } from "./log.js";
 import { EXIT_WAIT_MS, LINGER_S, alive, computerLastFile, computerOwner, cutRaw, lastTask, linkLock, setLastTask, spawnExecutor, takeComputer, type ComputerLock, type ExecutorHandle, type Launcher } from "./task.js";
 import type { ModelCallRecord } from "../otel/context.js";
+import { STOP_CAUSES, type StopCause } from "../protocol/computer.js";
 
 /** The first stdin line: which session, and the settings for this process. `driver` and `scope` (H2) go into every
  *  computer task's request: the executor's driver (sim | hands) and the task folder. */
@@ -129,6 +130,9 @@ interface Task {
   ended: Promise<TaskEnd>;
   resolve: (e: TaskEnd) => void;
   exitTimer: NodeJS.Timeout | null;
+  /** Steps it began (`step`) with no `step_result` yet: an end the session writes itself while one is open says its
+   *  result is unknown (cause last_step_unknown). */
+  openSteps: Set<string>;
 }
 
 export interface QueueItem { id: string; text: string; held?: boolean; note?: string }
@@ -199,7 +203,7 @@ export class SessionHost {
             this.recovering.push(this.awaitOldEnd(runId, own.executor_pid, !closed.has(runId)));
             continue;
           }
-          this.log.emit(interrupted(runId, steers));
+          this.log.emit(interrupted(runId, steers, evs));
         }
       }
       if (!closed.has(runId)) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
@@ -219,7 +223,7 @@ export class SessionHost {
         if (!done) done = [...readRunEvents(file)].reverse().find((e) => e.kind === "task_done");
         const steers = readRunEvents(file).filter((e) => e.kind === "steered").map((e) => String(e.text));
         if (this.log.events.some((e) => e.kind === "session.task_end" && e.run_id === runId)) return;
-        this.log.emit(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers));
+        this.log.emit(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, readRunEvents(file)));
         if (close) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
         return;
       }
@@ -427,7 +431,7 @@ export class SessionHost {
     try { handle = (this.o.launch ?? spawnExecutor)(request, { runs: this.runs, runId, linger: this.linger }); }
     catch (e) { handle = { write: () => {}, close: () => {}, onLine: () => {}, exited: Promise.resolve({ code: null, signal: `spawn: ${e instanceof Error ? e.message : String(e)}` }) }; }
     lock.setExecutor(handle.pid);
-    const task: Task = { runId, handle, lock, undoLock: null, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null };
+    const task: Task = { runId, handle, lock, undoLock: null, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set() };
     this.current = task;
     this.tasks.set(runId, task);
     handle.onLine((l) => this.onExecutorLine(task, l));
@@ -444,6 +448,8 @@ export class SessionHost {
       case "ask": task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; break;
       case "resumed": case "ask_void": if (ev.ask_id === task.card) task.card = null; break;
       case "steered": if (typeof ev.text === "string") task.steers.push(ev.text); break;
+      case "step": if (typeof ev.step_id === "string") task.openSteps.add(ev.step_id); break;
+      case "step_result": if (typeof ev.step_id === "string") task.openSteps.delete(ev.step_id); break;
       case "task_done": this.taskDone(task, ev); break;
       case "result_response":
         if (typeof ev.undone === "number" && typeof ev.total === "number") this.log.emit({ kind: "session.task_undo", run_id: task.runId, undone: ev.undone, total: ev.total, refused: typeof ev.refused === "string" ? ev.refused : null });
@@ -481,7 +487,8 @@ export class SessionHost {
     task.lock?.release(); task.lock = null;
     task.undoLock?.release(); task.undoLock = null;
     if (!task.end) {
-      this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
+      // no task_done: a step it had begun and not ended may or may not have taken effect
+      this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
     }
     if (task.state !== "closed") { task.state = "closed"; this.log.emit({ kind: "session.task_closed", run_id: task.runId, why: "linger" }); }
     this.tasks.delete(task.runId);
@@ -640,12 +647,12 @@ export class SessionHost {
   private stopForExit() {
     const t = this.current;
     if (!t || t.exitTimer || t.end) return;
-    t.handle.write(JSON.stringify({ type: "stop" }));
+    t.handle.write(JSON.stringify({ type: "stop", app_gone: true }));
     // no task_done in time: recorded as stopped all the same. Its executor may still be acting: the machine lock stays
     // with it (its pid is in the lock) until it exits
     t.exitTimer = setTimeout(() => {
       t.exitTimer = null;
-      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", summary: "", undo: "none", ...(t.steers.length ? { steers: t.steers } : {}) });
+      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", ...unknownIf(t.openSteps.size > 0), summary: "", undo: "none", ...(t.steers.length ? { steers: t.steers } : {}) });
       this.maybeExit();
     }, this.o.exitWaitMs ?? EXIT_WAIT_MS);
   }
@@ -669,13 +676,23 @@ function readRunEvents(file: string): Record<string, unknown>[] {
   try { return fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } }); } catch { return []; }
 }
 
-const interrupted = (runId: string, steers: string[]): TaskEnd => ({ kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", summary: "", undo: "none", ...(steers.length ? { steers } : {}) });
+/** cause last_step_unknown when a step was open, else nothing. */
+const unknownIf = (open: boolean): { cause?: StopCause } => (open ? { cause: "last_step_unknown" } : {});
+/** A run's steps with a `step` and no `step_result`, from its events. */
+function openStepsIn(evs: Record<string, unknown>[]): number {
+  const open = new Set<unknown>();
+  for (const e of evs) { if (e.kind === "step" && typeof e.step_id === "string") open.add(e.step_id); if (e.kind === "step_result") open.delete(e.step_id); }
+  return open.size;
+}
+const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[]): TaskEnd => ({ kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(steers.length ? { steers } : {}) });
 
-/** session.task_end from the executor's task_done. */
+/** session.task_end from the executor's task_done: its cause is the field copied (one of the known values), never read
+ *  out of its reason. */
 function endFrom(runId: string, ev: Record<string, unknown>, undo: "open" | "none", steers: string[]): TaskEnd {
   const changes = capChanges(ev.changes as Record<string, unknown> | undefined);
+  const cause = (STOP_CAUSES as readonly unknown[]).includes(ev.cause) ? (ev.cause as StopCause) : undefined;
   return { kind: "session.task_end", run_id: runId, status: String(ev.status ?? "failed"), summary: typeof ev.summary === "string" ? ev.summary : "", undo,
-    ...(typeof ev.reason === "string" && ev.reason ? { reason: ev.reason.slice(0, 500) } : {}), ...(typeof ev.answer === "string" ? { answer: ev.answer } : {}),
+    ...(typeof ev.reason === "string" && ev.reason ? { reason: ev.reason.slice(0, 500) } : {}), ...(cause ? { cause } : {}), ...(typeof ev.answer === "string" ? { answer: ev.answer } : {}),
     ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}) };
 }
 

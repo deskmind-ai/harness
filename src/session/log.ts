@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { z } from "zod";
+import { STOP_CAUSES } from "../protocol/computer.js";
 
 /** Where sessions live when the command line does not say: the app's own folder. */
 export const DEFAULT_DIR = path.join(os.homedir(), "Library", "Application Support", "DeskMind");
@@ -56,7 +57,9 @@ export const SessionBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.task"), msg_id: z.string(), run_id: z.string(), raw: z.string(), goal: z.string().optional(), by: z.enum(["slash", "model"]), reply_to: z.string().optional() }),
   // H2: how it ended — what the model was told (status, reason, summary, answer, changes, steers) and whether the result
   // card's undo was open then. `interrupted`: no task_done (the session process went away mid-task)
-  z.object({ kind: z.literal("session.task_end"), run_id: z.string(), status: z.string(), summary: z.string(), undo: z.enum(["open", "none"]), reason: z.string().optional(),
+  // `cause` (additive): task_done's cause as a field, or the session's own when it ends the task with no task_done —
+  // last_step_unknown when a step had begun (`step`) and not ended (`step_result`)
+  z.object({ kind: z.literal("session.task_end"), run_id: z.string(), status: z.string(), summary: z.string(), undo: z.enum(["open", "none"]), reason: z.string().optional(), cause: z.enum(STOP_CAUSES).optional(),
     answer: z.string().nullable().optional(), changes: Changes.optional(), steers: z.array(z.string()).optional() }),
   // H2: the session closed the run's executor (its stdin): the result card can no longer be answered. linger: it ended by
   // itself (a respond answered, its deadline, no result card); new_task: a computer task started on this Mac; session_end

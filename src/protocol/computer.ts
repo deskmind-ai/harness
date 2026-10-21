@@ -89,6 +89,18 @@ export type ActionKind = Action["kind"];
 
 export type ActStatus = "ok" | "unverified" | "stale" | "needs_consent" | "needs_plan" | "refused" | "blocked" | "error" | "stopped" | "environment";
 
+/** Why a task stopped, in structure (a closed set; `reason` is display text only and is never matched): set only where
+ *  the code that ends the task knows it, never read back out of a text. Absent: a plain error or a normal end.
+ *  - `screen_locked`: the screen was found locked;
+ *  - `last_step_unknown`: the task ended while a step was in progress and whether it took effect is not known (a stop
+ *    that could not wait for the driver's receipt; the executor or the session process gone before task_done with a
+ *    step begun and not ended); its object is in `changes.unconfirmed` when the executor knows it;
+ *  - `user_stopped`: the user's stop — a stop line (not one marked app_gone), a SIGINT to app-run, the cancel option on
+ *    a card, or the caller's finish with outcome "stopped". Every step's result is known.
+ *  The app going away (stdin / stdout closed, a stop line with app_gone, SIGTERM) gives no cause: nobody asked. */
+export const STOP_CAUSES = ["screen_locked", "last_step_unknown", "user_stopped"] as const;
+export type StopCause = (typeof STOP_CAUSES)[number];
+
 /** One place the request can be read more than one way: the reading the plan takes, the others, and the evidence
  *  for the choice (things seen: a window title, a file name, a line of a file, the user's answer — never the
  *  request's own words). The judge decides whether the evidence settles it; if not, the user is asked first. */
@@ -100,6 +112,9 @@ export type PlanVerdict = { accepted: true; steps: PlanStep[] } | { accepted: fa
 export interface ActResult {
   status: ActStatus;
   why?: string;
+  /** Set by the branch that found it: `screen_locked` when the screen was locked (status environment: nothing was done
+   *  and the task ends; unverified: the action went through, then the screen locked). Absent otherwise. */
+  cause?: StopCause;
   epoch: number;                     // after the action
   consequence: Consequence;          // the class the executor settled on
   object: string;                    // what it touched (a window id, a tab id, a path)

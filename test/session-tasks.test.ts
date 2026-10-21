@@ -548,6 +548,8 @@ describe("review of #54", () => {
     const kinds = events.map((e) => e.kind);
     expect(events.find((e) => e.kind === "ask_void")).toMatchObject({ why: "ended" });
     expect(events.find((e) => e.kind === "task_done")).toMatchObject({ status: "stopped" });
+    // the app went away: nobody asked for the stop, and the step in flight got its receipt — no cause
+    expect(events.find((e) => e.kind === "task_done")).not.toHaveProperty("cause");
     expect(kinds.indexOf("ask_void")).toBeLessThan(kinds.indexOf("task_done"));
     expect(events.some((e) => e.kind === "step" && e.text.includes("set_value"))).toBe(false);
   });
@@ -590,5 +592,172 @@ describe("review of #54", () => {
     const plain = { ...(MODEL as any), id: "gpt-6-luna", provider: "yy", baseUrl: "https://example.com" };
     expect(withReasoningBack(inner, plain)).toBe(inner);
     expect(withReasoningBack(inner, { ...plain, provider: "deepseek" })).not.toBe(inner);
+  });
+});
+
+describe("stop cause: why a task stopped, as a field (task_done.cause, session.task_end.cause)", () => {
+  /** A sim the test can reach (the session makes one per task). */
+  const lockable = () => { let sim!: SimComputer; return { make: (scope?: string) => (sim = new SimComputer(scope)), sim: () => sim }; };
+  /** A launcher whose executor begins a step (a `step` line, no `step_result`), or says nothing; `exit` ends it. */
+  const fake = (o: { step: boolean }) => {
+    let exit!: (x: { code: number | null; signal: string | null }) => void;
+    const launch: Launcher = (req) => ({ write: () => {}, close: () => {}, exited: new Promise((r) => { exit = r; }),
+      onLine: (f) => { if (o.step) f(JSON.stringify({ seq: 1, t: 1, run_id: req.run_id, kind: "step", step_id: "s1", text: "{}" })); } });
+    return { launch, exit: (x = { code: null, signal: "SIGKILL" }) => exit(x) };
+  };
+
+  it("the screen locks mid-run: task_done.cause is screen_locked, and the session's task_end carries it", async () => {
+    const l = lockable();
+    const steps: Step[] = [
+      () => { l.sim().lock(); return { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] }; },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "写了 a.txt" } }] },
+    ];
+    const s = session({ scope: tmp(), sim: l.make, model: [CALL("新建 a.txt"), { text: "锁屏了" }], tasks: [steps] });
+    s.send({ type: "say", text: "新建 a.txt" });
+    await s.h.idle();
+    expect(s.evs.find((e) => e.kind === "task_done")).toMatchObject({ status: "environment", reason: "the screen is locked", cause: "screen_locked" });
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "environment", cause: "screen_locked" });
+  });
+
+  it("the screen locks during an action that failed: the reason is \"<why>; the screen is locked\", the cause screen_locked all the same", async () => {
+    const ed = editorSim();
+    const make = (scope?: string) => {
+      const sim = ed.make(scope);
+      const perform = sim.perform.bind(sim);
+      sim.perform = (a) => { if (a.kind === "set_value") { sim.lock(); return { status: "error", why: "the field did not take it" }; } return perform(a); };
+      return sim;
+    };
+    const s = session({ sim: make, model: [CALL("改笔记"), { text: "锁屏了" }], launch: (req, o) => inproc([EDIT("editor-1")], make).launch(req, o) });
+    s.on((e) => { if (e.kind === "ask") setTimeout(() => s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: e.card.options.findIndex((x: any) => x.kind === "approve") }), 5); });
+    s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await s.h.idle();
+    expect(s.evs.find((e) => e.kind === "task_done")).toMatchObject({ status: "environment", reason: "the field did not take it; the screen is locked", cause: "screen_locked" });
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ cause: "screen_locked" });
+  });
+
+  it("the screen is locked at the start: the same cause; a normal end has none", async () => {
+    const s = session({ scope: tmp(), sim: (scope) => { const x = new SimComputer(scope); x.lock(); return x; }, model: [CALL("新建 a.txt"), { text: "锁屏了" }], tasks: [CREATE()] });
+    s.send({ type: "say", text: "新建 a.txt" });
+    await s.h.idle();
+    expect(s.evs.find((e) => e.kind === "task_done")).toMatchObject({ status: "environment", cause: "screen_locked" });
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ cause: "screen_locked" });
+
+    const ok = session({ scope: tmp(), model: [CALL("新建 a.txt"), { text: "好了" }], tasks: [CREATE()] });
+    ok.send({ type: "say", text: "新建 a.txt" });
+    await ok.h.idle();
+    expect(ok.evs.find((e) => e.kind === "task_done").status).toBe("succeeded");
+    expect(ok.evs.find((e) => e.kind === "task_done")).not.toHaveProperty("cause");
+    expect(ok.stored().find((e: any) => e.kind === "session.task_end")).not.toHaveProperty("cause");
+  });
+
+  it("the user's stop: user_stopped — a stop line, a card's cancel option, the caller's finish outcome stopped", async () => {
+    const s = session({ scope: tmp(), model: [CALL("新建 a.txt"), { text: "停下了" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE()]] });
+    s.send({ type: "say", text: "新建 a.txt" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "stop" });
+    await s.h.idle();
+    expect(s.evs.find((e) => e.kind === "task_done")).toMatchObject({ status: "stopped", cause: "user_stopped" });
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "stopped", cause: "user_stopped" });
+
+    const ed = editorSim();
+    const c = session({ sim: ed.make, model: [CALL("改笔记"), { text: "取消了" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+    c.on((e) => { if (e.kind === "ask") setTimeout(() => c.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: e.card.options.findIndex((x: any) => x.kind === "cancel") }), 5); });
+    c.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await c.h.idle();
+    expect(c.evs.find((e) => e.kind === "task_done")).toMatchObject({ status: "cancelled", cause: "user_stopped" });
+
+    const f = session({ scope: tmp(), model: [CALL("新建 a.txt"), { text: "好" }], tasks: [[{ calls: [{ name: "finish", args: { outcome: "stopped", summary: "用户说先别做了" } }] }]] });
+    f.send({ type: "say", text: "新建 a.txt" });
+    await f.h.idle();
+    expect(f.evs.find((e) => e.kind === "task_done")).toMatchObject({ status: "cancelled", cause: "user_stopped" });
+  });
+
+  it("a stop before begin is final: begin finding the screen locked does not replace it, nor leave a stale cause", async () => {
+    const input = new PassThrough();
+    const events: any[] = [];
+    const reader = new LineReader(input);
+    input.write(JSON.stringify({ type: "stop" }) + "\n");
+    await waitFor(() => reader.stopped);                       // read with the request, before the run starts
+    const sim = new SimComputer(tmp()); sim.lock();
+    await appRun({ run_id: "r_stop", raw: "新建 a.txt", config: "ds-flash" } as never, { runs: tmp(), out: (e) => events.push(e), input: reader, linger: 0,
+      inject: { driver: sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(CREATE()) } } });
+    expect(events.find((e) => e.kind === "task_done")).toMatchObject({ status: "stopped", reason: "stopped by the app", cause: "user_stopped" });
+    // an early stop because the app went away keeps its own words, and no cause
+    const gone = new PassThrough();
+    const evs2: any[] = [];
+    const goneReader = new LineReader(gone);
+    gone.write(JSON.stringify({ type: "stop", app_gone: true }) + "\n");
+    await waitFor(() => goneReader.stopped);
+    await appRun({ run_id: "r_gone", raw: "新建 a.txt", config: "ds-flash" } as never, { runs: tmp(), out: (e) => evs2.push(e), input: goneReader, linger: 0,
+      inject: { driver: new SimComputer(tmp()), gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(CREATE()) } } });
+    const d2 = evs2.find((e) => e.kind === "task_done");
+    expect(d2).toMatchObject({ status: "stopped", reason: "the app went away (the session stopped its task)" });
+    expect(d2).not.toHaveProperty("cause");
+  });
+
+  it("the app going away is nobody's stop: the session's stop line says app_gone, and task_done has no cause", async () => {
+    const s = session({ scope: tmp(), model: [CALL("新建 a.txt"), { text: "不该说这句" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE()]] });
+    s.send({ type: "say", text: "新建 a.txt" });
+    await waitFor(() => s.kinds("start").length);
+    s.h.inputClosed();
+    await waitFor(() => s.exited());
+    expect(s.evs.find((e) => e.kind === "task_done")).toMatchObject({ status: "stopped" });
+    expect(s.evs.find((e) => e.kind === "task_done")).not.toHaveProperty("cause");
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).not.toHaveProperty("cause");
+  });
+
+  it("the session ends a task itself (no task_done): last_step_unknown when a step was open, else no cause", async () => {
+    // the executor exits before its task_done, a step begun and not ended
+    const a1 = fake({ step: true });
+    const a = session({ model: [CALL("做点事"), { text: "出错了" }], launch: a1.launch });
+    a.send({ type: "say", text: "做点事" });
+    await waitFor(() => a.stored().some((e: any) => e.kind === "session.task"));
+    a1.exit();
+    await a.h.idle();
+    expect(a.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "failed", cause: "last_step_unknown" });
+    // no step open (it went away during a model call), or it could not be started at all: no cause
+    const b1 = fake({ step: false });
+    const b = session({ model: [CALL("做点事"), { text: "出错了" }], launch: b1.launch });
+    b.send({ type: "say", text: "做点事" });
+    await waitFor(() => b.stored().some((e: any) => e.kind === "session.task"));
+    b1.exit();
+    await b.h.idle();
+    expect(b.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "failed" });
+    expect(b.stored().find((e: any) => e.kind === "session.task_end")).not.toHaveProperty("cause");
+    const n = session({ model: [CALL("做点事"), { text: "出错了" }], launch: () => { throw new Error("no node"); } });
+    n.send({ type: "say", text: "做点事" });
+    await n.h.idle();
+    expect(n.stored().find((e: any) => e.kind === "session.task_end")).not.toHaveProperty("cause");
+
+    // the app went away and the executor, a step open, never answered the stop
+    const q1 = fake({ step: true });
+    const q = session({ model: [CALL("做点事")], launch: q1.launch, exitWaitMs: 100 });
+    q.send({ type: "say", text: "做点事" });
+    await waitFor(() => q.stored().some((e: any) => e.kind === "session.task"));
+    q.h.inputClosed();
+    await waitFor(() => q.exited(), 5000);
+    expect(q.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "stopped", cause: "last_step_unknown" });
+
+    // resume: no task_done → interrupted, last_step_unknown only with a step open; a task_done's cause is copied as the
+    // field; a reason that only says it in words gives none, and so does a value not in the set
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_c");
+    const ids = ["run_cut", "run_quiet", "run_lock", "run_words", "run_bad"];
+    for (const id of ids) log.emit({ kind: "session.task", msg_id: `m_${id}`, run_id: id, raw: "做点事", by: "slash" });
+    const runs = path.join(dir, "sessions", "ses_c", "runs");
+    const write = (id: string, evs: object[]) => { fs.mkdirSync(path.join(runs, id), { recursive: true }); fs.writeFileSync(path.join(runs, id, "events.jsonl"), evs.map((e, i) => JSON.stringify({ seq: i + 1, t: 1, run_id: id, ...e })).join("\n") + "\n"); };
+    const done = (x: object) => ({ kind: "task_done", status: "environment", summary: "", result_card: null, ...x });
+    write("run_cut", [{ kind: "start", raw: "做点事" }, { kind: "step", step_id: "s1", text: "{}" }, { kind: "step_result", step_id: "s1", status: "ok" }, { kind: "step", step_id: "s2", text: "{}" }]);
+    write("run_quiet", [{ kind: "start", raw: "做点事" }, { kind: "step", step_id: "s1", text: "{}" }, { kind: "step_result", step_id: "s1", status: "ok" }]);
+    write("run_lock", [done({ reason: "x", cause: "screen_locked" })]);
+    write("run_words", [done({ reason: "the screen is locked" })]);
+    write("run_bad", [done({ reason: "x", cause: "not_a_cause" })]);
+    const r = session({ dir, sid: "ses_c", model: [] });
+    const ends = Object.fromEntries(r.stored().filter((e: any) => e.kind === "session.task_end").map((e: any) => [e.run_id, e]));
+    expect(ends.run_cut).toMatchObject({ status: "interrupted", cause: "last_step_unknown" });
+    expect(ends.run_quiet).toMatchObject({ status: "interrupted" });
+    expect(ends.run_lock).toMatchObject({ status: "environment", cause: "screen_locked" });
+    expect(ends.run_words).toMatchObject({ status: "environment", reason: "the screen is locked" });
+    for (const id of ["run_quiet", "run_words", "run_bad"]) expect(ends[id], id).not.toHaveProperty("cause");
   });
 });

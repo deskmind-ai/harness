@@ -3,6 +3,7 @@
  *
  *   {"type":"answer", "ask_id":"ask_…", "option":<n>} | {"type":"answer", "ask_id":"ask_…", "text":"…"}   a card's answer
  *   {"type":"stop"}                                                                                      stop the task now
+ *   {"type":"stop", "app_gone":true}                                     the same, sent because the app ended or left (not the user)
  *   {"type":"respond", "option":<n>}                                                                     the result card's answer
  *   {"type":"steer", "text":"…"}                                                                         the user's words mid-run
  *
@@ -12,7 +13,7 @@
  */
 export type Control =
   | { type: "answer"; ask_id?: string; option?: number; text?: string }
-  | { type: "stop" }
+  | { type: "stop"; app_gone?: true }
   | { type: "respond"; option?: number; text?: string }
   | { type: "steer"; text: string };
 
@@ -34,7 +35,7 @@ export function parseControl(line: string): Control | null {
   }
   switch (o.type) {
     case "answer": return { type: "answer", ...str("ask_id"), ...num("option"), ...str("text") };
-    case "stop": return { type: "stop" };
+    case "stop": return { type: "stop", ...(o.app_gone === true ? { app_gone: true as const } : {}) };
     case "respond": return { type: "respond", ...num("option"), ...str("text") };
     case "steer": return typeof o.text === "string" ? { type: "steer", text: o.text } : null;
     default: return null;

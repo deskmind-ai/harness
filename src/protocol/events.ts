@@ -13,6 +13,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
+import { STOP_CAUSES } from "./computer.js";
 
 const Consequence = z.enum(["read", "create", "modify_user", "external"]);
 const FrameEv = z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() });
@@ -90,7 +91,10 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("judge"), judge_id: z.string(), question: z.string(), answer: z.string().nullable(), by: z.string().nullable(), confidence: z.number().optional(),
     tiers: z.array(z.object({ tier: z.string(), outcome: z.string(), choice: z.string().nullable(), confidence: z.number().optional(), settled: z.boolean() })),
     shadow: z.object({ tier: z.string(), top: z.string().nullable(), agree: z.boolean().nullable() }).optional(), step_id: z.string().optional(), ms: z.number().optional() }),
-  z.object({ kind: z.literal("task_done"), status: z.string(), reason: z.string(), summary: z.string(), result_card: CardEvent.nullable(), answer: z.string().nullable().optional(), changes: z.object({ created: z.array(z.string()), modified: z.array(z.string()), deleted: z.array(z.string()), external: z.array(z.string()),
+  // `reason` is display text, never matched; `cause` (additive, events v1) says in structure why the task stopped, set
+  // only where the code knew it (protocol/computer.ts STOP_CAUSES): screen_locked, last_step_unknown, user_stopped.
+  // Absent: a plain error or a normal end
+  z.object({ kind: z.literal("task_done"), status: z.string(), reason: z.string(), cause: z.enum(STOP_CAUSES).optional(), summary: z.string(), result_card: CardEvent.nullable(), answer: z.string().nullable().optional(), changes: z.object({ created: z.array(z.string()), modified: z.array(z.string()), deleted: z.array(z.string()), external: z.array(z.string()),
     // changed during a screen action with no driver receipt: neither the task's nor another program's (the app may show them later)
     unconfirmed: z.array(z.string()).optional() }).optional().optional(),
     // the run's model calls in sum (M0): every call of every role, the acting model's included
