@@ -18,13 +18,14 @@ DeskMind 的「想」：理解要求、计划、调工具、核对，在用户�
 
 | 目录 | 内容 |
 |---|---|
-| `src/executor/` | `types.ts` 执行层契约（快照、观察、动作、后果类别、凭证、计划）；`ledger.ts` 归属清单；`consent.ts` 挑战与凭证（签名 / 验签 / 三档范围 / 一次性 / 登记挑战）；`judge.ts` 判官——执行层唯一会调模型的地方，只做选择题，分层（Brain 本地 → 前沿）、低层只能批准不能单独拒绝、有缓存和预算；`executor.ts` 把关（锁屏、用户活跃、过期观察、停止、下限 ⊔ 模型类别、验签）、文件也是对象（版本代替 epoch、内容归属、外来改动记事实）、开始闸门（没有过判官的计划不碰用户的东西）、动前意图核对、结束核对 `verdict`、撤回、回执日志与崩溃恢复；`sim.ts` 模拟桌面；`hands.ts` 真机驱动，对接 hands 的 `deskmind_hands.executor` |
-| `src/runtime/` | `loop.ts` 前沿配置的单循环：工具（看电脑、看窗口、动手、计划、文件能力、问用户、回答、读教程、结束），把关在 `beforeToolCall`，每步核对和原地打转在动作结果里，不核对不让结束在 `finishTurn`，中途改要求（steer），结果卡和撤回；`compact.ts` 上下文压缩；`text.ts` 卡片文字的 zh / en；`model.ts` pi-ai 模型；`scripted.ts` 测试用的脚本化模型 |
+| `src/executor/` | `types.ts` 执行层契约（快照、观察、动作、后果类别、凭证、计划）；`ledger.ts` 归属清单；`consent.ts` 挑战与凭证（签名 / 验签 / 三档范围 / 一次性 / 登记挑战）；`judge.ts` 判官——执行层唯一会调模型的地方，只做选择题，分层（Brain 本地 → 前沿）、低层只能批准不能单独拒绝、有缓存和预算；`executor.ts` 把关（锁屏、用户活跃、过期观察、停止、下限 ⊔ 模型类别、验签）、文件也是对象（版本代替 epoch、内容归属、外来改动记事实）、开始闸门（没有过判官的计划不碰用户的东西）、动前意图核对、结束核对 `verdict`、撤回、回执日志与崩溃恢复；`service.ts` 给运行时的服务（实现 `ExecutorPort`）：签名、所有卡片（歧义、计划、动作同意、提问、结果卡）、开始闸门、教程、核对、撤回、中途改要求（steer），任务最后的状态由它定；`text.ts` 卡片文字的 zh / en；`sim.ts` 模拟桌面；`hands.ts` 真机驱动，对接 hands 的 `deskmind_hands.executor` |
+| `src/runtime/` | `loop.ts` 前沿配置的单循环，只是执行层端口的调用方：工具（看电脑、看窗口、动手、计划、文件能力、问用户、回答、读教程、结束）一个工具对应端口的一个方法；预算（工具调用、轮数）、上下文和压缩、把中途改的要求告诉模型；`compact.ts` 上下文压缩；`model.ts` pi-ai 模型；`scripted.ts` 测试用的脚本化模型 |
+| `src/host/` | `frontier.ts` 把运行时和执行层的服务接在同一个进程里（P1），只通过 `ExecutorPort`；app 的停止、改要求、结果卡的回答都交给执行层这一边 |
 | `src/skills/` | `agentskills.ts` SKILL.md 文件夹的读写、按结构筛候选、模型选；`teach.ts` 运行时这条路的学教材（自然语言 SKILL.md + 确认过的例子，重放一致才收下；反例修订）；`library.ts` 老编排器的教材（可执行规则在 `rules.ts`） |
 | `src/orchestrator/` | 本地配置的编排器：七个角色（goal / plan / bind / intent / choice / skill / verify / transform），运行日志折叠出状态 |
 | `src/gateway/` | 模型网关：`openai`（任何 OpenAI 兼容服务，`<provider>|<model>`，key 只从环境变量来）、OpenRouter、本地 mlx、Brain 的 systemone、`claude -p`（只在开发时）、脚本化（测试） |
 | `src/registry/` | 工作目录（资源版本）与文件能力 |
-| `src/protocol/` | 协议对象、各角色回答的 zod schema、给 app 的事件协议 |
+| `src/protocol/` | 协议对象、各角色回答的 zod schema、给 app 的事件协议；两边共用的类型：同意凭证（`consent.ts`）、电脑和动作（`computer.ts`）、卡片（`cards.ts`）、执行层端口（`port.ts`） |
 | `src/cli/` | `app.ts` app 的入口（见下）；`mcp.ts` 执行层的 MCP 服务——七个工具（begin / snapshot / observe / plan / act / verify / stop / end），Codex、Claude Code 接上就带着三条底线 |
 | `src/eval/` | 检查集 / 考卷的跑分（两个引擎：`--engine orchestrator|runtime`），练习场 `gym.ts`（模拟桌面上的邮件任务，按应用真实状态判分） |
 | `skills/` | 自带的基础技能 `deskmind-computer-use` |

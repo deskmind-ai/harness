@@ -14,7 +14,7 @@ import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor } from "../src/executor/executor.js";
 import { OUTGOING_QUESTION } from "../src/executor/judge.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
-import { FrontierRuntime, type RuntimeUser } from "../src/runtime/loop.js";
+import { FrontierRuntime, type RuntimeUser } from "../src/host/frontier.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
@@ -207,9 +207,11 @@ describe("frontier runtime: steer", () => {
     const third = seen[2]!.map((m: any) => (typeof m.content === "string" ? m.content : "")).join("\n");
     expect(third).toContain("用户改了要求");
     expect(third).toContain("会议几点");
-    // the verdict was asked about the new request, not the old one
-    expect(asked[0]).toContain("会议几点");
-    expect(asked[0]).not.toContain("收到，谢谢");
+    // the verdict was asked about the new request; the old one is there too, as what the user said before the change
+    // (docs/0.5-decisions.md, steer prerequisite 1: the judges see the original request and every steer)
+    const words = JSON.parse(asked[0]!.slice(asked[0]!.indexOf("{"), asked[0]!.lastIndexOf("}") + 1));
+    expect(words.用户原文).toContain("会议几点");
+    expect(JSON.stringify(Object.entries(words).find(([k]) => k.startsWith("用户中途改要求之前说的"))?.[1])).toContain("收到，谢谢");
   });
 });
 

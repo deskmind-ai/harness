@@ -1,6 +1,7 @@
 /**
  * What the user reads on cards, in the request's language (plan §四: 卡片和步骤的文字跟着请求的语言走). The model is
- * spoken to in Chinese regardless; only the user-facing strings live here.
+ * spoken to in Chinese regardless; only the user-facing strings live here. The executor shows every card, so the text
+ * is the executor's (moved from runtime/text.ts in the executor split P1).
  */
 export type Lang = "zh" | "en";
 

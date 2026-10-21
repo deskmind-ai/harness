@@ -28,7 +28,9 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("step"), text: z.string(), consequence: Consequence.optional(), object: z.string().optional(), status: z.string().optional(), purpose: z.string().optional() }),
   z.object({ kind: z.literal("ask"), ask_id: z.string(), card: CardEvent }),
   z.object({ kind: z.literal("waiting"), ask_id: z.string().optional() }),
-  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional() }),
+  // `voided`: the card was let go without an answer because the user changed the request (a steer, "steer"): the app
+  // closes it; an answer sent for it later is refused (additive field, events v1)
+  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional() }),
   z.object({ kind: z.literal("consent"), object: z.string(), consequence: Consequence, scope: z.enum(["action", "object", "rule"]), picked: z.string().nullable() }),
   z.object({ kind: z.literal("refused"), what: z.string(), why: z.string(), by: z.enum(["user", "executor"]) }),
   z.object({ kind: z.literal("answer_given"), text: z.string() }),

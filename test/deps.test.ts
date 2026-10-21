@@ -4,8 +4,9 @@
  * src/protocol/, src/gateway/ and src/runtime/ (packages and node: builtins are free); code under src/executor/ never
  * imports src/runtime/. Type-only imports count: they tie the two sides' sources together just the same.
  *
- * Today's violations are listed below, each by importing file and imported file. The test fails on a new one, and on a
- * listed one that is gone (so the list only shrinks). P1 removes them.
+ * P1 removed every violation the P0 list held: the shared types live in src/protocol/ (consent, computer, cards, port),
+ * the card texts in src/executor/text.ts, and the runtime reaches the executor only through `ExecutorPort`. The lists
+ * below are empty and stay so; the test fails on any violation. src/host/ is the one place that joins both sides.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,21 +15,10 @@ import { describe, expect, it } from "vitest";
 
 const SRC = path.resolve(import.meta.dirname, "..", "src");
 
-/** Runtime ↔ executor: to be removed in P1. */
-const KNOWN_CROSS = [
-  "runtime/loop.ts -> executor/executor.ts",
-  "runtime/loop.ts -> executor/judge.ts",
-  "runtime/loop.ts -> executor/types.ts",
-  "executor/executor.ts -> runtime/text.ts",
-];
-/** Runtime → modules that are neither protocol nor gateway (card types, prompts, the file registry and workspace):
- *  to be removed in P1 too, by moving what the runtime needs into protocol/ or behind the executor's tools. */
-const KNOWN_OTHER = [
-  "runtime/loop.ts -> orchestrator/index.ts",
-  "runtime/loop.ts -> orchestrator/prompts.ts",
-  "runtime/loop.ts -> registry/capability.ts",
-  "runtime/loop.ts -> registry/workspace.ts",
-];
+/** Runtime ↔ executor: none since P1. */
+const KNOWN_CROSS: string[] = [];
+/** Runtime → modules that are neither protocol nor gateway: none since P1. */
+const KNOWN_OTHER: string[] = [];
 
 const files = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? files(path.join(dir, e.name)) : /\.ts$/.test(e.name) ? [path.join(dir, e.name)] : []);
 
@@ -54,7 +44,7 @@ function violations(): { edge: string; at: string; kind: "cross" | "other" }[] {
       const target = top(to);
       const edge = `${from} -> ${to}`.split(path.sep).join("/");
       if (side === "runtime" && target === "executor") found.push({ edge, at: `${from}:${line}`, kind: "cross" });
-      else if (side === "executor" && target === "runtime") found.push({ edge, at: `${from}:${line}`, kind: "cross" });
+      else if (side === "executor" && (target === "runtime" || target === "host")) found.push({ edge, at: `${from}:${line}`, kind: "cross" });
       else if (side === "runtime" && !["runtime", "protocol", "gateway"].includes(target)) found.push({ edge, at: `${from}:${line}`, kind: "other" });
     }
   }
@@ -71,13 +61,13 @@ describe("dependency direction: runtime ↔ executor", () => {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it("no runtime ↔ executor import beyond the known list (to be removed in P1)", () => {
+  it("no runtime ↔ executor import", () => {
     const v = violations().filter((x) => x.kind === "cross");
     const edges = [...new Set(v.map((x) => x.edge))].sort();
     expect({ new: edges.filter((e) => !KNOWN_CROSS.includes(e)), gone: KNOWN_CROSS.filter((e) => !edges.includes(e)) }).toEqual({ new: [], gone: [] });
   });
 
-  it("the runtime imports only protocol/, gateway/ and itself, beyond the known list (to be removed in P1)", () => {
+  it("the runtime imports only protocol/, gateway/ and itself", () => {
     const v = violations().filter((x) => x.kind === "other");
     const edges = [...new Set(v.map((x) => x.edge))].sort();
     expect({ new: edges.filter((e) => !KNOWN_OTHER.includes(e)), gone: KNOWN_OTHER.filter((e) => !edges.includes(e)) }).toEqual({ new: [], gone: [] });

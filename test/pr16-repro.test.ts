@@ -7,7 +7,7 @@ import { Executor } from '../src/executor/executor.js';
 import { SimComputer, ZH_MAIL_TEXTS } from '../src/executor/sim.js';
 import { Workspace, build } from '../src/registry/workspace.js';
 import { fileRegistry } from '../src/registry/fs.js';
-import { FrontierRuntime } from '../src/runtime/loop.js';
+import { FrontierRuntime } from '../src/host/frontier.js';
 import { Gateway } from '../src/gateway/index.js';
 import { scriptedStream } from '../src/runtime/scripted.js';
 import { LineReader, StdioUser } from '../src/cli/app.js';

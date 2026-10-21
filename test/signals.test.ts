@@ -1,7 +1,7 @@
 /**
  * app-run under SIGINT / SIGTERM (the helper quitting, or the user's ^C): the run stops as a stop line would stop it,
  * `task_done` (stopped) is written to the log and stdout, and the process exits within a second. Before, it died
- * without a task_done. A steer line sent mid-run is read and noted in the trace, not handed to the runtime (yet). The run is held in a model call to a local server that never answers, so the signal lands
+ * without a task_done. A steer line sent mid-run is handed to the executor (P1), which holds it until the step in progress is over. The run is held in a model call to a local server that never answers, so the signal lands
  * mid-run with no network and no key.
  */
 import * as fs from "node:fs";
@@ -37,7 +37,7 @@ async function runAndSignal(sig: NodeJS.Signals) {
   child.stdin.write(JSON.stringify({ run_id: `run_sig_${sig}`, raw: "把下载文件夹里的截图整理一下", config: "openai:local|m" }) + "\n");
   try {
     await Promise.race([called, exited.then(() => { throw new Error(`exited before the model call: ${out}\n${err}`); })]);
-    // a steer mid-run (control v1) is read and noted, not handed to the runtime yet
+    // a steer mid-run (control v1): handed to the executor, applied only between steps (the model call never returns)
     child.stdin.write(JSON.stringify({ type: "steer", text: "只整理今天的" }) + "\n");
     await new Promise((r) => setTimeout(r, 200));
     const t0 = Date.now();
@@ -68,8 +68,10 @@ describe("app-run under a signal", () => {
       expect(r.onDisk.at(-1)).toMatchObject({ kind: "task_done", status: "stopped" });
       expect(r.code).toBe(0);
       expect(r.ms).toBeLessThan(1000);
-      expect(r.trace.filter((t) => t.kind === "control.steer").map((t) => [t.text, t.note])).toEqual([["只整理今天的", "steer not supported yet"]]);
-      expect(r.trace.some((t) => t.kind === "steer")).toBe(false);
+      expect(r.trace.filter((t) => t.kind === "control.steer").map((t) => t.text)).toEqual(["只整理今天的"]);
+      expect(r.trace.filter((t) => t.kind === "steer").map((t) => t.raw)).toEqual(["只整理今天的"]);
+      // held: the model call in progress never ended, so no step came between and the steer was never applied
+      expect(r.trace.some((t) => t.kind === "steer.applied")).toBe(false);
       expect(r.events.filter((e) => e.kind === "refused")).toHaveLength(1);
     }, 30_000);
   }

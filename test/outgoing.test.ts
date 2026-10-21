@@ -260,7 +260,7 @@ describe("outgoing check: classify over MCP", () => {
 
 describe("outgoing check: in the agent loop", () => {
   it("a site search's Return in the user's window, cleared by the judge, goes under the plan's object consent: no extra card", async () => {
-    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const site: FakeWin = {
       info: { id: "site", app: "浏览器", title: "帮助中心" },
@@ -600,7 +600,7 @@ describe("outgoing check: third review of #23", () => {
 
 describe("outgoing check: the loop after a stale", () => {
   const run = async (steps: (desk: FakeDesk) => any[], w: FakeWin, outgoing = "sends") => {
-    const { FrontierRuntime } = await import("../src/runtime/loop.js");
+    const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const desk = new FakeDesk([w]), app = ConsentSigner.fresh();
     const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });

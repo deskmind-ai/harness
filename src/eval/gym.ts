@@ -16,7 +16,7 @@ import { CONFIGS, Gateway, withOverrides } from "../gateway/index.js";
 import { ConsentSigner } from "../executor/consent.js";
 import { Executor } from "../executor/executor.js";
 import { SimComputer, ZH_MAIL_TEXTS, type MailMessage } from "../executor/sim.js";
-import { FrontierRuntime, type RuntimeUser } from "../runtime/loop.js";
+import { FrontierRuntime, type RuntimeUser } from "../host/frontier.js";
 import { loopModel } from "../runtime/model.js";
 import type { Answer, Card } from "../orchestrator/index.js";
 

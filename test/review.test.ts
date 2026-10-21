@@ -14,7 +14,7 @@ import { Executor } from "../src/executor/executor.js";
 import { HandsDriver } from "../src/executor/hands.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import type { Driver } from "../src/executor/types.js";
-import { FrontierRuntime, type RuntimeUser } from "../src/runtime/loop.js";
+import { FrontierRuntime, type RuntimeUser } from "../src/host/frontier.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
 import { fileRegistry } from "../src/registry/fs.js";
 import { Workspace, build } from "../src/registry/workspace.js";
