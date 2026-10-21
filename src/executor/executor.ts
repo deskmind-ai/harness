@@ -128,39 +128,73 @@ const close = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]
 /** Two elements, each already found, are the same: same content, and roughly the same place when both have one. */
 const sameEl = (a: Ident, b: Ident): boolean => a.c === b.c && (a.at && b.at ? close(a.at, b.at) : !a.at && !b.at);
 
-/** Pair every element of `bound` with one of `now`, one to one; null when one cannot be paired or the pairing is not
- *  certain. With a place on every element: elements of the same content form a group, which must have as many members
- *  on both sides; within a group they are paired nearest first, each within NEAR_PX — identical neighbours (nested
- *  empty groups sharing a rect, a duplicate text-recognition box) are interchangeable, so which goes with which does
- *  not matter (review of #26: requiring one candidate each never paired them, and a send never went through). Without: by order
- *  — `bound` must appear in `now` in the same order (things may have come in between), and in one way only (the
- *  earliest and the latest such pairing agree); a same-named line elsewhere breaks the order, a duplicate makes it
- *  uncertain. Returns the indexes of `now` that were paired. */
-function pair(bound: Ident[], now: Ident[]): Set<number> | null {
-  if (bound.every((b) => b.at) && now.every((n) => n.at)) {
-    const used = new Set<number>();
-    for (const c of new Set(bound.map((b) => b.c))) {
-      // an anonymous container bound may be gone; everything else bound must be paired, and no more of a content than
-      // was bound may be there now (more is an addition)
-      const bs = bound.filter((b) => b.c === c), ns = now.map((n, i) => ({ n, i })).filter((x) => x.n.c === c);
-      const must = bs.filter((b) => !b.anon).length;
-      if (ns.length > bs.length || ns.length < must) return null;
-      const d = (a: [number, number], b: [number, number]) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]);
-      const cand = bs.flatMap((b, k) => ns.filter((x) => close(b.at!, x.n.at!)).map((x) => ({ k, i: x.i, d: d(b.at!, x.n.at!) }))).sort((x, y) => x.d - y.d);
-      const done = new Set<number>();
-      for (const x of cand) if (!done.has(x.k) && !used.has(x.i)) { done.add(x.k); used.add(x.i); }
-      if (bs.some((b, k) => !b.anon && !done.has(k))) return null;
+/** An element as a send's binding is compared: its content, its place, and the flags `identOf` gives. */
+type Item = { c: string; at: [number, number] | null; act?: true; ax?: true; anon?: boolean };
+
+/** The one comparison of a send's bound elements with a later look, behind both `within` (is the consent still good?)
+ *  and `bindingDiff` (the trace's why), so every re-ask is explained by the diff — rc.12 run_dc7236fc: pairing by order
+ *  left the anonymous containers out, then counted each of them as a new control, and an unchanged page asked seven
+ *  times with an empty diff.
+ *  - By place, when every element on both sides has one (`placed`; a screen-read window under `strict` always): elements
+ *    of the same content are paired nearest first, each within `tol` on both axes, and elements without a place with
+ *    ones without; identical neighbours (nested empty groups sharing a rect, a duplicate text-recognition box) are
+ *    interchangeable, so which goes with which does not matter (review of #26). More of a content than was bound is an
+ *    addition.
+ *  - By order otherwise (some element has no place: hands' 「在地址栏搜索」 in every browser window): the named elements
+ *    bound must appear in `now` in the same order — things may have come in between — and in one way only (the earliest
+ *    and the latest such pairing agree); a same-named line elsewhere breaks the order, a duplicate makes it uncertain.
+ *    Either is `order`. Anonymous containers bound are then paired, in order, with what is left of their content.
+ *  An anonymous container bound and not found is not a change (rc.10, #33); one more of them now is an addition.
+ *  Returns the bound elements left unpaired (`left`: named ones only), those paired only out of order or uncertainly
+ *  (`order`: bound index and the `now` index it was found at), the additions (`extra`: indexes of `now`), and every
+ *  index of `now` not paired (`unused`, the additions among them). What counts as an addition beyond "more of a
+ *  content": everything (`allNew`, strict), or what can be acted on in the accessibility tree (a new button, tag, link
+ *  or field may be a new recipient — review of #25: 「b@evil.com」 added). Text recognition offers every row as
+ *  clickable, so in a screen-read window under `match` nothing tells a new control from a new line: additions of new
+ *  content stay allowed there (the owner's trade-off; `strict` is the default). */
+function compareItems(bound: Item[], now: Item[], o: { placed: boolean; tol: number; allNew: boolean }): { left: number[]; order: [number, number][]; extra: number[]; unused: number[] } {
+  const paired = new Set<number>(), usedNow = new Set<number>(), order: [number, number][] = [];
+  const take = (k: number, i: number) => { paired.add(k); usedNow.add(i); };
+  if (o.placed) {
+    const near = (x: Item, y: Item) => (!x.at || !y.at ? !x.at && !y.at : Math.abs(x.at[0] - y.at[0]) <= o.tol && Math.abs(x.at[1] - y.at[1]) <= o.tol);
+    const d = (x: Item, y: Item) => (x.at && y.at ? Math.abs(x.at[0] - y.at[0]) + Math.abs(x.at[1] - y.at[1]) : 0);
+    const of = new Map<string, number[]>();
+    now.forEach((n, i) => { const l = of.get(n.c); if (l) l.push(i); else of.set(n.c, [i]); });
+    const cand = bound.flatMap((b, k) => (of.get(b.c) ?? []).filter((i) => near(b, now[i]!)).map((i) => ({ k, i, d: d(b, now[i]!) }))).sort((x, y) => x.d - y.d);
+    for (const x of cand) if (!paired.has(x.k) && !usedNow.has(x.i)) take(x.k, x.i);
+  } else {
+    const req = bound.map((_, k) => k).filter((k) => !bound[k]!.anon);
+    const first = new Map<number, number>(), last = new Map<number, number>();
+    let j = 0;
+    for (const k of req) { let i = j; while (i < now.length && now[i]!.c !== bound[k]!.c) i += 1; if (i < now.length) { first.set(k, i); j = i + 1; } }
+    if (first.size === req.length) {
+      j = now.length - 1;
+      for (let r = req.length - 1; r >= 0; r -= 1) { const k = req[r]!; let i = j; while (i >= 0 && now[i]!.c !== bound[k]!.c) i -= 1; last.set(k, i); j = i - 1; }
     }
-    return used;
+    for (const k of req) {
+      const i = first.get(k);
+      if (i === undefined) continue;
+      take(k, i);
+      // found in order, but paired another way too: which element is the bound one is not certain
+      if (first.size === req.length && last.get(k) !== i) order.push([k, i]);
+    }
+    // a named one not found in order: there, but out of order (a same-named line elsewhere), or not there at all
+    for (const k of req) {
+      if (paired.has(k)) continue;
+      const i = now.findIndex((n, x) => !usedNow.has(x) && n.c === bound[k]!.c);
+      if (i >= 0) { take(k, i); order.push([k, i]); }
+    }
+    for (let k = 0; k < bound.length; k += 1) {
+      if (!bound[k]!.anon) continue;
+      const i = now.findIndex((n, x) => !usedNow.has(x) && n.c === bound[k]!.c);
+      if (i >= 0) take(k, i);
+    }
   }
-  // an anonymous container bound may be gone: only the rest must appear, in order
-  const req = bound.filter((b) => !b.anon);
-  const first: number[] = [], last: number[] = [];
-  let j = 0;
-  for (const b of req) { while (j < now.length && now[j]!.c !== b.c) j += 1; if (j >= now.length) return null; first.push(j); j += 1; }
-  j = now.length - 1;
-  for (let k = req.length - 1; k >= 0; k -= 1) { while (j >= 0 && now[j]!.c !== req[k]!.c) j -= 1; if (j < 0) return null; last.unshift(j); j -= 1; }
-  return first.every((x, i) => x === last[i]) ? new Set(first) : null;
+  const left = bound.map((_, k) => k).filter((k) => !paired.has(k) && !bound[k]!.anon);
+  const unused = now.map((_, i) => i).filter((i) => !usedNow.has(i));
+  const count = (xs: Item[], c: string) => xs.reduce((s, x) => s + (x.c === c ? 1 : 0), 0);
+  const extra = unused.filter((i) => { const n = now[i]!; return o.allNew || (n.act && n.ax) || (o.placed && count(bound, n.c) > 0 && count(now, n.c) > count(bound, n.c)); });
+  return { left, order, extra, unused };
 }
 
 /** The element an action names (`id` in the caller's observation `decided`), found in `look` — what the driver acts on
@@ -205,65 +239,63 @@ interface SendBinding { window: { app: string; title: string; url: string | null
 
 /** Is what the user consented to still there: the window, the dialog and the typed text unchanged, the same target and
  *  focused element, and every bound element matched one to one by an element of the new look with the same content and
- *  identity (id, or place)? New elements may have come (an incoming message, a "typing…" line); any bound one changed,
- *  moved or gone is another send. */
-function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding): boolean {
-  if (canon([bound.window, bound.modal, bound.typed]) !== canon([now.window, now.modal, now.typed])) return false;
-  // the same target and focus under every policy: a screen the same as before, renumbered, can put the caller's id on
-  // the other pane's「发送」 (review of #25)
-  const one = (a: Ident | null, b: Ident | null) => (a === null || b === null ? a === b : sameEl(a, b));
-  if (!one(bound.target, now.target) || !one(bound.focused, now.focused)) return false;
-  // strict, for a window read from the screen: nothing may have changed at all
-  if (pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined)) return sameScreen(bound.whole, now.whole);
-  const used = pair(bound.elements, now.elements);
-  if (!used) return false;
-  // what came since: in a window read from the accessibility tree, only what cannot be acted on (an incoming message,
-  // a "typing…" line); a new button, tag, link or field may be a new recipient (review of #25: 「b@evil.com」 added).
-  // Text recognition offers every row as clickable, so in a screen-read window under `match` nothing tells them apart:
-  // additions stay allowed there (the owner's trade-off; `strict` is the default)
-  if (now.elements.some((n, i) => !used.has(i) && n.act && n.ax)) return false;
-  return true;
+ *  identity (place, or order)? New elements may have come (an incoming message, a "typing…" line); any bound one
+ *  changed, moved or gone is another send. Exactly when `bindingDiff` finds nothing: one comparison, so the trace
+ *  explains every re-ask (rc.12). */
+export function within(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding): boolean {
+  return bindingDiff(bound, now, pixels, 1).length === 0;
 }
 
 /** One difference between what a consent was bound to and what is there now, for the trace (never for the user's
- *  card): which part, and its signature before and after — role, label, value, where read from, focus, place; no ids. */
-export interface BindingChange { part: "window" | "modal" | "field" | "typed" | "target" | "focus" | "element"; before: unknown; after: unknown }
+ *  card): which part, and its signature before and after — role, label, value, where read from, focus, place; no ids.
+ *  `order`: a bound element found only out of its order, or paired in more than one way (a duplicate), where elements
+ *  are paired by order. */
+export interface BindingChange { part: "window" | "modal" | "field" | "typed" | "target" | "focus" | "element" | "order"; before: unknown; after: unknown }
 
 /** What differs between two send bindings, at most `max` items (a real Mac's re-ask is read from the trace: rc.9, the
- *  user approved one send four times). Elements: each one bound is paired (same content, near or both without a
- *  place); what is left over is reported as changed — same role and label on both sides: its value ("field"), its
- *  focus ("focus") or its place ("element") — or gone, and then what came that can be acted on (accessibility tree)
- *  or anything that came (strict, screen-read). */
+ *  user approved one send four times), and nothing exactly when the consent still stands (`within`). The window, the
+ *  dialog, the typed text, the target and the focus; then the elements, compared by `compareItems`: each bound one left
+ *  unpaired is reported as changed — same role and label as one left over now: its value ("field"), its focus
+ *  ("focus") or its place ("element") — or gone; then what was found only out of order ("order"); then what came that
+ *  counts as an addition. The strict policy, for a window read from the screen, compares every element (`whole`), and
+ *  any addition counts. */
 export function bindingDiff(bound: SendBinding, now: SendBinding, pixels: PixelSendBinding, max = 10): BindingChange[] {
   const out: BindingChange[] = [];
   const push = (c: BindingChange) => { if (out.length < max) out.push(c); };
   const sig = (i: { c: string; at: [number, number] | null } | null) => (i ? { sig: JSON.parse(i.c) as unknown[], at: i.at } : null);
-  for (const k of ["app", "title", "url", "tab"] as const) if (bound.window[k] !== now.window[k]) push({ part: "window", before: { [k]: bound.window[k] }, after: { [k]: now.window[k] } });
+  const keys = [...new Set([...Object.keys(bound.window), ...Object.keys(now.window)])] as (keyof SendBinding["window"])[];
+  for (const k of keys) if (canon(bound.window[k] ?? null) !== canon(now.window[k] ?? null)) push({ part: "window", before: { [k]: bound.window[k] ?? null }, after: { [k]: now.window[k] ?? null } });
   if (bound.modal !== now.modal) push({ part: "modal", before: bound.modal, after: now.modal });
   if (canon(bound.typed) !== canon(now.typed)) push({ part: "typed", before: bound.typed, after: now.typed });
+  // the same target and focus under every policy: a screen the same as before, renumbered, can put the caller's id on
+  // the other pane's「发送」 (review of #25)
   const one = (a: Ident | null, b: Ident | null) => (a === null || b === null ? a === b : sameEl(a, b));
   if (!one(bound.target, now.target)) push({ part: "target", before: sig(bound.target), after: sig(now.target) });
   if (!one(bound.focused, now.focused)) push({ part: "focus", before: sig(bound.focused), after: sig(now.focused) });
   const strict = pixels === "strict" && (bound.whole !== undefined || now.whole !== undefined);
-  const A: { c: string; at: [number, number] | null; act?: true; ax?: true }[] = strict ? bound.whole ?? [] : bound.elements;
-  const B: { c: string; at: [number, number] | null; act?: true; ax?: true }[] = strict ? now.whole ?? [] : now.elements;
-  const tol = strict ? JITTER_PX : NEAR_PX;
-  const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (x.at && y.at ? Math.abs(x.at[0] - y.at[0]) <= tol && Math.abs(x.at[1] - y.at[1]) <= tol : !x.at && !y.at);
-  const usedB = new Set<number>(), leftA: number[] = [];
-  A.forEach((a, k) => { const i = B.findIndex((b, j) => !usedB.has(j) && b.c === a.c && near(a, b)); if (i >= 0) usedB.add(i); else leftA.push(k); });
+  if (strict && (!bound.whole || !now.whole)) {
+    // read from the screen once and from the accessibility tree the other time: nothing to compare one to one
+    push({ part: "window", before: { read: bound.whole ? "screen" : "accessibility" }, after: { read: now.whole ? "screen" : "accessibility" } });
+    return out;
+  }
+  const A: Item[] = strict ? bound.whole! : bound.elements;
+  const B: Item[] = strict ? now.whole! : now.elements;
+  const placed = strict || (A.every((a) => a.at) && B.every((b) => b.at));
+  const r = compareItems(A, B, { placed, tol: strict ? JITTER_PX : NEAR_PX, allNew: strict });
   // the content's parts: [role, label, value, source, focus] in the binding, [role, label, value, focus] in strict's whole
   const F = strict ? 3 : 4;
   const rl = (c: string) => { const x = JSON.parse(c) as unknown[]; return canon(strict ? [x[0], x[1]] : [x[0], x[1], x[3]]); };
-  for (const k of leftA) {
+  const spare = new Set(r.unused);
+  for (const k of r.left) {
     const a = A[k]!;
-    if ((a as { anon?: boolean }).anon) continue;                // an anonymous container gone: not a change
-    const i = B.findIndex((b, j) => !usedB.has(j) && rl(b.c) === rl(a.c));
-    if (i < 0) { push({ part: "element", before: sig(a), after: null }); continue; }
-    usedB.add(i);
+    const i = [...spare].find((j) => rl(B[j]!.c) === rl(a.c));
+    if (i === undefined) { push({ part: "element", before: sig(a), after: null }); continue; }
+    spare.delete(i);
     const x = JSON.parse(a.c) as unknown[], y = JSON.parse(B[i]!.c) as unknown[];
     push({ part: canon(x[2]) !== canon(y[2]) ? "field" : canon(x[F]) !== canon(y[F]) ? "focus" : "element", before: sig(a), after: sig(B[i]!) });
   }
-  B.forEach((b, j) => { if (!usedB.has(j) && (strict || (b.act && b.ax))) push({ part: "element", before: null, after: sig(b) }); });
+  for (const [k, i] of r.order) push({ part: "order", before: sig(A[k]!), after: sig(B[i]!) });
+  for (const i of r.extra) if (spare.has(i)) push({ part: "element", before: null, after: sig(B[i]!) });
   return out;
 }
 
@@ -273,23 +305,13 @@ const JITTER_PX = 4;
 
 /** The strict policy's "nothing changed" for a window read from the screen: the same elements, none added or gone —
  *  as many of each content on both sides — each paired with one of the same role, label, value and focus whose centre
- *  is within JITTER_PX on both axes. Identical neighbours (a duplicate text-recognition box) are interchangeable: within
- *  a content they are paired nearest first (review of #26: requiring one candidate each never paired them, and a send
- *  never went through on an unchanged screen). */
-export function sameScreen(a: { c: string; at: [number, number] | null; anon?: boolean }[] | undefined, b: { c: string; at: [number, number] | null; anon?: boolean }[] | undefined): boolean {
+ *  is within JITTER_PX on both axes; an anonymous container bound may be gone. Identical neighbours (a duplicate
+ *  text-recognition box) are interchangeable: within a content they are paired nearest first (review of #26). The
+ *  comparison `bindingDiff` uses under `strict`. */
+export function sameScreen(a: Item[] | undefined, b: Item[] | undefined): boolean {
   if (!a || !b) return false;
-  const near = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (!x.at || !y.at ? !x.at && !y.at : Math.abs(x.at[0] - y.at[0]) <= JITTER_PX && Math.abs(x.at[1] - y.at[1]) <= JITTER_PX);
-  const d = (x: { at: [number, number] | null }, y: { at: [number, number] | null }) => (x.at && y.at ? Math.abs(x.at[0] - y.at[0]) + Math.abs(x.at[1] - y.at[1]) : 0);
-  for (const c of new Set([...a.map((e) => e.c), ...b.map((e) => e.c)])) {
-    // every element now must pair with one bound (nothing added); every bound one must pair, except an anonymous
-    // container, which may be gone
-    const as = a.filter((e) => e.c === c), bs = b.filter((e) => e.c === c);
-    const cand = as.flatMap((x, k) => bs.map((y, i) => ({ k, i, ok: near(x, y), d: d(x, y) }))).filter((p) => p.ok).sort((p, q) => p.d - q.d);
-    const ka = new Set<number>(), kb = new Set<number>();
-    for (const p of cand) if (!ka.has(p.k) && !kb.has(p.i)) { ka.add(p.k); kb.add(p.i); }
-    if (kb.size !== bs.length || as.some((x, k) => !x.anon && !ka.has(k))) return false;
-  }
-  return true;
+  const r = compareItems(a, b, { placed: true, tol: JITTER_PX, allNew: true });
+  return !r.left.length && !r.order.length && !r.extra.length;
 }
 
 /** What an action touches: the object the guard and the consent are about. */
