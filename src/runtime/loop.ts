@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { compact } from "./compact.js";
-import { costOf } from "../gateway/index.js";
+import { costOf, priceEstimated } from "../gateway/index.js";
 import { current as traceContext } from "../otel/context.js";
 import { CONSEQUENCES, type Consequence } from "../protocol/consent.js";
 import type { Action, Reading } from "../protocol/computer.js";
@@ -211,14 +211,17 @@ export class AgentLoop {
     const emit = async (e: AgentEvent) => {
       if (e.type === "turn_start") turnAt = Date.now();
       if (e.type === "message_end" && e.message.role === "assistant") {
-        this.count("model_calls"); const u = e.message.usage; this.count("tokens_in", u.input); this.count("tokens_out", u.output);
+        this.count("model_calls"); const u = e.message.usage; this.count("tokens_in", u.input + (u.cacheRead ?? 0)); this.count("tokens_out", u.output);
         // the acting model's call, recorded like the gateway's (role "loop"): tokens, cost by the price table when pi-ai
-        // says none, latency from the turn's start, and how much was sent
+        // says none, latency from the turn's start, and how much was sent. Input tokens are everything the model read:
+        // pi-ai's `input` leaves out what came from the prompt cache, so it is added (the gateway's definition)
         const m = e.message;
+        const cacheRead = u.cacheRead ?? 0, tokensIn = u.input + cacheRead;
+        const priced = !u.cost?.total;
         try {
           traceContext().onModelCall?.({ kind: "model.call", call_id: `mc_${randomUUID().slice(0, 8)}`, started_at: turnAt, role: "loop", backend: "pi-ai", model: spec,
-            outcome: m.stopReason === "error" ? "error" : m.stopReason === "aborted" ? "aborted" : "answered", tokens_in: u.input, tokens_out: u.output, cache_read: u.cacheRead,
-            cost_usd: Number((u.cost?.total || costOf(spec, u.input, u.output)).toFixed(9)), latency_ms: Date.now() - turnAt, sent_chars: sentChars,
+            outcome: m.stopReason === "error" ? "error" : m.stopReason === "aborted" ? "aborted" : "answered", tokens_in: tokensIn, tokens_out: u.output, cache_read: cacheRead,
+            cost_usd: Number((u.cost?.total || costOf(spec, tokensIn, u.output, cacheRead)).toFixed(9)), ...(priced && priceEstimated(spec, cacheRead) ? { cost_estimated: true } : {}), latency_ms: Date.now() - turnAt, sent_chars: sentChars,
             tool_calls: m.content.filter((c) => c.type === "toolCall").length, ...(m.errorMessage ? { error: m.errorMessage.slice(0, 300) } : {}) });
         } catch { /* recording never stops the loop */ }
       }

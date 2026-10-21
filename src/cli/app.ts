@@ -227,7 +227,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     for (const x of [usage, b]) { x.calls += 1; x.tokens_in += r.tokens_in; x.tokens_out += r.tokens_out; x.cost_usd = Number((x.cost_usd + r.cost_usd).toFixed(9)); }
     b.latency_ms += r.latency_ms;
     // a raced judge call can answer after the run: on disk and in the trace, never after task_done
-    if (!done) log.emit({ kind: "model_call", call_id: r.call_id, role: r.role, model: r.model, outcome: r.outcome, tokens_in: r.tokens_in, tokens_out: r.tokens_out, cost_usd: r.cost_usd, latency_ms: r.latency_ms, ...(r.step_id ? { step_id: r.step_id } : {}), ...(r.judge_id ? { judge_id: r.judge_id } : {}) });
+    if (!done) log.emit({ kind: "model_call", call_id: r.call_id, role: r.role, model: r.model, outcome: r.outcome, tokens_in: r.tokens_in, tokens_out: r.tokens_out, cost_usd: r.cost_usd, latency_ms: r.latency_ms, ...(r.step_id ? { step_id: r.step_id } : {}), ...(typeof r.cache_read === "number" ? { cache_read: r.cache_read } : {}), ...(r.cost_estimated ? { cost_estimated: true } : {}), ...(r.judge_id ? { judge_id: r.judge_id } : {}) });
   };
   const signer = ConsentSigner.fresh();
   const ws = req.scope ? new Workspace(req.scope) : undefined;

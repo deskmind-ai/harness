@@ -137,8 +137,9 @@ export function withOverrides(base: RoleTable, overrides: string[]): RoleTable {
 const localUrl = (model: string) => model.split("|")[0]!;
 const localModelName = (model: string) => model.split("|")[1] ?? "local";
 
-/** USD per token (in, out); from openrouter.ai/api/v1/models on 2026-10-07, used only when a reply carries no cost. */
-const PRICES: Record<string, [number, number]> = {
+/** USD per token (in, out, and in read from the service's prompt cache when its price is known); from
+ *  openrouter.ai/api/v1/models on 2026-10-07, used only when a reply carries no cost. */
+const PRICES: Record<string, [number, number, number?]> = {
   "openai/gpt-6-luna": [0.1e-6, 0.5e-6],
   "openai/gpt-6.1-sol": [2e-6, 10e-6],
   "openai/gpt-6-sol": [2e-6, 10e-6],
@@ -151,10 +152,22 @@ const PRICES: Record<string, [number, number]> = {
 };
 
 /** What a call of `model` cost in USD by the price table, for a reply that carries no cost of its own (the agent
- *  loop's model is priced here too: pi-ai's model entry says 0). 0 when the model is not in the table. */
-export function costOf(model: string, tokensIn: number, tokensOut: number): number {
+ *  loop's model is priced here too: pi-ai's model entry says 0). 0 when the model is not in the table.
+ *
+ *  One definition of input tokens for every caller: `tokensIn` is everything the model read, `cacheRead` (part of it)
+ *  what it read from the service's prompt cache — OpenAI-compatible `prompt_tokens` already counts that part; pi-ai's
+ *  `usage.input` does not, so the agent loop adds `cacheRead` before calling this. A cache-read price the table does not
+ *  know is taken at the input rate, and the cost is then an estimate (`priceEstimated`). */
+export function costOf(model: string, tokensIn: number, tokensOut: number, cacheRead = 0): number {
   const priced = PRICES[model] ?? PRICES["openai/" + model.split("|").pop()!];
-  return priced ? tokensIn * priced[0] + tokensOut * priced[1] : 0;
+  if (!priced) return 0;
+  const cached = Math.min(Math.max(cacheRead, 0), tokensIn);
+  return (tokensIn - cached) * priced[0] + cached * (priced[2] ?? priced[0]) + tokensOut * priced[1];
+}
+/** The table has no cache-read price for `model` and some input came from the cache: its cost is at the input rate. */
+export function priceEstimated(model: string, cacheRead: number): boolean {
+  const priced = PRICES[model] ?? PRICES["openai/" + model.split("|").pop()!];
+  return !!priced && cacheRead > 0 && priced[2] === undefined;
 }
 
 export type Outcome = "answered" | "refusal" | "invalid" | "error" | "timeout";
@@ -166,6 +179,8 @@ export interface Reply<T = unknown> {
   model: string;
   tokensIn: number;
   tokensOut: number;
+  /** Of tokensIn, read from the service's prompt cache (when the service says). */
+  cacheRead?: number;
   costUsd: number;
   latencyMs: number;
   error: string;
@@ -188,7 +203,11 @@ export interface CallRecord {
   outcome: Outcome;
   tokens_in: number;
   tokens_out: number;
+  /** Of tokens_in (everything the model read), read from the service's prompt cache. */
+  cache_read: number;
   cost_usd: number;
+  /** The cost took the cache-read part at the input rate (the table has no cache price for this model). */
+  cost_estimated?: boolean;
   latency_ms: number;
   error: string;
   system_chars: number;
@@ -199,6 +218,13 @@ export interface CallRecord {
 export type Scripted = (role: Role, system: string, user: string) => unknown;
 
 const OPENROUTER = "https://openrouter.ai/api/v1/chat/completions";
+
+/** The prompt tokens a chat-completions reply says came from the service's cache: OpenAI's
+ *  `prompt_tokens_details.cached_tokens`, DeepSeek's `prompt_cache_hit_tokens`. Part of `prompt_tokens`. */
+function cachedOf(usage: Record<string, any>): number {
+  const n = usage?.prompt_tokens_details?.cached_tokens ?? usage?.prompt_cache_hit_tokens ?? 0;
+  return typeof n === "number" && n > 0 ? n : 0;
+}
 
 /** The first complete JSON object in the text (models sometimes add a second object or prose after it). */
 function extractJson(text: string): unknown {
@@ -282,6 +308,7 @@ export class Gateway {
     const sys = `${system}\n\n只输出一个 JSON 对象，不要别的文字。字段名必须和这个 JSON Schema 完全一致（例如判别字段叫 kind 就写 kind）：\n${JSON.stringify(jsonSchema)}`;
     const base = { role, model, tokensIn: 0, tokensOut: 0, costUsd: 0, latencyMs: 0, error: "" };
     const startedAt = Date.now();
+    let estimated = false;
     let rep: Reply<z.infer<S>>;
     if (this.opts.maxCostUsd !== undefined && this.spentUsd >= this.opts.maxCostUsd) {
       rep = { ...base, outcome: "error", error: "budget: gateway cost cap reached" };
@@ -312,7 +339,7 @@ export class Gateway {
           rep.data = undefined;
         }
       }
-      if (!rep.costUsd) rep.costUsd = costOf(model, rep.tokensIn, rep.tokensOut);
+      if (!rep.costUsd) { rep.costUsd = costOf(model, rep.tokensIn, rep.tokensOut, rep.cacheRead ?? 0); estimated = priceEstimated(model, rep.cacheRead ?? 0); }
     }
     this.spentUsd += rep.costUsd;
     this.calls += 1;
@@ -324,7 +351,7 @@ export class Gateway {
     const ctx = traceContext();
     const record: CallRecord = {
       kind: "model.call", call_id: `mc_${randomUUID().slice(0, 8)}`, started_at: startedAt, run_id: runId, role, backend, model, outcome: rep.outcome, tokens_in: rep.tokensIn,
-      tokens_out: rep.tokensOut, cost_usd: Number(rep.costUsd.toFixed(9)), latency_ms: Math.round(rep.latencyMs),
+      tokens_out: rep.tokensOut, cache_read: rep.cacheRead ?? 0, cost_usd: Number(rep.costUsd.toFixed(9)), ...(estimated ? { cost_estimated: true } : {}), latency_ms: Math.round(rep.latencyMs),
       error: rep.error.slice(0, 300), system_chars: sys.length, user_chars: user.length, answer: rep.data,
       ...(retryOf ? { retry_of: retryOf } : {}), ...(ctx.step_id ? { step_id: ctx.step_id } : {}), ...(ctx.judge_id ? { judge_id: ctx.judge_id } : {}),
     };
@@ -378,7 +405,7 @@ export class Gateway {
       const out = JSON.parse(raw);
       const ch = out.choices[0];
       const usage = out.usage ?? {};
-      const rep: Partial<Reply> = { outcome: "answered", tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, costUsd: Number(usage.cost ?? 0), latencyMs };
+      const rep: Partial<Reply> = { outcome: "answered", tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, cacheRead: cachedOf(usage), costUsd: Number(usage.cost ?? 0), latencyMs };
       if (ch.message?.refusal || ch.finish_reason === "content_filter") return { ...rep, outcome: "refusal", error: String(ch.message?.refusal ?? "content_filter").slice(0, 300) };
       if (ch.finish_reason === "length") return { ...rep, outcome: "invalid", error: TRUNCATED };
       rep.data = extractJson(ch.message?.content ?? "");
@@ -440,7 +467,7 @@ export class Gateway {
     try {
       const out = JSON.parse(raw);
       const usage = out.usage ?? {};
-      const counts = { tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, costUsd: Number(usage.cost ?? 0), latencyMs };
+      const counts = { tokensIn: usage.prompt_tokens ?? 0, tokensOut: usage.completion_tokens ?? 0, cacheRead: cachedOf(usage), costUsd: Number(usage.cost ?? 0), latencyMs };
       const ch = out.choices[0];
       if (ch.message?.refusal || ch.finish_reason === "content_filter") return { ...counts, outcome: "refusal", error: String(ch.message?.refusal ?? "content_filter").slice(0, 300) };
       if (ch.finish_reason === "length") return { outcome: "invalid", error: TRUNCATED, ...counts };

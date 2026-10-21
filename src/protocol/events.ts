@@ -56,7 +56,10 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("answer_given"), text: z.string() }),
   // one model call (M0): the acting model's turns (role "loop"), the judges' and the rewrites' — tokens, cost (USD, by the
   // price table when the service says none), latency, and the step and judge question it served
-  z.object({ kind: z.literal("model_call"), call_id: z.string(), role: z.string(), model: z.string(), outcome: z.string(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number(), step_id: z.string().optional(), judge_id: z.string().optional() }),
+  z.object({ kind: z.literal("model_call"), call_id: z.string(), role: z.string(), model: z.string(), outcome: z.string(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number(), step_id: z.string().optional(), judge_id: z.string().optional(),
+    // of tokens_in (everything the model read), from the service's prompt cache; cost_estimated: the cache part priced at
+    // the input rate (no cache price known)
+    cache_read: z.number().optional(), cost_estimated: z.boolean().optional() }),
   // one judge question (M0): which question (intent, outgoing, provenance, verify, evidence), the answer and the tier
   // that settled it (null: no tier could), every tier asked and what it said, the shadow comparison when one ran
   z.object({ kind: z.literal("judge"), judge_id: z.string(), question: z.string(), answer: z.string().nullable(), by: z.string().nullable(), confidence: z.number().optional(),
