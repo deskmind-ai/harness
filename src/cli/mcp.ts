@@ -36,7 +36,7 @@ import { PORT_TOOLS, mcpTools } from "../protocol/tools.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
 import { MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSIONS, PROTOCOL } from "../protocol/version.js";
-import { JsonRpcPeer, type Json } from "../transport/jsonrpc.js";
+import { JsonRpcPeer, MAX_LINE, type Json } from "../transport/jsonrpc.js";
 
 /** The tools/list entries (name, description, inputSchema). */
 export const TOOLS = mcpTools();
@@ -105,8 +105,8 @@ export class McpExecutorServer {
     const s = this.session;
     if (!s) return { text: "begin first", out: { error: "begin first" }, isError: true };
     const port = s.port;
-    const obj = (x: unknown) => ({ text: JSON.stringify(x), out: x as Json, isError: false });
-    const reply = (r: ToolReply) => ({ text: r.text, out: r as unknown as Json, isError: !!r.isError });
+    const obj = (x: unknown) => { const o = bounded(x as Json); return { text: JSON.stringify(o), out: o, isError: false }; };
+    const reply = (r: ToolReply) => { const t = r.text.length > REPLY_MAX ? `${r.text.slice(0, REPLY_MAX)}…(cut: ${r.text.length - REPLY_MAX} more characters)` : r.text; return { text: t, out: { ...r, text: t } as unknown as Json, isError: !!r.isError }; };
     switch (name) {
       case "begin": return obj(await port.begin());
       case "snapshot": return obj(await port.snapshot());
@@ -169,6 +169,28 @@ export class McpExecutorServer {
   }
 }
 
+/** What one reply may carry (its text; the line holds it twice, as text and as the structured result): one huge window
+ *  must not make a line the other side refuses (review of #50). */
+export const REPLY_MAX = 4 * 1024 * 1024;
+
+/** An object reply within REPLY_MAX: an observation's elements and text are cut, with a `truncated` marker saying what
+ *  was left out; anything else too large is replaced by a marker. */
+export function bounded(x: Json): Json {
+  const size = (v: unknown) => JSON.stringify(v).length;
+  if (!x || typeof x !== "object" || size(x) <= REPLY_MAX) return x;
+  const out: Json = { ...x };
+  const truncated: Json = {};
+  if (typeof out.text === "string" && out.text.length > REPLY_MAX / 4) { truncated.text = out.text.length; out.text = out.text.slice(0, REPLY_MAX / 4) + "…(cut)"; }
+  if (Array.isArray(out.elements)) {
+    const all = out.elements as unknown[];
+    let keep = all.length;
+    while (keep > 0 && size({ ...out, elements: all.slice(0, keep) }) > REPLY_MAX) keep = Math.floor(keep * 0.8);
+    if (keep < all.length) { truncated.elements = all.length; out.elements = all.slice(0, keep); }
+  }
+  if (size(out) > REPLY_MAX) return { truncated: { bytes: size(x) }, note: "the reply was too large to send; look at a smaller part" };
+  return { ...out, truncated };
+}
+
 /** A tools/call of `stop`. */
 export const isStop = (msg: Json) => msg.method === "tools/call" && (msg.params as Json | undefined)?.name === "stop";
 
@@ -199,7 +221,8 @@ async function main() {
   const ws = a.scope ? new Workspace(a.scope) : undefined;
   const log = (l: string) => process.stderr.write(l + "\n");
   const server = new McpExecutorServer({ driver: () => (a.driver === "hands" ? new HandsDriver(ws ? { workspace: ws.root } : {}) : new SimComputer(ws?.root)), gateway: gw, workspace: ws, consent: a.consent === "auto" ? "auto" : "none", log });
-  const peer = new JsonRpcPeer(process.stdin, process.stdout);
+  // a foreign caller: a request over 16 MB is answered with an error (or, without a readable id, the connection closed)
+  const peer = new JsonRpcPeer(process.stdin, process.stdout, { maxLine: MAX_LINE, oversize: "error" });
   const s = serve(server, peer, log);
   await peer.closed;
   await s.idle();

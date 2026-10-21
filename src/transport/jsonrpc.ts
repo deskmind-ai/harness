@@ -18,14 +18,44 @@ export class RpcError extends Error {
   constructor(readonly code: number, message: string) { super(message); }
 }
 
-/** Limits on what the other side may send (the executor sets them for its runtime child): a line longer than
- *  `maxLine` bytes is dropped whole; notifications beyond `notifyPerSec` (a bucket of `notifyBurst`) are dropped. */
-export interface PeerLimits { maxLine?: number; notifyPerSec?: number; notifyBurst?: number }
+/** Limits on what the other side may send. By default none: the runtime child reading its parent (the executor)
+ *  trusts it. A line longer than `maxLine` bytes is never dropped silently (the side waiting for it would hang, review
+ *  of #50): `oversize` "close" (the executor reading its child: a protocol violation) rejects every pending request and
+ *  closes the peer with `violation` set; "error" (the standalone server reading a foreign caller) answers it with a
+ *  JSON-RPC error when the line's id can be read from its start, and otherwise closes. Notifications beyond
+ *  `notifyPerSec` (a bucket of `notifyBurst`) are dropped and counted by method. */
+export interface PeerLimits { maxLine?: number; oversize?: "close" | "error"; notifyPerSec?: number; notifyBurst?: number }
 export const MAX_LINE = 16 * 1024 * 1024;
+
+/** The top-level `"id"` of a JSON object's beginning (a number or a short string), read without parsing the rest:
+ *  the answer to a request too large to read. Undefined when it is not there in `head`. */
+export function topLevelId(head: string): RpcId | undefined {
+  let depth = 0, i = 0;
+  const str = (): string | null => { const m = /^"(?:[^"\\]|\\.)*"/.exec(head.slice(i)); if (!m) return null; i += m[0].length; return m[0]; };
+  while (i < head.length) {
+    const c = head[i]!;
+    if (c === "{" || c === "[") { depth++; i++; continue; }
+    if (c === "}" || c === "]") { depth--; i++; continue; }
+    if (c === '"') {
+      const k = str(); if (k === null) return undefined;
+      if (depth === 1 && k === '"id"') {
+        const m = /^\s*:\s*(-?\d+(?!\.)|"(?:[^"\\]|\\.){0,200}")\s*[,}]/.exec(head.slice(i));
+        if (m) return JSON.parse(m[1]!) as RpcId;
+      }
+      continue;
+    }
+    i++;
+  }
+  return undefined;
+}
 
 export class JsonRpcPeer {
   /** Lines dropped for being too long, notifications dropped for coming too fast: the trace says how many. */
   readonly dropped = { long_lines: 0, notifications: 0 };
+  /** Notifications dropped for the rate, by method. */
+  readonly droppedByMethod: Record<string, number> = Object.create(null);
+  /** Why the peer was closed for breaking the protocol (a line over the cap), if it was. */
+  violation: string | null = null;
   private tokens: number;
   private refilled = Date.now();
   private nextId = 1;
@@ -43,18 +73,32 @@ export class JsonRpcPeer {
 
   constructor(input: NodeJS.ReadableStream, private readonly output: NodeJS.WritableStream, private readonly limits: PeerLimits = {}) {
     this.tokens = limits.notifyBurst ?? Infinity;
-    // lines by hand (not readline): a line over the cap is dropped as it streams in, never held whole
-    const max = limits.maxLine ?? MAX_LINE, dec = new StringDecoder("utf8");
+    // lines by hand (not readline): a line over the cap is handled as it streams in, never held whole
+    const max = limits.maxLine ?? Infinity, dec = new StringDecoder("utf8");
     let buf = "", skipping = false;
+    const tooLong = (head: string): boolean => {          // true: the reader goes on (skipping the rest of the line)
+      this.dropped.long_lines++;
+      if (limits.oversize === "error") {
+        const id = topLevelId(head.slice(0, 4096));
+        if (id !== undefined) { this.write({ jsonrpc: "2.0", id, error: { code: -32600, message: `request too large (over ${max} bytes)` } }); return true; }
+        this.write({ jsonrpc: "2.0", id: null, error: { code: -32600, message: `line too large (over ${max} bytes)` } });
+      }
+      this.violation = "line too long";
+      this.close("protocol: line too long");
+      return false;
+    };
     input.on("data", (chunk: Buffer | string) => {
+      if (this.violation) return;
       buf += typeof chunk === "string" ? chunk : dec.write(chunk);
       for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
         if (skipping) { skipping = false; continue; }
-        if (line.length > max / 4 && Buffer.byteLength(line) > max) { this.dropped.long_lines++; continue; }
+        if (line.length > max / 4 && Buffer.byteLength(line) > max) { if (!tooLong(line)) return; continue; }
         this.read(line.endsWith("\r") ? line.slice(0, -1) : line);
+        if (this.violation) return;
       }
-      if (Buffer.byteLength(buf) > max) { if (!skipping) this.dropped.long_lines++; skipping = true; buf = ""; }
+      if (!skipping && buf.length > max / 4 && Buffer.byteLength(buf) > max) { if (!tooLong(buf)) { buf = ""; return; } skipping = true; }
+      if (skipping) buf = "";
     });
     input.on("end", () => { if (buf && !skipping) this.read(buf); buf = ""; this.close("the other side closed its stream"); });
     input.on("close", () => this.close("the other side closed its stream"));
@@ -65,7 +109,7 @@ export class JsonRpcPeer {
   get isClosed() { return this.done; }
 
   /** One notification within the rate (a token bucket), or dropped. */
-  private admit(): boolean {
+  private admit(method: string): boolean {
     const rate = this.limits.notifyPerSec;
     if (rate === undefined) return true;
     const now = Date.now();
@@ -73,6 +117,7 @@ export class JsonRpcPeer {
     this.refilled = now;
     if (this.tokens >= 1) { this.tokens -= 1; return true; }
     this.dropped.notifications++;
+    this.droppedByMethod[method] = (this.droppedByMethod[method] ?? 0) + 1;
     return false;
   }
 
@@ -82,7 +127,7 @@ export class JsonRpcPeer {
     try { msg = JSON.parse(line); } catch { this.onParseError(line); return; }
     if (!msg || typeof msg !== "object" || Array.isArray(msg)) { this.onParseError(line); return; }
     if (typeof msg.method === "string") {
-      if (msg.id === undefined || msg.id === null) { if (this.admit()) this.onNotification(msg.method, (msg.params ?? {}) as Json); }
+      if (msg.id === undefined || msg.id === null) { if (this.admit(msg.method)) this.onNotification(msg.method, (msg.params ?? {}) as Json); }
       else this.onRequest(msg);
       return;
     }

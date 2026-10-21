@@ -24,7 +24,9 @@ import { Gateway } from "../src/gateway/index.js";
 import type { JsonStep } from "../src/host/agent.js";
 import type { AppEvent } from "../src/protocol/events.js";
 import { scriptedStream } from "../src/runtime/scripted.js";
-import { JsonRpcPeer } from "../src/transport/jsonrpc.js";
+import { JsonRpcPeer, topLevelId } from "../src/transport/jsonrpc.js";
+import { EventLog } from "../src/protocol/events.js";
+import { REPLY_MAX, bounded } from "../src/cli/mcp.js";
 import { ReportMirror, checkedCounters } from "../src/transport/report.js";
 import { agentEnv } from "../src/host/agent.js";
 import { FrontierRuntime } from "../src/host/frontier.js";
@@ -360,21 +362,116 @@ describe("the boundary does not trust the runtime (review of #50)", () => {
     expect(({} as any).polluted).toBeUndefined();
   });
 
-  it("the transport drops a line over the cap and a notification flood; a non-JSON line goes to the parse-error hook", async () => {
+  it("the transport: a notification flood is dropped and counted by method; a non-JSON line goes to the parse-error hook", async () => {
     const input = new PassThrough(), output = new PassThrough();
-    const peer = new JsonRpcPeer(input, output, { maxLine: 1000, notifyPerSec: 10, notifyBurst: 5 });
+    const peer = new JsonRpcPeer(input, output, { maxLine: 1000, oversize: "close", notifyPerSec: 10, notifyBurst: 5 });
     const got: string[] = [], bad: string[] = [];
     peer.onNotification = (m) => got.push(m);
     peer.onParseError = (l) => bad.push(l);
-    input.write("x".repeat(600)); input.write("y".repeat(600) + '"}\n');        // one line of 1200 bytes, in two pieces
     input.write("hello, not json\n");
-    for (let i = 0; i < 20; i++) input.write(JSON.stringify({ jsonrpc: "2.0", method: `n${i}` }) + "\n");
+    for (let i = 0; i < 20; i++) input.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/deskmind/model_call" }) + "\n");
     await sleep(20);
-    expect(peer.dropped.long_lines).toBe(1);
     expect(bad).toEqual(["hello, not json"]);
     expect(got.length).toBe(5);
     expect(peer.dropped.notifications).toBe(15);
+    expect(peer.droppedByMethod["notifications/deskmind/model_call"]).toBe(15);
   });
+
+  /** A response line of `mb` megabytes to a pending request, written in 64 KB pieces. */
+  const bigLine = (mb: number, id: number | null = 1) => Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, result: { text: "字".repeat(Math.floor((mb * 1024 * 1024) / 3)) } }) + "\n");
+  const feed = (input: PassThrough, b: Buffer) => { for (let i = 0; i < b.length; i += 65536) input.write(b.subarray(i, i + 65536)); };
+
+  it("an oversize line is never dropped silently — the child reading its parent has no cap: a 17 MB reply arrives", async () => {
+    const input = new PassThrough(), output = new PassThrough();
+    const peer = new JsonRpcPeer(input, output);                          // as runtimeMain makes it
+    const p = peer.request("tools/call", {});
+    feed(input, bigLine(17));
+    await expect(Promise.race([p.then(() => "answered"), sleep(5000).then(() => "hung")])).resolves.toBe("answered");
+  });
+
+  it("the executor reading its child: an oversize line is a protocol violation — pending requests rejected, the peer closed", async () => {
+    const input = new PassThrough(), output = new PassThrough();
+    const peer = new JsonRpcPeer(input, output, { maxLine: 16 * 1024 * 1024, oversize: "close" });
+    const p = peer.request("x", {});
+    feed(input, bigLine(17));
+    await expect(Promise.race([p.then(() => "answered", (e) => `rejected: ${e.message}`), sleep(5000).then(() => "hung")])).resolves.toMatch(/^rejected: .*line too long/);
+    expect(peer.violation).toBe("line too long");
+    expect(await peer.closed).toBe("protocol: line too long");
+  });
+
+  it("the standalone server reading a foreign caller: an oversize request is answered with an error (its id read from the line's start), else the connection is closed", async () => {
+    const input = new PassThrough(), output = new PassThrough();
+    const peer = new JsonRpcPeer(input, output, { maxLine: 1024, oversize: "error" });
+    const replies: any[] = [];
+    output.on("data", (d) => String(d).split("\n").filter(Boolean).forEach((l) => replies.push(JSON.parse(l))));
+    const reqs: unknown[] = [];
+    peer.onRequest = (m) => reqs.push(m.id);
+    input.write(JSON.stringify({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "act", arguments: { id: 99, text: "x".repeat(5000) } } }) + "\n");
+    input.write(JSON.stringify({ jsonrpc: "2.0", id: 8, method: "ping" }) + "\n");
+    await sleep(20);
+    expect(replies[0]).toMatchObject({ id: 7, error: { code: -32600 } });
+    expect(reqs).toEqual([8]);                                              // the next request is still served
+    expect(peer.violation).toBeNull();
+    input.write(JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { text: "y".repeat(5000) } }) + "\n");
+    await sleep(20);
+    expect(replies[1]).toMatchObject({ id: null, error: { code: -32600 } });
+    expect(peer.violation).toBe("line too long");
+    expect(topLevelId('{"jsonrpc":"2.0","params":{"id":3},"id":"a\\"b","method":"x"')).toBe('a"b');
+    expect(topLevelId('{"jsonrpc":"2.0","params":{"id":3,"text":"xxxx')).toBeUndefined();
+  });
+
+  it("a runtime that writes an oversize line: the run ends failed, agent exited (protocol: line too long), promptly", async () => {
+    const dir = tmp(), evil = path.join(dir, "big.mjs");
+    fs.writeFileSync(evil, `import * as readline from "node:readline";
+      const rl = readline.createInterface({ input: process.stdin }); rl.on("line", () => {});
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { pad: "z".repeat(17 * 1024 * 1024) } }) + "\\n");
+      setInterval(() => {}, 1000);`);
+    const signer = ConsentSigner.fresh(), t0 = Date.now();
+    const rt = new FrontierRuntime({ task: "big", raw: "x", executor: new Executor(new SimComputer(), { task: "big", publicKey: signer.publicKey }), signer, user: { ask: () => null }, gateway: gateway(), mode: "process", agent: { model: "local|m", command: [process.execPath, evil] } });
+    const r = await rt.run();
+    expect(r).toMatchObject({ status: "failed", reason: "agent exited (protocol: line too long)" });
+    expect(Date.now() - t0).toBeLessThan(10_000);
+  }, 30_000);
+
+  it("the executor caps what it sends: one huge window's observation is cut with a marker", async () => {
+    const sim = new SimComputer();
+    const w = sim.addEditor("编辑器", { title: "大.txt", text: "字".repeat(3_000_000), path: null });
+    const signer = ConsentSigner.fresh();
+    const svc = new ExecutorService({ task: "t", raw: "看", executor: new Executor(sim, { task: "t", publicKey: signer.publicKey }), signer, user: { ask: () => null }, gateway: gateway() });
+    const s = new McpExecutorServer({ session: { port: svc.port, stop: () => {} } });
+    await s.call("begin", { raw: "看" });
+    const o = await s.call("observe", { window: w.id });
+    expect(o.text.length).toBeLessThanOrEqual(REPLY_MAX + 1000);
+    expect((o.out as any).truncated).toBeTruthy();
+    const huge = { elements: Array.from({ length: 200_000 }, (_, i) => ({ id: `e${i}`, label: "标签".repeat(20) })), text: "t" };
+    const b = bounded(huge as never) as any;
+    expect(JSON.stringify(b).length).toBeLessThanOrEqual(REPLY_MAX);
+    expect(b.truncated.elements).toBe(200_000);
+    expect(b.elements.length).toBeGreaterThan(1000);
+  });
+
+  it("model_call reports dropped by the rate limit: the run says its usage is incomplete", async () => {
+    const dir = tmp(), evil = path.join(dir, "flood.mjs");
+    fs.writeFileSync(evil, `import * as readline from "node:readline";
+      const w = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+      const rl = readline.createInterface({ input: process.stdin });
+      const pending = new Map(); let id = 0;
+      const req = (method, params) => new Promise((r) => { const i = ++id; pending.set(i, r); w({ jsonrpc: "2.0", id: i, method, params }); });
+      rl.on("line", (l) => { const m = JSON.parse(l); if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); } });
+      await req("initialize", {});
+      for (let i = 0; i < 3000; i++) w({ jsonrpc: "2.0", method: "notifications/deskmind/model_call", params: { record: { tokens_in: 1 } } });
+      await req("tools/call", { name: "end", arguments: {} });
+      process.exit(0);`);
+    const recs: unknown[] = [];
+    const signer = ConsentSigner.fresh();
+    const rt = new FrontierRuntime({ task: "flood", raw: "x", executor: new Executor(new SimComputer(), { task: "flood", publicKey: signer.publicKey }), signer, user: { ask: () => null }, gateway: gateway(), mode: "process", agent: { model: "local|m", command: [process.execPath, evil] } });
+    await within({ onModelCall: (x) => recs.push(x) }, () => rt.run());
+    expect(recs.length).toBeLessThan(3000);
+    expect(rt.usageIncomplete).toBe(true);
+    // and the event carries it
+    const ev = new EventLog(path.join(dir, "e.jsonl"), "r").emit({ kind: "task_done", status: "failed", reason: "x", summary: "", result_card: null, usage_incomplete: true } as never);
+    expect(ev).toMatchObject({ usage_incomplete: true });
+  }, 30_000);
 
   it("a hostile runtime: its stop is refused (the run ends by end, not as the user's stop), forged reports are sanitized, junk on stdout is logged", async () => {
     const dir = tmp();

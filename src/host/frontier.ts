@@ -28,7 +28,7 @@ import type { AgentLoop, LoopOptions } from "../runtime/loop.js";
 import { serve, McpExecutorServer } from "../cli/mcp.js";
 import { AGENT_EXITED, AgentProcess, inProcess, loopFromSpec, type AgentSpec } from "./agent.js";
 import { tracedPort } from "./port-trace.js";
-import { ReportMirror, checkedCounters } from "../transport/report.js";
+import { MODEL_CALL_NOTIFICATION, ReportMirror, checkedCounters } from "../transport/report.js";
 import { current as traceContext } from "../otel/context.js";
 
 export type { SkillSource, ConsentProvider };
@@ -96,6 +96,9 @@ export class FrontierRuntime {
   /** Where the loop runs: "process" (a child) or "inproc". */
   get mode(): "process" | "inproc" { return this.loop ? "inproc" : "process"; }
 
+  /** The runtime's model-call reports were not all taken (the rate limit dropped some): the run's usage is low. */
+  get usageIncomplete(): boolean { return (this.agent?.peer.droppedByMethod[MODEL_CALL_NOTIFICATION] ?? 0) > 0; }
+
   /** Both sides' counters (model_calls adds the loop's turns and the executor's judges and rewrites). */
   get counters(): Record<string, number> { return sum(this.service.counters, this.loop ? this.loop.counters : this.agentCounters); }
 
@@ -161,7 +164,8 @@ export class FrontierRuntime {
     // let go
     const ex = await Promise.race([agent.exited, sleep(300).then(() => null)]);
     agent.kill();
-    const detail = ex ? (ex.signal ?? `code ${ex.code}`) : "pipe closed";
+    // a protocol violation (a line over the cap) closes the connection: that is why it went, whatever its exit says
+    const detail = agent.peer.violation ? `protocol: ${agent.peer.violation}` : ex ? (ex.signal ?? `code ${ex.code}`) : "pipe closed";
     emit("agent.exit", { code: ex?.code ?? null, signal: ex?.signal ?? null, ms: Date.now() - agent.startedAt });
     // a line it wrote before it went and that is read only now is not served: the run is ending (review of #50)
     served.refuse(AGENT_EXITED);

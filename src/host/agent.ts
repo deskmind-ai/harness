@@ -105,7 +105,8 @@ export function agentCommand(): string[] {
 
 /** The runtime child; whoever holds it serves the port on `peer` (cli/mcp.ts serve) and hands it `spec` in the
  *  initialize result. What it writes to stdout that is not JSON goes to its log (runtime.log), not dropped unseen; a line
- *  over 16 MB is dropped, notifications beyond 500 a second (bursts of 2000) too. */
+ *  over 16 MB breaks the protocol (the connection is closed and the run ends "agent exited (protocol: line too long)");
+ *  notifications beyond 500 a second (bursts of 2000) are dropped and counted. */
 export class AgentProcess {
   readonly peer: JsonRpcPeer;
   readonly exited: Promise<{ code: number | null; signal: string | null }>;
@@ -121,7 +122,7 @@ export class AgentProcess {
       this.proc.on("exit", (code, signal) => res({ code, signal }));
       this.proc.on("error", (e) => res({ code: null, signal: `spawn: ${e.message}` }));     // could not start at all
     });
-    this.peer = new JsonRpcPeer(this.proc.stdout!, this.proc.stdin!, { maxLine: MAX_LINE, notifyPerSec: 500, notifyBurst: 2000 });
+    this.peer = new JsonRpcPeer(this.proc.stdout!, this.proc.stdin!, { maxLine: MAX_LINE, oversize: "close", notifyPerSec: 500, notifyBurst: 2000 });
     const stderrFile = o.stderr;
     this.peer.onParseError = (line) => {
       const note = `[runtime stdout, not JSON-RPC] ${line.slice(0, 2000)}\n`;
