@@ -335,8 +335,9 @@ async function main() {
   if (a.selftest) { const r = await selftest(); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
   const cmd = positionals[0];
   if (cmd === "model-check") { const r = await modelCheck(a.config!); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
-  const input = new LineReader(process.stdin);
+  // the runtime's stdin is the MCP channel: no control-line reader on it (review of P2)
   if (cmd === "runtime") { const code = await runtimeMain(); process.stdout.write("", () => process.exit(code)); return; }
+  const input = new LineReader(process.stdin);
   if (cmd === "app-run" || cmd === "executor") {
     // SIGINT / SIGTERM: before the run has started there is nothing to stop; after, the run ends as stopped
     // (task_done written) and the process exits within a second. stdout is drained before exit.

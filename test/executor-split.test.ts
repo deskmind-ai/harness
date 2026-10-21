@@ -213,6 +213,20 @@ describe("a process that dies", () => {
 });
 
 describe("the fallback and the steer push", () => {
+  it("a steer read with the request (before the runtime's process exists) reaches its first turn, as in process", async () => {
+    const go = async (inproc: boolean) => {
+      const runs = tmp(), input = new PassThrough(), reader = new LineReader(input), events: AppEvent[] = [];
+      input.write(JSON.stringify({ type: "steer", text: "开一个编辑器窗口，标题叫 x" }) + "\n");     // in the same batch as the request
+      await sleep(30);
+      await appRun({ run_id: "r", raw: "开一个编辑器窗口", config: "ds-flash" }, { runs, out: (e) => events.push(e), input: reader, linger: 0,
+        inject: { driver: new SimComputer(), gateway: gateway(), ...(inproc ? { model: { model: SCRIPTED_MODEL, streamFn: scriptedStream(OPEN) } } : { agent: { scripted: OPEN } }) } });
+      return lines(path.join(runs, "r", "trace.jsonl")).filter((t) => t.kind === "steer.applied" || (t.kind === "executor.act")).map((t) => t.kind === "executor.act" ? `act:${t.status}` : t.kind);
+    };
+    const inproc = await go(true);
+    expect(inproc).toEqual(["steer.applied", "act:ok"]);
+    expect(await go(false)).toEqual(inproc);
+  }, 30_000);
+
   it("DESKMIND_EXECUTOR_INPROC=1: the loop runs in the executor's process, the same events, its log still its own", async () => {
     process.env.DESKMIND_EXECUTOR_INPROC = "1";
     const r = run(OPEN);

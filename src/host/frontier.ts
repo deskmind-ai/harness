@@ -98,7 +98,10 @@ export class FrontierRuntime {
   get counters(): Record<string, number> { return sum(this.service.counters, this.loop ? this.loop.counters : this.agentCounters); }
 
   /** The user changed what they want mid-run (the protocol's steer): to the executor, which applies it between steps. */
-  steer(raw: string) { this.service.steer(raw); this.agent?.steer(); }
+  steer(raw: string) { this.service.steer(raw); if (this.agent) this.agent.steer(); else this.steeredEarly = true; }
+  /** A steer came before the runtime's process was started (read with the request): it is told once it is there, so its
+   *  first turn hears the words, as the loop in process does (its first poll) — review of P2. */
+  private steeredEarly = false;
 
   /** The app's stop: the executor refuses every later action and lets go of an open card; the loop stops. */
   stop(why = "stopped") {
@@ -130,6 +133,7 @@ export class FrontierRuntime {
     const served = serve(server, agent.peer, (l) => emit("mcp.error", { text: l }));
     emit("agent.start", { pid: agent.pid ?? null });
     if (this.stopped) agent.stop(this.stopped);         // stopped before the process was there
+    if (this.steeredEarly) agent.steer();
     const endCalled = new Promise<"end">((r) => { this.onEnded = () => r("end"); if (this.ended) r("end"); });
     const first = await Promise.race([endCalled, agent.exited.then(() => "gone" as const), agent.peer.closed.then(() => "gone" as const)]);
     if (first === "end") {
@@ -146,6 +150,8 @@ export class FrontierRuntime {
     agent.kill();
     const detail = ex ? (ex.signal ?? `code ${ex.code}`) : "pipe closed";
     emit("agent.exit", { code: ex?.code ?? null, signal: ex?.signal ?? null, ms: Date.now() - agent.startedAt });
+    // a line it wrote before it went and that is read only now is not served: the run is ending (review of P2)
+    served.refuse(AGENT_EXITED);
     this.service.stop(`${AGENT_EXITED} (${detail})`, "failed");
     await served.idle();
     if (this.ended) return this.ended;                   // it asked for the end before it went

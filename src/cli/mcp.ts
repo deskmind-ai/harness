@@ -163,7 +163,9 @@ export const isStop = (msg: Json) => msg.method === "tools/call" && (msg.params 
  *  every request received so far has been answered (an act at the driver has its receipt). */
 export function serve(server: McpExecutorServer, peer: JsonRpcPeer, log: (line: string) => void = () => {}) {
   let queue: Promise<void> = Promise.resolve();
+  let refused: string | null = null;
   peer.onRequest = (msg) => {
+    if (refused !== null) { peer.respond({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: refused } }); return; }
     const at = Date.now();
     const answer = (res: Json | null) => { if (res) peer.respond(res); };
     if (isStop(msg) || msg.method === "ping") { void server.handle(msg, at).then(answer, (e) => log(String(e))); return; }
@@ -172,6 +174,8 @@ export function serve(server: McpExecutorServer, peer: JsonRpcPeer, log: (line: 
   peer.onNotification = (method, params) => { void server.handle({ jsonrpc: "2.0", method, params }); };
   return {
     async idle() { let q: Promise<void>; do { q = queue; await q; } while (q !== queue); },
+    /** From now on every request is answered with an error, unserved (the caller is gone; what it sent before still is). */
+    refuse(why: string) { refused = why; },
   };
 }
 
