@@ -358,7 +358,7 @@ async function main() {
     for (const t of tasks) {
       if (done.has(`${t.id}#${rep}`)) continue;
       if (a.v) console.log(`\n=== ${t.id} (${t.split}, rep ${rep}): ${t.raw}`);
-      const r = { ...(model ? await runTaskRuntime(t, gw, model, capsFor(t), new SimUser(t), out, a.v!, rep) : await runTask(t, gw, out, a.v!, library, rep, policy)), rep };
+      const r = { ...(model ? await runTaskRuntime(t, gw, model, capsFor(t), new SimUser(t), out, a.v!, rep, a.loop ?? roleTable.goal.model) : await runTask(t, gw, out, a.v!, library, rep, policy)), rep };
       fs.appendFileSync(resPath, JSON.stringify(r) + "\n");
       console.log(`${r.correct ? "✓" : "✗"} ${t.id}#${rep} ${r.status} (${(r.reason ?? "").slice(0, 60)}) calls=${r.model_calls} $${r.cost_usd.toFixed(4)} ${r.seconds}s ${r.correct ? "" : r.why.slice(0, 80)}`);
       if (gw.spentUsd >= Number(a["max-cost"])) { console.log("cost cap reached, stopping"); break outer; }

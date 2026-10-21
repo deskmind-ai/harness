@@ -3,129 +3,536 @@
     "name": "begin",
     "inputSchema": {
       "type": "object",
+      "required": [
+        "raw"
+      ],
       "properties": {
         "raw": {
           "type": "string"
         }
-      },
-      "required": [
-        "raw"
-      ]
+      }
     }
   },
   {
     "name": "snapshot",
     "inputSchema": {
       "type": "object",
-      "properties": {},
-      "required": []
+      "properties": {}
     }
   },
   {
     "name": "observe",
     "inputSchema": {
       "type": "object",
+      "required": [
+        "window"
+      ],
       "properties": {
         "window": {
           "type": "string"
         }
-      },
-      "required": [
-        "window"
-      ]
-    }
-  },
-  {
-    "name": "plan",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "steps": {
-          "type": "array"
-        },
-        "readings": {
-          "type": "array"
-        }
-      },
-      "required": [
-        "steps"
-      ]
+      }
     }
   },
   {
     "name": "classify",
     "inputSchema": {
       "type": "object",
+      "required": [
+        "action"
+      ],
       "properties": {
         "action": {
-          "type": "object"
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "const": "click"
+                },
+                {
+                  "type": "string",
+                  "const": "double_click"
+                },
+                {
+                  "type": "string",
+                  "const": "set_value"
+                },
+                {
+                  "type": "string",
+                  "const": "type"
+                },
+                {
+                  "type": "string",
+                  "const": "select"
+                },
+                {
+                  "type": "string",
+                  "const": "key"
+                },
+                {
+                  "type": "string",
+                  "const": "scroll"
+                },
+                {
+                  "type": "string",
+                  "const": "open_window"
+                },
+                {
+                  "type": "string",
+                  "const": "close_window"
+                },
+                {
+                  "type": "string",
+                  "const": "focus_window"
+                },
+                {
+                  "type": "string",
+                  "const": "wait"
+                }
+              ]
+            },
+            "window": {
+              "type": "string",
+              "description": "窗口 id（open_window、wait 不用）"
+            },
+            "target": {
+              "type": "string",
+              "description": "元素 id，来自 computer_observe"
+            },
+            "value": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "option": {
+              "type": "string"
+            },
+            "chord": {
+              "type": "string",
+              "description": "按键，如 cmd+s、return"
+            },
+            "dy": {
+              "type": "number"
+            },
+            "app": {
+              "type": "string",
+              "description": "open_window：应用名"
+            },
+            "url": {
+              "type": "string"
+            },
+            "ms": {
+              "type": "number"
+            }
+          }
         },
         "epoch": {
           "type": "number"
         },
         "consequence": {
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "read"
+            },
+            {
+              "type": "string",
+              "const": "create"
+            },
+            {
+              "type": "string",
+              "const": "modify_user"
+            },
+            {
+              "type": "string",
+              "const": "external"
+            }
+          ]
         }
-      },
-      "required": [
-        "action"
-      ]
+      }
     }
   },
   {
     "name": "act",
     "inputSchema": {
       "type": "object",
+      "required": [
+        "action",
+        "epoch",
+        "consequence",
+        "purpose"
+      ],
       "properties": {
         "action": {
-          "type": "object"
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "const": "click"
+                },
+                {
+                  "type": "string",
+                  "const": "double_click"
+                },
+                {
+                  "type": "string",
+                  "const": "set_value"
+                },
+                {
+                  "type": "string",
+                  "const": "type"
+                },
+                {
+                  "type": "string",
+                  "const": "select"
+                },
+                {
+                  "type": "string",
+                  "const": "key"
+                },
+                {
+                  "type": "string",
+                  "const": "scroll"
+                },
+                {
+                  "type": "string",
+                  "const": "open_window"
+                },
+                {
+                  "type": "string",
+                  "const": "close_window"
+                },
+                {
+                  "type": "string",
+                  "const": "focus_window"
+                },
+                {
+                  "type": "string",
+                  "const": "wait"
+                }
+              ]
+            },
+            "window": {
+              "type": "string",
+              "description": "窗口 id（open_window、wait 不用）"
+            },
+            "target": {
+              "type": "string",
+              "description": "元素 id，来自 computer_observe"
+            },
+            "value": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "option": {
+              "type": "string"
+            },
+            "chord": {
+              "type": "string",
+              "description": "按键，如 cmd+s、return"
+            },
+            "dy": {
+              "type": "number"
+            },
+            "app": {
+              "type": "string",
+              "description": "open_window：应用名"
+            },
+            "url": {
+              "type": "string"
+            },
+            "ms": {
+              "type": "number"
+            }
+          }
         },
         "epoch": {
           "type": "number"
         },
         "consequence": {
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "read"
+            },
+            {
+              "type": "string",
+              "const": "create"
+            },
+            {
+              "type": "string",
+              "const": "modify_user"
+            },
+            {
+              "type": "string",
+              "const": "external"
+            }
+          ]
         },
         "purpose": {
+          "type": "string",
+          "description": "这一步为了什么，一句话"
+        }
+      }
+    }
+  },
+  {
+    "name": "file",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "capability",
+        "args"
+      ],
+      "properties": {
+        "capability": {
           "type": "string"
         },
-        "consent": {
-          "type": "object"
+        "args": {
+          "type": "object",
+          "patternProperties": {
+            "^.*$": {
+              "type": "string"
+            }
+          }
         }
-      },
-      "required": [
-        "action"
-      ]
+      }
     }
   },
   {
-    "name": "verify",
+    "name": "plan",
     "inputSchema": {
       "type": "object",
+      "required": [
+        "steps"
+      ],
       "properties": {
-        "summary": {
+        "steps": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "purpose",
+              "objects",
+              "consequence"
+            ],
+            "properties": {
+              "purpose": {
+                "type": "string"
+              },
+              "objects": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "consequence": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "const": "read"
+                  },
+                  {
+                    "type": "string",
+                    "const": "create"
+                  },
+                  {
+                    "type": "string",
+                    "const": "modify_user"
+                  },
+                  {
+                    "type": "string",
+                    "const": "external"
+                  }
+                ]
+              },
+              "opens": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "app",
+                    "url"
+                  ],
+                  "properties": {
+                    "app": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "sends": {
+                      "type": "string",
+                      "description": "网址会把什么发到这个网站，一句话，比如「搜索『北京天气』」"
+                    }
+                  }
+                },
+                "description": "这一步用 open_window 打开的网址：应用、网址、发过去的内容"
+              }
+            }
+          }
+        },
+        "readings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "point",
+              "reading",
+              "alternatives",
+              "evidence"
+            ],
+            "properties": {
+              "point": {
+                "type": "string"
+              },
+              "reading": {
+                "type": "string"
+              },
+              "alternatives": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "evidence": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "ask_user",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "question",
+        "options"
+      ],
+      "properties": {
+        "question": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "answer",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
           "type": "string"
         }
-      },
-      "required": [
-        "summary"
-      ]
+      }
     }
   },
   {
-    "name": "stop",
+    "name": "read_skill",
     "inputSchema": {
       "type": "object",
-      "properties": {},
-      "required": []
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "finish",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "outcome",
+        "summary"
+      ],
+      "properties": {
+        "outcome": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "done"
+            },
+            {
+              "type": "string",
+              "const": "unconfirmed"
+            },
+            {
+              "type": "string",
+              "const": "cannot"
+            },
+            {
+              "type": "string",
+              "const": "stopped"
+            }
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "missing": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "steers",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
     }
   },
   {
     "name": "end",
     "inputSchema": {
       "type": "object",
-      "properties": {},
-      "required": []
+      "properties": {
+        "failure": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "stop",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
     }
   }
 ]

@@ -338,7 +338,7 @@ describe("executor port: the runtime cannot sign", () => {
     const svc = new ExecutorService({ task: "t1", raw: RAW, executor: ex, signer, user: { ask: () => null }, gateway: judge().gw });
     const port = svc.port as unknown as Record<string, unknown>;
     expect(Object.isFrozen(port)).toBe(true);
-    expect(Object.keys(port).sort()).toEqual(["act", "answer", "askUser", "begin", "end", "file", "finish", "observe", "plan", "readSkill", "snapshot", "steers"]);
+    expect(Object.keys(port).sort()).toEqual(["act", "answer", "askUser", "begin", "classify", "end", "file", "finish", "observe", "plan", "readSkill", "snapshot", "steers"]);
     expect(Object.values(port).every((v) => typeof v === "function")).toBe(true);
     // the service keeps the signer in a private field: not a property anyone can read
     expect(Object.values(svc).some((v) => v === signer)).toBe(false);
@@ -433,7 +433,7 @@ describe("executor port: a steer withdraws the plan's consent", () => {
     // covered by the plan: no card
     expect((await port.act({ action: { kind: "click", window: w, target: `${w}:0:row:m1` }, epoch: o.epoch, consequence: "modify_user", purpose: "选中" })).isError).toBeFalsy();
     svc.steer("别动这个窗口了");
-    expect(port.steers()).toEqual(["别动这个窗口了"]);
+    expect(await port.steers()).toEqual(["别动这个窗口了"]);
     o = await port.observe(w);
     const r = await port.act({ action: { kind: "click", window: w, target: `${w}:0:row:m2` }, epoch: o.epoch, consequence: "modify_user", purpose: "选中另一封" });
     expect(r.isError).toBe(true);

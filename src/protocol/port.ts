@@ -1,7 +1,8 @@
 /**
- * The executor port: what a runtime (our agent loop today, Codex or another MCP client later) may ask of the executor,
- * and nothing else. It is the TypeScript shape of the MCP tool set the executor will serve once the runtime runs in a
- * child process (executor split P2, deskmind#90 item 6); in P1 the runtime calls it in process.
+ * The executor port: what a runtime (our agent loop, Codex or another MCP client) may ask of the executor, and nothing
+ * else. It is the TypeScript shape of the MCP tool set the executor serves (protocol/tools.ts, cli/mcp.ts): since P2
+ * (deskmind#90 item 6) our runtime runs in a child process of the executor and reaches this port over MCP on its
+ * stdin/stdout (transport/mcp-port.ts); with DESKMIND_EXECUTOR_INPROC=1 it calls it in process, as in P1.
  *
  * Everything that keeps the user safe sits behind it: the signing key, the cards (plan, ambiguity, action consent,
  * questions, the result card), the start gate, the intent check, skills, verification and undo, and the task's final
@@ -58,6 +59,10 @@ export interface TaskResult {
 
 export type FinishOutcome = "done" | "unconfirmed" | "cannot" | "stopped";
 
+/** What an action would be: its consequence class, the object it touches, who settled the class (structure, the
+ *  caller's own higher class, a judge tier, or nothing settled), and whether it needs the user's yes. */
+export interface Classified { consequence: Consequence; object: string; why: string; by: string; needs_consent: boolean }
+
 export interface ExecutorPort {
   /** Start the task: everything on screen now is the user's. */
   begin(): Promise<Begun>;
@@ -68,6 +73,10 @@ export interface ExecutorPort {
   /** One action on screen. The executor settles its class, asks the user when it needs consent (and waits), signs the
    *  yes, and acts. */
   act(p: { action: Action; epoch: number; consequence: Consequence; purpose: string }): Promise<ToolReply>;
+  /** Read-only: what `act` would class this action as (the same answer: an action on one epoch is classed once, and
+   *  `act` does not take this one on trust — it classes again and gets the kept answer). Asks the outgoing judge when a
+   *  UI action may send; nothing is done. */
+  classify(p: { action: Action; epoch?: number; consequence?: Consequence }): Promise<Classified>;
   /** One file capability on the task folder (a `FileTool`), under the same guard. */
   file(p: { capability: string; args: Record<string, string> }): Promise<ToolReply>;
   /** The plan: the start gate (readings the judge cannot settle are asked of the user), then one plan card for the
@@ -84,8 +93,10 @@ export interface ExecutorPort {
   /** What the user said mid-run (steer) that no reply has carried yet, applied now — between two steps, never during
    *  one. A step the caller asks for while one is pending is not done: its reply carries the new words instead, and
    *  every further step is refused the same way until the caller calls this again (at its next turn: the steps it had
-   *  decided before hearing the words are not done). */
-  steers(): string[];
+   *  decided before hearing the words are not done). Async since P2: over MCP it is a call (`steers`). A caller in a
+   *  child process of the executor (our runtime) is also told, by a `notifications/deskmind/steer` push, that words are
+   *  waiting, and calls this only then or after a reply that carried words; any other caller calls it at every turn. */
+  steers(): Promise<string[]>;
   /** Close the task and give its result. `failure`: why the caller is giving up (a budget, a model error), used only
    *  when the executor has not settled the status itself. */
   end(p?: { failure?: string }): Promise<TaskResult>;

@@ -20,7 +20,7 @@ import * as P from "../orchestrator/prompts.js";
 import type { Gateway } from "../gateway/index.js";
 import type { Answer, Card, CardAsker, CardOption } from "../protocol/cards.js";
 import { canon, siteOf, type ConsentProvider } from "../protocol/consent.js";
-import type { Begun, ExecutorPort, FileTool, FinishOutcome, PlanStepIn, TaskResult, TaskStatus, ToolReply } from "../protocol/port.js";
+import type { Begun, Classified, ExecutorPort, FileTool, FinishOutcome, PlanStepIn, TaskResult, TaskStatus, ToolReply } from "../protocol/port.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import { Executor, appName, cardText, describeAction, windowLabel } from "./executor.js";
@@ -143,11 +143,12 @@ export class ExecutorService {
     const port: ExecutorPort = {
       begin: () => (this.begun ? Promise.reject(new Error("begin was already called for this task")) : this.begin()),
       snapshot: () => this.o.executor.snapshot(), observe: (w) => this.o.executor.observe(w),
+      classify: async (p): Promise<Classified> => { const ex = this.o.executor; const c = await ex.classify(p.action, p.epoch ?? ex.currentEpoch, p.consequence); return { consequence: c.consequence, object: c.object, why: c.why, by: c.by, needs_consent: NEEDS_CONSENT.has(c.consequence) }; },
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
       act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.act(p))), file: live((p) => this.file(p)),
       plan: live((p) => this.plan(p.steps, p.readings ?? [])),
       askUser: live((p) => this.askUser(p)), answer: live((p) => this.answer(p)), readSkill: (p) => this.readSkill(p), finish: live((p) => this.finish(p)),
-      steers: () => { this.reDecide = false; return this.applySteers(); }, end: (p) => this.end(p),
+      steers: async () => { this.reDecide = false; return this.applySteers(); }, end: (p) => this.end(p),
     };
     this.port = Object.freeze(port);
   }
@@ -165,8 +166,9 @@ export class ExecutorService {
 
   // --- control: the app's stop and steer -----------------------------------------------------------------------------
 
-  /** The app's stop: the executor refuses every later action, an open card is left unanswered, the task ends stopped. */
-  stop(why = "stopped") { this.o.executor.stop(); if (!this.status) { this.status = "stopped"; this.reason = why; } this.stopped.abort(); }
+  /** The app's stop: the executor refuses every later action, an open card is left unanswered, the task ends stopped.
+   *  `as`: the status when the stop is not the user's (the runtime process died: "failed"). */
+  stop(why = "stopped", as: TaskStatus = "stopped") { this.o.executor.stop(); if (!this.status) { this.status = as; this.reason = why; } this.stopped.abort(); }
 
   /** The user changed what they want mid-run (the protocol's steer). Nothing changes mid-step: the words wait until the
    *  step in progress is over (`applySteers`). A card open now is voided at once — its answer was for the old words —
