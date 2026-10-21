@@ -20,14 +20,17 @@ import * as R from "../protocol/roles.js";
  *  it is the top tier (the provenance question's「没有」, executor.ts). */
 export interface JudgeTier { name: string; gateway: Gateway; role?: Role; floor?: number; local?: boolean }
 export interface JudgeOption { id: string; text: string }
-export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean; missing_kind?: "action" | "evidence" }
+export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean; missing_kind?: "action" | "evidence"; claims_contradicted?: string[] }
 /** How one question is routed (all optional; leaving them out keeps the behaviour every question had before):
  *  - `settle`: the option a lower tier may settle on its own above its floor; the default is the first option (the
  *    direction a later check still covers). The outgoing check's safe direction is「会发出去」, so it names that.
  *  - `route: false`: this question is never skipped for a lower tier by the "settles too rarely" rule — a question
  *    whose lower tier is meant to escalate most of the time (and is measured on those escalations) would otherwise be
- *    taken away from it before any comparisons are in. */
-export interface ChooseOptions { settle?: string; route?: boolean }
+ *    taken away from it before any comparisons are in.
+ *  - `claims`: the answer also lists claims_contradicted (the finish verdict). */
+export interface ChooseOptions { settle?: string; route?: boolean;
+  /** the answer also lists the sentences of the run's own account that the evidence contradicts (the finish verdict) */
+  claims?: boolean }
 
 /** How often a lower tier settles each kind of question (kinds: the question's first words — intent, verify, and
  *  the evidence questions share a prefix), kept across tasks when a path is given: a tier that never settles a kind
@@ -104,6 +107,7 @@ export class Judge {
     // own limits already bound how many questions a task can raise, and the cache stops repeats). Evaluations may set one.
     if (this.opts.budget !== undefined && this.calls >= this.opts.budget) { this.opts.onEvent?.("judge.budget", {}); return null; }
     const ids = options.map((o) => o.id) as [string, ...string[]];
+    const schema = R.choiceAnswer(ids, { claims: how.claims });
     const kind = TierStats.kindOf(question, context);
     let last: JudgeAnswer | null = null, settled = false, settledBy: JudgeTier | null = null, lower: JudgeAnswer | null = null;
     const escalations: JudgeAnswer[] = [];                // lower tiers that answered and passed the question up
@@ -117,18 +121,19 @@ export class Judge {
     // abandoning it (with both on, aborting first left the agreement routing with no samples — deskmind#86 review)
     const shadowNow = this.opts.shadow === true || (typeof this.opts.shadow === "number" && Math.random() < this.opts.shadow);
     // the race: the top tier starts now, alongside the lower tiers; abortable
-    type Answer = Reply<z.infer<ReturnType<typeof R.choiceAnswer>>>;
+    type Answer = Reply<z.infer<typeof schema>>;
     const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
-    if (raced) raced.promise = topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids), "", raced.controller.signal);
+    if (raced) raced.promise = topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", raced.controller.signal);
     for (const tier of this.tiers) {
       const final = tier === topTier;
       if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
-      const rep = final && raced?.promise ? await raced.promise : await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids));
+      const rep = final && raced?.promise ? await raced.promise : await tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema);
       if (rep.outcome !== "answered") { this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
-      last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason, ...(rep.data!.missing_kind ? { missing_kind: rep.data!.missing_kind } : {}) };
+      const claims = (rep.data as { claims_contradicted?: string[] }).claims_contradicted;
+      last = { choice: rep.data!.choice, by: tier.name, confidence, reason: rep.data!.reason, ...(rep.data!.missing_kind ? { missing_kind: rep.data!.missing_kind } : {}), ...(how.claims && Array.isArray(claims) ? { claims_contradicted: claims } : {}) };
       if (final) {
         settled = true; sample(last.choice);
         // every lower answer that was passed up now has the top's answer beside it: counted per lower choice
@@ -146,7 +151,7 @@ export class Judge {
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
     if (settled && settledBy && shadowNow) {
-      const rep = raced?.promise ? await raced.promise : await topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, R.choiceAnswer(ids));
+      const rep = raced?.promise ? await raced.promise : await topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema);
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
       if (agree !== null) this.opts.stats?.noteAgreement(settledBy.name, kind, agree);
       if (rep.outcome === "answered") sample(rep.data!.choice);
@@ -246,6 +251,7 @@ export const VERIFY_QUESTION = [
   "每条都被证明才选 pass；有一条证据矛盾选 fail；有一条证据不够、没有或间接，选 unknown。reason 里写明哪一条、缺什么。",
   "证据里的「正在发声的应用」是系统给的事实（哪个应用正在往扬声器送声音，不含曲目名）：标着「任务开始时就在发声」的不算本任务做的；「任务期间开始发声」的可以作为在播放的证据，是哪一首看窗口里的标题。",
   "选 unknown 时，missing_kind 写缺的是哪一种：action（还有要求没做、没做完）；evidence（回执里该做的动作都做了，只是现在能看到的证据证明不了结果，比如从画面读的应用里看不出是不是在播放）。",
+  "claims_contradicted：把「模型自称」里和证据矛盾的每一句原样列出来（说做了而没做、说没动而动了、说原来是什么样而证据不是）；没有就给空列表。",
 ].join("\n");
 export const VERIFY_OPTIONS: JudgeOption[] = [
   { id: "pass", text: "做成了：每一条要求都有现在状态的证据" },

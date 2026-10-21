@@ -712,10 +712,10 @@ export class ExecutorService {
 
   /** The independent verdict: the computer and files after, every window the task touched, what it did, its claim — and
    *  the user's words, their answers among them, which the executor holds whatever the caller reports. */
-  private async verify(summary: string): Promise<{ verdict: string; reason: string; by?: string; missing_kind?: "action" | "evidence" }> {
+  private async verify(summary: string): Promise<{ verdict: string; reason: string; by?: string; missing_kind?: "action" | "evidence"; claims_contradicted?: string[] }> {
     this.count("model_calls");
     const v = await this.o.executor.verdict(summary, { 本任务做过的动作: this.effects, ...(this.answers.length ? { "用户对提问的回答（和原话一样是证据）": this.answers } : {}), ...(this.answerText !== null ? { 给用户的答案: this.answerText } : {}) });
-    return { verdict: v.verdict, reason: v.reason, by: v.by, ...(v.missing_kind ? { missing_kind: v.missing_kind } : {}) };
+    return { verdict: v.verdict, reason: v.reason, by: v.by, ...(v.missing_kind ? { missing_kind: v.missing_kind } : {}), ...(v.claims_contradicted ? { claims_contradicted: v.claims_contradicted } : {}) };
   }
 
   // --- the end, the result card and undo ----------------------------------------------------------------------------------

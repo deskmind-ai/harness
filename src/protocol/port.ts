@@ -51,7 +51,10 @@ export type TaskStatus = "succeeded" | "unconfirmed" | "failed" | "cancelled" | 
 export interface TaskResult {
   status: TaskStatus; reason: string; summary: string; answer: string | null;
   counters: Record<string, number>; consents: { scope: string; object: string; consequence: Consequence }[];
-  effects: string[]; verdicts: { verdict: string; reason: string }[];
+  effects: string[];
+  /** The finish verdicts, in order; claims_contradicted: the sentences of the run's account the judge found
+   *  contradicted by the evidence (absent when the judge left the field out). */
+  verdicts: { verdict: string; reason: string; claims_contradicted?: string[] }[];
   /** Shown with the result, not blocking: 「好的」, and 「撤回」 when every effect can be taken back. */
   result_card: Card | null;
 }
