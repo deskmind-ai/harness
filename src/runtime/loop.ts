@@ -18,7 +18,8 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { compact } from "./compact.js";
 import { costOf, priceEstimated } from "../gateway/index.js";
-import { current as traceContext } from "../otel/context.js";
+import { current as traceContext, within, type SpanLike } from "../otel/context.js";
+import { chatAttrs, span } from "../otel/trace.js";
 import { CONSEQUENCES, type Consequence } from "../protocol/consent.js";
 import type { Action, Reading } from "../protocol/computer.js";
 import type { Begun, ExecutorPort, FinishOutcome, PlanStepIn, TaskResult, TaskStatus, ToolReply } from "../protocol/port.js";
@@ -90,6 +91,20 @@ export class AgentLoop {
     if (r.done) this.over = true;
     if (r.steers?.length) this.heard.push(...r.steers);
     return { ...(r.isError ? err(r.text) : text(r.text)), ...(r.done ? { terminate: true } : {}) };
+  }
+
+  /** The model turn in progress, as a span (when the run is traced): the tool calls of the turn are its children. */
+  private turnSpan: SpanLike | null = null;
+
+  /** Every tool as a span of its own under the turn (execute_tool, per the GenAI conventions): what the executor does
+   *  for it nests below. */
+  private traced(tools: AgentTool<any>[]): AgentTool<any>[] {
+    return tools.map((t) => ({ ...t, execute: (id: string, p: unknown, ...rest: unknown[]) => within(this.turnSpan ? { span: this.turnSpan } : {}, () =>
+      span(`execute_tool ${t.name}`, { "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": t.name, "gen_ai.tool.call.id": id, "gen_ai.tool.type": "function" }, async (s) => {
+        const r = await (t.execute as (...a: unknown[]) => Promise<AgentToolResult>)(id, p, ...rest);
+        if (r.isError) s?.set({ "deskmind.tool.error": true });
+        return r;
+      })) }) as AgentTool<any>);
   }
 
   // --- tools ---------------------------------------------------------------------------------------------------------
@@ -166,7 +181,7 @@ export class AgentLoop {
         { role: "system", content: this.systemPrompt(b), timestamp: Date.now() },
         { role: "user", content: `用户的要求：${this.o.raw}\n\n现在整台电脑的状态：${J(b.snapshot)}${recovery}`, timestamp: Date.now() },
       ],
-      tools: this.tools(b),
+      tools: this.traced(this.tools(b)),
     };
     let turns = 0, calls = 0, nudge = false;
     // one model call per turn: when it was sent (the turn's start) and how much went with it, for its record
@@ -208,8 +223,16 @@ export class AgentLoop {
       },
     };
     const spec = `${this.o.model.model.provider}|${this.o.model.model.id}`;
+    // the call chain (otel/trace.ts), when the run is traced: a span per turn, the model's call in it
+    const { tracer, span: runSpan } = traceContext();
+    let chat: SpanLike | null = null;
+    const endTurn = () => { if (chat && tracer) { chat.fail("the turn ended without an answer"); tracer.end(chat); chat = null; } if (this.turnSpan && tracer) { tracer.end(this.turnSpan); this.turnSpan = null; } };
     const emit = async (e: AgentEvent) => {
-      if (e.type === "turn_start") turnAt = Date.now();
+      if (e.type === "turn_start") {
+        turnAt = Date.now();
+        if (tracer) { endTurn(); this.turnSpan = tracer.start("deskmind.turn", { parent: runSpan ?? null, attrs: { "deskmind.turn": turns + 1 } }); chat = tracer.start(`chat ${this.o.model.model.id}`, { kind: "client", parent: this.turnSpan }); }
+      }
+      if (e.type === "turn_end") endTurn();
       if (e.type === "message_end" && e.message.role === "assistant") {
         this.count("model_calls"); const u = e.message.usage; this.count("tokens_in", u.input + (u.cacheRead ?? 0)); this.count("tokens_out", u.output);
         // the acting model's call, recorded like the gateway's (role "loop"): tokens, cost by the price table when pi-ai
@@ -224,6 +247,12 @@ export class AgentLoop {
             cost_usd: Number((u.cost?.total || costOf(spec, tokensIn, u.output, cacheRead)).toFixed(9)), ...(priced && priceEstimated(spec, cacheRead) ? { cost_estimated: true } : {}), latency_ms: Date.now() - turnAt, sent_chars: sentChars,
             tool_calls: m.content.filter((c) => c.type === "toolCall").length, ...(m.errorMessage ? { error: m.errorMessage.slice(0, 300) } : {}) });
         } catch { /* recording never stops the loop */ }
+        if (chat && tracer) {
+          const cost = Number((u.cost?.total || costOf(spec, tokensIn, u.output, cacheRead)).toFixed(9));
+          chat.set({ ...chatAttrs({ model: spec, role: "loop", tokens_in: tokensIn, cache_read: cacheRead, tokens_out: u.output, cost_usd: cost, outcome: m.stopReason }), "gen_ai.response.finish_reasons": [m.stopReason], "deskmind.sent_chars": sentChars });
+          if (m.stopReason === "error" || m.stopReason === "aborted") chat.fail(m.errorMessage ?? m.stopReason);
+          tracer.end(chat); chat = null;
+        }
       }
     };
     try {
@@ -231,6 +260,7 @@ export class AgentLoop {
     } catch (e) {
       this.giveUp(`loop error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
     }
+    endTurn();
     return port.end(this.failure ? { failure: this.failure } : {});
   }
 }

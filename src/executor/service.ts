@@ -26,6 +26,7 @@ import type { Workspace } from "../registry/workspace.js";
 import { randomUUID } from "node:crypto";
 import { Executor, appName, cardText, describeAction, elementName, stepText, windowLabel } from "./executor.js";
 import { current, within } from "../otel/context.js";
+import { span } from "../otel/trace.js";
 import { defaultJudge } from "./judge.js";
 import { T, type Lang } from "./text.js";
 import { NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "./types.js";
@@ -235,7 +236,16 @@ export class ExecutorService {
   }
 
   // --- cards -----------------------------------------------------------------------------------------------------------
-  private async askCard(card: Card): Promise<Got> {
+  /** A card, waiting for the user (its span: the wait in the call chain, and how it was answered). */
+  private askCard(card: Card): Promise<Got> {
+    return span("deskmind.ask_user", { "deskmind.card.kind": card.kind, "deskmind.card.blocking": card.blocking }, async (s) => {
+      const got = await this.askCardNow(card);
+      s?.set({ "deskmind.card.answer": got === "voided" ? "voided" : !got ? "none" : got.option?.kind ?? "text" });
+      return got;
+    });
+  }
+
+  private async askCardNow(card: Card): Promise<Got> {
     // a steer that came before the card was shown: its answer would be to the old words
     if (this.pending.length) return "voided";
     this.count("cards"); this.count(`cards:${card.kind}`);
@@ -391,16 +401,20 @@ export class ExecutorService {
     this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
       human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role } } : {}),
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
-    let reply: ToolReply;
-    try { reply = await within({ step_id }, body); }
-    catch (e) { this.results.delete(step_id); this.answered.delete(step_id); this.emit("step.end", { step_id, status: "error", why: String(e instanceof Error ? e.message : e).slice(0, 300) }); throw e; }
-    const r = this.results.get(step_id) ?? null;
-    const user = this.answered.get(step_id);
-    this.results.delete(step_id); this.answered.delete(step_id);
-    const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
-    const why = user ?? r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
-    this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}) });
-    return reply;
+    return span("deskmind.step", { "deskmind.step_id": step_id, "deskmind.action.kind": a.kind, "deskmind.consequence.declared": consequence, "deskmind.plan_step": p.plan_step }, async (sp) => {
+      let reply: ToolReply;
+      try { reply = await within({ step_id }, body); }
+      catch (e) { this.results.delete(step_id); this.answered.delete(step_id); this.emit("step.end", { step_id, status: "error", why: String(e instanceof Error ? e.message : e).slice(0, 300) }); throw e; }
+      const r = this.results.get(step_id) ?? null;
+      const user = this.answered.get(step_id);
+      this.results.delete(step_id); this.answered.delete(step_id);
+      const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
+      const why = user ?? r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
+      this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}) });
+      sp?.set({ "deskmind.step.status": status, "deskmind.executor_status": r?.status, "deskmind.consequence": r?.consequence, "deskmind.object": r?.object });
+      if (status === "error") sp?.fail(why || "error");
+      return reply;
+    });
   }
 
   // --- acting ----------------------------------------------------------------------------------------------------------
@@ -529,7 +543,11 @@ export class ExecutorService {
   }
 
   // --- the plan: the start gate and the plan card ------------------------------------------------------------------------
-  private async plan(steps: PlanStepIn[], readings: Reading[]): Promise<ToolReply> {
+  private plan(steps: PlanStepIn[], readings: Reading[]): Promise<ToolReply> {
+    return span("deskmind.plan", { "deskmind.plan.steps": steps.length, "deskmind.plan.readings": readings.length }, () => this.planNow(steps, readings));
+  }
+
+  private async planNow(steps: PlanStepIn[], readings: Reading[]): Promise<ToolReply> {
     const s = this.steered(); if (s) return s;
     const ex = this.o.executor;
     this.count("plans");
@@ -779,7 +797,15 @@ export class ExecutorService {
 
   /** The independent verdict: the computer and files after, every window the task touched, what it did, its claim — and
    *  the user's words, their answers among them, which the executor holds whatever the caller reports. */
-  private async verify(summary: string): Promise<{ verdict: string; reason: string; by?: string; missing_kind?: "action" | "evidence"; claims_contradicted?: string[] }> {
+  private verify(summary: string): Promise<{ verdict: string; reason: string; by?: string; missing_kind?: "action" | "evidence"; claims_contradicted?: string[] }> {
+    return span("deskmind.verify", {}, async (s) => {
+      const v = await this.verifyNow(summary);
+      s?.set({ "deskmind.verdict": v.verdict, "deskmind.tier": v.by, "deskmind.missing_kind": v.missing_kind });
+      return v;
+    });
+  }
+
+  private async verifyNow(summary: string): Promise<{ verdict: string; reason: string; by?: string; missing_kind?: "action" | "evidence"; claims_contradicted?: string[] }> {
     this.count("model_calls");
     const v = await this.o.executor.verdict(summary, { 本任务做过的动作: this.effects, ...(this.answers.length ? { "用户对提问的回答（和原话一样是证据）": this.answers } : {}), ...(this.answerText !== null ? { 给用户的答案: this.answerText } : {}) });
     return { verdict: v.verdict, reason: v.reason, by: v.by, ...(v.missing_kind ? { missing_kind: v.missing_kind } : {}), ...(v.claims_contradicted ? { claims_contradicted: v.claims_contradicted } : {}) };
