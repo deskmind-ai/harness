@@ -95,7 +95,7 @@ MCP（JSON-RPC 2.0，stdio，每行一条）。服务名 `deskmind-executor`，�
 
 app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身（`{raw, config, …}`，或用 `--request <file>` 给），之后是控制行，按 `type` 分四种（`src/protocol/control.ts`）：
 
-- **请求里的 `context`（H2 加的，可选，不升版本）：** 会话里的模型开电脑任务时，它对要做的事的转述放在这里，`raw` 只放用户自己的原话。运行时只在给模型的第一条消息里显示它，标明「助手的转述，不是用户原话（以用户的要求为准）」；执行层和判官不读它：判官当作用户的话的只有 `raw`、之后的 steer 和卡片上的回答。
+- **请求里的 `context`（H2 加的，可选，不升版本）：** 会话里的模型开电脑任务时，它对要做的事的转述放在这里，`raw` 只放用户自己的原话。运行时只在给模型的第一条消息里显示它，标明「助手的转述，不是用户原话（以用户的要求为准）」；判官当作用户的话的只有 `raw`、之后的 steer 和卡片上的回答。执行层把 `context` 当作**读过的材料**（和读过的文件、窗口一样）：它是模型写的，可能带着前一个任务读到、经结果摘要回到聊天模型的内容。所以带 `context` 的运行一开始就有材料，打开没有批准过的网站要问出处判官（以 `raw` 为准），判官说不清就是往外发，要先有计划、出卡（review of #54）。
 
 | type | 内容 | 什么时候 |
 |---|---|---|
@@ -111,6 +111,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - 0.8 秒时还没结束：如果有一个改东西的动作已经交给驱动、还没回音（hands 一个动作最长可以等 120 秒，它可能在「停下」之后才生效），就再等它的回执，最多 10 秒。等到了，照常结束；等不到，`task_done` 的 reason 写 "a step was in progress; its result is unknown"，并把这个动作的对象列进 `changes.unconfirmed`，不说成干净地停了。没有这样的动作，就直接写 `task_done` 退出。
 - 第二个信号：不再等。`task_done` 还没写的就写上（规则同上），然后立刻退出，不等 stdout 写完。
 - 还没读到任务就收到信号：直接退出。
+- **读 stdout 的一方没了（H2 加的）：** 写事件时 stdout 报错（EPIPE：会话进程或 app 死了），按 stop 行同样处理：整次运行停下（reason "the app went away (stdout closed)"），正在驱动那里的动作照旧等它的回执，事件只写进运行目录的 `events.jsonl`，不再写 stdout；之后照常写 `task_done` 退出（退出码 0）。等模型或等卡片时它不写东西，这期间发现不了，直到下一个事件。
 
 ## 四、兼容规则
 
@@ -167,6 +168,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `card_open` | 任务在等用户回答卡片时来了 `say`、`steer` 或 `queue_send_now`（H2）。卡片要在卡片上答：app 这时禁用输入框，要打字的卡有自己的输入框（`answer{text}`） | 否 |
 | `no_task` | `steer`、`answer`、`respond`、`stop{run_id}`、`attach{run_id}` 说的任务不是这个会话的、已经关了，或者没有任务在跑（H2） | 否 |
 | `undo_expired` | `respond` 来的时候这台 Mac 上已经开始了别的电脑任务，撤回过期了（H2）。这个任务同时关掉（`task_closed new_task`） | 否 |
+| `bad_control` | 控制行缺它要的东西（H2）：`respond` 没有 `option`，或者它不是结果卡上某个选项的下标（整数）。什么都不占、不转发，之后合格的 `respond` 照常 | 否 |
 | `not_yet` | H1 用过（H2 的控制还没做时），现在不再发 | 否 |
 
 前五个出现时，用户那条消息已经入库了（`reply_to` 指向它）。错误的 `text` 最多 300 字，而且去掉了 key：环境变量里各家服务 key 的实际值（服务可能把收到的 key 原样写进错误里），以及看起来像 key 的 `sk-…`、`Bearer …`。`model-check` 用的是同一个函数（`src/gateway/index.ts` 的 `redactKeys`）。
@@ -182,7 +184,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `cua` | `{"type":"cua","text":"…","scope"?:"…"}` | `/cua`（H2）：不经过模型，直接开电脑任务，`raw` 就是 `text`。`scope` 是这一次的任务目录（不给就用头一行的）。有回复或任务在跑时 `busy` |
 | `steer` | `{"type":"steer","text":"…","run_id"?:"…"}` | 任务进行中补充要求（H2）：原样转给执行层（控制第 1 版的 steer，执行层的规则照旧：两步之间生效，生效时发 `steered`），同时入库 `session.steer` |
 | `answer` | 执行层的 answer 行，加 `run_id` | 回答卡片（H2）：整行原样转给那个任务（不带 `run_id` 就是正在跑的那个）；多出来的字段执行层不看。按选项下标答：`{"type":"answer","run_id":"…","ask_id":"…","option":n}`；卡上自己写：`…,"text":"…"}` |
-| `respond` | 执行层的 respond 行，加 `run_id` | 回答结果卡（撤回等，H2）：转给那个还在等结果卡的执行层（不带 `run_id` 就是最近的一个）。撤回要动电脑，所以这期间占着 `computer.lock`；别的会话的任务正占着时 `computer_busy`，已经开始过别的任务时 `undo_expired` |
+| `respond` | 执行层的 respond 行，加 `run_id` | 回答结果卡（撤回等，H2）：转给那个还在等结果卡的执行层（不带 `run_id` 就是最近的一个）。先检查 `option` 是结果卡上的一个下标，不是就 `bad_control`；撤回要动电脑，所以这期间占着 `computer.lock`；别的会话的任务正占着时 `computer_busy`，已经开始过别的任务时 `undo_expired` |
 | `retry` | `{"type":"retry"}` | 重答最后一条用户消息（H2）：不再存一遍这条消息，入库 `session.retry`，之前对它的回答从上下文里拿掉（其间做过的电脑任务留着：它们真的发生了），然后回复。有回复或任务在跑时 `busy` |
 | `queue_edit` | `{"type":"queue_edit","id":"…","text":"…"}` | 改一条排队的话（H2） |
 | `queue_cancel` | `{"type":"queue_cancel","id":"…"}` | 撤掉一条排队的话（H2） |
@@ -194,14 +196,15 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - 用配置里 `goal` 角色的模型，经 pi-agent-core 的 `runAgentLoop` 调，流式收 `text_delta`。工具只有一个 `computer_task({goal})`（声明在开头的系统消息上，所以服务的提示缓存不受影响）。key 和服务地址从环境变量来（和 `app-run` 一样）。
 - 系统提示：DeskMind 是用户 Mac 上的个人助手（末尾写着今天的本地日期）；它只能通过 `computer_task` 操作电脑；goal 写它的转述，用户原话会原样交给任务；改用户东西、往外发之前任务自己会出卡征得同意，不用先问；一条用户消息最多开 3 个任务；它看不到屏幕和文件，只看得到任务的结果；**只有 status 是 succeeded 才能说做成了**，其他状态如实说；不调 `computer_task` 时不能说自己在电脑上做了什么。`lang` 决定系统提示用中文还是英文。
 - 上下文 = 系统提示 + 入库的消息 + 电脑任务。每个任务在上下文里是模型的一次 `computer_task` 调用（`goal`；`/cua` 的是用户的原话）加上它的结果（`session.task_end` 的那些字段，撤回后来做了写成 `undone n/m`，过期了写成 `expired`），结果紧跟在调用后面。还在跑、没有结果的调用不放进去。超过模型窗口的 60%（按一个字算一个 token）时，从最早的开始整轮丢掉（一轮 = 用户的话和对它的回复，包括其间的任务），一次丢到这个额度的一半左右，系统提示末尾加一句「更早的 n 条对话已省略」（n 是丢掉的条数）。这样丢的位置隔好几轮才动一次，模型读到的开头在这几轮里不变，服务的提示缓存用得上。丢到哪里是把对话一轮一轮重放算出来的（每轮的长度只算一次），同样的历史总得到同样的结果。最新的那一轮（含最新的用户消息）永远不丢。停下前一个字都没说的回复不进上下文；说了一半的进上下文，并注明「这条回复被用户中途停下了」。
-- DeepSeek 在思考模式下，送回去的带工具调用的助手消息必须有 `reasoning_content`，否则回 400。从历史重建的调用（以及 `/cua` 代表的那次调用）没有，会话给它一个空的 `reasoning_content`（服务接受）；这次回复里模型自己的调用带着它自己的。只对 DeepSeek 这样做。
+- DeepSeek 在思考模式下，送回去的带工具调用的助手消息必须有 `reasoning_content`，否则回 400。从历史重建的调用（以及 `/cua` 代表的那次调用）没有，会话给它一个空的 `reasoning_content`（服务接受）；这次回复里模型自己的调用带着它自己的。只对 DeepSeek 这样做：服务是 DeepSeek 自己的，或者模型名里有 deepseek（经代理的）。
 - 一条回复最多 64k 字，到了就截断并停止生成，入库时带 `truncated: true`。
 - 每次模型调用记一行到同一个文件夹的 `model_calls.jsonl`（权限 0600），格式和运行的一样，`role` 是 `session`：`tokens_in`（模型读的全部输入，含提示缓存的部分，那部分另记在 `cache_read`）、`tokens_out`、`cost_usd`（服务没给就按价目表算）、`latency_ms`、`sent_chars`、`outcome`，以及 `msg_id`、`reply_to`。开了任务的回复有两次以上调用（每轮一次），各记一行。
 
 **电脑任务（H2）：**
 - **开始：** 模型调 `computer_task({goal})`，或用户发 `cua`。会话先拿这台 Mac 的锁 `sessions/computer.lock`（和会话锁同样的建法：自己的临时文件硬链接成锁；占着的进程不在了就挪开接过来）。锁里写 `{pid, session_id, run_id, executor_pid}`：会话进程或者任务的执行层还活着，就算占着（会话进程被杀掉时执行层可能还在动手，这期间别人不能开始）。拿到之后：这个会话里还在等结果卡的执行层关掉（`task_closed new_task`），写 `computer.last`，入库 `session.task`，启动 `harness.mjs executor --linger 600 --runs sessions/<sid>/runs`，第一行是请求 `{run_id, raw, context?, config, lang, driver?, scope?}`。执行层就是 P2 的执行层，没有改。
-- **`raw` 和 `context`：** `raw` 是从上一个任务开始以来用户自己发的消息，原样，用空行连起来，最多 4000 字（超了留最近的）；同一次回复里的第二、第三个任务用同一个 `raw`。模型的 `goal` 只进 `context`（见第三节）。`/cua` 的 `raw` 就是它的 `text`，没有 `context`。
-- **模型在等：** `computer_task` 一直挂着，直到任务结束，所以任务进行时模型不跑。结束后工具返回 `session.task_end` 的那些字段（JSON），模型接着说。它看不到截图、观察和 trace。一条用户消息最多 3 个任务，第 4 个直接回错误给模型。
+- **`raw` 和 `context`：** `raw` 是从上一个任务开始以来用户自己发的消息，原样，用空行连起来，大约最多 4000 字。超了：最新的一条整条留着，前面的从近到远放得下几条放几条，放不下的写「（更早的 n 条消息省略）」；最新的一条自己就超过 4000 字时，留开头 1500 字和结尾，中间写「…（中间省略 N 字）…」——指令通常在开头，不能被截掉、只剩贴进来的正文当成「用户的话」。同一次回复里的第二、第三个任务用同一个 `raw`。模型的 `goal` 只进 `context`（见第三节）。`/cua` 的 `raw` 就是它的 `text`，没有 `context`。
+- **模型在等：** `computer_task` 一直挂着，直到任务结束，所以任务进行时模型不跑。结束后工具返回 `session.task_end` 的那些字段（JSON），模型接着说。它看不到截图、观察和 trace。一条用户消息最多 3 个任务，第 4 个直接回错误给模型。**用户停下了一个任务**（status `stopped`）之后，这次回复不能再开任务（不管模型读到的网页里写了什么）：模型再调就回错误，它说完下一轮就结束这次回复。
+- **拿锁之后出错：** 写 `computer.last` 或入库失败时，锁马上放掉，任务不开始（`/cua` 回 `busy`，带原因）。
 - **`/cua` 之后：** 任务结束，模型说一轮：它的上下文里这个任务是一次 `computer_task` 调用和结果，用户消息是 `/cua` 的原话（`via: "cua"`）。这一轮不能再开任务。
 - **电脑被占：** 另一个会话的任务正占着锁时，模型的工具返回「电脑正被另一个会话使用，等它做完再试。」，`/cua` 回 `session.error{code:"computer_busy"}`。
 - **转发：** 执行层的每个事件原样发到会话的 stdout，加上 `session_id`。`answer`、`respond`、`stop`（带 `run_id`）和 `steer` 转到那个执行层的 stdin（控制第 1 版的行，多的字段执行层不看）。
@@ -209,7 +212,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - **卡片在等时（负责人 10-21）：** app 禁用输入框（同 Claude Code）；要打字的卡有自己的输入框，用 `answer{text}` 答。所以任务里有卡在等（`ask` 之后还没有同一 `ask_id` 的 `resumed` / `ask_void`）时，`say`、`steer`、`queue_send_now` 回 `card_open`。
 - **撤回和等待（负责人 10-21）：** `task_done` 之后执行层最多再等 600 秒结果卡（`--linger 600`），锁在 `task_done` 时就放了。`respond` 转给它；撤回期间重新占着锁。这台 Mac 上开始**任何**新的电脑任务，撤回就过期：开任务的会话写 `computer.last`；有执行层在等结果卡的会话盯着这个文件（每 0.5 秒看一次），里面换成了别的任务就关掉自己的执行层（`task_closed new_task`）。`respond` 之前也再看一次。执行层自己结束（答了结果卡、到了时间、本来没有结果卡）时发 `task_closed linger`。
 - **app 走了（stdin 关闭，负责人 10-21）：** 有任务在跑就给它发 stop，最多等 12 秒它的 `task_done`。等到了就按它的结局记 `session.task_end`（通常是 `stopped`）；等不到就记 `status: "stopped"`、reason「the app went away; the task did not confirm the stop in time」，这时执行层可能还在收尾，锁留给它（锁里有它的 pid），它退出后别人才能接过来。然后关掉所有执行层（`task_closed session_end`），不再让模型说话，退出。`end` 和 SIGINT / SIGTERM 一样。
-- **重新打开：** 有 `session.task` 没有 `session.task_end` 的任务，读它的 `runs/<run_id>/events.jsonl`：有 `task_done` 就照它补一条 `session.task_end`（`undo: none`：执行层已经不在了），`steers` 取自其中的 `steered`；没有就记 `interrupted`（如果锁里写着这个任务、它的执行层还活着，先给执行层发 SIGTERM）。没有 `session.task_closed` 的任务补一条 `session_end`。
+- **重新打开：** 有 `session.task` 没有 `session.task_end` 的任务，读它的 `runs/<run_id>/events.jsonl`：有 `task_done` 就照它补一条 `session.task_end`（`undo: none`：执行层已经不在了），`steers` 取自其中的 `steered`；没有就记 `interrupted`。如果锁里写着这个任务、它的执行层还活着：先给它发 SIGTERM，最多等 12 秒它自己的 `task_done`（有就照它记，带它的改动），等不到才记 `interrupted`。没有 `session.task_closed` 的任务补一条 `session_end`。
 
 **退出：** stdin 关了（app 走了）或收到 `end`，而且没有回复、任务在进行，进程就关掉还在等结果卡的执行层，最多等它们 2 秒，然后退出（退出码 0）。stdin 关的时候正有回复，就等它说完、入库之后再退出；正有任务，见上面「app 走了」。SIGINT / SIGTERM 等同 `end`。
 

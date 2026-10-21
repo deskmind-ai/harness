@@ -110,11 +110,16 @@ interface Running {
   tasks: number; maxTasks: number; raw: string | null;
   /** The turn in progress already stored its text (it called a tool). */
   cut: boolean;
+  /** A task of this reply was stopped by the user: no more tasks in it; `final`: the model's last turn (its words about
+   *  the stop) is under way, and the reply ends after it. */
+  stopped: boolean; final: boolean;
 }
 
 type TaskEnd = Extract<SessionBody, { kind: "session.task_end" }>;
 interface Task {
   runId: string; handle: ExecutorHandle; lock: ComputerLock | null; undoLock: ComputerLock | null;
+  /** How many options its result card has (a respond's option must be one of them). */
+  options: number;
   /** running: until task_done; lingering: its result card can be answered; ending: it exits by itself; closed. */
   state: "running" | "lingering" | "ending" | "closed";
   /** The card waiting for the user (an ask with no resumed / ask_void yet). */
@@ -187,12 +192,38 @@ export class SessionHost {
         const steers = evs.filter((e) => e.kind === "steered").map((e) => String(e.text));
         if (done) this.log.emit(endFrom(runId, done, "none", steers));
         else {
+          // its executor still runs (the lock names it): stopped, and its own end waited for (its changes are the truth)
           const own = computerOwner(this.o.dir);
-          if (own?.run_id === runId && own.executor_pid && alive(own.executor_pid)) { try { process.kill(own.executor_pid, "SIGTERM"); } catch { /* gone meanwhile */ } }
-          this.log.emit({ kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", summary: "", undo: "none", ...(steers.length ? { steers } : {}) });
+          if (own?.run_id === runId && own.executor_pid && alive(own.executor_pid)) {
+            try { process.kill(own.executor_pid, "SIGTERM"); } catch { /* gone meanwhile */ }
+            this.recovering.push(this.awaitOldEnd(runId, own.executor_pid, !closed.has(runId)));
+            continue;
+          }
+          this.log.emit(interrupted(runId, steers));
         }
       }
       if (!closed.has(runId)) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
+    }
+  }
+
+  /** Ends recorded later by recover (an old executor that was still running). Tests wait on it. */
+  readonly recovering: Promise<void>[] = [];
+  private async awaitOldEnd(runId: string, pid: number, close: boolean) {
+    const file = path.join(this.runs, runId, "events.jsonl");
+    const t0 = Date.now();
+    let done: Record<string, unknown> | undefined;
+    for (;;) {
+      const evs = readRunEvents(file);
+      done = [...evs].reverse().find((e) => e.kind === "task_done");
+      if (done || !alive(pid) || Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) {
+        if (!done) done = [...readRunEvents(file)].reverse().find((e) => e.kind === "task_done");
+        const steers = readRunEvents(file).filter((e) => e.kind === "steered").map((e) => String(e.text));
+        if (this.log.events.some((e) => e.kind === "session.task_end" && e.run_id === runId)) return;
+        this.log.emit(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers));
+        if (close) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
+        return;
+      }
+      await sleep(100);
     }
   }
 
@@ -278,21 +309,21 @@ export class SessionHost {
     const model = this.resolveModel();
     if ("code" in model) { this.fail(model.code, model.text, { reply_to: replyTo }); return this.afterActivity(); }
     const context = buildContext(this.log.messages(), { budgetChars: Math.floor((model.model.contextWindow ?? 128_000) * WINDOW_SHARE), lang: this.lang });
-    const r: Running = { msgId: newId(), replyTo, abort: new AbortController(), sent: "", buffer: "", timer: null, done: Promise.resolve(), tasks: 0, maxTasks: o.maxTasks ?? MAX_TASKS, raw: null, cut: false };
+    const r: Running = { msgId: newId(), replyTo, abort: new AbortController(), sent: "", buffer: "", timer: null, done: Promise.resolve(), tasks: 0, maxTasks: o.maxTasks ?? MAX_TASKS, raw: null, cut: false, stopped: false, final: false };
     this.running = r;
     const spec = `${model.model.provider}|${model.model.id}`;
     // the reply has begun (the app shows "thinking" until text comes): an empty delta at offset 0
     this.send({ kind: "session.delta", msg_id: r.msgId, text: "", offset: 0 });
     const onDelta = (d: string) => { r.buffer += d; if (!r.timer) r.timer = setTimeout(() => this.flush(r), this.o.coalesceMs ?? 50); };
     // a turn after a task: a new bubble, begun with an empty delta
-    const onTurnStart = (n: number) => { r.cut = false; if (n > 0) this.send({ kind: "session.delta", msg_id: r.msgId, text: "", offset: 0 }); };
+    const onTurnStart = (n: number) => { r.cut = false; if (r.stopped) r.final = true; if (n > 0) this.send({ kind: "session.delta", msg_id: r.msgId, text: "", offset: 0 }); };
     // a turn that calls computer_task: its words are a message of their own, before the task
     const onTurnEnd = (text: string) => {
       this.settle(r, text);
       if (text) this.log.emit({ kind: "session.message", msg_id: r.msgId, role: "assistant", text, reply_to: r.replyTo, model: spec });
       r.msgId = newId(); r.sent = ""; r.buffer = ""; r.cut = true;
     };
-    r.done = reply({ model, context, signal: r.abort.signal, maxChars: MAX_ASSISTANT_CHARS, onDelta, tools: [this.computerTask(r)], onTurnStart, onTurnEnd, endNow: () => this.closing, ...(o.oneTurn ? { oneTurn: true } : {}) }).then((res) => {
+    r.done = reply({ model, context, signal: r.abort.signal, maxChars: MAX_ASSISTANT_CHARS, onDelta, tools: [this.computerTask(r)], onTurnStart, onTurnEnd, endNow: () => this.closing || r.final, ...(o.oneTurn ? { oneTurn: true } : {}) }).then((res) => {
       if (r.timer) { clearTimeout(r.timer); r.timer = null; }
       this.recordCalls(r, res);
       if (res.ended === "error") {
@@ -330,15 +361,19 @@ export class SessionHost {
       parameters: Type.Object({ goal: Type.String({ description: en ? "what to do, in your words" : "要做的事，你的转述" }) }),
       execute: async (_id: string, p: { goal: string }) => {
         if (this.closing) return result(en ? "the session is ending" : "会话正在结束", true);
+        // the user stopped a task of this reply: the reply does not start another (the user's stop is not overruled by
+        // the model, whatever a page it read said)
+        if (r.stopped) return result(en ? "The user stopped the task. Do not start another one in this reply; tell the user it stopped." : "用户停下了任务。这次回复不能再开任务，告诉用户已经停下。", true);
         if (r.tasks >= r.maxTasks) return result(r.maxTasks === 0
           ? (en ? "This task was started by the user with /cua; its result is above. Do not start another; tell the user the result." : "这个任务是用户用 /cua 直接开的，结果在上面。不要再开任务，直接告诉用户结果。")
           : (en ? `This message has started ${MAX_TASKS} computer tasks already; no more. Tell the user where things stand.` : `这条消息已经开过 ${MAX_TASKS} 个电脑任务了，不能再开。告诉用户现在的情况。`), true);
-        r.raw ??= cutRaw(this.log.userWordsSinceTask() || this.lastUserText());
+        if (r.raw === null) { const since = this.log.userWordsSinceTask(); r.raw = cutRaw(since.length ? since : [this.lastUserText()]); }
         const goal = typeof p.goal === "string" ? p.goal.slice(0, 4000) : "";
         const t = this.startTask({ raw: r.raw, ...(goal.trim() ? { goal } : {}), by: "model", replyTo: r.replyTo });
         if ("busy" in t) return result(en ? "The computer is being used by another session. Try again when it is done." : "电脑正被另一个会话使用，等它做完再试。", true);
         r.tasks += 1;
         const end = await t.ended;
+        if (end.status === "stopped") r.stopped = true;
         if (this.closing) r.abort.abort();             // the app went away: no more turns
         return result(taskView(end));
       },
@@ -356,10 +391,11 @@ export class SessionHost {
     if (this.closing || !text.trim() || this.tooLong(text, "cua")) return;
     if (this.current || this.running || this.flows) return this.refuseBusy("cua");
     let userId = "";
-    const t = this.startTask({ raw: cutRaw(text), by: "slash", ...(scope ? { scope } : {}), before: () => {
+    let t: Task | { busy: true };
+    try { t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
       userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua" }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
       return userId;
-    } });
+    } }); } catch (e) { return this.refuse("busy", `the task could not start: ${e instanceof Error ? e.message : String(e)}`, "cua"); }
     if ("busy" in t) return this.refuse("computer_busy", this.t("电脑正被另一个会话使用", "the computer is being used by another session"), "cua");
     this.flows += 1;
     void t.ended.then(() => {
@@ -377,10 +413,12 @@ export class SessionHost {
     if ("busy" in lock) return { busy: true };
     // a new computer task on this Mac: undo expires for every lingering executor — this session's now, the other
     // sessions' when they see computer.last change
-    for (const t of this.tasks.values()) if (t.state !== "running") this.closeTask(t, "new_task");
-    setLastTask(this.o.dir, runId, this.o.sessionId);
-    const replyTo = o.before?.() ?? o.replyTo;
-    this.log.emit({ kind: "session.task", msg_id: newId(), run_id: runId, raw: o.raw, ...(o.goal ? { goal: o.goal } : {}), by: o.by, ...(replyTo ? { reply_to: replyTo } : {}) });
+    try {
+      for (const t of this.tasks.values()) if (t.state !== "running") this.closeTask(t, "new_task");
+      setLastTask(this.o.dir, runId, this.o.sessionId);
+      const replyTo = o.before?.() ?? o.replyTo;
+      this.log.emit({ kind: "session.task", msg_id: newId(), run_id: runId, raw: o.raw, ...(o.goal ? { goal: o.goal } : {}), by: o.by, ...(replyTo ? { reply_to: replyTo } : {}) });
+    } catch (e) { lock.release(); throw e; }               // nothing started: the machine is not held for it
     const scope = o.scope ?? this.o.scope;
     const request = { run_id: runId, raw: o.raw, ...(o.goal ? { context: o.goal } : {}), config: this.config, lang: this.lang, ...(this.o.driver ? { driver: this.o.driver } : {}), ...(scope ? { scope } : {}) };
     let resolve!: (e: TaskEnd) => void;
@@ -389,7 +427,7 @@ export class SessionHost {
     try { handle = (this.o.launch ?? spawnExecutor)(request, { runs: this.runs, runId, linger: this.linger }); }
     catch (e) { handle = { write: () => {}, close: () => {}, onLine: () => {}, exited: Promise.resolve({ code: null, signal: `spawn: ${e instanceof Error ? e.message : String(e)}` }) }; }
     lock.setExecutor(handle.pid);
-    const task: Task = { runId, handle, lock, undoLock: null, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null };
+    const task: Task = { runId, handle, lock, undoLock: null, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null };
     this.current = task;
     this.tasks.set(runId, task);
     handle.onLine((l) => this.onExecutorLine(task, l));
@@ -419,6 +457,7 @@ export class SessionHost {
     task.lock?.release(); task.lock = null;
     if (task.end) return;                                // the session had to end it already (the app went away)
     const card = ev.result_card as { options?: { kind?: string }[] } | null | undefined;
+    task.options = Array.isArray(card?.options) ? card.options.length : 0;
     const undo = this.linger > 0 && !!card?.options?.some((x) => x.kind === "undo") ? "open" : "none";
     this.recordEnd(task, endFrom(task.runId, ev, undo, task.steers));
     if (task.state === "running") task.state = card && this.linger > 0 ? "lingering" : "ending";
@@ -491,6 +530,9 @@ export class SessionHost {
   respond(line: Record<string, unknown>, runId?: string) {
     const t = runId ? this.tasks.get(runId) : [...this.tasks.values()].reverse().find((x) => x.state === "lingering");
     if (!t || t.state !== "lingering") return this.refuse("no_task", "no result card of this session is waiting", "respond");
+    // checked before anything is held: only an option index of its card is a respond the executor acts on
+    const opt = line.option;
+    if (typeof opt !== "number" || !Number.isInteger(opt) || opt < 0 || opt >= t.options) return this.refuse("bad_control", `a respond needs option: the index of one of the result card's ${t.options} options`, "respond");
     if (t.undoLock) return;                              // one respond per card: the executor reads only the first
     this.checkLast();
     if (t.state !== "lingering") return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond");
@@ -626,6 +668,8 @@ export class SessionHost {
 function readRunEvents(file: string): Record<string, unknown>[] {
   try { return fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l)]; } catch { return []; } }); } catch { return []; }
 }
+
+const interrupted = (runId: string, steers: string[]): TaskEnd => ({ kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", summary: "", undo: "none", ...(steers.length ? { steers } : {}) });
 
 /** session.task_end from the executor's task_done. */
 function endFrom(runId: string, ev: Record<string, unknown>, undo: "open" | "none", steers: string[]): TaskEnd {

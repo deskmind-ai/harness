@@ -72,7 +72,13 @@ export function reasoningBack(payload: unknown): unknown {
   for (const m of p.messages) if (m && m.role === "assistant" && Array.isArray(m.tool_calls) && m.reasoning_content === undefined) m.reasoning_content = "";
   return p;
 }
-const needsReasoningBack = (m: Model<any>) => m.provider === "deepseek" || /deepseek\.com/.test(m.baseUrl ?? "");
+/** DeepSeek's own service, or a DeepSeek model behind a proxy (its id names it). */
+export const needsReasoningBack = (m: Model<any>) => m.provider === "deepseek" || /deepseek/i.test(m.baseUrl ?? "") || /deepseek/i.test(m.id ?? "");
+/** The stream with reasoningBack on every request's payload (after the caller's own onPayload, if any), for DeepSeek. */
+export function withReasoningBack(streamFn: StreamFn, model: Model<any>): StreamFn {
+  if (!needsReasoningBack(model)) return streamFn;
+  return (m, c, opts) => streamFn(m, c, { ...opts, onPayload: async (pl: unknown, mm: Model<any>) => reasoningBack((await opts?.onPayload?.(pl, mm)) ?? pl) } as never);
+}
 
 /** The session model's one tool. */
 export const COMPUTER_TASK = "computer_task";
@@ -128,10 +134,7 @@ export async function reply(o: { model: SessionModel; context: BuiltContext; sig
     }
   };
   try {
-    const streamFn: StreamFn = needsReasoningBack(model)
-      ? (m, c, opts) => o.model.streamFn(m, c, { ...opts, onPayload: async (pl: unknown, mm: Model<any>) => reasoningBack((await opts?.onPayload?.(pl, mm)) ?? pl) } as never)
-      : o.model.streamFn;
-    await runAgentLoop([], context, config, emit, inner.signal, streamFn);
+    await runAgentLoop([], context, config, emit, inner.signal, withReasoningBack(o.model.streamFn, model));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const c = call(null);

@@ -27,11 +27,12 @@ export const MAX_ASSISTANT_CHARS = 64_000;
 
 /** The model's errors (stored) and the refusals of a control line (sent, not stored). H2 adds computer_busy (another
  *  session holds the computer), card_open (say / steer while the running task's card waits), no_task (a task control
- *  naming no task of this session) and undo_expired (a respond after another task started on this Mac). */
-export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired"] as const;
+ *  naming no task of this session), undo_expired (a respond after another task started on this Mac) and bad_control
+ *  (a control line without what it needs: a respond with no valid option index). */
+export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 /** Codes that refuse a control line: sent without a seq, never in the history. */
-export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired"];
+export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control"];
 
 /** How a computer task ended, as the session keeps it: the executor's task_done status, or `interrupted` (the process
  *  went away and the run has no task_done). */
@@ -169,15 +170,15 @@ export class SessionLog {
     return out;
   }
 
-  /** The user's own words since the last computer task began (their messages, joined by a blank line), or "" if none. */
-  userWordsSinceTask(): string {
+  /** The user's own messages since the last computer task began, oldest first (none: []). */
+  userWordsSinceTask(): string[] {
     const words: string[] = [];
     for (let i = this.events.length - 1; i >= 0; i--) {
       const e = this.events[i]!;
       if (e.kind === "session.task") break;
       if (e.kind === "session.message" && e.role === "user") words.unshift(e.text);
     }
-    return words.join("\n\n");
+    return words;
   }
 }
 

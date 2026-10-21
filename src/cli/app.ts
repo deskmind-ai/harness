@@ -261,6 +261,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // the journal lives beside the run's events: an app-run started again with the same run_id finds what the last
   // process did without a receipt and tells the model (D10)
   const executor = new Executor(o.inject?.driver ?? driverFor(req.driver, req.scope), { task: runId, publicKey: signer.publicKey, journal: path.join(o.runs, runId, "journal.jsonl"), shots: path.join(o.runs, runId, "shots"), onEvent: send });
+  // the chat model's restatement (a session's computer task) is not the user's words, and it may carry what an earlier
+  // task read (its summary went back to the chat model): read material, so an open of a site not approved asks the
+  // provenance judge, anchored on raw — a run never starts with nothing read when the request was written by a model
+  if (typeof req.context === "string" && req.context.trim()) executor.noteTakenIn("the chat model's restatement (request.context)", req.context);
   log.emit({ kind: "preparing" });
   const rt = new FrontierRuntime({
     task: runId, raw: req.raw, ...(typeof req.context === "string" && req.context.trim() ? { context: req.context } : {}), executor, signer, user: new StdioUser(log, o.input), gateway: gw,
@@ -389,7 +393,11 @@ async function main() {
     request: { type: "string" }, runs: { type: "string", default: "runs/app" }, run: { type: "string" }, selftest: { type: "boolean", default: false }, config: { type: "string", default: "ds-flash" },
     out: { type: "string" },
   } });
-  const out = (ev: AppEvent) => process.stdout.write(JSON.stringify(ev) + "\n");
+  // the reader of stdout went away (the session or the app died: EPIPE): events still go to the run's files, never to
+  // the dead pipe, and the run is stopped like a stop line (in executor mode, below) instead of crashing mid-action
+  let stdoutGone = false, onStdoutGone = () => {};
+  process.stdout.on("error", () => { if (stdoutGone) return; stdoutGone = true; onStdoutGone(); });
+  const out = (ev: AppEvent) => { if (!stdoutGone) process.stdout.write(JSON.stringify(ev) + "\n"); };
   if (a.selftest) { const r = await selftest(); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
   const cmd = positionals[0];
   if (cmd === "model-check") { const r = await modelCheck(a.config!); console.log(JSON.stringify(r)); process.exit(r.ok ? 0 : 1); }
@@ -410,7 +418,8 @@ async function main() {
   if (cmd === "app-run" || cmd === "executor") {
     // SIGINT / SIGTERM: before the run has started there is nothing to stop; after, the run ends as stopped
     // (task_done written) and the process exits within a second. stdout is drained before exit.
-    const exit = () => process.stdout.write("", () => process.exit(0));
+    const exit = () => (stdoutGone ? process.exit(0) : process.stdout.write("", () => process.exit(0)));
+    onStdoutGone = () => input.stop("the app went away (stdout closed)");
     const exitNow = () => process.exit(0);           // a second signal: no waiting for stdout either
     let onSignal: (sig: string) => void = () => exitNow();
     for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => onSignal(sig));

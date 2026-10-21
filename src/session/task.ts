@@ -5,8 +5,10 @@
  * The machine lock: `<dir>/sessions/computer.lock`, one computer task at a time on this Mac, whichever session asks.
  * It is taken the way a session's own lock is (a file of our own hard-linked to the name, a holder that is gone taken
  * over by renaming it aside first). It holds `{pid, session_id, run_id, executor_pid?, undo?}`: it counts as held while
- * the session's process or the task's executor lives (a session killed mid-task leaves its executor acting until it
- * ends; nobody else may start meanwhile). Taken when a task starts, released at its task_done; taken again for the
+ * the session's process or the task's executor lives. A session killed mid-task leaves its executor running until it
+ * notices: it stops its run when its next event finds stdout's reader gone (EPIPE, cli/app.ts), after the step in
+ * flight gets its receipt — but while it waits on a model or a card it writes nothing and may go on a while. Nobody
+ * else may start meanwhile. Taken when a task starts, released at its task_done; taken again for the
  * moment an undo runs. Beside it, `computer.last` names the last task that started on this Mac: undo expires when any
  * new computer task starts (owner 10-21), so a session with an executor lingering for its result card watches that file
  * and closes the executor when another run appears there.
@@ -150,13 +152,30 @@ export const spawnExecutor: Launcher = (request, o) => {
   };
 };
 
-/** The user's words a task carries (request.raw): at most this many characters, the most recent kept. */
+/** The user's words a task carries (request.raw): at most about this many characters. */
 export const MAX_RAW = 4000;
-export function cutRaw(s: string): string {
-  if (s.length <= MAX_RAW) return s;
-  let out = s.slice(-MAX_RAW);
-  if (/^[\uDC00-\uDFFF]/.test(out)) out = out.slice(1);            // not half a character
-  return out;
+const HEAD = 1500;
+/** Not half a character at a cut. */
+const clean = (s: string) => s.replace(/^[\uDC00-\uDFFF]/, "").replace(/[\uD800-\uDBFF]$/, "");
+
+/** The user's messages since the last task (oldest first) as one request: the newest message whole and as many earlier
+ *  ones as fit before it, the rest marked as left out; a newest message longer than the whole budget keeps its head
+ *  (where an instruction usually is) and its tail, the middle marked as left out — never a cut that silently drops the
+ *  instruction and leaves pasted text as "the user's words". */
+export function cutRaw(messages: string[]): string {
+  const msgs = messages.filter((m) => m.trim());
+  const all = msgs.join("\n\n");
+  if (all.length <= MAX_RAW || !msgs.length) return all;
+  const last = msgs[msgs.length - 1]!;
+  if (last.length > MAX_RAW) {
+    const tail = MAX_RAW - HEAD;
+    const marker = `\n…（中间省略 ${last.length - HEAD - tail} 字）…\n`;
+    return (msgs.length > 1 ? `（更早的 ${msgs.length - 1} 条消息省略）\n\n` : "") + clean(last.slice(0, HEAD)) + marker + clean(last.slice(-tail));
+  }
+  const kept = [last];
+  let room = MAX_RAW - last.length, i = msgs.length - 2;
+  for (; i >= 0 && msgs[i]!.length + 2 <= room; i--) { kept.unshift(msgs[i]!); room -= msgs[i]!.length + 2; }
+  return (i >= 0 ? `（更早的 ${i + 1} 条消息省略）\n\n` : "") + kept.join("\n\n");
 }
 
 /** How long a session waits for task_done after it stopped a task because the app went away. */
