@@ -237,6 +237,18 @@ describe("set_config: the model and lang of a live session", () => {
     expect(normalizeConfig("ds-flash")).toBe("ds-flash");
   });
 
+  it("a built-in config the session cannot use (not a keyed service) is refused without repeating its name", () => {
+    const evs: any[] = [];
+    const h = new SessionHost({ dir: tmp(), sessionId: "ses_c", out: (e) => evs.push(e), config: "ds-flash" });
+    hosts.push(h);
+    h.start();
+    h.handle(JSON.stringify({ type: "set_config", config: "dev-claude" }));
+    const err = evs.filter((e) => e.kind === "session.error").at(-1);
+    expect(err).toMatchObject({ code: "bad_config", control: "set_config" });
+    expect(err.text).not.toContain("dev-claude");
+    expect(h.config).toBe("ds-flash");
+  });
+
   it("a model name with spaces around it is taken trimmed: stored, used and sent to the executor without them", async () => {
     const s = session({ config: C("A"), scope: tmp(), models: { A: [], B: [CALL("新建 a.txt"), { text: "好" }] }, tasks: [CREATE()] });
     s.send({ type: "set_config", config: `${C("B").replace("|", "|  ")} ` });
