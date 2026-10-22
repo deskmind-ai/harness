@@ -14,7 +14,8 @@ import type { Message } from "@earendil-works/pi-ai";
 import { SessionHost } from "../src/session/host.js";
 import { SessionLog } from "../src/session/log.js";
 import { reasoningBack, withReasoningBack, reply } from "../src/session/loop.js";
-import { computerLockFile, cutRaw, MAX_RAW, type ExecutorHandle, type Launcher } from "../src/session/task.js";
+import { cutRaw, MAX_RAW, type ExecutorHandle, type Launcher } from "../src/session/task.js";
+import { computerLockFile, held, readHolder } from "../src/session/computer.js";
 import { spawn } from "node:child_process";
 import * as http from "node:http";
 import { isProvenance, scripted as judgeScript } from "./helpers/provenance-judge.js";
@@ -60,14 +61,14 @@ function inproc(scripts: Step[][], sim: (scope?: string) => SimComputer = (s) =>
 const hosts: SessionHost[] = [];
 afterEach(async () => { for (const h of hosts.splice(0)) h.end(); await new Promise((r) => setTimeout(r, 50)); });
 
-function session(o: { model: Step[]; tasks?: Step[][]; dir?: string; sid?: string; scope?: string; launch?: Launcher; watchMs?: number; exitWaitMs?: number; sim?: (scope?: string) => SimComputer }) {
+function session(o: { model: Step[]; tasks?: Step[][]; dir?: string; sid?: string; scope?: string; launch?: Launcher; exitWaitMs?: number; sim?: (scope?: string) => SimComputer }) {
   const evs: any[] = [], seen: Message[][] = [];
   const dir = o.dir ?? tmp();
   const ex = inproc(o.tasks ?? [], o.sim);
   let onEvent: ((e: any) => void) | null = null;
   let exitedFlag = false;
   const h = new SessionHost({ dir, sessionId: o.sid ?? "ses_t", out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(o.model, seen) },
-    launch: o.launch ?? ex.launch, watchMs: o.watchMs ?? 20, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: () => { exitedFlag = true; } });
+    launch: o.launch ?? ex.launch, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: () => { exitedFlag = true; } });
   hosts.push(h);
   h.start();
   const send = (c: Record<string, unknown>) => h.handle(JSON.stringify(c));
@@ -285,7 +286,56 @@ describe("session tasks: undo, the machine lock, the app going away", () => {
     expect(b.stored().some((e: any) => e.kind === "session.task")).toBe(false);
     a.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: asked.card.options.findIndex((x: any) => x.kind === "approve") });
     await a.h.idle();
-    expect(fs.existsSync(computerLockFile(dir))).toBe(false);
+    // done acting: lingering (its card) until its executor has gone, then free
+    expect(readHolder(dir)?.state ?? "free").not.toBe("acting");
+  });
+
+  it("lock: a task's executor that exits leaving a child (the session lives on) keeps the Mac: the next task is refused until the child is gone", async () => {
+    const dir = tmp();
+    const kids: number[] = [];
+    // a real executor (its own process group): takes its request, starts a child in its group, exits without task_done
+    const leaving: Launcher = (req) => {
+      const p = spawn(process.execPath, ["-e", `process.stdin.once("data",()=>{const c=require("child_process").spawn("sleep",["30"],{stdio:"ignore"});console.log(JSON.stringify({kid:c.pid}));setTimeout(()=>process.exit(1),100)})`],
+        { stdio: ["pipe", "pipe", "ignore"], detached: true });
+      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("exit", (code, signal) => r({ code, signal })));
+      let cb: ((l: string) => void) | null = null;
+      p.stdout!.on("data", (d) => { for (const l of String(d).split("\n").filter(Boolean)) { try { const k = JSON.parse(l).kid; if (k) kids.push(k); } catch { /* */ } cb?.(l); } });
+      return { pid: p.pid, start: () => p.stdin!.write(JSON.stringify(req) + "\n"), write: () => {}, close: () => p.stdin!.end(), onLine: (f) => { cb = f; }, exited };
+    };
+    const s = session({ dir, model: [], launch: leaving });
+    s.send({ type: "cua", text: "改一下" });
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "failed" });
+    expect(kids).toHaveLength(1);
+    const h = readHolder(dir)!;
+    expect(h).toMatchObject({ state: "acting", by: "session" });
+    expect(held(h)).toBe(true);                       // the executor is gone, its child is not
+    await waitFor(() => !s.h.busy);
+    s.send({ type: "cua", text: "再来" });
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "computer_busy", control: "cua" });
+    process.kill(kids[0]!, "SIGKILL");
+    await waitFor(() => !held(h));
+    s.send({ type: "cua", text: "再来" });
+    await waitFor(() => s.stored().filter((e: any) => e.kind === "session.task").length === 2);
+    await waitFor(() => kids.length === 2);
+    process.kill(kids[1]!, "SIGKILL");
+  });
+
+  it("lock: an undo right at task_done (as the app hears of it) is let through: the lock says lingering before task_done is passed on", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [CALL("新建 a.txt"), { text: "好了" }], tasks: [CREATE()] });
+    s.on((e) => {
+      if (e.kind !== "task_done") return;
+      expect(readHolder(s.dir)).toMatchObject({ run_id: e.run_id, state: "lingering" });
+      const undoAt = e.result_card.options.findIndex((x: any) => x.kind === "undo");
+      s.send({ type: "respond", run_id: e.run_id, option: undoAt });
+      expect(readHolder(s.dir)).toMatchObject({ run_id: e.run_id, state: "acting" });   // the undo acts
+      s.send({ type: "respond", run_id: e.run_id, option: undoAt });                    // a second answer to the card
+    });
+    s.send({ type: "say", text: "新建 a.txt 写 hi" });
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_undo"));
+    expect(s.kinds("session.error")).toEqual([expect.objectContaining({ code: "busy", control: "respond" })]);
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
   });
 
   it("stdin EOF mid-task: the task is stopped, its end recorded as stopped, then the process exits", async () => {
@@ -464,7 +514,7 @@ describe("review of #54", () => {
     for (const bad of [{ text: "撤回吧" }, { option: "1" }, { option: 99 }, { option: -1 }, { option: 0.5 }]) {
       s.send({ type: "respond", run_id: done.run_id, ...bad });
       expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "bad_control", control: "respond" });
-      expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+      expect(readHolder(s.dir)).toMatchObject({ run_id: done.run_id, state: "lingering" });   // not acting: nothing let through
     }
     s.send({ type: "respond", run_id: done.run_id, option: done.result_card.options.findIndex((x: any) => x.kind === "undo") });
     await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_undo"));
@@ -560,7 +610,8 @@ describe("review of #54", () => {
     (s.h.log as any).emit = (b: any) => { if (b.kind === "session.task") throw new Error("disk full"); return orig(b); };
     s.send({ type: "cua", text: "新建 a.txt" });
     expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", text: expect.stringContaining("disk full") });
-    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    // its executor never got its task (a real one waits for it): stdin closed, it exits, and the lock goes with it
+    await waitFor(() => !fs.existsSync(computerLockFile(s.dir)));
   });
 
   it("E3: resume with the old executor still running: SIGTERM, then its own task_done (with its changes) is the end", async () => {
@@ -571,10 +622,11 @@ describe("review of #54", () => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify({ seq: 1, t: 1, run_id: "run_old", kind: "start", raw: "新建 a.txt" }) + "\n");
     const done = JSON.stringify({ seq: 2, t: 2, run_id: "run_old", kind: "task_done", status: "stopped", reason: "stopped by SIGTERM", summary: "", result_card: null, changes: { created: ["a.txt"], modified: [], deleted: [], external: [] } });
-    const old = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{setTimeout(()=>{require("fs").appendFileSync(${JSON.stringify(file)},${JSON.stringify(done + "\n")});process.exit(0)},300)});setInterval(()=>{},1000)`]);
+    const old = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{setTimeout(()=>{require("fs").appendFileSync(${JSON.stringify(file)},${JSON.stringify(done + "\n")});process.exit(0)},300)});setInterval(()=>{},1000)`], { detached: true });
     await new Promise((r) => setTimeout(r, 300));
     fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
-    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ pid: 999999, session_id: "ses_e3", run_id: "run_old", executor_pid: old.pid }));
+    // the lock as the last session process left it: its executor's group, acting (that process is gone)
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 2, state: "acting", pgid: old.pid, pid: old.pid, start: 0, session_id: "ses_e3", run_id: "run_old", by: "session", owner: 999999, t: 0 }));
     const s = session({ dir, sid: "ses_e3", model: [] });
     expect(s.stored().some((e: any) => e.kind === "session.task_end")).toBe(false);   // not `interrupted` at once
     await Promise.all(s.h.recovering);
