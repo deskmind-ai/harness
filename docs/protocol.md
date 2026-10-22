@@ -191,7 +191,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `cua` | `{"type":"cua","text":"…","scope"?:"…"}` | `/cua`（H2）：不经过模型，直接开电脑任务，`raw` 就是 `text`。`scope` 是这一次的任务目录（不给就用头一行的）。有回复或任务在跑时 `busy` |
 | `steer` | `{"type":"steer","text":"…","run_id"?:"…"}` | 任务进行中补充要求（H2）：原样转给执行层（控制第 1 版的 steer，执行层的规则照旧：两步之间生效，生效时发 `steered`），同时入库 `session.steer` |
 | `answer` | 执行层的 answer 行，加 `run_id` | 回答卡片（H2）：整行原样转给那个任务（不带 `run_id` 就是正在跑的那个）；多出来的字段执行层不看。按选项下标答：`{"type":"answer","run_id":"…","ask_id":"…","option":n}`；卡上自己写：`…,"text":"…"}` |
-| `respond` | 执行层的 respond 行，加 `run_id` | 回答结果卡（撤回等，H2）：转给那个还在等结果卡的执行层（不带 `run_id` 就是最近的一个）。先检查 `option` 是结果卡上的一个下标，不是就 `bad_control`；撤回要动电脑：只有锁里正是这个任务、状态 `lingering` 时才转过去，锁改回 `acting`，到它的 `result_response` 再改回 `lingering`；已经开始过别的任务（锁里不是它了）时 `undo_expired` |
+| `respond` | 执行层的 respond 行，加 `run_id` | 回答结果卡（撤回等，H2）：转给那个还在等结果卡的执行层（不带 `run_id` 就是最近的一个）。先检查 `option` 是结果卡上的一个下标，不是就 `bad_control`；撤回要动电脑：只有锁里正是这个任务、状态 `lingering` 时才转过去，锁改回 `acting`，到它的 `result_response` 再改回 `lingering`；已经开始过别的任务（锁里不是它了）时 `undo_expired`；同一张卡第二次回答、或锁文件读写出错时 `busy`（带原因） |
 | `retry` | `{"type":"retry"}` | 重答最后一条用户消息（H2）：不再存一遍这条消息，入库 `session.retry`，之前对它的回答从上下文里拿掉（其间做过的电脑任务留着：它们真的发生了），然后回复。有回复或任务在跑时 `busy` |
 | `queue_edit` | `{"type":"queue_edit","id":"…","text":"…"}` | 改一条排队的话（H2） |
 | `queue_cancel` | `{"type":"queue_cancel","id":"…"}` | 撤掉一条排队的话（H2） |
@@ -219,7 +219,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - **卡片在等时（负责人 10-21）：** app 禁用输入框（同 Claude Code）；要打字的卡有自己的输入框，用 `answer{text}` 答。所以任务里有卡在等（`ask` 之后还没有同一 `ask_id` 的 `resumed` / `ask_void`）时，`say`、`steer`、`queue_send_now` 回 `card_open`。
 - **撤回和等待（负责人 10-21）：** `task_done` 之后执行层最多再等 600 秒结果卡（`--linger 600`）。会话在把 `task_done` 转出去**之前**把锁改成 `lingering`（app 一看到结果卡就点撤回也能过）。`respond` 见上表。这台 Mac 上开始**任何**新的电脑任务，撤回就过期：新任务拿锁时结束那个 `lingering` 的进程组；它所在的会话看到执行层退出、锁里已是别的任务，发 `task_closed new_task`。执行层自己结束（答了结果卡、到了时间、本来没有结果卡）时发 `task_closed linger`。
 - **app 走了（stdin 关闭，负责人 10-21）：** 有任务在跑就给它发 stop（带 `app_gone: true`），最多等 12 秒它的 `task_done`。等到了就按它的结局记 `session.task_end`（通常是 `stopped`）；等不到就记 `status: "stopped"`、reason「the app went away; the task did not confirm the stop in time」（有一步开始了还没结局时带 `cause: "last_step_unknown"`），这时执行层可能还在收尾，锁留给它（锁写的是它的进程组，和会话进程在不在无关），整个组都退出后别人才能接过来。然后关掉所有执行层（`task_closed session_end`），不再让模型说话，退出。`end` 和 SIGINT / SIGTERM 一样。
-- **重新打开：** 有 `session.task` 没有 `session.task_end` 的任务，读它的 `runs/<run_id>/events.jsonl`：有 `task_done` 就照它补一条 `session.task_end`（`undo: none`：执行层已经不在了），`steers` 取自其中的 `steered`，`cause` 照抄；没有就记 `interrupted`（运行记录里有一步只有 `step`、没有 `step_result` 时带 `cause: "last_step_unknown"`）。如果锁里写着这个任务、它的进程组还活着：先给这个组发 SIGTERM，最多等 12 秒它自己的 `task_done`（有就照它记，带它的改动），等不到才记 `interrupted`。没有 `session.task_closed` 的任务补一条 `session_end`。
+- **重新打开：** 有 `session.task` 没有 `session.task_end` 的任务，读它的 `runs/<run_id>/events.jsonl`：有 `task_done` 就照它补一条 `session.task_end`（`undo: none`：执行层已经不在了），`steers` 取自其中的 `steered`，`cause` 照抄；没有就记 `interrupted`（运行记录里有一步只有 `step`、没有 `step_result` 时带 `cause: "last_step_unknown"`）。如果锁里写着这个任务、它的进程组还活着：先给这个组发 SIGTERM，最多等 12 秒它自己的 `task_done`（有就照它记，带它的改动），等不到才记 `interrupted`，同时结束这个组里还剩的进程。没有 `session.task_closed` 的任务补一条 `session_end`。
 
 **电脑锁（第 2 版，会话和 DeskMind helper 共用；`src/session/computer.ts`，helper 里 `ComputerLock` 是同一协议的 Swift 版）：**
 - **两个文件**，都在 `<--dir>/sessions/` 下：`computer.guard`（空文件，只用来加 flock：读改写锁的每一步都在这个排他锁里做，进程之间不会交错；Node 用 macOS 的 `O_EXLOCK` 打开它）；`computer.lock`（占着的人，JSON，整个文件换掉：先写自己的临时文件再 rename 过去）：
@@ -228,7 +228,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - **拿锁（新任务）：** 在 guard 里一步做完：锁里是 `acting` 且占着 → `computer_busy`；是 `lingering` 且占着 → 结束它（给整个组 SIGTERM，最多 1.5 秒，再 SIGKILL，最多 1 秒；还在就拒绝，helper 回 `previous_run_alive`，会话回 `computer_busy`）——它的撤回过期；然后启动执行层，写 `acting`。执行层在锁写好之后才收到请求。
 - **`task_done`：** 改成 `lingering`，在把 `task_done` 转给任何人之前。
 - **撤回：** 只有锁里正是这个任务且 `lingering` 才行，改回 `acting`；`result_response` 后改回 `lingering`。
-- **没人管的占用：** 锁是 `acting`、组里还有进程活着，但 `owner` 和组长都不在了（比如 helper 被直接杀掉、执行层自己先退出了）：下一个任务先被拒（`computer_busy`），同时在锁里记下 `orphan_since`（1970 年起的秒）；过了 12 秒（和等 stop 一样长）再来的任务就结束这个组、接过锁——不能让它永远占着。启动它的一方还在时，自己在执行层没 `task_done` 就退出后等 12 秒，组里还有人就结束它们。
+- **没人管的占用：** 锁是 `acting`、组里还有进程活着，但 `owner` 和组长都不在了（比如 helper 被直接杀掉、执行层自己先退出了）：下一个任务先被拒（`computer_busy`），同时在锁里记下 `orphan_since`（1970 年起的秒）；过了 12 秒（和等 stop 一样长）再来的任务就结束这个组、接过锁——不能让它永远占着。启动它的一方还在时，执行层一退出，就看锁：锁里还是这个任务、还是 `acting`（没说 `task_done`，或撤回途中死了），等 12 秒，组里还有人就结束它们；`lingering` 的不用管，下一个任务会结束它。
 - **启动时间：** 两边算的都是内核里的秒数（Swift 读 `pbi_start_tvsec`；Node 用 `ps -o lstart` 时设 `TZ=UTC0`，按 GMT 解析），和所在时区无关。
 - **放锁：** 只在进程组确认没了之后：启动它的一方看到执行层退出时，锁还是这个任务、组里没人了，就删掉；组里还有子进程，锁照旧（`acting` 的话，下一个任务就是 `computer_busy`）。没人占的锁下一个人直接接过来。
 - 以前的 `computer.last` 不再用：新任务拿锁时直接结束 `lingering` 的那一个，这台 Mac 上最多只有一个等结果卡的执行层。
