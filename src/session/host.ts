@@ -153,6 +153,8 @@ interface Task {
   unrecordedClose: "new_task" | "session_end" | null;
   /** Its lock could not be set lingering at task_done: it does not linger (its card is not offered; it exits now). */
   noLinger?: boolean;
+  /** Why its executor could not be sent its task (the end its exit records says so). */
+  startError?: string;
 }
 
 export interface QueueItem { id: string; text: string; held?: boolean; note?: string; client_id?: string }
@@ -491,7 +493,9 @@ export class SessionHost {
     } catch (e) {
       // the lock could not be written (acquire ended a group it had started); an executor it started is let go here too
       const started = handle as ExecutorHandle | null;
-      if (started) this.abandon(runId, started, null);
+      if (started) this.abandon(runId, started, null, true, started.pid ?? 0);
+      // acquire may have ended this session's lingering executor before it failed: that card is closed (new_task)
+      for (const t of [...this.tasks.values()]) if (t.state === "lingering" && t.pgid > 0 && t.holder && !held(t.holder)) { try { this.closeTask(t, "new_task"); } catch { /* recorded at its exit */ } }
       return { failed: errText(e) };
     }
     if (!("ok" in got)) return { busy: true };
@@ -524,7 +528,8 @@ export class SessionHost {
       h.start?.();
     } catch (e) {
       // recorded, but the executor could not be given its task: it is ended, and its exit records the end (failed)
-      process.stderr.write(`session: the task could not be sent: ${errText(e)}\n`);
+      task.startError = errText(e);
+      process.stderr.write(`session: the task could not be sent: ${task.startError}\n`);
       this.abandon(runId, h, holder, false);
     }
     return task;
@@ -533,10 +538,10 @@ export class SessionHost {
   /** Let go of what a start that failed took: its executor's stdin is closed, its group ended and the lock it wrote
    *  removed (compare-and-set on `holder`); a group that would not end is ended later (reapLater), and once it exits
    *  the lock is removed if it still names it. `forget`: the session never knew the task (nothing follows its exit). */
-  private abandon(runId: string, h: ExecutorHandle, holder: Holder | null, forget = true) {
+  private abandon(runId: string, h: ExecutorHandle, holder: Holder | null, forget = true, pgid = holder?.pgid ?? 0) {
     try { h.close(); } catch { /* gone */ }
     if (holder && !release(this.o.dir, holder)) reapLater(this.o.dir, runId, holder.pgid, 2000);
-    if (forget) void h.exited.then(() => { inProcess.delete(runId); try { free(this.o.dir, runId, holder?.pgid ?? 0); } catch { /* the next task finds its group gone */ } });
+    if (forget) void h.exited.then(() => { inProcess.delete(runId); try { free(this.o.dir, runId, pgid); } catch { /* the next task finds its group gone */ } });
   }
 
   /** An executor's event: to the app as it is (plus the session), and what the session follows of it. */
@@ -550,7 +555,8 @@ export class SessionHost {
       if (!this.lockLinger(task)) task.noLinger = true;
       this.cardOf(task, ev);
     }
-    this.o.out({ ...ev, session_id: this.o.sessionId });
+    // (a task that does not linger offers no result card: none is shown that could not be answered)
+    this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { result_card: null } : {}), session_id: this.o.sessionId });
     switch (ev.kind) {
       case "ask": task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; break;
       case "resumed": case "ask_void": if (ev.ask_id === task.card) task.card = null; break;
@@ -618,7 +624,7 @@ export class SessionHost {
       reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
       if (!task.end) {
         // no task_done: a step it had begun and not ended may or may not have taken effect
-        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
+        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
       }
       if (task.state !== "closed") {
         // a lingering executor ended by a new task elsewhere on this Mac (the lock names another run now): undo expired

@@ -973,7 +973,7 @@ describe("a task start that fails part-way lets go of what it took (the disk is 
    *  sees it through its own `import * as fs` (syncBuiltinESMExports). Undone after each test. */
   const undoFs: (() => void)[] = [];
   afterEach(() => { for (const u of undoFs.splice(0)) u(); });
-  const failFs = (name: "openSync" | "writeFileSync" | "renameSync", when: (...a: any[]) => boolean, times = 1) => {
+  const failFs = (name: "openSync" | "writeFileSync" | "renameSync" | "fsyncSync", when: (...a: any[]) => boolean, times = 1) => {
     const orig = (fsCjs as any)[name];
     let left = times;
     const hit = { n: 0 };
@@ -1111,6 +1111,7 @@ rl.on("close",()=>process.exit(0));`;
     expect(f.hit.n).toBe(1);
     expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded", undo: "none" });
     expect(s.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ why: "linger" });
+    expect(s.evs.find((e) => e.kind === "task_done").result_card).toBeNull();   // no card that could not be answered
     await waitFor(() => !groupUp(ex.pgids[0]!) && lockState(s.dir) === "free");
     await waitFor(() => !s.h.busy);
     s.send({ type: "cua", text: "第二件" });
@@ -1165,6 +1166,50 @@ rl.on("close",()=>process.exit(0));`;
     expect(lockAtResponse).toBe("lingering");
     s.send({ type: "cua", text: "第二件" });
     await waitFor(() => doneRuns(s.evs).length === 2);
+  });
+
+  it("the lock's own write fails while this session's card lingers: the lingering executor acquire ended is closed as new_task; the next task starts", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+    s.send({ type: "cua", text: "第一件" });
+    await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+    const runA = doneRuns(s.evs)[0];
+    const f = failFs("renameSync", (_from, to) => String(to).endsWith("computer.lock"));
+    s.send({ type: "cua", text: "第二件" });
+    f.restore();
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", text: expect.stringContaining("ENOSPC") });
+    await waitFor(() => !groupUp(ex.pgids[0]!) && !groupUp(ex.pgids[1]!));
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+    expect(s.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ run_id: runA, why: "new_task" });
+    s.send({ type: "cua", text: "第三件" });
+    await waitFor(() => doneRuns(s.evs).length === 2);
+    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[2], state: "lingering" });
+  });
+
+  it("recorded, but the request cannot be sent: the group is ended, the lock released, the end says why (failed), the next task starts", async () => {
+    const ex = realExec();
+    let first = true;
+    const launch: Launcher = (req, o) => { const h = ex.launch(req, o); if (!first) return h; first = false; return { ...h, start: () => { throw new Error("EPIPE: broken pipe, write"); } }; };
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch });
+    s.send({ type: "cua", text: "第一件" });
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    await waitFor(() => !s.h.busy && s.stored().some((e: any) => e.kind === "session.task_end"));
+    expect(groupUp(ex.pgids[0]!)).toBe(false);
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "failed", reason: expect.stringContaining("could not be sent to the executor: EPIPE") });
+    s.send({ type: "cua", text: "第二件" });
+    await waitFor(() => doneRuns(s.evs).length === 1);
+  });
+
+  it("a history line that lands but cannot be synced is cut off again: never in the file when the caller was told it failed", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_l");
+    log.emit({ kind: "session.retry", reply_to: "m0" });
+    const f = failFs("fsyncSync", () => true);
+    expect(() => log.emit({ kind: "session.task_closed", run_id: "run_x", why: "new_task" })).toThrow(/ENOSPC/);
+    f.restore();
+    log.emit({ kind: "session.task_closed", run_id: "run_x", why: "new_task" });
+    const back = new SessionLog(dir, "ses_l").events;
+    expect(back.map((e) => [e.seq, e.kind])).toEqual([[1, "session.retry"], [2, "session.task_closed"]]);
   });
 
   it("resume: the ends cannot be stored: the old executor is still ended, recovery does not reject, the next task starts", async () => {

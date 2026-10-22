@@ -135,7 +135,12 @@ export class SessionLog {
     const parsed = SessionBody.parse(body);
     const ev = { seq: this.events.length + 1, t: Date.now() / 1000, session_id: this.sessionId, ...parsed } as SessionEvent;
     const fd = fs.openSync(this.file, "a", 0o600);
-    try { fs.writeSync(fd, JSON.stringify(ev) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    // all or nothing: a write that fails part-way, or lands and then cannot be synced, is cut off again — an event the
+    // caller was told failed is never in the file (stored once more later, or said to have happened when it did not)
+    let size = -1;
+    try { size = fs.fstatSync(fd).size; fs.writeSync(fd, JSON.stringify(ev) + "\n"); fs.fsyncSync(fd); }
+    catch (e) { if (size >= 0) { try { fs.ftruncateSync(fd, size); } catch { /* the reader skips a cut-off line */ } } throw e; }
+    finally { fs.closeSync(fd); }
     this.events.push(ev);
     this.sink?.(ev);
     return ev;
