@@ -1168,6 +1168,27 @@ rl.on("close",()=>process.exit(0));`;
     await waitFor(() => doneRuns(s.evs).length === 2);
   });
 
+  it("acquire throws after its lock write landed (closing the guard fails): the lock naming this run is released and its group ended", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+    // the guard's fd as acquire opens it; its first close fails (after closing it: the flock goes)
+    const guardFds = new Set<number>();
+    const origOpen = fsCjs.openSync;
+    const undoOpen = () => { (fsCjs as any).openSync = origOpen; syncBuiltinESMExports(); };
+    (fsCjs as any).openSync = (...a: any[]) => { const fd = (origOpen as any)(...a); if (String(a[0]).endsWith("computer.guard")) guardFds.add(fd); return fd; };
+    syncBuiltinESMExports();
+    undoFs.push(undoOpen);
+    const c = failFs("closeSync", (fd) => guardFds.has(fd));
+    s.send({ type: "cua", text: "第一件", client_id: "k1" });
+    c.restore(); undoOpen();
+    expect(c.hit.n).toBe(1);
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", client_id: "k1", text: expect.stringContaining("ENOSPC") });
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);          // released at once, compare-and-set
+    await waitFor(() => !groupUp(ex.pgids[0]!));
+    s.send({ type: "cua", text: "第二件" });
+    await waitFor(() => doneRuns(s.evs).length === 1);
+  });
+
   it("the lock's own write fails while this session's card lingers: the lingering executor acquire ended is closed as new_task; the next task starts", async () => {
     const ex = realExec();
     const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
