@@ -352,6 +352,8 @@ export class Executor {
   readonly consent: ConsentVerifier;
   readonly receipts: Receipt[] = [];
   private stopped = false;
+  /** Fires at the stop: every judge call checks it right before it goes out, and it aborts the ones in flight. */
+  private readonly halt = new AbortController();
   private epoch = 0;
   private last: Snapshot | null = null;
   /** The computer as the task began (null before begin): facts for whatever is filtered by structure — which apps are
@@ -697,7 +699,7 @@ export class Executor {
       const evidence = r.evidence.filter((e) => e.trim() && ![this.opts.raw ?? "", ...this.earlierRequests].some((w) => w.includes(e.trim())));   // the request cannot settle its own ambiguity
       if (!evidence.length || !this.opts.judge) { open.push(r); continue; }
       const options = [r.reading, ...r.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
-      const ans = await this.opts.judge.choose(P.evidenceQuestion(r.point), { ...this.userWords(), 证据: evidence }, options);
+      const ans = await this.choose(this.opts.judge, P.evidenceQuestion(r.point), { ...this.userWords(), 证据: evidence }, options);
       if (ans?.choice !== "r0") open.push(r);
     }
     this.emit("executor.plan", { steps: p.steps.length, readings: (p.readings ?? []).length, open: open.map((r) => r.point) });
@@ -716,7 +718,7 @@ export class Executor {
     const j = this.opts.judge;
     if (!j || !this.opts.raw) return { verdict: "unavailable", reason: "no judge" };
     const ctx = { ...this.userWords(), 即将执行的动作: text, 后果类别: consequence, 对象: object, 证据: evidence };
-    const ans = await j.choose(INTENT_QUESTION, ctx, INTENT_OPTIONS);
+    const ans = await this.choose(j, INTENT_QUESTION, ctx, INTENT_OPTIONS);
     if (!ans) return { verdict: "unavailable", reason: "the judge could not answer" };
     this.emit("executor.intent", { action: a, verdict: ans.choice, by: ans.by, confidence: ans.confidence, reason: ans.reason ?? "", ...(ans.judge_id ? { judge_id: ans.judge_id } : {}) });
     return { verdict: ans.choice as "matches" | "mismatch" | "insufficient", reason: ans.reason ?? "", by: ans.by };
@@ -813,7 +815,15 @@ export class Executor {
   /** The caller's last observation of a window (what its element ids refer to), for what a step is said to be. */
   observed(windowId: string): Observation | undefined { return this.lastObs.get(windowId); }
 
-  stop() { this.stopped = true; this.emit("executor.stopped"); }
+  stop() { this.stopped = true; this.halt.abort(); this.emit("executor.stopped"); }
+
+  /** Every judge question of this executor goes out through here: none once the task is stopped, and the stop aborts
+   *  one in flight. Its answer is then none — the caller's conservative branch — and the step ends stopped (the user's
+   *  words, a window's text and what would go out are not sent to a model after a stop). */
+  private choose(judge: Judge, question: string, context: unknown, options: Parameters<Judge["choose"]>[2], role?: Parameters<Judge["choose"]>[3], how: Parameters<Judge["choose"]>[4] = {}) {
+    if (this.stopped) return Promise.resolve(null);
+    return judge.choose(question, context, options, role, { ...how, signal: this.halt.signal });
+  }
 
   /** The state-changing screen action handed to the driver and not answered yet (its intent is journaled, its receipt
    *  is not): a stop cannot call the run cleanly stopped while it is out, since it may still land (hands may take up to
@@ -1079,7 +1089,7 @@ export class Executor {
         ...(material.length > recent.length ? { 没给出的更早条目: material.length - recent.length } : {}),
       },
     };
-    const ans = await judge.choose(PROVENANCE_QUESTION, ctx, PROVENANCE_OPTIONS, undefined, { settle: "has", route: false });
+    const ans = await this.choose(judge, PROVENANCE_QUESTION, ctx, PROVENANCE_OPTIONS, undefined, { settle: "has", route: false });
     const local = !!ans && !!judge.tiers.find((t) => t.name === ans.by)?.local;
     const out = !ans ? { cleared: false, why: "the provenance check got no answer: treated as sending", by: "no_answer" }
       : ans.choice === "none" && local ? { cleared: false, why: `判官（${ans.by}，本地）答「没有」不能单独算数：按往外发处理`, by: ans.by }
@@ -1169,7 +1179,7 @@ export class Executor {
       本次任务在这个窗口里打过的字: typed,
       结构线索: { 目标名字命中发送词表: !!h.el?.sends, 回车或换行: h.submits, 窗口里有名字命中发送词表的控件: !!h.sender },
     };
-    const ans = await judge.choose(OUTGOING_QUESTION, ctx, OUTGOING_OPTIONS, undefined, { settle: "sends", route: false });
+    const ans = await this.choose(judge, OUTGOING_QUESTION, ctx, OUTGOING_OPTIONS, undefined, { settle: "sends", route: false });
     if (!ans) return settle({ consequence: "external", object: s.object, why: "the outgoing check got no answer: treated as sending", by: "no_answer" });
     if (ans.choice !== "stays") return settle({ consequence: "external", object: s.object, why: `判官（${ans.by}）：${ans.choice === "sends" ? "会发出去" : "拿不准"}${ans.reason ? "。" + ans.reason : ""}`, by: ans.by, definite: ans.choice === "sends" });
     const m = mine();
@@ -1318,6 +1328,8 @@ export class Executor {
     const asked = this.classified.size;
     const c = await this.classify(req.action, req.epoch, req.consequence);
     consequence = c.consequence; base = { consequence, object: c.object };
+    // stopped while the judges were asked: the step ends here (no further judge, no card)
+    if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
     if (pending) {
       epochBound = readsObs || NEEDS_CONSENT.has(consequence);
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `decided on epoch ${req.epoch}, the computer is at ${now.epoch}; observe again`, epoch: now.epoch });
@@ -1345,6 +1357,7 @@ export class Executor {
       if (lost) return done({ ...base, status: "stale", why: `the target is gone from ${target}, or no longer one of a kind; observe it again and decide anew`, epoch: now.epoch });
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
       const judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
       if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
       // the judge answers over the network: the user may have selected another row meanwhile, and the action would land
       // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
@@ -1607,6 +1620,8 @@ export class Executor {
       const judgedOn: Record<string, string> = {};
       for (const p of new Set([...fp.reads, ...reach(ws, fp.writes)])) if (!ws.isDir(p)) judgedOn[p] = ws.version(p);
       const judged = await this.judgeIntent(a, consequence, object, evidence, text);
+      // stopped while the judge was asked: the step ends here (no card), as act's
+      if (this.stopped) return { ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch };
       // the screen first: locked meanwhile, the task stops, a file action as much as a window one. It is the last
       // wait: from the versions read below to the write there is none, or another program's edit made during it
       // would be overwritten unchecked (review of #16: the lock look, put after the checks, opened just that gap)
@@ -1739,7 +1754,7 @@ export class Executor {
       模型自称: summary,
     };
     if (!this.opts.judge) return { verdict: "unknown", reason: "no judge to verify with" };
-    const ans = await this.opts.judge.choose(VERIFY_QUESTION, { ...this.userWords(), 证据: evidence }, VERIFY_OPTIONS, "verify", { claims: true });
+    const ans = await this.choose(this.opts.judge, VERIFY_QUESTION, { ...this.userWords(), 证据: evidence }, VERIFY_OPTIONS, "verify", { claims: true });
     if (!ans) return { verdict: "unknown", reason: "the judge could not answer" };
     const missing = ans.choice === "unknown" && ans.missing_kind ? { missing_kind: ans.missing_kind } : {};
     // the sentences of the run's account the judge found contradicted: recorded with the verdict (not a gate here — an

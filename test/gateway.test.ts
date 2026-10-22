@@ -58,7 +58,8 @@ describe("model configurations by name or spec", () => {
   });
   it("model-check reports an unreachable model without leaking the key", async () => {
     const { modelCheck } = await import("../src/cli/app.js");
-    expect(await modelCheck("no-such-config")).toEqual({ ok: false, error: "unknown config no-such-config" });
+    // (the same grammar a session's open checks: Test never says connected for a config a session refuses)
+    expect(await modelCheck("no-such-config")).toEqual({ ok: false, error: "a config is a configuration name or openai:<service>|<model>" });
     const saved = { url: process.env.CUSTOM_URL, key: process.env.CUSTOM_API_KEY };
     process.env.CUSTOM_URL = "http://127.0.0.1:9"; process.env.CUSTOM_API_KEY = "sk-secretsecretsecret";
     const r = await modelCheck("openai:custom|m");

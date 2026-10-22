@@ -24,7 +24,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Type } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
-import { configTable, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
+import { configSyntaxProblem, configTable, normalizeConfig, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
 import { loopModel } from "../runtime/model.js";
 import { PROTOCOL } from "../protocol/version.js";
 import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
@@ -57,7 +57,8 @@ export type SessionControl =
   | { type: "retry" }
   | { type: "queue_edit"; id: string; text: string }
   | { type: "queue_cancel"; id: string }
-  | { type: "queue_send_now"; id: string };
+  | { type: "queue_send_now"; id: string }
+  | ({ type: "set_config"; line: Record<string, unknown> } & ClientId);
 
 /** The longest client_id kept (a longer one is ignored, as if absent). */
 export const MAX_CLIENT_ID = 100;
@@ -88,6 +89,8 @@ export function parseSessionControl(line: string): SessionControl | null {
     case "queue_edit": return str("id") && str("text") ? { type: "queue_edit", id: o.id as string, text: o.text as string } : null;
     case "queue_cancel": return str("id") ? { type: "queue_cancel", id: o.id as string } : null;
     case "queue_send_now": return str("id") ? { type: "queue_send_now", id: o.id as string } : null;
+    // (its fields are checked where it is handled: a bad one is refused as bad_config, never ignored)
+    case "set_config": return { type: "set_config", line: o, ...cid };
     default: return null;
   }
 }
@@ -95,6 +98,7 @@ export function parseSessionControl(line: string): SessionControl | null {
 export interface HostOptions {
   dir: string;
   sessionId: string;
+  /** The open's settings (header or command line). Absent: the last stored session.config's, else ds-flash / zh. */
   config?: string;
   lang?: Lang;
   /** Every computer task's executor driver and task folder (the header's). */
@@ -105,8 +109,8 @@ export interface HostOptions {
   /** Called once when the session has nothing left to do: the app went away (stdin closed) or said end, and no reply
    *  or task runs. `failure`: it halted instead — a terminal record could not be stored (the process exits non-zero). */
   onExit?: (failure?: string) => void;
-  /** Tests: a model in place of the config's. */
-  model?: SessionModel;
+  /** Tests: a model in place of the config's (a function: the model for each config name). */
+  model?: SessionModel | ((config: string) => SessionModel);
   /** How long deltas are gathered before they are sent (ms). */
   coalesceMs?: number;
   /** Tests: how an executor is started (default: this harness's `executor` as a child process). */
@@ -191,7 +195,8 @@ export interface QueueItem { id: string; text: string; held?: boolean; note?: st
 export class SessionHost {
   readonly log: SessionLog;
   readonly resumed: boolean;
-  config: string;
+  /** The model config every model turn that starts now uses; null: no model (set_config null) — no turn starts. */
+  config: string | null;
   lang: Lang;
   private running: Running | null = null;
   /** The task that runs now (at most one per session; the machine lock makes it one per Mac). */
@@ -208,11 +213,33 @@ export class SessionHost {
   private gone = false;
 
   constructor(private readonly o: HostOptions) {
-    this.config = o.config ?? "ds-flash";       // the app's default (cli/app.ts)
-    this.lang = o.lang === "en" ? "en" : "zh";
     this.resumed = fs.existsSync(path.join(sessionDir(o.dir, o.sessionId), "session.jsonl"));
     this.log = new SessionLog(o.dir, o.sessionId, (ev) => { this.noteTaken(ev); o.out(ev); });
     for (const ev of this.log.events) this.noteTaken(ev);
+    // the open's own settings win; without them, the last stored (set_config, or an earlier open's); else the defaults
+    const last = this.lastConfig();
+    this.config = o.config !== undefined ? normalizeConfig(o.config) : last ? last.config : "ds-flash";     // the app's default (cli/app.ts)
+    this.lang = o.lang === "en" || o.lang === "zh" ? o.lang : last ? last.lang : "zh";
+  }
+
+  private lastConfig() {
+    for (let i = this.log.events.length - 1; i >= 0; i--) { const e = this.log.events[i]!; if (e.kind === "session.config") return e; }
+    return null;
+  }
+
+  /** The settings now, stored (session.config): the ack of set_config, and what a reopen with no settings of its own
+   *  takes. Never a key: the config is a name (checked: configProblem), the model its `<provider>|<model>`. */
+  private storeConfig(by: "set_config" | "open", cid?: string) {
+    const model = this.config === null ? null : this.modelName(this.config);
+    this.log.emit({ kind: "session.config", config: this.config, ...(model ? { model } : {}), lang: this.lang, by, ...(cid ? { client_id: cid } : {}) });
+  }
+
+  /** An open (or a resume's header) that named other settings than the last stored ones: stored, so the next open with
+   *  none of its own takes these (the latest), not the older set_config's. Nothing stored yet: nothing to supersede. */
+  private storeOpenConfig() {
+    const last = this.lastConfig();
+    if (!last || (last.config === this.config && last.lang === this.lang)) return;
+    try { this.storeConfig("open"); } catch (e) { process.stderr.write(`session: the open's settings could not be stored: ${errText(e)}\n`); }
   }
 
   /** The client_ids of the app's words the history holds (a stored user message or session.steer), with their seq:
@@ -253,6 +280,7 @@ export class SessionHost {
    *  Then, on a resumed session, every task the last process left without an end gets one (recover). */
   start() {
     this.send({ kind: "session.start", session_id: this.o.sessionId, protocol: { session: PROTOCOL.session }, last_seq: this.log.lastSeq, resumed: this.resumed });
+    this.storeOpenConfig();
     if (this.resumed) this.recover();
   }
 
@@ -362,16 +390,17 @@ export class SessionHost {
   configure(h: Record<string, unknown>) {
     const bad = headerProblem(h);
     if (bad) return this.refuse("bad_config", bad);
-    if (typeof h.config === "string") this.config = h.config;
+    if (typeof h.config === "string") this.config = normalizeConfig(h.config);
     if (h.lang === "zh" || h.lang === "en") this.lang = h.lang;
     if (typeof h.driver === "string") this.o.driver = h.driver;
     if (typeof h.scope === "string") this.o.scope = h.scope;
+    this.storeOpenConfig();
   }
 
   handle(line: string) {
     if (this.exited || !line.trim()) return;
     const c = parseSessionControl(line);
-    if (!c) return;
+    if (!c || this.refusedNoModel(c)) return;
     switch (c.type) {
       case "say": return this.say(c.text, c.client_id);
       case "stop": return this.stop(c.run_id);
@@ -386,21 +415,89 @@ export class SessionHost {
       case "queue_edit": { const it = this.queue.find((q) => q.id === c.id); if (it && c.text.trim() && c.text.length <= MAX_USER_CHARS) it.text = c.text; return this.emitQueue(); }
       case "queue_cancel": this.queue = this.queue.filter((q) => q.id !== c.id); return this.emitQueue();
       case "queue_send_now": return this.sendNow(c.id);
+      case "set_config": return this.setConfig(c.line, c.client_id);
     }
   }
 
-  /** The model of the session's config: its goal model, keys from the environment. An error says what to fix. */
-  private resolveModel(): SessionModel | { code: ErrorCode; text: string } {
-    if (this.o.model) return this.o.model;
-    const table = configTable(this.config);
-    if (!table) return { code: "bad_config", text: `unknown config ${this.config}` };
-    const goal = table.goal;
-    if (goal.backend !== "openai") return { code: "bad_config", text: `config ${this.config}: the session needs a keyed service (<provider>|<model>), not ${goal.backend}` };
-    const p = providerOf(goal.model);
+  /** `set_config{config, lang?}`, in the order of stdin like every control. The config is for every model turn that
+   *  starts after this line (a turn streaming now ends on the one it began with; a running task keeps the config it was
+   *  started with) and every task started after it; the lang for everything rendered after it. Stored (session.config:
+   *  the ack, and what a reopen takes). Nothing is restarted or stopped by a config — except by null, no model: the reply
+   *  under way is stopped (as by stop), no model turn starts any more (say, cua, retry, steer, queue_send_now refused
+   *  no_model at once; a task's follow-up turn skipped, its end stored; the queue kept), and a running task is stopped by
+   *  the normal stop (its executor calls the cloud's judges every step). Its result card, undo and card answers go on:
+   *  they need no model. A config again: the queue (what is not held) goes to the model as usual. */
+  setConfig(line: Record<string, unknown>, cid?: string) {
+    const bad = this.configProblem(line);
+    if (bad) return this.refuse("bad_config", bad, "set_config", cid);
+    const was = this.config;
+    this.config = typeof line.config === "string" ? normalizeConfig(line.config) : null;
+    if (line.lang === "zh" || line.lang === "en") this.lang = line.lang;
+    // (applied whatever the record: no model must hold in this process even when the disk does not take the record)
+    try { this.storeConfig("set_config", cid); }
+    catch (e) { this.refuse("busy", `the settings apply to this session now, but could not be stored (a reopen takes the earlier ones): ${errText(e)}`, "set_config", cid); }
+    if (this.config === null) {
+      // the reply under way is stopped, as by the user's stop (what it said so far is stored, stopped: true): a turn
+      // streaming sends nothing more, and a request the service retries (a 429, a 5xx: the provider's backoff, which
+      // never comes back through the turn's model check) is not sent again with the whole conversation
+      this.running?.abort.abort();
+      const t = this.current;
+      if (t && t.state === "running" && !t.end) t.handle.write(JSON.stringify({ type: "stop" }));
+    } else if (was === null) this.afterActivity();
+  }
+
+  /** What is wrong with a set_config line, or null: `config` must be there — a config name (or
+   *  `openai:<provider>|<model>`) this harness knows, with a keyed service, or null; never a key; `lang` zh or en. */
+  private configProblem(line: Record<string, unknown>): string | null {
+    if (!("config" in line)) return "set_config needs config: a model config, or null for no model";
+    const c = line.config;
+    if (line.lang !== undefined && line.lang !== "zh" && line.lang !== "en") return "lang must be zh or en";
+    if (c === null) return null;
+    if (typeof c !== "string") return "config must be a config name or openai:<service>|<model>, or null";
+    const bad = configSyntaxProblem(c);
+    if (bad) return bad;
+    const m = goalOf(c);
+    return "code" in m ? m.text : null;
+  }
+
+  /** `<provider>|<model>` of a config's goal model (no key), or null. */
+  private modelName(config: string): string | null {
+    if (this.o.model) { const m = typeof this.o.model === "function" ? this.o.model(config) : this.o.model; return `${m.model.provider}|${m.model.id}`; }
+    const g = goalOf(config);
+    return "spec" in g ? g.spec : null;
+  }
+
+  /** No model (set_config null): a control that needs one — say, cua, retry, steer, queue_send_now — is refused
+   *  no_model at once, whatever the session is doing (a task still stopping, a recover): never queued, so nothing is
+   *  left waiting that no control could send. Words already taken (a repeated client_id) are said so as ever; an empty
+   *  line and a closing session answer as they always do. Entries already queued stay. */
+  private refusedNoModel(c: SessionControl): boolean {
+    if (this.config !== null || this.closing) return false;
+    switch (c.type) {
+      case "say": case "cua": case "steer":
+        if (c.text.trim() && !this.sendsDuplicate(c.client_id, c.type)) this.refuseNoModel(c.type, c.client_id);
+        return true;
+      case "retry": this.refuseNoModel("retry"); return true;
+      case "queue_send_now": { const it = this.queue.find((q) => q.id === c.id); if (it) this.refuseNoModel("queue_send_now", it.client_id); else this.emitQueue(); return true; }
+      default: return false;
+    }
+  }
+
+  private refuseNoModel(control: string, cid?: string) { this.refuse("no_model", this.t("模型已关闭：在模型设置里打开后再试", "no model is set (the model is turned off); turn one on in the model settings"), control, cid); }
+
+  /** The model of a config: its goal model, keys from the environment. An error says what to fix. */
+  private resolveModel(config: string): SessionModel | { code: ErrorCode; text: string } {
+    if (this.o.model) return typeof this.o.model === "function" ? this.o.model(config) : this.o.model;
+    const g = goalOf(config);
+    if ("code" in g) return g;
+    const p = providerOf(g.spec);
     if ("error" in p) return { code: "bad_config", text: p.error };
     if (!p.key) return { code: "no_key", text: `${PROVIDERS[p.name]!.keyEnv} is not set` };
-    return loopModel(goal.model);
+    return loopModel(g.spec);
   }
+
+  /** The model each turn takes as it starts: the config now (null: none). */
+  private turnModel(): SessionModel | { code: ErrorCode; text: string } | null { return this.config === null ? null : this.resolveModel(this.config); }
 
   private tooLong(text: string, control: string, cid?: string): boolean {
     if (text.length <= MAX_USER_CHARS) return false;
@@ -443,28 +540,36 @@ export class SessionHost {
   /** One reply to `replyTo` (the newest user message). `maxTasks`: computer tasks it may start; `oneTurn`: the model
    *  speaks one turn (after a /cua). */
   private startReply(replyTo: string, o: { maxTasks?: number; oneTurn?: boolean } = {}) {
-    const model = this.resolveModel();
+    // no model: the turn is skipped, not run (the say / cua / retry that would start one were refused already; this is
+    // a /cua's turn after its task: the task's end is stored, a later turn reads it)
+    if (this.config === null) return;
+    const model = this.resolveModel(this.config);
     if ("code" in model) { this.fail(model.code, model.text, { reply_to: replyTo }); return this.afterActivity(); }
     const context = buildContext(this.log.messages(), { budgetChars: Math.floor((model.model.contextWindow ?? 128_000) * WINDOW_SHARE), lang: this.lang });
     const r: Running = { msgId: newId(), replyTo, abort: new AbortController(), sent: "", buffer: "", timer: null, done: Promise.resolve(), tasks: 0, maxTasks: o.maxTasks ?? MAX_TASKS, raw: null, cut: false, stopped: false, final: false };
     this.running = r;
-    const spec = `${model.model.provider}|${model.model.id}`;
     // the reply has begun (the app shows "thinking" until text comes): an empty delta at offset 0
     this.send({ kind: "session.delta", msg_id: r.msgId, text: "", offset: 0 });
     const onDelta = (d: string) => { r.buffer += d; if (!r.timer) r.timer = setTimeout(() => this.flush(r), this.o.coalesceMs ?? 50); };
     // a turn after a task: a new bubble, begun with an empty delta
     const onTurnStart = (n: number) => { r.cut = false; if (r.stopped) r.final = true; if (n > 0) this.send({ kind: "session.delta", msg_id: r.msgId, text: "", offset: 0 }); };
     // a turn that calls computer_task: its words are a message of their own, before the task
-    const onTurnEnd = (text: string) => {
+    const onTurnEnd = (text: string, _calls: number, spec: string) => {
       this.settle(r, text);
       if (text) this.log.emit({ kind: "session.message", msg_id: r.msgId, role: "assistant", text, reply_to: r.replyTo, model: spec });
       r.msgId = newId(); r.sent = ""; r.buffer = ""; r.cut = true;
     };
-    r.done = reply({ model, context, signal: r.abort.signal, maxChars: MAX_ASSISTANT_CHARS, onDelta, tools: [this.computerTask(r)], onTurnStart, onTurnEnd, endNow: () => this.closing || r.final, ...(o.oneTurn ? { oneTurn: true } : {}) }).then((res) => {
+    r.done = reply({ model, context, signal: r.abort.signal, maxChars: MAX_ASSISTANT_CHARS, onDelta, tools: [this.computerTask(r)], onTurnStart, onTurnEnd, current: () => this.turnModel(),
+      // (no model: the turn after a task is not run)
+      endNow: () => this.closing || r.final || this.config === null, ...(o.oneTurn ? { oneTurn: true } : {}) }).then((res) => {
       if (r.timer) { clearTimeout(r.timer); r.timer = null; }
       this.recordCalls(r, res);
       if (this.halted) return;                           // halted: this process stores nothing more
-      if (res.ended === "error") {
+      if (res.ended === "error" && res.error?.code === "no_model") {
+        // a turn that found no model as it was about to be sent: nothing was asked; its bubble is void (not stored)
+        r.buffer = "";
+        this.send({ kind: "session.error", code: "no_model", text: res.error.text, msg_id: r.msgId, reply_to: r.replyTo });
+      } else if (res.ended === "error") {
         r.buffer = "";
         this.fail(res.error!.code, res.error!.text, { msg_id: r.msgId, reply_to: r.replyTo });
       } else if (!r.cut && !(r.tasks && !res.text)) {
@@ -500,6 +605,8 @@ export class SessionHost {
       parameters: Type.Object({ goal: Type.String({ description: en ? "what to do, in your words" : "要做的事，你的转述" }) }),
       execute: async (_id: string, p: { goal: string }) => {
         if (this.closing) return result(en ? "the session is ending" : "会话正在结束", true);
+        // the model was turned off while this turn was streaming: no task (its executor would call the cloud's judges)
+        if (this.config === null) return result(en ? "The model was turned off; the task was not started." : "模型已关闭，任务没有开始。", true);
         // the user stopped a task of this reply: the reply does not start another (the user's stop is not overruled by
         // the model, whatever a page it read said)
         if (r.stopped) return result(en ? "The user stopped the task. Do not start another one in this reply; tell the user it stopped." : "用户停下了任务。这次回复不能再开任务，告诉用户已经停下。", true);
@@ -555,6 +662,7 @@ export class SessionHost {
    *  never got its task) is ended and the lock it wrote removed, compare-and-set on that holder (computer.ts release) —
    *  and the caller is told `failed` with the reason; nothing says the task began. */
   private startTask(o: { raw: string; goal?: string; by: "slash" | "model"; replyTo?: string; scope?: string; before?: () => string }): Task | { busy: true } | { failed: string } {
+    if (this.config === null) return { failed: "no model is set" };      // (refused before: cua, computer_task)
     const runId = `run_${randomUUID().slice(0, 8)}`;
     const scope = o.scope ?? this.o.scope;
     const request = { run_id: runId, raw: o.raw, ...(o.goal ? { context: o.goal } : {}), config: this.config, lang: this.lang, ...(this.o.driver ? { driver: this.o.driver } : {}), ...(scope ? { scope } : {}) };
@@ -916,7 +1024,8 @@ export class SessionHost {
   private afterActivity() {
     if (this.closing || this.running || this.current || this.flows || this.recoverPending) return;
     const go = this.queue.filter((q) => !q.held);
-    if (!go.length) return;
+    // (no model: the queue stays as it is, never delivered; a config again delivers it — setConfig)
+    if (!go.length || this.config === null) return;
     // each stored, then out of the queue; the queue sent after (should storing fail, what is left is still queued)
     let last = "";
     try {
@@ -933,7 +1042,7 @@ export class SessionHost {
     for (const c of res.calls) {
       const outcome = c.stop === "error" || (res.ended === "error" && c === res.calls[res.calls.length - 1]) ? "error" : c.stop === "aborted" || (res.ended === "stopped" && c === res.calls[res.calls.length - 1]) ? "aborted" : "answered";
       const err = c.error ?? (outcome === "error" ? res.error?.text : undefined);
-      const rec: ModelCallRecord = { kind: "model.call", call_id: `mc_${randomUUID().slice(0, 8)}`, started_at: c.started_at, role: "session", backend: "pi-ai", model: res.model,
+      const rec: ModelCallRecord = { kind: "model.call", call_id: `mc_${randomUUID().slice(0, 8)}`, started_at: c.started_at, role: "session", backend: "pi-ai", model: c.model ?? res.model,
         outcome, tokens_in: c.tokens_in, tokens_out: c.tokens_out, cache_read: c.cache_read,
         cost_usd: c.cost_usd, ...(c.cost_estimated ? { cost_estimated: true } : {}), latency_ms: c.latency_ms, sent_chars: c.sent_chars, msg_id: r.msgId, reply_to: r.replyTo,
         ...(err ? { error: err } : {}) };
@@ -1094,5 +1203,19 @@ export function headerProblem(h: Record<string, unknown>): string | null {
   for (const k of ["session_id", "config", "lang", "driver", "scope"]) if (h[k] !== undefined && typeof h[k] !== "string") return `${k} must be a string`;
   if (typeof h.session_id === "string" && !SESSION_ID.test(h.session_id)) return `bad session id ${JSON.stringify(h.session_id).slice(0, 80)}: letters, digits, _ and - only, at most 64`;
   if (h.lang !== undefined && h.lang !== "zh" && h.lang !== "en") return `lang must be zh or en`;
+  // (a config is stored as it is — session.config: only what its grammar allows, never a key of the environment)
+  if (typeof h.config === "string") { const bad = configSyntaxProblem(h.config); if (bad) return `config: ${bad}`; }
   return null;
+}
+
+/** A config's goal model, `<provider>|<model>` (a keyed service), or why it cannot be the session's. */
+function goalOf(config: string): { spec: string } | { code: ErrorCode; text: string } {
+  const table = configTable(config);
+  // (the text never repeats the config: see configSyntaxProblem)
+  if (!table) return { code: "bad_config", text: "unknown config" };
+  const goal = table.goal;
+  if (goal.backend !== "openai") return { code: "bad_config", text: `this config's model is not a keyed service (<provider>|<model>) but ${goal.backend}` };
+  const p = providerOf(goal.model);
+  if ("error" in p) return { code: "bad_config", text: p.error };
+  return { spec: goal.model };
 }

@@ -18,7 +18,7 @@ export interface SessionModel { model: Model<any>; apiKey?: string; streamFn: St
 /** One model call of a reply (a reply that starts a computer task takes two or more: one per turn). tokens_in is
  *  everything the model read (the prompt cache's part included, also in cache_read), cost in USD (the price table when
  *  the service says none), when it was sent and how long it took, and how many characters went with it. */
-export interface CallRecord { started_at: number; latency_ms: number; tokens_in: number; tokens_out: number; cache_read: number; cost_usd: number; cost_estimated?: boolean; sent_chars: number; stop: string; error?: string }
+export interface CallRecord { started_at: number; model: string; latency_ms: number; tokens_in: number; tokens_out: number; cache_read: number; cost_usd: number; cost_estimated?: boolean; sent_chars: number; stop: string; error?: string }
 
 export interface ReplyResult {
   /** The last turn's text (a turn that called a tool handed its text to `onTurnEnd`). */
@@ -80,17 +80,27 @@ export function withReasoningBack(streamFn: StreamFn, model: Model<any>): Stream
   return (m, c, opts) => streamFn(m, c, { ...opts, onPayload: async (pl: unknown, mm: Model<any>) => reasoningBack((await opts?.onPayload?.(pl, mm)) ?? pl) } as never);
 }
 
+/** A turn that may not start: the session's model at that moment is none (`no_model`: set_config null) or one that
+ *  cannot be used (its code: no_key, bad_config). No request is sent. */
+export class TurnRefused extends Error { constructor(readonly code: ErrorCode, text: string) { super(text); } }
+
 /** The session model's one tool. */
 export const COMPUTER_TASK = "computer_task";
 
 /** `tools`: the tools the model may call (H2: computer_task); a turn that calls one is followed by another turn once the
  *  tool returns. `onTurnStart(n)`: a model turn begins (n from 0); `onTurnEnd(text, calls)`: a turn's message is done —
  *  its final text and how many tool calls it made (before they run). The reply's text is the last turn's. `oneTurn`: one
- *  model turn only (its tool calls still run, so the context stays well formed). */
+ *  model turn only (its tool calls still run, so the context stays well formed). `current`: the model each turn uses,
+ *  asked right before its request (the session's config can change between turns: set_config) — null is no model:
+ *  that turn is not sent (TurnRefused no_model); a turn already streaming keeps the model it began with. Without it,
+ *  every turn uses `model`. `onTurnEnd`'s `model` is that turn's `<provider>|<model>`. */
 export async function reply(o: { model: SessionModel; context: BuiltContext; signal: AbortSignal; maxChars: number; onDelta: (text: string) => void;
-  tools?: AgentTool<any>[]; onTurnStart?: (n: number) => void; onTurnEnd?: (text: string, calls: number) => void; oneTurn?: boolean; endNow?: () => boolean }): Promise<ReplyResult> {
+  tools?: AgentTool<any>[]; onTurnStart?: (n: number) => void; onTurnEnd?: (text: string, calls: number, model: string) => void; oneTurn?: boolean; endNow?: () => boolean;
+  current?: () => SessionModel | { code: ErrorCode; text: string } | null }): Promise<ReplyResult> {
   const { model } = o.model;
-  const spec = `${model.provider}|${model.id}`;
+  // the model of the turn under way (set right before each request)
+  let active = o.model;
+  let spec = `${model.provider}|${model.id}`;
   const messages = toMessages(o.context, model, o.tools ?? []);
   const context: AgentContext = { messages, tools: o.tools ?? [] };
   // the caller's stop, or our own cut at maxChars
@@ -103,7 +113,7 @@ export async function reply(o: { model: SessionModel; context: BuiltContext; sig
   const call = (f: AssistantMessage | null): CallRecord => {
     const u = f?.usage, cacheRead = u?.cacheRead ?? 0, tokensIn = (u?.input ?? 0) + cacheRead, tokensOut = u?.output ?? 0;
     const cost = Number((u?.cost?.total || costOf(spec, tokensIn, tokensOut, cacheRead)).toFixed(9));
-    return { started_at: startedAt, latency_ms: Date.now() - startedAt, tokens_in: tokensIn, tokens_out: tokensOut, cache_read: cacheRead, cost_usd: cost,
+    return { started_at: startedAt, model: spec, latency_ms: Date.now() - startedAt, tokens_in: tokensIn, tokens_out: tokensOut, cache_read: cacheRead, cost_usd: cost,
       ...(!u?.cost?.total && priceEstimated(spec, cacheRead) ? { cost_estimated: true } : {}), sent_chars: sentChars, stop: f?.stopReason ?? "none", ...(f?.errorMessage ? { error: scrub(f.errorMessage) } : {}) };
   };
   const config: AgentLoopConfig = {
@@ -111,6 +121,15 @@ export async function reply(o: { model: SessionModel; context: BuiltContext; sig
     // a chat reply should start soon: fewer and shorter retries than the task loop's
     maxRetries: 2, maxRetryDelayMs: 8_000, timeoutMs: 120_000,
     transformContext: async (m) => { sentChars = JSON.stringify(m).length; return m; },
+    // each request: the session's model as it is now (no key ever kept from an earlier turn's service)
+    prepareRequest: async () => {
+      if (!o.current) return undefined;
+      const m = o.current();
+      if (m === null) throw new TurnRefused("no_model", "no model is set");
+      if ("code" in m) throw new TurnRefused(m.code, m.text);
+      active = m; spec = `${m.model.provider}|${m.model.id}`;
+      return { model: m.model };
+    },
     // a turn that only talked ends the reply; one that called a tool goes on once the tool returned
     // (`oneTurn`: the model speaks once, whatever it calls)
     // (`endNow`: the caller is going away — no turn after the tools)
@@ -130,13 +149,16 @@ export async function reply(o: { model: SessionModel; context: BuiltContext; sig
       final = f;
       calls.push(call(f));
       const n = f.content.filter((c) => c.type === "toolCall").length;
-      if (n && f.stopReason === "toolUse") o.onTurnEnd?.(textOf(f) || text, n);
+      if (n && f.stopReason === "toolUse") o.onTurnEnd?.(textOf(f) || text, n, spec);
     }
   };
   try {
-    await runAgentLoop([], context, config, emit, inner.signal, withReasoningBack(o.model.streamFn, model));
+    // (the turn's own service, key and DeepSeek patch: `active` is set by prepareRequest before each request)
+    const stream: StreamFn = (_m, c, opts) => withReasoningBack(active.streamFn, active.model)(active.model, c, { ...opts, apiKey: active.apiKey } as never);
+    await runAgentLoop([], context, config, emit, inner.signal, stream);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (err instanceof TurnRefused) { const c = call(null); return { text, ended: "error", error: { code: err.code, text: scrub(msg) }, model: spec, call: c, calls }; }
     const c = call(null);
     return { text, ended: "error", error: { code: classifyError(msg), text: scrub(msg) }, model: spec, call: c, calls: [...calls, c] };
   } finally {

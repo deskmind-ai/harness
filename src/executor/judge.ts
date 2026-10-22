@@ -34,7 +34,10 @@ export interface JudgeAnswer { choice: string; by: string; confidence?: number; 
  *  - `claims`: the answer also lists claims_contradicted (the finish verdict). */
 export interface ChooseOptions { settle?: string; route?: boolean;
   /** the answer also lists the sentences of the run's own account that the evidence contradicts (the finish verdict) */
-  claims?: boolean }
+  claims?: boolean;
+  /** the task's stop: no tier is asked once it has fired, and it aborts a call in flight; the answer is then none
+   *  (never cached) */
+  signal?: AbortSignal }
 
 /** How often a lower tier settles each kind of question (kinds: the question's first words — intent, verify, and
  *  the evidence questions share a prefix), kept across tasks when a path is given: a tier that never settles a kind
@@ -129,6 +132,8 @@ export class Judge {
     // no cap by default (owner 10-20: a count cap only turned finished tasks into "not done" when it ran out; the loop's
     // own limits already bound how many questions a task can raise, and the cache stops repeats). Evaluations may set one.
     if (this.opts.budget !== undefined && this.calls >= this.opts.budget) { this.opts.onEvent?.("judge.budget", {}); return null; }
+    const stop = how.signal;
+    if (stop?.aborted) return null;
     const ids = options.map((o) => o.id) as [string, ...string[]];
     const schema = R.choiceAnswer(ids, { claims: how.claims });
     const kind = TierStats.kindOf(question, context);
@@ -146,12 +151,14 @@ export class Judge {
     // the race: the top tier starts now, alongside the lower tiers; abortable
     type Answer = Reply<z.infer<typeof schema>>;
     const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
-    if (raced) raced.promise = within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", raced.controller.signal));
+    if (raced) raced.promise = within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", stop ? AbortSignal.any([raced.controller.signal, stop]) : raced.controller.signal));
     for (const tier of this.tiers) {
+      // stopped meanwhile: no further tier is asked (a raced call in flight is aborted by the same signal)
+      if (stop?.aborted) break;
       const final = tier === topTier;
       if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
-      const rep = final && raced?.promise ? await raced.promise : await within({ tier: tier.name }, () => tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema));
+      const rep = final && raced?.promise ? await raced.promise : await within({ tier: tier.name }, () => tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema, "", stop));
       if (rep.outcome !== "answered") { asked.push({ tier: tier.name, outcome: rep.outcome, choice: null, settled: false }); this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
       const scores = rep.data!.scores;
       const confidence = scores && Object.keys(scores).length ? Math.max(...Object.values(scores)) : undefined;
@@ -174,6 +181,12 @@ export class Judge {
       this.opts.onEvent?.("judge.escalate", { tier: tier.name, choice: last.choice, confidence: confidence ?? null });
     }
     // shadow: the top tier's answer to a question a lower tier settled — never used, only compared (measurement)
+    if (stop?.aborted) {
+      // the task was stopped while it was being asked: nothing more is asked, the answer is none and is not kept
+      if (raced) { raced.promise?.catch(() => undefined); raced.controller.abort(); }
+      this.opts.onEvent?.("judge.stopped", { judge_id, name: questionName(question) });
+      return null;
+    }
     if (settled && settledBy && shadowNow) {
       const rep = raced?.promise ? await raced.promise : await within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema));
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
