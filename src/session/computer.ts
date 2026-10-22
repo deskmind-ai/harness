@@ -60,12 +60,30 @@ export const computerGuardFile = (dir: string) => path.join(dir, "sessions", "co
 /** macOS open(2): take an exclusive flock as the file opens (waits for it). */
 const O_EXLOCK = 0x20;
 
-/** `f` with the guard's flock held. */
+/** `f` ran to its end — whatever it changed in the lock stands — but closing the guard then failed: `result` is what
+ *  `f` returned. Thrown by guarded so that its caller knows the change landed (and never takes it for one that did
+ *  not: a lock left saying something nobody accounts for). */
+export class GuardClosed<T = unknown> extends Error {
+  constructor(readonly result: T, cause: unknown) { super(`closing the computer lock's guard failed after the change was made: ${cause instanceof Error ? cause.message : String(cause)}`); }
+}
+
+/** `f` with the guard's flock held. `f` throwing: its error (closing the guard is tried, its error dropped). `f`
+ *  returning and the guard's close failing: GuardClosed with `f`'s result. */
 export function guarded<T>(dir: string, f: () => T): T {
   fs.mkdirSync(path.join(dir, "sessions"), { recursive: true, mode: 0o700 });
   const flags = fs.constants.O_RDWR | fs.constants.O_CREAT | (process.platform === "darwin" ? O_EXLOCK : 0);
   const fd = fs.openSync(computerGuardFile(dir), flags, 0o600);
-  try { return f(); } finally { fs.closeSync(fd); }
+  let r: T;
+  try { r = f(); } catch (e) { try { fs.closeSync(fd); } catch { /* f's error is the one */ } throw e; }
+  try { fs.closeSync(fd); } catch (e) { throw new GuardClosed(r, e); }
+  return r;
+}
+
+/** A guarded change's outcome as it landed: its result, also when only closing the guard failed afterwards (logged).
+ *  Any other error is thrown as it is (the change did not land). */
+export function landed<T>(f: () => T): T {
+  try { return f(); }
+  catch (e) { if (!(e instanceof GuardClosed)) throw e; process.stderr.write(`computer lock: ${e.message}\n`); return e.result as T; }
 }
 
 /** Some process of group `pgid` lives — a zombie does not count (it can act no more; this process may not have reaped
@@ -231,6 +249,7 @@ export function release(dir: string, from: Holder, o: { killMs?: number } = {}):
       return true;
     });
   } catch (e) {
+    if (e instanceof GuardClosed) return e.result as boolean;   // done; only closing the guard failed
     // the guard or the file could not be used: the group is ended all the same (the lock then names a group that is
     // gone, which holds nothing: the next task takes it over)
     if (from.pgid > 0) { try { process.kill(-from.pgid, "SIGKILL"); } catch { /* gone */ } }
