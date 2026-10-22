@@ -152,13 +152,17 @@ interface Task {
   holder: Holder | null;
   /** An answer to its result card was sent (the executor reads only the first). */
   responded: boolean;
-  /** That answer was the card's undo (stored: session.task_respond), and its result_response came. */
+  /** That answer was the card's undo (stored: session.task_respond). */
   undoAsked?: boolean;
-  sawResponse?: boolean;
-  /** Its undo was recorded as unknown (no result_response came). */
-  undoUnknown?: boolean;
-  /** The session is ending and waits for its undo: the stop budget, after which its group is ended. */
+  /** Its undo's session.task_undo was written (or tried: a failure halts), from its result_response — on stdout or
+   *  in its run's events.jsonl, which the executor writes first — or as unknown. Never twice. */
+  undoRecorded?: boolean;
+  /** The session is ending and waits for its undo: the stop budget, after which the session exits leaving it open. */
   undoTimer?: NodeJS.Timeout;
+  /** Its undo outlasted that wait: the session exits without ending it or writing its closure (the next open does). */
+  leftOpen?: boolean;
+  /** Its changes so far (its last `changes` event): an end the session writes itself carries them. */
+  changes?: ReturnType<typeof capChanges>;
   /** Its executor said task_done (not only the session, when the app went away). */
   sawDone: boolean;
   /** How many options its result card has (a respond's option must be one of them), and their kinds. */
@@ -200,6 +204,8 @@ export class SessionHost {
   private exited = false;
   /** Why the session halted (a terminal record could not be stored), or null. */
   private halted: string | null = null;
+  /** It exited normally (onExit called): nothing of an executor's is handled any more. */
+  private gone = false;
 
   constructor(private readonly o: HostOptions) {
     this.config = o.config ?? "ds-flash";       // the app's default (cli/app.ts)
@@ -278,7 +284,8 @@ export class SessionHost {
         if (((need.end && !doneAlready) || need.undo) && own?.run_id === runId && own.session_id === this.o.sessionId && own.pgid > 0 && held(own)) {
           // the executor itself is asked to stop when it never said task_done (after it, a signal ends it at once and
           // would cut an undo short); the lock stays its group's until all of it is gone
-          if (!doneAlready) { try { process.kill(own.pid, "SIGTERM"); } catch { /* gone meanwhile */ } }
+          // (an undo was answered after its task_done by definition: never signalled, whatever its run file says)
+          if (!doneAlready && !need.undo) { try { process.kill(own.pid, "SIGTERM"); } catch { /* gone meanwhile */ } }
           this.recoverPending += 1;
           this.recovering.push(this.awaitOld(runId, own, need).finally(() => {
             this.recoverPending -= 1;
@@ -305,11 +312,7 @@ export class SessionHost {
       const steers = evs.filter((e) => e.kind === "steered").map((e) => String(e.text));
       if (!this.terminal(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, evs))) return;
     }
-    if (need.undo && !this.stored("session.task_undo", runId)) {
-      const r = [...evs].reverse().find((e) => e.kind === "result_response" && typeof e.undone === "number" && typeof e.total === "number");
-      if (!this.terminal(r ? { kind: "session.task_undo", run_id: runId, undone: r.undone as number, total: r.total as number, refused: typeof r.refused === "string" ? r.refused : null }
-        : undoUnknown(runId))) return;
-    }
+    if (need.undo && !this.stored("session.task_undo", runId) && !this.terminal(this.undoOfRun(runId))) return;
     if (need.close && !this.stored("session.task_closed", runId)) this.terminal({ kind: "session.task_closed", run_id: runId, why: "session_end" });
   }
 
@@ -325,6 +328,9 @@ export class SessionHost {
     for (;;) {
       const evs = readRunEvents(this.runFile(runId));
       const finished = need.undo ? evs.some((e) => e.kind === "result_response") : evs.some((e) => e.kind === "task_done");
+      // an undo still under way at the deadline is never cut short: it is watched on, outside the wait (the model may
+      // speak meanwhile: the run reads as not closed), and its records written when it ends (or by the next open)
+      if (need.undo && !finished && held(own) && Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) { void this.watchUndo(runId, own, need); return; }
       if (finished || !held(own) || Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) {
         // not ended in time: what is left of its group is ended now (a resumed session's first task must not find it)
         if (!finished) { try { const cur = readHolder(this.o.dir); if (cur?.run_id === runId && held(cur)) endTree(cur); } catch { /* the next task finds it */ } }
@@ -332,6 +338,16 @@ export class SessionHost {
         return;
       }
       await sleep(100);
+    }
+  }
+
+  /** An old executor's undo that outlasted recover's wait: its records are written once it has its result_response
+   *  or its group is gone (then from the run: its result, else unknown) — unless this process exits first (the next
+   *  open does it). Never rejects. */
+  private async watchUndo(runId: string, own: Holder, need: { end: boolean; undo: boolean; close: boolean }) {
+    while (!this.exited && !this.halted) {
+      if (readRunEvents(this.runFile(runId)).some((e) => e.kind === "result_response") || !held(own)) return this.recordRecovered(runId, need);
+      await sleep(250);
     }
   }
 
@@ -385,7 +401,11 @@ export class SessionHost {
     this.refuse("too_long", `a message is at most ${MAX_USER_CHARS} characters; this one has ${text.length}`, control, cid);
     return true;
   }
-  private refuseBusy(control: string, cid?: string) { this.refuse("busy", this.t("上一条回复还没完：先停下它，或者等它说完", "a reply is still coming; stop it first or wait"), control, cid); }
+  private refuseBusy(control: string, cid?: string) {
+    // recover is still writing what the last process left (waiting for an old executor): its own reason
+    if (this.recoverPending && !this.running && !this.current && !this.flows) return this.send({ kind: "session.error", code: "busy", text: this.t("正在补记上次没记完的任务，稍等再试", "the session is still recording what the last process left; try again shortly"), control, why: ["recovering"], ...(cid ? { client_id: cid } : {}) });
+    this.refuse("busy", this.t("上一条回复还没完：先停下它，或者等它说完", "a reply is still coming; stop it first or wait"), control, cid);
+  }
   private refuseCard(control: string, cid?: string) { this.refuse("card_open", this.t("任务在等你回答卡片：先在卡片上回答", "the task is waiting for your answer on its card; answer it there first"), control, cid); }
 
   /** `fromQueue`: the queue's own entry sent now (queue_send_now): not a repeat of itself. */
@@ -603,7 +623,7 @@ export class SessionHost {
 
   /** An executor's event: to the app as it is (plus the session), and what the session follows of it. */
   private onExecutorLine(task: Task, line: string) {
-    if (this.halted) return;                             // halted: its executor is being ended; nothing more is said
+    if (this.halted || this.gone) return;                             // halted: its executor is being ended; nothing more is said
     let ev: Record<string, unknown>;
     try { const j = JSON.parse(line); if (!j || typeof j !== "object" || Array.isArray(j)) return; ev = j; } catch { return; }
     // done acting: the lock and the task say so before anyone hears of it (an undo sent at once finds it lingering)
@@ -621,14 +641,14 @@ export class SessionHost {
       case "steered": if (typeof ev.text === "string") task.steers.push(ev.text); break;
       case "step": if (typeof ev.step_id === "string") task.openSteps.add(ev.step_id); break;
       case "step_result": if (typeof ev.step_id === "string") task.openSteps.delete(ev.step_id); break;
+      case "changes": task.changes = capChanges(ev); break;
       case "task_done": this.taskDone(task, ev); if (task.noLinger) { try { task.handle.close(); } catch { /* gone */ } } break;
       case "result_response":
-        task.sawResponse = true;
         this.lockLinger(task);                           // the answer carried out: it acts no more (first: whatever the record)
         // what the undo did is the run's record of a change to the user's things: one that cannot be stored halts the
         // session (terminal) — never read as "expired" meanwhile; the next open records it from the run
         if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
-        if (typeof ev.undone === "number" && typeof ev.total === "number") this.terminal({ kind: "session.task_undo", run_id: task.runId, undone: ev.undone, total: ev.total, refused: typeof ev.refused === "string" ? ev.refused : null });
+        if (!task.undoRecorded && typeof ev.undone === "number" && typeof ev.total === "number") { task.undoRecorded = true; this.terminal(undoFrom(task.runId, ev)); }
         this.maybeExit();                                // a session ending waited for this undo's outcome
         break;
     }
@@ -680,13 +700,13 @@ export class SessionHost {
       // until that child ends — or is ended after the stop wait)
       inProcess.delete(task.runId);
       try { free(this.o.dir, task.runId, task.pgid); } catch { /* the next task finds its group gone */ }
-      if (this.halted) return;                           // halted: halt lets go of it; this process records nothing more
+      if (this.halted || this.gone) return;              // halted / exited: this process records nothing more (halt lets go of it)
       // the lock still says it acts (no task_done of its own, or it died during an undo): what is left of its group is
       // ended after the stop wait (and by the next task, if this process is gone by then: orphaned)
       reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
       if (!task.end) {
         // no task_done: a step it had begun and not ended may or may not have taken effect
-        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
+        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.changes ? { changes: task.changes } : {}), ...(task.steers.length ? { steers: task.steers } : {}) });
       }
       if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
       // it died while carrying out an undo (asked for, no result_response): how much of it was done is not known — said
@@ -717,12 +737,19 @@ export class SessionHost {
   /** An undo this session asked for whose outcome is not recorded (no result_response, no unknown). A run's closure is
    *  never written while one is open: the session's exit waits for it (maybeExit), and a closure that comes first all
    *  the same (its executor died before its exit was seen: a new task found the Mac free) records it unknown first. */
-  private undoOpen(t: Task): boolean { return !!t.undoAsked && !t.sawResponse && !t.undoUnknown; }
-  /** Before a run's closure: an undo with no outcome is recorded as unknown. False: it could not be (halted). */
+  private undoOpen(t: Task): boolean { return !!t.undoAsked && !t.undoRecorded; }
+  /** Before a run's closure: an undo with no outcome recorded gets it — from its run's events.jsonl when its
+   *  result_response is there (the executor writes it before stdout: its exit can be seen before the line), else
+   *  unknown. False: it could not be stored (halted). */
   private settleUndo(t: Task): boolean {
     if (!this.undoOpen(t)) return true;
-    t.undoUnknown = true;
-    return this.terminal(undoUnknown(t.runId));
+    t.undoRecorded = true;
+    return this.terminal(this.undoOfRun(t.runId));
+  }
+  /** What a run's undo did, from its events (its last result_response with the counts), or unknown. */
+  private undoOfRun(runId: string) {
+    const r = [...readRunEvents(this.runFile(runId))].reverse().find((e) => e.kind === "result_response" && typeof e.undone === "number" && typeof e.total === "number");
+    return r ? undoFrom(runId, r) : undoUnknown(runId);
   }
 
   /** A run's terminal record — session.task_end, session.task_closed, or session.task_undo (what an undo did, or that
@@ -971,7 +998,7 @@ export class SessionHost {
     // with it (its pid is in the lock) until it exits
     t.exitTimer = setTimeout(() => {
       t.exitTimer = null;
-      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", ...unknownIf(t.openSteps.size > 0), summary: "", undo: "none", ...(t.steers.length ? { steers: t.steers } : {}) });
+      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", ...unknownIf(t.openSteps.size > 0), summary: "", undo: "none", ...(t.changes ? { changes: t.changes } : {}), ...(t.steers.length ? { steers: t.steers } : {}) });
       this.maybeExit();
     }, this.o.exitWaitMs ?? EXIT_WAIT_MS);
   }
@@ -982,24 +1009,28 @@ export class SessionHost {
   private maybeExit() {
     // (a recover still waiting for an old executor writes its records first: an exit now would abandon them)
     if (!this.closing || this.running || this.current || this.flows || this.recoverPending || this.exited) return;
-    // an undo under way is let finish (its result_response) before any closure, within the stop budget; then what is
-    // left of its group is ended, and its exit records the undo unknown (onExecutorExit) — this runs again then
-    const undoing = [...this.tasks.values()].filter((t) => this.undoOpen(t));
+    // an undo under way is let finish (its result_response) before any closure, within the stop budget. One that
+    // outlasts it is never cut short (the user's things would be left half undone): the session exits without ending
+    // its executor or writing its closure — the run stays open, its executor finishes holding the lock, and the next
+    // open's recover waits for or reads its result, then closes it. This runs again at its result_response or then
+    const undoing = [...this.tasks.values()].filter((t) => this.undoOpen(t) && !t.leftOpen);
     if (undoing.length) {
       for (const t of undoing) t.undoTimer ??= setTimeout(() => {
         t.undoTimer = undefined;
         if (this.halted || !this.undoOpen(t)) return;
-        try { if (t.holder && t.pgid > 0 && held(t.holder)) endTree(t.holder); else inProcess.get(t.runId)?.(); }
-        catch (e) { process.stderr.write(`session: ending ${t.runId}: ${errText(e)}\n`); }
+        t.leftOpen = true;
+        process.stderr.write(`session: the undo of ${t.runId} is still under way: left to finish; the next open records it\n`);
+        this.maybeExit();
       }, this.o.exitWaitMs ?? EXIT_WAIT_MS);
       return;
     }
     this.exited = true;
-    const open = [...this.tasks.values()];
+    const open = [...this.tasks.values()].filter((t) => !(t.leftOpen && this.undoOpen(t)));
     for (const t of open) this.closeTask(t, "session_end");
     if (this.halted) return;                             // a close could not be stored: halt ends them and exits
-    // the executors read their stdin's end and exit; one that does not is not waited for long
-    void Promise.race([Promise.all(open.map((t) => t.handle.exited)), sleep(2000)]).then(() => { if (!this.halted) this.o.onExit?.(); });   // (halted meanwhile: halt calls it, with the reason)
+    // the executors read their stdin's end and exit; one that does not is not waited for long. After onExit this
+    // process handles nothing of theirs (it exits): an undo left open is the next open's
+    void Promise.race([Promise.all(open.map((t) => t.handle.exited)), sleep(2000)]).then(() => { if (this.halted) return; this.gone = true; this.o.onExit?.(); });   // (halted meanwhile: halt calls it, with the reason)
   }
 }
 
@@ -1018,9 +1049,14 @@ function openStepsIn(evs: Record<string, unknown>[]): number {
   for (const e of evs) { if (e.kind === "step" && typeof e.step_id === "string") open.add(e.step_id); if (e.kind === "step_result") open.delete(e.step_id); }
   return open.size;
 }
+/** session.task_undo from a result_response's counts. */
+const undoFrom = (runId: string, r: Record<string, unknown>): Extract<SessionBody, { kind: "session.task_undo" }> => ({ kind: "session.task_undo", run_id: runId, undone: r.undone as number, total: r.total as number, refused: typeof r.refused === "string" ? r.refused : null });
 /** session.task_undo for an undo that began and was cut off with no result_response. */
 const undoUnknown = (runId: string): Extract<SessionBody, { kind: "session.task_undo" }> => ({ kind: "session.task_undo", run_id: runId, undone: 0, total: 0, refused: "the undo was cut off before it ended; how much of it was done is not known", unknown: true });
-const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[]): TaskEnd => ({ kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(steers.length ? { steers } : {}) });
+/** An end the session writes for a run with no task_done: its changes so far are its last `changes` event's (as a
+ *  live end's, from task_done, are its own). */
+const changesIn = (evs: Record<string, unknown>[]) => { const c = [...evs].reverse().find((e) => e.kind === "changes"); return c ? capChanges(c) : undefined; };
+const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[]): TaskEnd => { const changes = changesIn(evs); return { kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}) }; };
 
 /** session.task_end from the executor's task_done: its cause is the field copied (one of the known values), never read
  *  out of its reason. */
