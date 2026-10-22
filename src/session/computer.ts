@@ -92,7 +92,12 @@ export function readHolder(dir: string): Holder | null {
   try { t = fs.readFileSync(computerLockFile(dir), "utf-8"); } catch { return null; }
   try {
     const j = JSON.parse(t);
-    if (j && j.v === 2 && (j.state === "acting" || j.state === "lingering") && Number.isInteger(j.pgid) && Number.isInteger(j.owner)) return j as Holder;
+    if (j && j.v !== undefined) {
+      // a versioned lock: this version with its fields, or no lock (as the helper reads it)
+      if (j.v !== 2 || (j.state !== "acting" && j.state !== "lingering") || !Number.isInteger(j.pgid) || !Number.isInteger(j.owner)) return null;
+      if (j.orphan_since !== undefined && typeof j.orphan_since !== "number") delete j.orphan_since;
+      return j as Holder;
+    }
     // an earlier format ({pid, executor_pid}): held while one of them lives, as acting
     if (j && typeof j.pid === "number") {
       const p = [j.pid, j.executor_pid].find((x) => typeof x === "number" && alive(x));
@@ -116,8 +121,8 @@ export function held(h: Holder): boolean {
 function write(dir: string, h: Holder) {
   const file = computerLockFile(dir);
   const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}`;
-  fs.writeFileSync(tmp, JSON.stringify(h), { mode: 0o600 });
-  fs.renameSync(tmp, file);
+  try { fs.writeFileSync(tmp, JSON.stringify(h), { mode: 0o600 }); fs.renameSync(tmp, file); }
+  catch (e) { try { fs.unlinkSync(tmp); } catch { /* never written */ } throw e; }
 }
 
 const nap = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -205,15 +210,18 @@ export function free(dir: string, run: string, pgid: number): void {
   });
 }
 
-/** After its executor exited without task_done, what is left of its group still acts (and holds the Mac): it is given
- *  `ms` to end by itself, then ended — an orphaned tree must not hold the Mac for good. */
+/** Its executor has exited while the lock still says it acts (no task_done; or it died during an undo): what is left of
+ *  its group is given `ms` to end by itself, then ended — it must not hold the Mac for good. A lingering leftover needs
+ *  nothing: the next task ends it. Never throws (a timer). */
 export function reapLater(dir: string, run: string, pgid: number, ms: number): void {
   if (!(pgid > 0)) return;
   const t = setTimeout(() => {
-    const h = guarded(dir, () => { const x = readHolder(dir); return mine(x, run, pgid) && held(x) ? x : null; });
-    if (!h) return;
-    endTree(h, { termMs: 2000, killMs: 2000 });
-    free(dir, run, pgid);
+    try {
+      const h = guarded(dir, () => { const x = readHolder(dir); return mine(x, run, pgid) && x.state === "acting" && held(x) ? x : null; });
+      if (!h) return;
+      endTree(h, { termMs: 2000, killMs: 2000 });
+      free(dir, run, pgid);
+    } catch (e) { process.stderr.write(`computer lock: ${e instanceof Error ? e.message : String(e)}\n`); }
   }, ms);
   t.unref?.();
 }

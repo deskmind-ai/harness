@@ -23,7 +23,7 @@ import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
 import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loop.js";
 import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, capChanges, sessionDir, taskView, type ErrorCode, type SessionBody, type SessionEvent } from "./log.js";
 import { EXIT_WAIT_MS, LINGER_S, alive, cutRaw, linkLock, spawnExecutor, type ExecutorHandle, type Launcher } from "./task.js";
-import { acquire, free, held, inProcess, linger, readHolder, reapLater, undo } from "./computer.js";
+import { acquire, endTree, free, held, inProcess, linger, readHolder, reapLater, undo } from "./computer.js";
 import type { ModelCallRecord } from "../otel/context.js";
 import { STOP_CAUSES, type StopCause } from "../protocol/computer.js";
 
@@ -226,6 +226,8 @@ export class SessionHost {
       const evs = readRunEvents(file);
       done = [...evs].reverse().find((e) => e.kind === "task_done");
       if (done || !up() || Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) {
+        // not ended in time: what is left of its group is ended now (a resumed session's first task must not find it)
+        if (!done && up()) { try { const own = readHolder(this.o.dir); if (own?.run_id === runId) endTree(own); } catch { /* the next task finds it */ } }
         if (!done) done = [...readRunEvents(file)].reverse().find((e) => e.kind === "task_done");
         const steers = readRunEvents(file).filter((e) => e.kind === "steered").map((e) => String(e.text));
         if (this.log.events.some((e) => e.kind === "session.task_end" && e.run_id === runId)) return;
@@ -442,7 +444,7 @@ export class SessionHost {
     } catch (e) {
       // nothing stored: the executor never gets its task (its stdin closed, it exits), and the lock goes with it
       h.close();
-      void h.exited.then(() => { inProcess.delete(runId); free(this.o.dir, runId, pgid); });
+      void h.exited.then(() => { inProcess.delete(runId); try { free(this.o.dir, runId, pgid); } catch { /* the next task finds its group gone */ } });
       throw e;
     }
     let resolve!: (e: TaskEnd) => void;
@@ -516,9 +518,9 @@ export class SessionHost {
     // until that child ends — or is ended after the stop wait)
     inProcess.delete(task.runId);
     try { free(this.o.dir, task.runId, task.pgid); } catch { /* the next task finds its group gone */ }
-    // no task_done of its own (gone early, or the end the session wrote when the app went away): what is left of its
-    // group is ended after the stop wait (and by the next task, if this process is gone by then: orphaned)
-    if (!task.sawDone) reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
+    // the lock still says it acts (no task_done of its own, or it died during an undo): what is left of its group is
+    // ended after the stop wait (and by the next task, if this process is gone by then: orphaned)
+    reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
     if (!task.end) {
       // no task_done: a step it had begun and not ended may or may not have taken effect
       this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
@@ -562,10 +564,13 @@ export class SessionHost {
     // checked before anything is held: only an option index of its card is a respond the executor acts on
     const opt = line.option;
     if (typeof opt !== "number" || !Number.isInteger(opt) || opt < 0 || opt >= t.options) return this.refuse("bad_control", `a respond needs option: the index of one of the result card's ${t.options} options`, "respond");
-    if (t.responded) return;                             // one respond per card: the executor reads only the first
-    const u = undo(this.o.dir, t.runId, t.pgid);
+    // one respond per card: the executor reads only the first
+    if (t.responded) return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
+    let u: ReturnType<typeof undo>;
+    try { u = undo(this.o.dir, t.runId, t.pgid); }
+    catch (e) { return this.refuse("busy", `the machine lock: ${e instanceof Error ? e.message : String(e)}`, "respond"); }
     if (u === "expired") { this.closeTask(t, "new_task"); return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
-    if (u === "busy") return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
+    if (u === "busy") return this.refuse("busy", this.t("这个任务的撤回正在进行", "an answer to this task's card is being carried out"), "respond");
     t.responded = true;
     t.handle.write(JSON.stringify(line));
   }

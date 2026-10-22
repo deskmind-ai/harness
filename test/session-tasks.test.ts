@@ -327,11 +327,14 @@ describe("session tasks: undo, the machine lock, the app going away", () => {
     s.on((e) => {
       if (e.kind !== "task_done") return;
       expect(readHolder(s.dir)).toMatchObject({ run_id: e.run_id, state: "lingering" });
-      s.send({ type: "respond", run_id: e.run_id, option: e.result_card.options.findIndex((x: any) => x.kind === "undo") });
+      const undoAt = e.result_card.options.findIndex((x: any) => x.kind === "undo");
+      s.send({ type: "respond", run_id: e.run_id, option: undoAt });
+      expect(readHolder(s.dir)).toMatchObject({ run_id: e.run_id, state: "acting" });   // the undo acts
+      s.send({ type: "respond", run_id: e.run_id, option: undoAt });                    // a second answer to the card
     });
     s.send({ type: "say", text: "新建 a.txt 写 hi" });
     await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_undo"));
-    expect(s.kinds("session.error")).toEqual([]);
+    expect(s.kinds("session.error")).toEqual([expect.objectContaining({ code: "busy", control: "respond" })]);
     expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
   });
 

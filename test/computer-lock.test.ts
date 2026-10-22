@@ -106,8 +106,16 @@ describe("the machine lock", () => {
     expect("ok" in r).toBe(true);
     expect(held(h)).toBe(false);
     expect(readHolder(dir)!.run_id).toBe("run_b");
-    // a live owner's acting run is never orphaned
+    // a live owner's acting run is never orphaned, even with its leader gone and a child of its group up
+    const p2 = group("sleep 30 & exit 0");
+    await gone(p2);
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ ...h, run_id: "run_live", pgid: p2.pid!, pid: p2.pid!, owner: process.pid }));
+    expect("busy" in acquire(dir, who("run_c"), () => ({ pid: 1 }), { now: t0 })).toBe(true);
+    expect(readHolder(dir)!.orphan_since).toBeUndefined();
     expect("busy" in acquire(dir, who("run_c"), () => ({ pid: 1 }), { now: t0 + 999 })).toBe(true);
+    // a versioned lock it cannot use is no lock (as the helper reads it), not the old format
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 3, pid: process.pid }));
+    expect(readHolder(dir)).toBeNull();
   });
 
   it("undo: only for its own lingering run (then acting until its result_response); another's or a run gone: expired", () => {
