@@ -31,19 +31,27 @@ import { STOP_CAUSES, type StopCause } from "../protocol/computer.js";
  *  computer task's request: the executor's driver (sim | hands) and the task folder. */
 export interface SessionHeader { session_id?: string; config?: string; lang?: Lang; driver?: string; scope?: string }
 
+/** `client_id` (additive, optional, on say / cua / steer): the app's own id for the words it sends. The session gives
+ *  it back on whatever becomes of them — the stored user message (or session.steer), the queue entry they wait in, and
+ *  a refusal of the line — so the app knows its words' fate from the session, never from the helper's ack. */
+export type ClientId = { client_id?: string };
+
 export type SessionControl =
-  | { type: "say"; text: string }
+  | ({ type: "say"; text: string } & ClientId)
   | { type: "stop"; run_id?: string }
   | { type: "attach"; after_seq: number; run_id?: string }
   | { type: "end" }
-  | { type: "cua"; text: string; scope?: string }
-  | { type: "steer"; text: string; run_id?: string }
+  | ({ type: "cua"; text: string; scope?: string } & ClientId)
+  | ({ type: "steer"; text: string; run_id?: string } & ClientId)
   | { type: "answer"; run_id?: string; line: Record<string, unknown> }
   | { type: "respond"; run_id?: string; line: Record<string, unknown> }
   | { type: "retry" }
   | { type: "queue_edit"; id: string; text: string }
   | { type: "queue_cancel"; id: string }
   | { type: "queue_send_now"; id: string };
+
+/** The longest client_id kept (a longer one is ignored, as if absent). */
+export const MAX_CLIENT_ID = 100;
 
 /** One stdin line → a control, or null (not JSON, not an object, no type, a type this version does not know, or a
  *  known type without its required fields). */
@@ -55,13 +63,14 @@ export function parseSessionControl(line: string): SessionControl | null {
   if (typeof o.type !== "string") return null;
   const runId = typeof o.run_id === "string" ? { run_id: o.run_id } : {};
   const str = (k: string) => typeof o[k] === "string";
+  const cid = typeof o.client_id === "string" && o.client_id && o.client_id.length <= MAX_CLIENT_ID ? { client_id: o.client_id } : {};
   switch (o.type) {
-    case "say": return str("text") ? { type: "say", text: o.text as string } : null;
+    case "say": return str("text") ? { type: "say", text: o.text as string, ...cid } : null;
     case "stop": return { type: "stop", ...runId };
     case "attach": return { type: "attach", after_seq: typeof o.after_seq === "number" && Number.isFinite(o.after_seq) && o.after_seq > 0 ? Math.floor(o.after_seq) : 0, ...runId };
     case "end": return { type: "end" };
-    case "cua": return str("text") ? { type: "cua", text: o.text as string, ...(str("scope") ? { scope: o.scope as string } : {}) } : null;
-    case "steer": return str("text") ? { type: "steer", text: o.text as string, ...runId } : null;
+    case "cua": return str("text") ? { type: "cua", text: o.text as string, ...(str("scope") ? { scope: o.scope as string } : {}), ...cid } : null;
+    case "steer": return str("text") ? { type: "steer", text: o.text as string, ...runId, ...cid } : null;
     // the executor's own control lines (control v1), forwarded as they came: extra fields (run_id) are ignored there
     case "answer": return { type: "answer", ...runId, line: o };
     case "respond": return { type: "respond", ...runId, line: o };
@@ -140,7 +149,7 @@ interface Task {
   openSteps: Set<string>;
 }
 
-export interface QueueItem { id: string; text: string; held?: boolean; note?: string }
+export interface QueueItem { id: string; text: string; held?: boolean; note?: string; client_id?: string }
 
 export class SessionHost {
   readonly log: SessionLog;
@@ -173,7 +182,9 @@ export class SessionHost {
   private send(body: Record<string, unknown>) { this.o.out({ t: Date.now() / 1000, session_id: this.o.sessionId, ...body }); }
 
   /** Every error's text, stored or not, passes here: no key value from the environment ever reaches the app or the file. */
-  private refuse(code: ErrorCode, text: string, control?: string) { this.send({ kind: "session.error", code, text: redactKeys(text), ...(control ? { control } : {}) }); }
+  private refuse(code: ErrorCode, text: string, control?: string, cid?: string) {
+    this.send({ kind: "session.error", code, text: redactKeys(text), ...(control ? { control } : {}), ...(cid ? { client_id: cid } : {}) });
+  }
   private fail(code: ErrorCode, text: string, ids: { msg_id?: string; reply_to: string }) { this.log.emit({ kind: "session.error", code, text: redactKeys(text).slice(0, 300), ...ids }); }
 
   /** The session interface's version only: this process speaks no other (the run's events and controls are app-run's).
@@ -255,12 +266,12 @@ export class SessionHost {
     const c = parseSessionControl(line);
     if (!c) return;
     switch (c.type) {
-      case "say": return this.say(c.text);
+      case "say": return this.say(c.text, c.client_id);
       case "stop": return this.stop(c.run_id);
       case "attach": return c.run_id ? this.attachRun(c.run_id, c.after_seq) : this.attach(c.after_seq);
       case "end": return this.end();
-      case "cua": return this.cua(c.text, c.scope);
-      case "steer": return this.steer(c.text, c.run_id);
+      case "cua": return this.cua(c.text, c.scope, c.client_id);
+      case "steer": return this.steer(c.text, c.run_id, c.client_id);
       case "answer": return this.answer(c.line, c.run_id);
       case "respond": return this.respond(c.line, c.run_id);
       case "retry": return this.retry();
@@ -283,24 +294,24 @@ export class SessionHost {
     return loopModel(goal.model);
   }
 
-  private tooLong(text: string, control: string): boolean {
+  private tooLong(text: string, control: string, cid?: string): boolean {
     if (text.length <= MAX_USER_CHARS) return false;
-    this.refuse("too_long", `a message is at most ${MAX_USER_CHARS} characters; this one has ${text.length}`, control);
+    this.refuse("too_long", `a message is at most ${MAX_USER_CHARS} characters; this one has ${text.length}`, control, cid);
     return true;
   }
-  private refuseBusy(control: string) { this.refuse("busy", this.t("上一条回复还没完：先停下它，或者等它说完", "a reply is still coming; stop it first or wait"), control); }
-  private refuseCard(control: string) { this.refuse("card_open", this.t("任务在等你回答卡片：先在卡片上回答", "the task is waiting for your answer on its card; answer it there first"), control); }
+  private refuseBusy(control: string, cid?: string) { this.refuse("busy", this.t("上一条回复还没完：先停下它，或者等它说完", "a reply is still coming; stop it first or wait"), control, cid); }
+  private refuseCard(control: string, cid?: string) { this.refuse("card_open", this.t("任务在等你回答卡片：先在卡片上回答", "the task is waiting for your answer on its card; answer it there first"), control, cid); }
 
-  say(text: string) {
-    if (this.closing || !text.trim() || this.tooLong(text, "say")) return;
+  say(text: string, cid?: string) {
+    if (this.closing || !text.trim() || this.tooLong(text, "say", cid)) return;
     // a task runs: the words wait in the queue (sent to the model after it), unless a card waits for the user
     if (this.current) {
-      if (this.current.card) return this.refuseCard("say");
-      this.queue.push({ id: `q_${randomUUID().slice(0, 8)}`, text });
+      if (this.current.card) return this.refuseCard("say", cid);
+      this.queue.push({ id: `q_${randomUUID().slice(0, 8)}`, text, ...(cid ? { client_id: cid } : {}) });
       return this.emitQueue();
     }
-    if (this.running || this.flows) return this.refuseBusy("say");
-    const user = this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text }) as Extract<SessionEvent, { kind: "session.message" }>;
+    if (this.running || this.flows) return this.refuseBusy("say", cid);
+    const user = this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>;
     this.startReply(user.msg_id);
   }
 
@@ -399,16 +410,19 @@ export class SessionHost {
 
   /** `/cua <text>`: a computer task with the user's words, no model in between; then the model speaks one turn with
    *  the task's call and result in its context. */
-  cua(text: string, scope?: string) {
-    if (this.closing || !text.trim() || this.tooLong(text, "cua")) return;
-    if (this.current || this.running || this.flows) return this.refuseBusy("cua");
+  cua(text: string, scope?: string, cid?: string) {
+    if (this.closing || !text.trim() || this.tooLong(text, "cua", cid)) return;
+    if (this.current || this.running || this.flows) return this.refuseBusy("cua", cid);
     let userId = "";
     let t: Task | { busy: true };
     try { t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
-      userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua" }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
+      userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua", ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
       return userId;
-    } }); } catch (e) { return this.refuse("busy", `the task could not start: ${e instanceof Error ? e.message : String(e)}`, "cua"); }
-    if ("busy" in t) return this.refuse("computer_busy", this.t("电脑正被另一个会话使用", "the computer is being used by another session"), "cua");
+    } }); } catch (e) {
+      // (the words were stored before the failure: they are the history's, so the refusal does not name them again)
+      return this.refuse("busy", `the task could not start: ${e instanceof Error ? e.message : String(e)}`, "cua", userId ? undefined : cid);
+    }
+    if ("busy" in t) return this.refuse("computer_busy", this.t("电脑正被另一个会话使用", "the computer is being used by another session"), "cua", cid);
     this.flows += 1;
     void t.ended.then(() => {
       this.flows -= 1;
@@ -576,28 +590,32 @@ export class SessionHost {
   }
 
   /** The user's words into the running task (control v1 steer). */
-  steer(text: string, runId?: string) {
-    if (this.closing || !text.trim() || this.tooLong(text, "steer")) return;
+  steer(text: string, runId?: string, cid?: string) {
+    if (this.closing || !text.trim() || this.tooLong(text, "steer", cid)) return;
     const t = this.current;
-    if (!t || (runId && runId !== t.runId)) return this.refuse("no_task", "no task is running", "steer");
-    if (t.card) return this.refuseCard("steer");
+    if (!t || (runId && runId !== t.runId)) return this.refuse("no_task", "no task is running", "steer", cid);
+    if (t.card) return this.refuseCard("steer", cid);
+    // stored first: should storing fail, the executor never has words the history (or the queue) does not account for
+    this.log.emit({ kind: "session.steer", run_id: t.runId, text, ...(cid ? { client_id: cid } : {}) });
     t.handle.write(JSON.stringify({ type: "steer", text }));
-    this.log.emit({ kind: "session.steer", run_id: t.runId, text });
   }
 
   private sendNow(id: string) {
     const it = this.queue.find((q) => q.id === id);
     if (!it) return this.emitQueue();
+    // the session is ending: the entry stays where it is (its words are never dropped on the way out of the queue)
+    if (this.closing) return this.refuse("busy", this.t("会话正在结束", "the session is ending"), "queue_send_now", it.client_id);
+    // (stored first, then out of the queue: should storing fail, the words are still queued, never in neither place)
     if (this.current) {
-      if (this.current.card) return this.refuseCard("queue_send_now");
+      if (this.current.card) return this.refuseCard("queue_send_now", it.client_id);
+      this.steer(it.text, undefined, it.client_id);
       this.queue = this.queue.filter((q) => q !== it);
-      this.emitQueue();
-      return this.steer(it.text);
+      return this.emitQueue();
     }
-    if (this.running || this.flows) return this.refuseBusy("queue_send_now");
+    if (this.running || this.flows) return this.refuseBusy("queue_send_now", it.client_id);
+    this.say(it.text, it.client_id);
     this.queue = this.queue.filter((q) => q !== it);
     this.emitQueue();
-    this.say(it.text);
   }
 
   private emitQueue() { this.send({ kind: "session.queue", items: this.queue.map((q) => ({ ...q })) }); }
@@ -607,10 +625,14 @@ export class SessionHost {
     if (this.closing || this.running || this.current || this.flows) return;
     const go = this.queue.filter((q) => !q.held);
     if (!go.length) return;
-    this.queue = this.queue.filter((q) => q.held);
-    this.emitQueue();
+    // each stored, then out of the queue; the queue sent after (should storing fail, what is left is still queued)
     let last = "";
-    for (const q of go) last = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text: q.text, via: "queue" }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
+    try {
+      for (const q of go) {
+        last = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text: q.text, via: "queue", ...(q.client_id ? { client_id: q.client_id } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
+        this.queue = this.queue.filter((x) => x !== q);
+      }
+    } finally { this.emitQueue(); }
     this.startReply(last);
   }
 
@@ -647,12 +669,13 @@ export class SessionHost {
   }
 
   /** Replay every stored event after `afterSeq`, then, while a reply is coming, its text so far (one delta at offset 0),
-   *  and the queue when it holds anything. */
+   *  and the queue, always (empty included): it is the whole queue, so an app that reconnects after the queue was sent
+   *  to the model replaces what it held. */
   attach(afterSeq: number) {
     for (const ev of this.log.since(afterSeq)) this.o.out(ev);
     const r = this.running;
     if (r) { this.flush(r); this.send({ kind: "session.delta", msg_id: r.msgId, text: r.sent, offset: 0 }); }
-    if (this.queue.length) this.emitQueue();
+    this.emitQueue();
   }
 
   /** A task's events after `afterSeq`, from its run's events.jsonl (with the session id, as they were sent): an app

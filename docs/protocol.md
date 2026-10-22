@@ -148,16 +148,16 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | kind | 字段 | 入库 | 说明 |
 |---|---|---|---|
 | `session.start` | `session_id, protocol:{session:1}, last_seq, resumed` | 否 | 进程一开始发一次。`protocol` 只报会话接口的版本：执行层的事件照它们自己的版本（`start.protocol`）。`last_seq` 是盘上最后一条的 `seq`，`resumed` 表示这是已有的会话 |
-| `session.message` | `msg_id, role: user\|assistant, text, reply_to?, model?, stopped?, truncated?, via?` | 是 | 最终消息。`reply_to` 是助手消息回答的那条用户消息；`model` 是 `<服务>\|<模型>`；`stopped: true` 是用户停下了，`text` 是停下时已经说出的部分（可以是空的）；`truncated: true` 是到了 64k 字被截断（或模型自己到了输出上限）；`via` 是用户消息怎么来的：`cua`（`/cua`）、`queue`（任务进行时排队、任务结束后交给模型的）。模型在一次回复里开了电脑任务时，任务之前说的话是一条助手消息，任务之后说的是另一条（新的 `msg_id`，同一个 `reply_to`） |
+| `session.message` | `msg_id, role: user\|assistant, text, reply_to?, model?, stopped?, truncated?, via?, client_id?` | 是 | 最终消息。`reply_to` 是助手消息回答的那条用户消息；`model` 是 `<服务>\|<模型>`；`stopped: true` 是用户停下了，`text` 是停下时已经说出的部分（可以是空的）；`truncated: true` 是到了 64k 字被截断（或模型自己到了输出上限）；`via` 是用户消息怎么来的：`cua`（`/cua`）、`queue`（任务进行时排队、任务结束后交给模型的）。模型在一次回复里开了电脑任务时，任务之前说的话是一条助手消息，任务之后说的是另一条（新的 `msg_id`，同一个 `reply_to`） |
 | `session.delta` | `msg_id, text, offset` | 否 | 流式输出，大约每 50 毫秒合并成一条。`offset` 是这段文字在整条回复里的起点，所以 app 能发现重复和缺口。每次回复先发一条 `text:""、offset:0` 的空 delta，表示「开始回复了」（app 显示「思考中」）；任务结束后模型接着说时，新的 `msg_id` 也先有一条空 delta。同一个 `msg_id` 的所有 delta 按 `offset` 拼起来，就是最后那条 `session.message` 的 `text`：服务最后给的全文和流式发出的对不上时，在最终消息之前再发一条 `offset:0` 的 delta，内容是全文，app 用它整个替换 |
-| `session.error` | `code, text, msg_id?, reply_to?, control?` | 见上 | `code` 见下表。`msg_id` 是失败的那次回复：它之前发过的 delta 作废，app 把那个正在长的气泡去掉。`reply_to` 是没得到回答的用户消息。`control` 是被拒绝的那行控制的 `type` |
+| `session.error` | `code, text, msg_id?, reply_to?, control?, client_id?` | 见上 | `code` 见下表。`msg_id` 是失败的那次回复：它之前发过的 delta 作废，app 把那个正在长的气泡去掉。`reply_to` 是没得到回答的用户消息。`control` 是被拒绝的那行控制的 `type`；`client_id` 是那行带的（见下「client_id」） |
 | `session.task` | `msg_id, run_id, raw, goal?, by: slash\|model, reply_to?` | 是 | 一个电脑任务开始了（H2）。`raw` 是交给执行层的用户原话，`goal` 是模型的转述（只有 `by:"model"` 有），`reply_to` 是它在回应的用户消息。之后带这个 `run_id` 的执行层事件都属于它 |
 | `session.task_end` | `run_id, status, summary, undo: open\|none, reason?, cause?, answer?, changes?, steers?` | 是 | 任务结束了（H2），也就是告诉模型的那些：`status` 是执行层 `task_done` 的 status，或 `interrupted`（进程没了、运行里也没有 task_done）；`cause` 照抄 `task_done.cause`（只认已知的取值，不从 reason 推）；没有 `task_done`、由会话自己记的结局（执行层没写 task_done 就退出了、app 走了而任务没在时限内确认停下、重新打开时发现 `interrupted`），在有一步开始了（`step`）还没有 `step_result` 时是 `last_step_unknown`，否则不带；`cause` 不进模型读到的内容；`changes` 每一类最多 20 个，多出的个数在 `changes.more`；`undo: open` 表示结果卡上的撤回这时可以点；`steers` 是用户中途补充、已经交给任务的话 |
 | `session.task_closed` | `run_id, why: linger\|new_task\|session_end` | 是 | 这个任务的执行层不在了，结果卡再也答不了（H2）。`linger`：它自己结束了（结果卡答了、等到了时间、或者本来就没有结果卡）；`new_task`：这台 Mac 上开始了新的电脑任务，撤回过期；`session_end`：会话进程结束（或上一个进程没了） |
 | `session.task_undo` | `run_id, undone, total, refused` | 是 | 结果卡的撤回做了（H2）：执行层 `result_response` 里的那三项 |
-| `session.steer` | `run_id, text` | 是 | 用户在任务进行中补充的话，已经发给执行层（H2）。执行层采用时另发 `steered` |
+| `session.steer` | `run_id, text, client_id?` | 是 | 用户在任务进行中补充的话，已经发给执行层（H2）。执行层采用时另发 `steered` |
 | `session.retry` | `reply_to` | 是 | 用户要求重答最后一条用户消息（H2）：从上下文里拿掉之前对它的回答 |
-| `session.queue` | `items: [{id, text, held?, note?}]` | 否 | 任务进行时打字排队的样子（H2），每次变化都发完整的列表。`held: true` 是任务被停下了、不会自己发出去，`note` 是给用户看的一句话（「任务已停，要发吗？」） |
+| `session.queue` | `items: [{id, text, held?, note?, client_id?}]` | 否 | 任务进行时打字排队的样子（H2），每次变化都发完整的列表（空的也发）。`held: true` 是任务被停下了、不会自己发出去，`note` 是给用户看的一句话（「任务已停，要发吗？」） |
 | 执行层的事件 | 原样，加 `session_id` | 否 | 任务的每一个事件（`start`、`ask`、`step`、`task_done`、`result_response` …，第二节）原样转发，只多一个 `session_id`；它们带自己的 `run_id` 和 `seq` |
 
 `session.error` 的 `code`：
@@ -184,12 +184,12 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 
 | type | 内容 | 说明 |
 |---|---|---|
-| `say` | `{"type":"say","text":"…"}` | 用户发一条消息：先入库，再开始回复。一次只回复一条。有任务在跑时不入库，进排队（见下）；有卡片在等时拒绝（`card_open`） |
+| `say` | `{"type":"say","text":"…","client_id"?:"…"}` | 用户发一条消息：先入库，再开始回复。一次只回复一条。有任务在跑时不入库，进排队（见下）；有卡片在等时拒绝（`card_open`） |
 | `stop` | `{"type":"stop","run_id"?:"…"}` | 带 `run_id`：转给那个任务的执行层（在跑的停下；还在等结果卡的，结果卡放下）。不带：有任务在跑就停那个任务，否则停下正在进行的回复——已经说出的部分作为 `stopped: true` 的消息入库；没有回复在进行时什么也不做。模型已经说完、只是结果还没处理时到的 stop 不算，那条消息照常入库，不带 `stopped` |
-| `attach` | `{"type":"attach","after_seq":n,"run_id"?:"…"}` | 补发：把 `seq` 大于 n 的入库事件按顺序重发一遍（不重复、不跳号）。如果正有回复在进行，再发一条 `offset:0` 的 delta，内容是到现在为止说出的全部文字，之后的 delta 接着这个 offset 往下；排队里有东西时再发一条 `session.queue`。带 `run_id`（H2）：改为从那个任务的 `events.jsonl` 补发它 `seq` 大于 n 的事件（带 `session_id`） |
+| `attach` | `{"type":"attach","after_seq":n,"run_id"?:"…"}` | 补发：把 `seq` 大于 n 的入库事件按顺序重发一遍（不重复、不跳号）。如果正有回复在进行，再发一条 `offset:0` 的 delta，内容是到现在为止说出的全部文字，之后的 delta 接着这个 offset 往下；最后总发一条 `session.queue`（空的也发：它是完整的排队，app 用它整个替换自己手上的，重连期间排队已经交给模型的，app 就不会还留着）。带 `run_id`（H2）：改为从那个任务的 `events.jsonl` 补发它 `seq` 大于 n 的事件（带 `session_id`） |
 | `end` | `{"type":"end"}` | 结束：有任务在跑就先停它（同 stdin 关闭，见下），停下正在进行的回复（同 `stop`，部分入库），然后退出 |
-| `cua` | `{"type":"cua","text":"…","scope"?:"…"}` | `/cua`（H2）：不经过模型，直接开电脑任务，`raw` 就是 `text`。`scope` 是这一次的任务目录（不给就用头一行的）。有回复或任务在跑时 `busy` |
-| `steer` | `{"type":"steer","text":"…","run_id"?:"…"}` | 任务进行中补充要求（H2）：原样转给执行层（控制第 1 版的 steer，执行层的规则照旧：两步之间生效，生效时发 `steered`），同时入库 `session.steer` |
+| `cua` | `{"type":"cua","text":"…","scope"?:"…","client_id"?:"…"}` | `/cua`（H2）：不经过模型，直接开电脑任务，`raw` 就是 `text`。`scope` 是这一次的任务目录（不给就用头一行的）。有回复或任务在跑时 `busy` |
+| `steer` | `{"type":"steer","text":"…","run_id"?:"…","client_id"?:"…"}` | 任务进行中补充要求（H2）：原样转给执行层（控制第 1 版的 steer，执行层的规则照旧：两步之间生效，生效时发 `steered`），同时入库 `session.steer` |
 | `answer` | 执行层的 answer 行，加 `run_id` | 回答卡片（H2）：整行原样转给那个任务（不带 `run_id` 就是正在跑的那个）；多出来的字段执行层不看。按选项下标答：`{"type":"answer","run_id":"…","ask_id":"…","option":n}`；卡上自己写：`…,"text":"…"}` |
 | `respond` | 执行层的 respond 行，加 `run_id` | 回答结果卡（撤回等，H2）：转给那个还在等结果卡的执行层（不带 `run_id` 就是最近的一个）。先检查 `option` 是结果卡上的一个下标，不是就 `bad_control`；撤回要动电脑：只有锁里正是这个任务、状态 `lingering` 时才转过去，锁改回 `acting`，到它的 `result_response` 再改回 `lingering`；已经开始过别的任务（锁里不是它了）时 `undo_expired`；同一张卡第二次回答、或锁文件读写出错时 `busy`（带原因） |
 | `retry` | `{"type":"retry"}` | 重答最后一条用户消息（H2）：不再存一遍这条消息，入库 `session.retry`，之前对它的回答从上下文里拿掉（其间做过的电脑任务留着：它们真的发生了），然后回复。有回复或任务在跑时 `busy` |
@@ -215,6 +215,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - **`/cua` 之后：** 任务结束，模型说一轮：它的上下文里这个任务是一次 `computer_task` 调用和结果，用户消息是 `/cua` 的原话（`via: "cua"`）。这一轮不能再开任务。
 - **电脑被占：** 另一个会话的任务正占着锁时，模型的工具返回「电脑正被另一个会话使用，等它做完再试。」，`/cua` 回 `session.error{code:"computer_busy"}`。
 - **转发：** 执行层的每个事件原样发到会话的 stdout，加上 `session_id`。`answer`、`respond`、`stop`（带 `run_id`）和 `steer` 转到那个执行层的 stdin（控制第 1 版的行，多的字段执行层不看）。
+- **client_id（加的可选字段，不升版本）：** `say`、`cua`、`steer` 可以带 app 自己给这段话起的 id（字符串，最长 100 个字符，更长的当没有）。会话把它原样带回到这段话的结局上：入库的用户消息（`session.message`，包括排队后按 `via: "queue"` 入库的）或 `session.steer`、它排着的那条 `session.queue` 项（`queue_send_now` 发出时也带着）、拒绝这一行的 `session.error`（busy、too_long、card_open、computer_busy、no_task）。app 据此知道自己的话落到了哪里：小助手回的 ok 只说明这一行写进去了，不说明会话收下了。几处细节：`queue_send_now` 被拒（`control: "queue_send_now"`，带那一项的 `client_id`）时，那一项照旧在排队里，话的主人还是排队；会话正在结束时，`queue_send_now` 被拒（busy），那一项留在排队里，而 `say`、`cua`、`steer` 不回任何东西（进程随后退出）；`text` 是空的或只有空白的 `say`、`cua`、`steer` 也不回任何东西（app 不该发这样的）；`client_id` 是空字符串也当没有。进程退出时还在排队的话不会入库，也不会再有事件提到它们：它最后发的 `session.queue` 就是它们最后的去处，app 把它们当成没发出去（重连后 attach 发的是新进程的排队，通常是空的）。
 - **任务进行时打字：** `say` 排进队（`session.queue`，每次都发完整列表），可以 `queue_edit`、`queue_cancel`、`queue_send_now`（有任务时等于 steer）。`steer` 直接转给执行层。任务结束、模型说完之后，排队的话按顺序作为用户消息（`via: "queue"`）入库，模型对它们回一次；任务是被停下的（status `stopped`），就不自动发，每条标上「任务已停，要发吗？」（`held: true`），等用户 `queue_send_now` 或撤掉。
 - **卡片在等时（负责人 10-21）：** app 禁用输入框（同 Claude Code）；要打字的卡有自己的输入框，用 `answer{text}` 答。所以任务里有卡在等（`ask` 之后还没有同一 `ask_id` 的 `resumed` / `ask_void`）时，`say`、`steer`、`queue_send_now` 回 `card_open`。
 - **撤回和等待（负责人 10-21）：** `task_done` 之后执行层最多再等 600 秒结果卡（`--linger 600`）。会话在把 `task_done` 转出去**之前**把锁改成 `lingering`（app 一看到结果卡就点撤回也能过）。`respond` 见上表。这台 Mac 上开始**任何**新的电脑任务，撤回就过期：新任务拿锁时结束那个 `lingering` 的进程组；它所在的会话看到执行层退出、锁里已是别的任务，发 `task_closed new_task`。执行层自己结束（答了结果卡、到了时间、本来没有结果卡）时发 `task_closed linger`。
