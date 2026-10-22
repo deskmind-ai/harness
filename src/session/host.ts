@@ -1,7 +1,7 @@
 /**
  * The session process's core (docs/protocol.md 「会话（第 1 版）」): one per chat session, long-lived. It reads control
  * lines, keeps the history (log.ts), runs one reply at a time (loop.ts) over the built context (context.ts), and writes
- * events: the stored ones with their `seq`, the transient ones (start, deltas, refusals, the queue) without.
+ * events: the stored ones with their `seq`, the transient ones (start, deltas, refusals, the queue, duplicates) without.
  *
  * Computer tasks (H2): the model has one tool, computer_task({goal}); the user has `/cua` (the `cua` control). Either
  * takes the machine lock (task.ts), records `session.task`, and starts the executor (`harness.mjs executor --linger 600`)
