@@ -23,7 +23,7 @@ import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
 import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loop.js";
 import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, capChanges, sessionDir, taskView, type ErrorCode, type SessionBody, type SessionEvent } from "./log.js";
 import { EXIT_WAIT_MS, LINGER_S, alive, cutRaw, linkLock, spawnExecutor, type ExecutorHandle, type Launcher } from "./task.js";
-import { acquire, endTree, free, held, inProcess, linger, readHolder, reapLater, undo, type Holder } from "./computer.js";
+import { acquire, endTree, free, held, inProcess, linger, readHolder, reapLater, release, undo, type Holder } from "./computer.js";
 import type { ModelCallRecord } from "../otel/context.js";
 import { STOP_CAUSES, type StopCause } from "../protocol/computer.js";
 
@@ -149,6 +149,12 @@ interface Task {
   /** Steps it began (`step`) with no `step_result` yet: an end the session writes itself while one is open says its
    *  result is unknown (cause last_step_unknown). */
   openSteps: Set<string>;
+  /** Closed (its stdin) but its session.task_closed could not be stored then: stored when its executor exits. */
+  unrecordedClose: "new_task" | "session_end" | null;
+  /** Its lock could not be set lingering at task_done: it does not linger (its card is not offered; it exits now). */
+  noLinger?: boolean;
+  /** Why its executor could not be sent its task (the end its exit records says so). */
+  startError?: string;
 }
 
 export interface QueueItem { id: string; text: string; held?: boolean; note?: string; client_id?: string }
@@ -228,30 +234,35 @@ export class SessionHost {
       if (e.kind === "session.task_closed") closed.add(e.run_id);
     }
     for (const runId of started) {
-      if (!ended.has(runId)) {
-        const evs = readRunEvents(path.join(this.runs, runId, "events.jsonl"));
-        const done = [...evs].reverse().find((e) => e.kind === "task_done");
-        const steers = evs.filter((e) => e.kind === "steered").map((e) => String(e.text));
-        if (done) this.log.emit(endFrom(runId, done, "none", steers));
-        else {
-          // its executor still runs (the lock names it): stopped, and its own end waited for (its changes are the truth)
-          const own = readHolder(this.o.dir);
-          if (own?.run_id === runId && own.session_id === this.o.sessionId && own.pgid > 0 && held(own)) {
-            // the executor itself is asked to stop (its own stop, which ends its driver's step with a receipt); the
-            // lock stays its group's until all of it is gone
-            try { process.kill(own.pid, "SIGTERM"); } catch { /* gone meanwhile */ }
-            this.recovering.push(this.awaitOldEnd(runId, () => held(own), !closed.has(runId)));
-            continue;
+      // (each run on its own: one whose records cannot be stored does not keep the others' executors running)
+      try {
+        if (!ended.has(runId)) {
+          const evs = readRunEvents(path.join(this.runs, runId, "events.jsonl"));
+          const done = [...evs].reverse().find((e) => e.kind === "task_done");
+          const steers = evs.filter((e) => e.kind === "steered").map((e) => String(e.text));
+          if (done) this.log.emit(endFrom(runId, done, "none", steers));
+          else {
+            // its executor still runs (the lock names it): stopped, and its own end waited for (its changes are the truth)
+            const own = readHolder(this.o.dir);
+            if (own?.run_id === runId && own.session_id === this.o.sessionId && own.pgid > 0 && held(own)) {
+              // the executor itself is asked to stop (its own stop, which ends its driver's step with a receipt); the
+              // lock stays its group's until all of it is gone
+              try { process.kill(own.pid, "SIGTERM"); } catch { /* gone meanwhile */ }
+              this.recovering.push(this.awaitOldEnd(runId, () => held(own), !closed.has(runId)));
+              continue;
+            }
+            this.log.emit(interrupted(runId, steers, evs));
           }
-          this.log.emit(interrupted(runId, steers, evs));
         }
-      }
-      if (!closed.has(runId)) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
+        if (!closed.has(runId)) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
+      } catch (e) { process.stderr.write(`session: recovering ${runId}: ${errText(e)}\n`); }
     }
   }
 
   /** Ends recorded later by recover (an old executor that was still running). Tests wait on it. */
   readonly recovering: Promise<void>[] = [];
+  /** Never rejects: the old group is ended first (when it did not end in time), then its end recorded — a record that
+   *  cannot be stored is logged (the next resume tries again). */
   private async awaitOldEnd(runId: string, up: () => boolean, close: boolean) {
     const file = path.join(this.runs, runId, "events.jsonl");
     const t0 = Date.now();
@@ -265,8 +276,10 @@ export class SessionHost {
         if (!done) done = [...readRunEvents(file)].reverse().find((e) => e.kind === "task_done");
         const steers = readRunEvents(file).filter((e) => e.kind === "steered").map((e) => String(e.text));
         if (this.log.events.some((e) => e.kind === "session.task_end" && e.run_id === runId)) return;
-        this.log.emit(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, readRunEvents(file)));
-        if (close) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
+        try {
+          this.log.emit(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, readRunEvents(file)));
+          if (close) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
+        } catch (e) { process.stderr.write(`session: recovering ${runId}: ${errText(e)}\n`); }
         return;
       }
       await sleep(100);
@@ -418,7 +431,9 @@ export class SessionHost {
         const goal = typeof p.goal === "string" ? p.goal.slice(0, 4000) : "";
         const t = this.startTask({ raw: r.raw, ...(goal.trim() ? { goal } : {}), by: "model", replyTo: r.replyTo });
         if ("busy" in t) return result(en ? "The computer is being used by another session. Try again when it is done." : "电脑正被另一个会话使用，等它做完再试。", true);
+        // (counted: a start that keeps failing is not tried more than a reply's tasks)
         r.tasks += 1;
+        if ("failed" in t) return result(en ? `The task could not start (nothing was done on the computer): ${redactKeys(t.failed).slice(0, 300)}. Tell the user.` : `任务没能开始（电脑上什么都没做）：${redactKeys(t.failed).slice(0, 300)}。告诉用户。`, true);
         const end = await t.ended;
         if (end.status === "stopped") r.stopped = true;
         if (this.closing) r.abort.abort();             // the app went away: no more turns
@@ -438,14 +453,12 @@ export class SessionHost {
     if (this.closing || !text.trim() || this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
     if (this.current || this.running || this.flows) return this.refuseBusy("cua", cid);
     let userId = "";
-    let t: Task | { busy: true };
-    try { t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
+    const t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
       userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua", ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
       return userId;
-    } }); } catch (e) {
-      // (the words were stored before the failure: they are the history's, so the refusal does not name them again)
-      return this.refuse("busy", `the task could not start: ${e instanceof Error ? e.message : String(e)}`, "cua", userId ? undefined : cid);
-    }
+    } });
+    // (words stored before the failure are the history's: the refusal does not name them again)
+    if ("failed" in t) return this.refuse("busy", `the task could not start: ${t.failed}`, "cua", userId ? undefined : cid);
     if ("busy" in t) return this.refuse("computer_busy", this.t("电脑正被另一个会话使用", "the computer is being used by another session"), "cua", cid);
     this.flows += 1;
     void t.ended.then(() => {
@@ -455,9 +468,14 @@ export class SessionHost {
     });
   }
 
-  /** Start a computer task, or say the machine is busy. `before`: what to store first once the lock is ours (the /cua
-   *  user message), giving the user message the task answers. */
-  private startTask(o: { raw: string; goal?: string; by: "slash" | "model"; replyTo?: string; scope?: string; before?: () => string }): Task | { busy: true } {
+  /** Start a computer task, say the machine is busy, or say why it could not start (`failed`). `before`: what to store
+   *  first once the lock is ours (the /cua user message), giving the user message the task answers.
+   *
+   *  No failure on the way leaves the Mac held: whatever throws while the lock is taken, earlier result cards are
+   *  closed or the task is recorded (a disk that is full), this attempt lets go of what it took — its executor (which
+   *  never got its task) is ended and the lock it wrote removed, compare-and-set on that holder (computer.ts release) —
+   *  and the caller is told `failed` with the reason; nothing says the task began. */
+  private startTask(o: { raw: string; goal?: string; by: "slash" | "model"; replyTo?: string; scope?: string; before?: () => string }): Task | { busy: true } | { failed: string } {
     const runId = `run_${randomUUID().slice(0, 8)}`;
     const scope = o.scope ?? this.o.scope;
     const request = { run_id: runId, raw: o.raw, ...(o.goal ? { context: o.goal } : {}), config: this.config, lang: this.lang, ...(this.o.driver ? { driver: this.o.driver } : {}), ...(scope ? { scope } : {}) };
@@ -465,35 +483,69 @@ export class SessionHost {
     // lingering one is ended (its undo expires: this session's own, or another's, or the helper's), and the executor is
     // started and named in the lock — before it is sent its task.
     let handle: ExecutorHandle | null = null, spawnError = "";
-    const got = acquire(this.o.dir, { run_id: runId, session_id: this.o.sessionId, by: "session" }, () => {
-      try { handle = (this.o.launch ?? spawnExecutor)(request, { runs: this.runs, runId, linger: this.linger }); }
-      catch (e) { spawnError = e instanceof Error ? e.message : String(e); return null; }
-      return { pid: handle.pid };
-    });
-    if (!("ok" in got)) return { busy: true };
-    const pgid = got.holder?.pgid ?? 0;
-    const h: ExecutorHandle = handle ?? { write: () => {}, close: () => {}, onLine: () => {}, exited: Promise.resolve({ code: null, signal: `spawn: ${spawnError}` }) };
-    if (handle && !h.pid) inProcess.set(runId, () => h.close());
-    // this session's result cards can no longer be answered: a new task started (the lock ended a lingering one)
-    for (const t of this.tasks.values()) if (t.state !== "running") this.closeTask(t, "new_task");
+    let got: ReturnType<typeof acquire>;
     try {
+      got = acquire(this.o.dir, { run_id: runId, session_id: this.o.sessionId, by: "session" }, () => {
+        try { handle = (this.o.launch ?? spawnExecutor)(request, { runs: this.runs, runId, linger: this.linger }); }
+        catch (e) { spawnError = e instanceof Error ? e.message : String(e); return null; }
+        return { pid: handle.pid };
+      });
+    } catch (e) {
+      // the lock could not be written (acquire ended a group it had started); an executor it started is let go here too
+      const started = handle as ExecutorHandle | null;
+      // (acquire can throw after its write landed — closing the guard failed: a lock naming this run is let go too)
+      let own: Holder | null = null;
+      try { const x = readHolder(this.o.dir); if (x?.run_id === runId) own = x; } catch { /* unreadable: its exit frees it */ }
+      if (started) this.abandon(runId, started, own, true, started.pid ?? 0);
+      else if (own && !release(this.o.dir, own)) reapLater(this.o.dir, runId, own.pgid, 2000);
+      // acquire may have ended this session's lingering executor before it failed: that card is closed (new_task)
+      for (const t of [...this.tasks.values()]) if (t.state === "lingering" && t.pgid > 0 && t.holder && !held(t.holder)) { try { this.closeTask(t, "new_task"); } catch { /* recorded at its exit */ } }
+      return { failed: errText(e) };
+    }
+    if (!("ok" in got)) return { busy: true };
+    const holder = got.holder;
+    const pgid = holder?.pgid ?? 0;
+    const started = handle as ExecutorHandle | null;
+    const h: ExecutorHandle = started ?? { write: () => {}, close: () => {}, onLine: () => {}, exited: Promise.resolve({ code: null, signal: `spawn: ${spawnError}` }) };
+    if (started && !h.pid) inProcess.set(runId, () => h.close());
+    try {
+      // this session's result cards can no longer be answered: a new task started (the lock ended a lingering one).
+      // Every one is closed even if recording one fails; then the failure stops this start.
+      let failure: unknown = null;
+      for (const t of [...this.tasks.values()]) if (t.state !== "running") { try { this.closeTask(t, "new_task"); } catch (e) { failure ??= e; } }
+      if (failure) throw failure;
       const replyTo = o.before?.() ?? o.replyTo;
       this.log.emit({ kind: "session.task", msg_id: newId(), run_id: runId, raw: o.raw, ...(o.goal ? { goal: o.goal } : {}), by: o.by, ...(replyTo ? { reply_to: replyTo } : {}) });
     } catch (e) {
-      // nothing stored: the executor never gets its task (its stdin closed, it exits), and the lock goes with it
-      h.close();
-      void h.exited.then(() => { inProcess.delete(runId); try { free(this.o.dir, runId, pgid); } catch { /* the next task finds its group gone */ } });
-      throw e;
+      // not recorded: the executor never gets its task; it is ended and the lock it took let go now
+      this.abandon(runId, h, holder);
+      return { failed: errText(e) };
     }
     let resolve!: (e: TaskEnd) => void;
     const ended = new Promise<TaskEnd>((res) => { resolve = res; });
-    const task: Task = { runId, handle: h, pgid, holder: got.holder, responded: false, sawDone: false, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set() };
+    const task: Task = { runId, handle: h, pgid, holder, responded: false, sawDone: false, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set(), unrecordedClose: null };
     this.current = task;
     this.tasks.set(runId, task);
-    h.onLine((l) => this.onExecutorLine(task, l));
     void h.exited.then((x) => this.onExecutorExit(task, x));
-    h.start?.();
+    try {
+      h.onLine((l) => this.onExecutorLine(task, l));
+      h.start?.();
+    } catch (e) {
+      // recorded, but the executor could not be given its task: it is ended, and its exit records the end (failed)
+      task.startError = errText(e);
+      process.stderr.write(`session: the task could not be sent: ${task.startError}\n`);
+      this.abandon(runId, h, holder, false);
+    }
     return task;
+  }
+
+  /** Let go of what a start that failed took: its executor's stdin is closed, its group ended and the lock it wrote
+   *  removed (compare-and-set on `holder`); a group that would not end is ended later (reapLater), and once it exits
+   *  the lock is removed if it still names it. `forget`: the session never knew the task (nothing follows its exit). */
+  private abandon(runId: string, h: ExecutorHandle, holder: Holder | null, forget = true, pgid = holder?.pgid ?? 0) {
+    try { h.close(); } catch { /* gone */ }
+    if (holder && !release(this.o.dir, holder)) reapLater(this.o.dir, runId, holder.pgid, 2000);
+    if (forget) void h.exited.then(() => { inProcess.delete(runId); try { free(this.o.dir, runId, pgid); } catch { /* the next task finds its group gone */ } });
   }
 
   /** An executor's event: to the app as it is (plus the session), and what the session follows of it. */
@@ -501,25 +553,36 @@ export class SessionHost {
     let ev: Record<string, unknown>;
     try { const j = JSON.parse(line); if (!j || typeof j !== "object" || Array.isArray(j)) return; ev = j; } catch { return; }
     // done acting: the lock and the task say so before anyone hears of it (an undo sent at once finds it lingering)
-    if (ev.kind === "task_done") { task.sawDone = true; this.lockLinger(task); this.cardOf(task, ev); }
-    this.o.out({ ...ev, session_id: this.o.sessionId });
+    if (ev.kind === "task_done") {
+      task.sawDone = true;
+      // a lock that cannot say lingering would keep the Mac busy while its card waits: it does not linger then
+      if (!this.lockLinger(task)) task.noLinger = true;
+      this.cardOf(task, ev);
+    }
+    // (a task that does not linger offers no result card: none is shown that could not be answered)
+    this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { result_card: null } : {}), session_id: this.o.sessionId });
     switch (ev.kind) {
       case "ask": task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; break;
       case "resumed": case "ask_void": if (ev.ask_id === task.card) task.card = null; break;
       case "steered": if (typeof ev.text === "string") task.steers.push(ev.text); break;
       case "step": if (typeof ev.step_id === "string") task.openSteps.add(ev.step_id); break;
       case "step_result": if (typeof ev.step_id === "string") task.openSteps.delete(ev.step_id); break;
-      case "task_done": this.taskDone(task, ev); break;
+      case "task_done": this.taskDone(task, ev); if (task.noLinger) { try { task.handle.close(); } catch { /* gone */ } } break;
       case "result_response":
-        if (typeof ev.undone === "number" && typeof ev.total === "number") this.log.emit({ kind: "session.task_undo", run_id: task.runId, undone: ev.undone, total: ev.total, refused: typeof ev.refused === "string" ? ev.refused : null });
-        this.lockLinger(task);                           // the answer carried out: it acts no more
+        this.lockLinger(task);                           // the answer carried out: it acts no more (first: whatever the record)
+        if (typeof ev.undone === "number" && typeof ev.total === "number") {
+          try { this.log.emit({ kind: "session.task_undo", run_id: task.runId, undone: ev.undone, total: ev.total, refused: typeof ev.refused === "string" ? ev.refused : null }); }
+          catch (e) { process.stderr.write(`session: the undo of ${task.runId} could not be stored: ${errText(e)}\n`); }
+        }
         break;
     }
   }
 
-  /** The lock says the task acts no more (a lock file that cannot be written is logged, not thrown into the reader). */
-  private lockLinger(task: Task) {
-    try { if (task.holder) { const n = linger(this.o.dir, task.holder); if (n) task.holder = n; } } catch (e) { process.stderr.write(`computer lock: ${e instanceof Error ? e.message : String(e)}\n`); }
+  /** The lock says the task acts no more (a lock file that cannot be written is logged, not thrown into the reader:
+   *  false). */
+  private lockLinger(task: Task): boolean {
+    try { if (task.holder) { const n = linger(this.o.dir, task.holder); if (n) task.holder = n; } return true; }
+    catch (e) { process.stderr.write(`computer lock: ${errText(e)}\n`); return false; }
   }
 
   /** task_done, before it is passed on: its result card's options, and whether it lingers for it. */
@@ -528,19 +591,22 @@ export class SessionHost {
     if (task.end) return;                                // the session had to end it already (the app went away)
     const card = ev.result_card as { options?: unknown[] } | null | undefined;
     task.options = Array.isArray(card?.options) ? card.options.length : 0;
-    if (task.state === "running") task.state = card && this.linger > 0 ? "lingering" : "ending";
+    if (task.state === "running") task.state = card && this.linger > 0 && !task.noLinger ? "lingering" : "ending";
   }
 
   private taskDone(task: Task, ev: Record<string, unknown>) {
     if (task.end) return;
     const card = ev.result_card as { options?: { kind?: string }[] } | null | undefined;
-    const undo = this.linger > 0 && !!card?.options?.some((x) => x.kind === "undo") ? "open" : "none";
+    const undo = this.linger > 0 && !task.noLinger && !!card?.options?.some((x) => x.kind === "undo") ? "open" : "none";
     this.recordEnd(task, endFrom(task.runId, ev, undo, task.steers));
   }
 
+  /** The task's end: stored, then the task is over for the session whatever happens to the write — the model's call
+   *  returns, the session is free again. An end that could not be stored is not in the history: a resumed session
+   *  finds the task without one and takes it from the run (its task_done, else interrupted). */
   private recordEnd(task: Task, body: TaskEnd) {
     if (task.exitTimer) { clearTimeout(task.exitTimer); task.exitTimer = null; }
-    this.log.emit(body);
+    try { this.log.emit(body); } catch (e) { process.stderr.write(`session: the end of ${task.runId} could not be stored: ${errText(e)}\n`); }
     task.end = body;
     if (this.current === task) this.current = null;
     // after a stop the queued words are not sent by themselves: the user says whether to
@@ -552,33 +618,46 @@ export class SessionHost {
   }
 
   private onExecutorExit(task: Task, x: { code: number | null; signal: string | null }) {
-    // the lock goes once nothing of its group is left (a child still up keeps it: acting, if it never said task_done,
-    // until that child ends — or is ended after the stop wait)
-    inProcess.delete(task.runId);
-    try { free(this.o.dir, task.runId, task.pgid); } catch { /* the next task finds its group gone */ }
-    // the lock still says it acts (no task_done of its own, or it died during an undo): what is left of its group is
-    // ended after the stop wait (and by the next task, if this process is gone by then: orphaned)
-    reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
-    if (!task.end) {
-      // no task_done: a step it had begun and not ended may or may not have taken effect
-      this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
+    try {
+      // the lock goes once nothing of its group is left (a child still up keeps it: acting, if it never said task_done,
+      // until that child ends — or is ended after the stop wait)
+      inProcess.delete(task.runId);
+      try { free(this.o.dir, task.runId, task.pgid); } catch { /* the next task finds its group gone */ }
+      // the lock still says it acts (no task_done of its own, or it died during an undo): what is left of its group is
+      // ended after the stop wait (and by the next task, if this process is gone by then: orphaned)
+      reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
+      if (!task.end) {
+        // no task_done: a step it had begun and not ended may or may not have taken effect
+        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
+      }
+      if (task.state !== "closed") {
+        // a lingering executor ended by a new task elsewhere on this Mac (the lock names another run now): undo expired
+        const other = task.state === "lingering" && readHolder(this.o.dir)?.run_id !== undefined && readHolder(this.o.dir)?.run_id !== task.runId;
+        task.state = "closed";
+        this.storeClosed(task, other ? "new_task" : "linger");
+      } else if (task.unrecordedClose) this.storeClosed(task, task.unrecordedClose);
+    } finally {
+      this.tasks.delete(task.runId);
+      this.maybeExit();
     }
-    if (task.state !== "closed") {
-      // a lingering executor ended by a new task elsewhere on this Mac (the lock names another run now): undo expired
-      const other = task.state === "lingering" && readHolder(this.o.dir)?.run_id !== undefined && readHolder(this.o.dir)?.run_id !== task.runId;
-      task.state = "closed";
-      this.log.emit({ kind: "session.task_closed", run_id: task.runId, why: other ? "new_task" : "linger" });
-    }
-    this.tasks.delete(task.runId);
-    this.maybeExit();
   }
 
-  /** Close an executor's stdin: its result card can no longer be answered. */
+  /** session.task_closed; one that cannot be stored is logged (the history then lacks it: a resumed session adds
+   *  session_end). */
+  private storeClosed(task: Task, why: "linger" | "new_task" | "session_end") {
+    try { this.log.emit({ kind: "session.task_closed", run_id: task.runId, why }); task.unrecordedClose = null; }
+    catch (e) { process.stderr.write(`session: task_closed of ${task.runId} could not be stored: ${errText(e)}\n`); }
+  }
+
+  /** Close an executor's stdin: its result card can no longer be answered. The executor is let go first, whatever
+   *  happens to the record; a record that cannot be stored throws (after the executor was let go), and is stored again
+   *  when the executor exits. */
   private closeTask(task: Task, why: "new_task" | "session_end") {
     if (task.state === "closed") return;
     task.state = "closed";
-    task.handle.close();
-    this.log.emit({ kind: "session.task_closed", run_id: task.runId, why });
+    try { task.handle.close(); } catch { /* gone */ }
+    try { this.log.emit({ kind: "session.task_closed", run_id: task.runId, why }); }
+    catch (e) { task.unrecordedClose = why; throw e; }
   }
 
   /** The executor's control lines, to the task they name (or the running one). */
@@ -607,7 +686,7 @@ export class SessionHost {
     let u: ReturnType<typeof undo>;
     try { u = t.holder ? undo(this.o.dir, t.holder) : "expired"; }
     catch (e) { return this.refuse("busy", `the machine lock: ${e instanceof Error ? e.message : String(e)}`, "respond"); }
-    if (u === "expired") { this.closeTask(t, "new_task"); return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
+    if (u === "expired") { try { this.closeTask(t, "new_task"); } catch { /* let go; recorded at its exit */ } return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
     if (u === "busy") return this.refuse("busy", this.t("这个任务的撤回正在进行", "an answer to this task's card is being carried out"), "respond");
     t.holder = u.ok;
     t.responded = true;
@@ -737,11 +816,13 @@ export class SessionHost {
     if (!this.closing || this.running || this.current || this.flows || this.exited) return;
     this.exited = true;
     const open = [...this.tasks.values()];
-    for (const t of open) this.closeTask(t, "session_end");
+    for (const t of open) { try { this.closeTask(t, "session_end"); } catch { /* let go; recorded at its exit */ } }
     // the executors read their stdin's end and exit; one that does not is not waited for long
     void Promise.race([Promise.all(open.map((t) => t.handle.exited)), sleep(2000)]).then(() => this.o.onExit?.());
   }
 }
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** A run's events.jsonl, as far as it reads. */
 function readRunEvents(file: string): Record<string, unknown>[] {

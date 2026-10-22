@@ -16,7 +16,9 @@ import { SessionLog } from "../src/session/log.js";
 import { reasoningBack, withReasoningBack, reply } from "../src/session/loop.js";
 import { cutRaw, MAX_RAW, type ExecutorHandle, type Launcher } from "../src/session/task.js";
 import { computerLockFile, held, readHolder } from "../src/session/computer.js";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import fsCjs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as http from "node:http";
 import { isProvenance, scripted as judgeScript } from "./helpers/provenance-judge.js";
 import { appRun, LineReader } from "../src/cli/app.js";
@@ -963,5 +965,346 @@ describe("stop cause: why a task stopped, as a field (task_done.cause, session.t
     expect(ends.run_lock).toMatchObject({ status: "environment", cause: "screen_locked" });
     expect(ends.run_words).toMatchObject({ status: "environment", reason: "the screen is locked" });
     for (const id of ["run_quiet", "run_words", "run_bad"]) expect(ends[id], id).not.toHaveProperty("cause");
+  });
+});
+
+describe("a task start that fails part-way lets go of what it took (the disk is full)", () => {
+  /** Make the next `times` calls of fs[name] that `when` picks throw ENOSPC (as a full disk does); the code under test
+   *  sees it through its own `import * as fs` (syncBuiltinESMExports). Undone after each test. */
+  const undoFs: (() => void)[] = [];
+  afterEach(() => { for (const u of undoFs.splice(0)) u(); });
+  const failFs = (name: "openSync" | "writeFileSync" | "renameSync" | "fsyncSync" | "closeSync" | "ftruncateSync", when: (...a: any[]) => boolean, times = 1) => {
+    const orig = (fsCjs as any)[name];
+    let left = times;
+    const hit = { n: 0 };
+    (fsCjs as any)[name] = (...a: any[]) => {
+      if (left > 0 && when(...a)) { left -= 1; hit.n += 1; if (name === "closeSync") { try { orig(...a); } catch { /* closed all the same */ } } throw Object.assign(new Error(`ENOSPC: no space left on device, ${name}`), { code: "ENOSPC" }); }
+      return orig(...a);
+    };
+    syncBuiltinESMExports();
+    const restore = () => { (fsCjs as any)[name] = orig; syncBuiltinESMExports(); };
+    undoFs.push(restore);
+    return { restore, hit };
+  };
+  /** An append to a session's history (SessionLog.emit opens session.jsonl with "a"). */
+  const historyAppend = (file: unknown, flags: unknown) => String(file).endsWith("session.jsonl") && flags === "a";
+
+  /** Some process of group `pgid` lives (not a zombie). */
+  const groupUp = (pgid: number) => execFileSync("/bin/ps", ["-A", "-o", "pgid=,stat="], { encoding: "utf-8" }).split("\n").some((r) => { const [g, st] = r.trim().split(/\s+/); return Number(g) === pgid && !!st && !st.startsWith("Z"); });
+  const groups: number[] = [];
+  afterEach(() => { for (const g of groups.splice(0)) { try { process.kill(-g, "SIGKILL"); } catch { /* gone */ } } });
+
+  /** A real executor, the leader of its own process group with a child in it (`sleep`, killed when the leader exits
+   *  by itself): takes its request, says task_done with an undo card, then lingers until its stdin ends. `got`: the
+   *  runs whose request reached it. */
+  const SCRIPT = `const c=require("child_process").spawn("sleep",["30"],{stdio:"ignore"});process.on("exit",()=>{try{c.kill("SIGKILL")}catch{}});
+const rl=require("readline").createInterface({input:process.stdin});let first=true;
+rl.on("line",(l)=>{if(!first){const j=JSON.parse(l);if(j.type==="respond"){console.log(JSON.stringify({seq:2,t:2,run_id:"",kind:"result_response",option:j.option,undone:1,total:1,refused:null}));setTimeout(()=>process.exit(0),50)}return}first=false;const r=JSON.parse(l);console.log(JSON.stringify({seq:1,t:1,run_id:r.run_id,kind:"task_done",status:"succeeded",summary:"ok",result_card:{options:[{kind:"undo",label:"撤回"},{kind:"keep",label:"保留"}]}}))});
+rl.on("close",()=>process.exit(0));`;
+  const realExec = () => {
+    const pgids: number[] = [];
+    const launch: Launcher = (req) => {
+      const p = spawn(process.execPath, ["-e", SCRIPT], { stdio: ["pipe", "pipe", "ignore"], detached: true });
+      pgids.push(p.pid!); groups.push(p.pid!);
+      p.stdin!.on("error", () => {});
+      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("exit", (code, signal) => r({ code, signal })));
+      let cb: ((l: string) => void) | null = null;
+      const early: string[] = [];
+      let buf = "";
+      p.stdout!.on("data", (d) => { buf += String(d); const ls = buf.split("\n"); buf = ls.pop()!; for (const l of ls.filter(Boolean)) { if (cb) cb(l); else early.push(l); } });
+      return { pid: p.pid, start: () => { p.stdin!.write(JSON.stringify(req) + "\n"); }, write: (l) => { if (p.stdin!.writable) p.stdin!.write(l + "\n"); }, close: () => { try { p.stdin!.end(); } catch { /* gone */ } },
+        onLine: (f) => { cb = f; for (const l of early.splice(0)) f(l); }, exited };
+    };
+    return { launch, pgids };
+  };
+  const lockState = (dir: string) => readHolder(dir)?.state ?? "free";
+  const doneRuns = (evs: any[]) => evs.filter((e) => e.kind === "task_done").map((e) => e.run_id);
+
+  it("the lock's own write fails at acquire: the executor it started is ended, nothing is stored, the next task starts", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+    const f = failFs("renameSync", (_from, to) => String(to).endsWith("computer.lock"));
+    s.send({ type: "cua", text: "新建 a.txt", client_id: "k1" });
+    f.restore();
+    expect(f.hit.n).toBe(1);
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", client_id: "k1", text: expect.stringContaining("ENOSPC") });
+    expect(s.stored()).toEqual([]);
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    await waitFor(() => !groupUp(ex.pgids[0]!));           // its whole group, the child included
+    expect(s.h.busy).toBe(false);
+    s.send({ type: "cua", text: "新建 a.txt", client_id: "k2" });
+    await waitFor(() => doneRuns(s.evs).length === 1);
+    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[1], state: "lingering" });
+  });
+
+  it("closing the earlier lingering task fails to store: the new executor is ended and its lock released; the earlier one is ended too; the next task starts", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }, { text: "好" }], launch: ex.launch });
+    s.send({ type: "cua", text: "第一件" });
+    await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+    const runA = doneRuns(s.evs)[0];
+    expect(readHolder(s.dir)).toMatchObject({ run_id: runA, state: "lingering" });
+    const f = failFs("openSync", historyAppend);             // the first write of the start: session.task_closed
+    s.send({ type: "cua", text: "第二件", client_id: "k2" });
+    f.restore();
+    expect(f.hit.n).toBe(1);
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", client_id: "k2", text: expect.stringContaining("ENOSPC") });
+    // released at once (compare-and-set on the holder it wrote), not when the executor gets round to exiting
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    expect(s.stored().some((e: any) => e.kind === "session.message" && e.text === "第二件")).toBe(false);
+    expect(s.stored().filter((e: any) => e.kind === "session.task")).toHaveLength(1);
+    await waitFor(() => !groupUp(ex.pgids[0]!) && !groupUp(ex.pgids[1]!));
+    expect(doneRuns(s.evs)).toEqual([runA]);                 // the second executor never got its task
+    // the earlier task's close is stored once its executor has exited (the write works again)
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed" && e.run_id === runA));
+    expect(s.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ run_id: runA, why: "new_task" });
+    s.send({ type: "cua", text: "第三件" });
+    await waitFor(() => doneRuns(s.evs).length === 2);
+    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[2], state: "lingering" });
+  });
+
+  it("/cua: session.task fails to store after the user's words: the executor is ended and the lock released at once", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }], launch: ex.launch });
+    let n = 0;
+    const f = failFs("openSync", (file, flags) => historyAppend(file, flags) && ++n === 2);   // 1: the /cua words, 2: session.task
+    s.send({ type: "cua", text: "新建 a.txt", client_id: "k1" });
+    f.restore();
+    expect(f.hit.n).toBe(1);
+    const err = s.kinds("session.error").at(-1);
+    expect(err).toMatchObject({ code: "busy", control: "cua", text: expect.stringContaining("ENOSPC") });
+    expect(err).not.toHaveProperty("client_id");            // the words are stored: the history's
+    expect(s.stored().map((e: any) => e.kind)).toEqual(["session.message"]);
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    await waitFor(() => !groupUp(ex.pgids[0]!));
+    s.send({ type: "cua", text: "再来" });
+    await waitFor(() => doneRuns(s.evs).length === 1);
+  });
+
+  it("the model's computer_task: a start that cannot be stored is a failed tool call (not a success), the Mac is free, the next call starts", async () => {
+    const ex = realExec();
+    const s = session({ model: [CALL("新建 a.txt"), { text: "没开成" }, CALL("新建 a.txt"), { text: "好了" }], launch: ex.launch });
+    s.send({ type: "say", text: "新建 a.txt" });
+    const f = failFs("openSync", historyAppend);             // the say is stored; next: session.task
+    await waitFor(() => f.hit.n === 1);
+    f.restore();
+    await s.h.idle();
+    const res = s.seen[1]!.find((m: any) => m.role === "toolResult") as any;
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("任务没能开始");
+    expect(textOf(res)).toContain("ENOSPC");
+    expect(s.stored().some((e: any) => e.kind === "session.task" || e.kind === "session.task_end")).toBe(false);
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    await waitFor(() => !groupUp(ex.pgids[0]!));
+    s.send({ type: "say", text: "再试一次" });
+    await s.h.idle();
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+  });
+
+  it("the lock cannot be set lingering at task_done: the executor does not linger (no undo), it exits, the lock is released, the next task is not refused", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+    const f = failFs("writeFileSync", (_file, data) => typeof data === "string" && data.includes('"state":"lingering"'));
+    s.send({ type: "cua", text: "第一件" });
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+    f.restore();
+    expect(f.hit.n).toBe(1);
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded", undo: "none" });
+    expect(s.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ why: "linger" });
+    expect(s.evs.find((e) => e.kind === "task_done").result_card).toBeNull();   // no card that could not be answered
+    await waitFor(() => !groupUp(ex.pgids[0]!) && lockState(s.dir) === "free");
+    await waitFor(() => !s.h.busy);
+    s.send({ type: "cua", text: "第二件" });
+    expect(s.kinds("session.error").filter((e: any) => e.code === "computer_busy")).toEqual([]);
+    await waitFor(() => doneRuns(s.evs).length === 2);
+  });
+
+  it("the task's end cannot be stored: the session is not left waiting, the lock is the lingering run's, and the next task ends it and starts", async () => {
+    const ex = realExec();
+    const s = session({ model: [CALL("第一件"), { text: "好" }, CALL("第二件"), { text: "好" }], launch: ex.launch });
+    // the one write that fails is the task's end (the store itself throws, as on a full disk)
+    const orig = s.h.log.emit.bind(s.h.log);
+    let hit = 0;
+    (s.h.log as any).emit = (body: any) => { if (body.kind === "session.task_end" && !hit++) throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" }); return orig(body); };
+    s.send({ type: "say", text: "第一件" });
+    await s.h.idle();
+    expect(hit).toBe(1);
+    expect(textOf(s.seen[1]!.find((m: any) => m.role === "toolResult"))).toContain("\"status\":\"succeeded\"");
+    expect(s.stored().some((e: any) => e.kind === "session.task_end")).toBe(false);   // nothing false stored
+    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[0], state: "lingering" });
+    s.send({ type: "say", text: "第二件" });
+    await s.h.idle();
+    expect(s.stored().filter((e: any) => e.kind === "session.task_end")).toHaveLength(1);
+    expect(groupUp(ex.pgids[0]!)).toBe(false);
+    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[1], state: "lingering" });
+  });
+
+  it("undo: the lock cannot be set acting (busy, the lock stays the lingering run's); the undo's record cannot be stored (the lock is set lingering all the same); then the next task starts", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+    s.send({ type: "cua", text: "第一件" });
+    await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+    const runA = doneRuns(s.evs)[0];
+    const before = readHolder(s.dir)!;
+    expect(before).toMatchObject({ run_id: runA, state: "lingering" });
+    const f = failFs("writeFileSync", (_file, data) => typeof data === "string" && data.includes('"state":"acting"'));
+    s.send({ type: "respond", run_id: runA, option: 0 });
+    f.restore();
+    expect(f.hit.n).toBe(1);
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "respond", text: expect.stringContaining("ENOSPC") });
+    expect(readHolder(s.dir)).toEqual(before);
+    // again, the lock writable; the undo's record is what fails now
+    const orig = s.h.log.emit.bind(s.h.log);
+    let hit = 0;
+    (s.h.log as any).emit = (body: any) => { if (body.kind === "session.task_undo" && !hit++) throw new Error("ENOSPC: no space left on device, write"); return orig(body); };
+    let lockAtResponse = "";
+    s.on((e) => { if (e.kind === "result_response") queueMicrotask(() => { lockAtResponse = lockState(s.dir); }); });   // once the line is handled
+    s.send({ type: "respond", run_id: runA, option: 0 });
+    expect(readHolder(s.dir)).toMatchObject({ run_id: runA, state: "acting", gen: before.gen! + 1 });
+    await waitFor(() => !groupUp(ex.pgids[0]!) && lockState(s.dir) === "free");
+    expect(hit).toBe(1);
+    expect(lockAtResponse).toBe("lingering");
+    s.send({ type: "cua", text: "第二件" });
+    await waitFor(() => doneRuns(s.evs).length === 2);
+  });
+
+  it("acquire throws after its lock write landed (closing the guard fails): the lock naming this run is released and its group ended", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+    // the guard's fd as acquire opens it; its first close fails (after closing it: the flock goes)
+    const guardFds = new Set<number>();
+    const origOpen = fsCjs.openSync;
+    const undoOpen = () => { (fsCjs as any).openSync = origOpen; syncBuiltinESMExports(); };
+    (fsCjs as any).openSync = (...a: any[]) => { const fd = (origOpen as any)(...a); if (String(a[0]).endsWith("computer.guard")) guardFds.add(fd); return fd; };
+    syncBuiltinESMExports();
+    undoFs.push(undoOpen);
+    const c = failFs("closeSync", (fd) => guardFds.has(fd));
+    s.send({ type: "cua", text: "第一件", client_id: "k1" });
+    c.restore(); undoOpen();
+    expect(c.hit.n).toBe(1);
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", client_id: "k1", text: expect.stringContaining("ENOSPC") });
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);          // released at once, compare-and-set
+    await waitFor(() => !groupUp(ex.pgids[0]!));
+    s.send({ type: "cua", text: "第二件" });
+    await waitFor(() => doneRuns(s.evs).length === 1);
+  });
+
+  it("the lock's own write fails while this session's card lingers: the lingering executor acquire ended is closed as new_task; the next task starts", async () => {
+    const ex = realExec();
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+    s.send({ type: "cua", text: "第一件" });
+    await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+    const runA = doneRuns(s.evs)[0];
+    const f = failFs("renameSync", (_from, to) => String(to).endsWith("computer.lock"));
+    s.send({ type: "cua", text: "第二件" });
+    f.restore();
+    expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", text: expect.stringContaining("ENOSPC") });
+    await waitFor(() => !groupUp(ex.pgids[0]!) && !groupUp(ex.pgids[1]!));
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+    expect(s.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ run_id: runA, why: "new_task" });
+    s.send({ type: "cua", text: "第三件" });
+    await waitFor(() => doneRuns(s.evs).length === 2);
+    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[2], state: "lingering" });
+  });
+
+  it("recorded, but the request cannot be sent: the group is ended, the lock released, the end says why (failed), the next task starts", async () => {
+    const ex = realExec();
+    let first = true;
+    const launch: Launcher = (req, o) => { const h = ex.launch(req, o); if (!first) return h; first = false; return { ...h, start: () => { throw new Error("EPIPE: broken pipe, write"); } }; };
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch });
+    s.send({ type: "cua", text: "第一件" });
+    expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    await waitFor(() => !s.h.busy && s.stored().some((e: any) => e.kind === "session.task_end"));
+    expect(groupUp(ex.pgids[0]!)).toBe(false);
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "failed", reason: expect.stringContaining("could not be sent to the executor: EPIPE") });
+    s.send({ type: "cua", text: "第二件" });
+    await waitFor(() => doneRuns(s.evs).length === 1);
+  });
+
+  it("a history line that lands but cannot be synced is cut off again: never in the file when the caller was told it failed", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_l");
+    log.emit({ kind: "session.retry", reply_to: "m0" });
+    const f = failFs("fsyncSync", () => true);
+    expect(() => log.emit({ kind: "session.task_closed", run_id: "run_x", why: "new_task" })).toThrow(/ENOSPC/);
+    f.restore();
+    log.emit({ kind: "session.task_closed", run_id: "run_x", why: "new_task" });
+    const back = new SessionLog(dir, "ses_l").events;
+    expect(back.map((e) => [e.seq, e.kind])).toEqual([[1, "session.retry"], [2, "session.task_closed"]]);
+  });
+
+  it("a short write (a full disk writes part of the line) fails and is cut back; a close error after the sync is not a failure; a cut that fails leaves the next line on its own", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_w");
+    const orig = fsCjs.writeSync;
+    const short = (fd: number, data: any) => orig(fd, String(data).slice(0, 10));
+    (fsCjs as any).writeSync = short; syncBuiltinESMExports();
+    undoFs.push(() => { (fsCjs as any).writeSync = orig; syncBuiltinESMExports(); });
+    expect(() => log.emit({ kind: "session.retry", reply_to: "m0" })).toThrow(/short write/);
+    (fsCjs as any).writeSync = orig; syncBuiltinESMExports();
+    expect(fs.readFileSync(log.file, "utf-8")).toBe("");
+    // synced, then the close fails: stored (not reported as a failure, so never stored twice)
+    const c = failFs("closeSync", () => true);
+    log.emit({ kind: "session.retry", reply_to: "m1" });
+    c.restore();
+    expect(c.hit.n).toBe(1);
+    // short again, and the cut back fails too: the partial line stays, the next event begins a line of its own
+    (fsCjs as any).writeSync = short; syncBuiltinESMExports();
+    const t = failFs("ftruncateSync", () => true);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "m2" })).toThrow(/short write/);
+    (fsCjs as any).writeSync = orig; syncBuiltinESMExports();
+    t.restore();
+    log.emit({ kind: "session.retry", reply_to: "m3" });
+    expect(new SessionLog(dir, "ses_w").events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "m1"], [2, "m3"]]);
+  });
+
+  it("two faults at once (the sync fails, and so does the cut back): the failed lines stay in the file, but the reader takes the later line for a seq used again", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_d");
+    log.emit({ kind: "session.retry", reply_to: "m0" });
+    const f = failFs("fsyncSync", () => true, 2), t = failFs("ftruncateSync", () => true, 2);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "failed_a" })).toThrow(/ENOSPC/);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "failed_b" })).toThrow(/ENOSPC/);
+    f.restore(); t.restore();
+    log.emit({ kind: "session.retry", reply_to: "ok" });
+    expect(fs.readFileSync(log.file, "utf-8")).toContain("failed_a");
+    const back = new SessionLog(dir, "ses_d");
+    expect(back.events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "m0"], [2, "ok"]]);
+    expect(back.lastSeq).toBe(log.lastSeq);
+  });
+
+  it("a close that fails after a failed sync does not hide the sync's error; a line that is not an object is skipped", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_e");
+    const f = failFs("fsyncSync", () => true), c = failFs("closeSync", () => true);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "x" })).toThrow(/fsyncSync/);
+    f.restore(); c.restore();
+    expect(c.hit.n).toBe(1);
+    log.emit({ kind: "session.retry", reply_to: "a" });
+    fs.appendFileSync(log.file, "null\n[1]\n{}\n");
+    log.emit({ kind: "session.retry", reply_to: "b" });
+    expect(new SessionLog(dir, "ses_e").events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "a"], [2, "b"]]);
+  });
+
+  it("resume: the ends cannot be stored: the old executor is still ended, recovery does not reject, the next task starts", async () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_r");
+    log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_old", raw: "新建 a.txt", by: "slash" });
+    log.emit({ kind: "session.task", msg_id: "t2", run_id: "run_gone", raw: "别的", by: "slash" });
+    // the old executor ignores SIGTERM (it must be ended all the same)
+    const old = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{});setInterval(()=>{},1000)`], { detached: true, stdio: "ignore" });
+    groups.push(old.pid!);
+    await new Promise((r) => setTimeout(r, 300));
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 2, state: "acting", pgid: old.pid, pid: old.pid, start: 0, session_id: "ses_r", run_id: "run_old", by: "session", owner: 999999, t: 0, gen: 1 }));
+    const f = failFs("openSync", historyAppend, 100);
+    const ex = realExec();
+    const s = session({ dir, sid: "ses_r", model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+    await Promise.all(s.h.recovering);
+    f.restore();
+    expect(groupUp(old.pid!)).toBe(false);
+    expect(held(readHolder(dir)!)).toBe(false);
+    s.send({ type: "cua", text: "新建 a.txt" });
+    await waitFor(() => doneRuns(s.evs).length === 1);
+    expect(readHolder(dir)).toMatchObject({ pgid: ex.pgids[0], state: "lingering" });
   });
 });

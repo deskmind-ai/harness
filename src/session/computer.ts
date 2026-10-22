@@ -213,6 +213,32 @@ export function undo(dir: string, from: Holder): { ok: Holder } | "busy" | "expi
   });
 }
 
+/** A start that failed after `acquire` named its run (its executor never got its task: it has done nothing): its
+ *  group is ended at once (SIGKILL) and the lock removed — only while the lock is still exactly `from`, the holder that
+ *  start wrote (its run, group, state and generation: compare-and-set); a lock changed since is left as it is. A group
+ *  that does not end keeps the lock, acting (reapLater and the next task end it). Never throws; true once the lock no
+ *  longer names it. */
+export function release(dir: string, from: Holder, o: { killMs?: number } = {}): boolean {
+  try {
+    return guarded(dir, () => {
+      const h = readHolder(dir);
+      if (!same(h, from)) return !mine(h, from.run_id, from.pgid);
+      if (h.pgid > 0) {
+        try { process.kill(-h.pgid, "SIGKILL"); } catch { /* gone */ }
+        if (!waitGone(h, o.killMs ?? 1000)) return false;
+      }
+      fs.unlinkSync(computerLockFile(dir));
+      return true;
+    });
+  } catch (e) {
+    // the guard or the file could not be used: the group is ended all the same (the lock then names a group that is
+    // gone, which holds nothing: the next task takes it over)
+    if (from.pgid > 0) { try { process.kill(-from.pgid, "SIGKILL"); } catch { /* gone */ } }
+    process.stderr.write(`computer lock: ${e instanceof Error ? e.message : String(e)}\n`);
+    return false;
+  }
+}
+
 /** Its executor has exited: the lock is removed if it still names that run and nothing of its group is left (a
  *  child still up keeps it, in the state it had). */
 export function free(dir: string, run: string, pgid: number): void {
