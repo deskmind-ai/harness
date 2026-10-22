@@ -706,7 +706,7 @@ export class SessionHost {
       reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
       if (!task.end) {
         // no task_done: a step it had begun and not ended may or may not have taken effect
-        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.changes ? { changes: task.changes } : {}), ...(task.steers.length ? { steers: task.steers } : {}) });
+        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...this.changesOf(task.runId, task.changes), ...(task.steers.length ? { steers: task.steers } : {}) });
       }
       if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
       // it died while carrying out an undo (asked for, no result_response): how much of it was done is not known — said
@@ -746,6 +746,14 @@ export class SessionHost {
     t.undoRecorded = true;
     return this.terminal(this.undoOfRun(t.runId));
   }
+  /** The changes an end written without task_done carries (every such end: the executor's exit, the app going away,
+   *  recover's interrupted): its run's last recorded `changes` event (the executor writes its events.jsonl before
+   *  stdout), else the last one seen on stdout — as an end from task_done carries task_done's own. */
+  private changesOf(runId: string, seen?: ReturnType<typeof capChanges>): { changes?: NonNullable<ReturnType<typeof capChanges>> } {
+    const c = changesIn(readRunEvents(this.runFile(runId))) ?? seen;
+    return c ? { changes: c } : {};
+  }
+
   /** What a run's undo did, from its events (its last result_response with the counts), or unknown. */
   private undoOfRun(runId: string) {
     const r = [...readRunEvents(this.runFile(runId))].reverse().find((e) => e.kind === "result_response" && typeof e.undone === "number" && typeof e.total === "number");
@@ -998,7 +1006,7 @@ export class SessionHost {
     // with it (its pid is in the lock) until it exits
     t.exitTimer = setTimeout(() => {
       t.exitTimer = null;
-      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", ...unknownIf(t.openSteps.size > 0), summary: "", undo: "none", ...(t.changes ? { changes: t.changes } : {}), ...(t.steers.length ? { steers: t.steers } : {}) });
+      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", ...unknownIf(t.openSteps.size > 0), summary: "", undo: "none", ...this.changesOf(t.runId, t.changes), ...(t.steers.length ? { steers: t.steers } : {}) });
       this.maybeExit();
     }, this.o.exitWaitMs ?? EXIT_WAIT_MS);
   }
@@ -1053,8 +1061,7 @@ function openStepsIn(evs: Record<string, unknown>[]): number {
 const undoFrom = (runId: string, r: Record<string, unknown>): Extract<SessionBody, { kind: "session.task_undo" }> => ({ kind: "session.task_undo", run_id: runId, undone: r.undone as number, total: r.total as number, refused: typeof r.refused === "string" ? r.refused : null });
 /** session.task_undo for an undo that began and was cut off with no result_response. */
 const undoUnknown = (runId: string): Extract<SessionBody, { kind: "session.task_undo" }> => ({ kind: "session.task_undo", run_id: runId, undone: 0, total: 0, refused: "the undo was cut off before it ended; how much of it was done is not known", unknown: true });
-/** An end the session writes for a run with no task_done: its changes so far are its last `changes` event's (as a
- *  live end's, from task_done, are its own). */
+/** A run's changes so far: its last `changes` event's (SessionHost.changesOf: every end written without task_done). */
 const changesIn = (evs: Record<string, unknown>[]) => { const c = [...evs].reverse().find((e) => e.kind === "changes"); return c ? capChanges(c) : undefined; };
 const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[]): TaskEnd => { const changes = changesIn(evs); return { kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}) }; };
 

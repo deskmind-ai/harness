@@ -1421,11 +1421,12 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     const end = s.stored().find((e: any) => e.kind === "session.task_end");
     expect(end).toMatchObject({ run_id: "run_note", status: "interrupted", changes: { created: ["note.txt"], modified: [], deleted: [], external: [] } });
     expect(s.h.log.messages().find((m) => m.msg_id === "end_run_note")!.text).toContain("note.txt");
-    // live: the executor says what it changed, then dies with no task_done
-    const CHANGER = `let rid="";require("readline").createInterface({input:process.stdin}).on("line",(l)=>{const j=JSON.parse(l);if(!rid){rid=j.run_id;console.log(JSON.stringify({seq:1,t:1,run_id:rid,kind:"changes",created:["b.txt"],modified:[],deleted:[],external:[],unconfirmed:[]}))}});setInterval(()=>{},1000);`;
+    // live: the executor records what it changed in its run (its events.jsonl: not a line the session saw), then is
+    // killed with no task_done — the end the session writes (failed, "the executor exited (SIGKILL)") carries it
+    const CHANGER = `let rid="";require("readline").createInterface({input:process.stdin}).on("line",(l)=>{const j=JSON.parse(l);if(!rid){rid=j.run_id;const f=process.env.DM_EVENTS;require("fs").mkdirSync(require("path").dirname(f),{recursive:true});require("fs").appendFileSync(f,JSON.stringify({seq:1,t:1,run_id:rid,kind:"changes",created:["note.txt"],modified:[],deleted:[],external:[],unconfirmed:[]})+"\\n");console.log(JSON.stringify({seq:2,t:2,run_id:rid,kind:"step",text:"wrote"}))}});setInterval(()=>{},1000);`;
     const pg: number[] = [];
-    const launch: Launcher = (req) => {
-      const p = spawn(process.execPath, ["-e", CHANGER], { stdio: ["pipe", "pipe", "ignore"], detached: true });
+    const launch: Launcher = (req, lo) => {
+      const p = spawn(process.execPath, ["-e", CHANGER], { stdio: ["pipe", "pipe", "ignore"], detached: true, env: { ...process.env, DM_EVENTS: path.join(lo.runs, lo.runId, "events.jsonl") } });
       pg.push(p.pid!); groups.push(p.pid!);
       p.stdin!.on("error", () => {});
       const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("close", (code, signal) => r({ code, signal })));
@@ -1435,10 +1436,13 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     };
     const s2 = session({ model: [{ text: "好" }], launch });
     s2.send({ type: "cua", text: "新建 b.txt" });
-    await waitFor(() => s2.evs.some((e) => e.kind === "changes"));
+    await waitFor(() => s2.evs.some((e) => e.kind === "step"));
+    expect(s2.evs.some((e) => e.kind === "changes")).toBe(false);
     process.kill(-pg[0]!, "SIGKILL");
     await waitFor(() => s2.stored().some((e: any) => e.kind === "session.task_end"));
-    expect(s2.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "failed", changes: { created: ["b.txt"] } });
+    const live = s2.stored().find((e: any) => e.kind === "session.task_end") as any;
+    expect(live).toMatchObject({ status: "failed", reason: expect.stringContaining("SIGKILL"), changes: { created: ["note.txt"] } });
+    expect(s2.h.log.messages().find((m) => m.msg_id === `end_${live.run_id}`)!.text).toContain("note.txt");
   }, 20_000);
 
   describe("a run's end or closure that cannot be stored halts the session on every path (fail-stop)", () => {
