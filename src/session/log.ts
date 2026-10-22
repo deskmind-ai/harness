@@ -92,10 +92,12 @@ export type StoredMessage =
 export const callId = (runId: string) => `ct_${runId}`;
 
 /** What the model reads of a finished task (and the tool result it got then): status, reason, summary, answer, the
- *  changes (at most MAX_CHANGES per kind), the undo (open | none, later undone n/m, unknown or expired), the user's mid-task
+ *  changes (at most MAX_CHANGES per kind), the undo (open | none, later undoing, undone n/m, unknown or expired), the user's mid-task
  *  words. Never a screenshot, an observation or the trace. */
-export function taskView(end: Extract<SessionBody, { kind: "session.task_end" }>, later: { undo?: { undone: number; total: number; refused: string | null; unknown?: true }; closed?: boolean } = {}): string {
-  const undo = later.undo?.unknown ? `unknown (${later.undo.refused ?? "the undo was cut off"})` : later.undo ? `undone ${later.undo.undone}/${later.undo.total}${later.undo.refused ? ` (stopped: ${later.undo.refused})` : ""}` : end.undo === "open" && later.closed ? "expired" : end.undo;
+export function taskView(end: Extract<SessionBody, { kind: "session.task_end" }>, later: { undo?: { undone: number; total: number; refused: string | null; unknown?: true }; closed?: boolean; undoing?: boolean } = {}): string {
+  // an undo asked for (session.task_respond) with no outcome recorded yet is under way: "undoing" — neither still open
+  // to the user nor done (the model must not offer it again, nor say what it did)
+  const undo = !later.undo && later.undoing ? "undoing" : later.undo?.unknown ? `unknown (${later.undo.refused ?? "the undo was cut off"})` : later.undo ? `undone ${later.undo.undone}/${later.undo.total}${later.undo.refused ? ` (stopped: ${later.undo.refused})` : ""}` : end.undo === "open" && later.closed ? "expired" : end.undo;
   return JSON.stringify({ status: end.status, ...(end.reason ? { reason: end.reason } : {}), summary: end.summary, ...(end.answer ? { answer: end.answer } : {}), ...(end.changes ? { changes: end.changes } : {}), undo, ...(end.steers?.length ? { steers: end.steers } : {}) });
 }
 
@@ -177,12 +179,13 @@ export class SessionLog {
    *  result (a task with no end yet has no result: it is still running). A retry takes the replies to its user message
    *  out (the tasks stay: they happened). */
   messages(): StoredMessage[] {
-    const undo = new Map<string, { undone: number; total: number; refused: string | null; unknown?: true }>(), closed = new Set<string>();
+    const undo = new Map<string, { undone: number; total: number; refused: string | null; unknown?: true }>(), closed = new Set<string>(), undoing = new Set<string>();
     const ends = new Map<string, Extract<SessionEvent, { kind: "session.task_end" }>>();
     for (const e of this.events) {
       if (e.kind === "session.task_undo") undo.set(e.run_id, { undone: e.undone, total: e.total, refused: e.refused, ...(e.unknown ? { unknown: true as const } : {}) });
       if (e.kind === "session.task_closed") closed.add(e.run_id);
       if (e.kind === "session.task_end") ends.set(e.run_id, e);
+      if (e.kind === "session.task_respond" && e.undo) undoing.add(e.run_id);
     }
     const out: StoredMessage[] = [];
     for (const e of this.events) {
@@ -191,7 +194,7 @@ export class SessionLog {
         // the result right after its call, wherever its end was stored (a resumed session stores it later)
         out.push({ msg_id: e.msg_id, role: "call", call_id: callId(e.run_id), goal: e.goal ?? e.raw, text: e.goal ?? e.raw });
         const end = ends.get(e.run_id);
-        if (end) out.push({ msg_id: `end_${e.run_id}`, role: "result", call_id: callId(e.run_id), text: taskView(end, { undo: undo.get(e.run_id), closed: closed.has(e.run_id) }) });
+        if (end) out.push({ msg_id: `end_${e.run_id}`, role: "result", call_id: callId(e.run_id), text: taskView(end, { undo: undo.get(e.run_id), closed: closed.has(e.run_id), undoing: undoing.has(e.run_id) }) });
       }
       else if (e.kind === "session.retry") {
         const at = out.findIndex((m) => m.msg_id === e.reply_to);

@@ -1688,6 +1688,44 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       expect(recs[0]).not.toHaveProperty("unknown");
     }, 20_000);
 
+    /** A session that ended during an undo past the budget (the run left open), reopened while the undo still runs:
+     *  recover's wait is over and it watches the undo. */
+    const reopenedDuringUndo = async () => {
+      const ex = realExec({ undoMs: 3000 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      s.h.inputClosed();
+      await waitFor(() => s.exited(), 15_000);
+      const s2 = session({ dir: s.dir, model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+      await Promise.all(s2.h.recovering);
+      expect(groupUp(ex.pgids[0]!)).toBe(true);
+      expect(recsOf(s2, runA, "session.task_undo", "session.task_closed")).toEqual([]);
+      return { ex, s2, runA };
+    };
+
+    it("while recover watches an old executor's undo, the session is not idle: end_if_idle is refused (recovering) and it does not exit", async () => {
+      const { ex, s2, runA } = await reopenedDuringUndo();
+      s2.send({ type: "end_if_idle", client_id: "i1" });
+      expect(s2.kinds("session.error").at(-1)).toMatchObject({ code: "not_idle", control: "end_if_idle", why: ["recovering"], client_id: "i1" });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(s2.exited()).toBe(false);
+      await waitFor(() => recsOf(s2, runA, "session.task_closed").length === 1, 10_000);
+      await waitFor(() => !groupUp(ex.pgids[0]!));
+      s2.send({ type: "end_if_idle", client_id: "i2" });
+      await waitFor(() => s2.exited());
+    }, 20_000);
+
+    it("while an undo asked for has no outcome recorded, the model reads it as undoing (not open: never offered again, no result promised)", async () => {
+      const { s2, runA } = await reopenedDuringUndo();
+      const view = () => JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo;
+      expect(view()).toBe("undoing");
+      await waitFor(() => recsOf(s2, runA, "session.task_undo").length === 1, 10_000);
+      expect(view()).toBe("undone 1/1");
+    }, 20_000);
+
     it("reopened while an undo left open still runs: recover waits, then watches it without cutting it (the model may speak meanwhile), and records its real result before the closure, once", async () => {
       const ex = realExec({ undoMs: 3000 });
       const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });

@@ -123,7 +123,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** Why a session is not idle (end_if_idle's refusal names each that holds), in this order: `busy` a reply is under
  *  way (or a /cua's task and the reply after it), `queue` words wait in the queue (held ones too), `task` a task is not
  *  closed (running, its card open, its result card lingering for undo, or exiting by itself), `recovering` recover is
- *  still writing an old run's records (waiting for an old executor). */
+ *  still writing an old run's records (waiting for an old executor, or watching its undo past that wait). */
 export const NOT_IDLE = ["busy", "queue", "task", "recovering"] as const;
 export type NotIdle = (typeof NOT_IDLE)[number];
 
@@ -320,6 +320,8 @@ export class SessionHost {
   readonly recovering: Promise<void>[] = [];
   /** How many of them are not done: the session is not idle, and does not exit, while one is (end waits for it). */
   private recoverPending = 0;
+  /** Old executors' undos watched past recover's wait (watchUndo): not idle either (`recovering`). */
+  private watching = 0;
   /** An old executor that still runs: waited for until it finished what it was doing (its task_done; its undo's
    *  result_response), its group is gone, or the stop budget is over; then what is left of its group is ended and the
    *  run's missing records written (recordRecovered). Never rejects. */
@@ -345,10 +347,14 @@ export class SessionHost {
    *  or its group is gone (then from the run: its result, else unknown) — unless this process exits first (the next
    *  open does it). Never rejects. */
   private async watchUndo(runId: string, own: Holder, need: { end: boolean; undo: boolean; close: boolean }) {
-    while (!this.exited && !this.halted) {
-      if (readRunEvents(this.runFile(runId)).some((e) => e.kind === "result_response") || !held(own)) return this.recordRecovered(runId, need);
-      await sleep(250);
-    }
+    // (while it watches the session is not idle: end_if_idle says `recovering`)
+    this.watching += 1;
+    try {
+      while (!this.exited && !this.halted) {
+        if (readRunEvents(this.runFile(runId)).some((e) => e.kind === "result_response") || !held(own)) return this.recordRecovered(runId, need);
+        await sleep(250);
+      }
+    } finally { this.watching -= 1; }
   }
 
   /** The header's settings, read after the process started (resume with `--session`, then a header line). A value of
@@ -979,7 +985,7 @@ export class SessionHost {
     if (this.running || this.flows > 0) why.push("busy");
     if (this.queue.length) why.push("queue");
     if ([...this.tasks.values()].some((t) => t.state !== "closed")) why.push("task");
-    if (this.recoverPending > 0) why.push("recovering");
+    if (this.recoverPending > 0 || this.watching > 0) why.push("recovering");
     return why;
   }
 
