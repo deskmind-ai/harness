@@ -493,7 +493,11 @@ export class SessionHost {
     } catch (e) {
       // the lock could not be written (acquire ended a group it had started); an executor it started is let go here too
       const started = handle as ExecutorHandle | null;
-      if (started) this.abandon(runId, started, null, true, started.pid ?? 0);
+      // (acquire can throw after its write landed — closing the guard failed: a lock naming this run is let go too)
+      let own: Holder | null = null;
+      try { const x = readHolder(this.o.dir); if (x?.run_id === runId) own = x; } catch { /* unreadable: its exit frees it */ }
+      if (started) this.abandon(runId, started, own, true, started.pid ?? 0);
+      else if (own && !release(this.o.dir, own)) reapLater(this.o.dir, runId, own.pgid, 2000);
       // acquire may have ended this session's lingering executor before it failed: that card is closed (new_task)
       for (const t of [...this.tasks.values()]) if (t.state === "lingering" && t.pgid > 0 && t.holder && !held(t.holder)) { try { this.closeTask(t, "new_task"); } catch { /* recorded at its exit */ } }
       return { failed: errText(e) };
@@ -563,7 +567,7 @@ export class SessionHost {
       case "steered": if (typeof ev.text === "string") task.steers.push(ev.text); break;
       case "step": if (typeof ev.step_id === "string") task.openSteps.add(ev.step_id); break;
       case "step_result": if (typeof ev.step_id === "string") task.openSteps.delete(ev.step_id); break;
-      case "task_done": this.taskDone(task, ev); if (task.noLinger) task.handle.close(); break;
+      case "task_done": this.taskDone(task, ev); if (task.noLinger) { try { task.handle.close(); } catch { /* gone */ } } break;
       case "result_response":
         this.lockLinger(task);                           // the answer carried out: it acts no more (first: whatever the record)
         if (typeof ev.undone === "number" && typeof ev.total === "number") {

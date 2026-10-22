@@ -207,8 +207,8 @@ export class SessionLog {
   }
 }
 
-/** A session.jsonl's events, as the session reads them: lines that are not an event (a cut-off write, an empty line)
- *  are skipped; a seq used again (a failed write that could not be cut back, then the next event with its seq) is the
+/** A session.jsonl's events, as the session reads them: lines that are not an event (a cut-off write, an empty line,
+ *  anything without a seq) are skipped; a seq used again (a failed write that could not be cut back, then the next event with its seq) is the
  *  later line's — the earlier ones from that seq on were reported as failed and never sent. (A failed line that is the
  *  file's last when the process ends, with nothing after it to use its seq again, is read as an event: two disk faults
  *  and an exit; not guarded against.) */
@@ -218,8 +218,8 @@ function parseEvents(raw: string): SessionEvent[] {
     if (!l.trim()) continue;
     let ev: SessionEvent;
     try { ev = JSON.parse(l) as SessionEvent; } catch { continue; }
-    if (!ev || typeof ev !== "object" || Array.isArray(ev)) continue;
-    if (typeof ev.seq === "number") while (events.length && events[events.length - 1]!.seq >= ev.seq) events.pop();
+    if (!ev || typeof ev !== "object" || Array.isArray(ev) || typeof ev.seq !== "number") continue;
+    while (events.length && events[events.length - 1]!.seq >= ev.seq) events.pop();
     events.push(ev);
   }
   return events;

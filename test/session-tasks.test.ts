@@ -1260,7 +1260,7 @@ rl.on("close",()=>process.exit(0));`;
     f.restore(); c.restore();
     expect(c.hit.n).toBe(1);
     log.emit({ kind: "session.retry", reply_to: "a" });
-    fs.appendFileSync(log.file, "null\n[1]\n");
+    fs.appendFileSync(log.file, "null\n[1]\n{}\n");
     log.emit({ kind: "session.retry", reply_to: "b" });
     expect(new SessionLog(dir, "ses_e").events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "a"], [2, "b"]]);
   });
