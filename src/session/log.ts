@@ -46,8 +46,9 @@ export const MAX_CHANGES = 20;
 export const SessionBody = z.discriminatedUnion("kind", [
   // a final message. `via`: how it came (H2: a computer task); `reply_to`: the user message an assistant one answers;
   // `stopped`: the user stopped the reply (the text is what had come by then); `truncated`: cut at MAX_ASSISTANT_CHARS
+  // `client_id` (additive): the app's id for a user message it sent (say / cua, or queued by a say), given back
   z.object({ kind: z.literal("session.message"), msg_id: z.string(), role: z.enum(["user", "assistant"]), text: z.string(), via: z.string().optional(),
-    reply_to: z.string().optional(), stopped: z.boolean().optional(), truncated: z.boolean().optional(), model: z.string().optional() }),
+    reply_to: z.string().optional(), stopped: z.boolean().optional(), truncated: z.boolean().optional(), model: z.string().optional(), client_id: z.string().optional() }),
   // the model could not answer (no key, a key the service refused, the network, the account's quota, a config that
   // names no service), or a control line was refused. `msg_id`: the reply that failed (its deltas, if any, are void);
   // `control`: the refused line's type
@@ -67,7 +68,7 @@ export const SessionBody = z.discriminatedUnion("kind", [
   // H2: the result card's undo was done (the executor's result_response, in fields)
   z.object({ kind: z.literal("session.task_undo"), run_id: z.string(), undone: z.number().int(), total: z.number().int(), refused: z.string().nullable() }),
   // H2: the user's words sent into a running task (steer, or a queued message sent now)
-  z.object({ kind: z.literal("session.steer"), run_id: z.string(), text: z.string() }),
+  z.object({ kind: z.literal("session.steer"), run_id: z.string(), text: z.string(), client_id: z.string().optional() }),
   // H2: the user asked for the last user message to be answered again: the replies to it so far leave the context
   z.object({ kind: z.literal("session.retry"), reply_to: z.string() }),
 ]);

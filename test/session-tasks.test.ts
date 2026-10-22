@@ -221,6 +221,41 @@ describe("session tasks: controls into the task", () => {
   });
 });
 
+describe("session tasks: client_id on the queue (the app's words have one owner)", () => {
+  it("a queued say keeps its client_id on the queue entry and on the message it becomes; a queue_send_now refusal names it; attach sends the queue even empty", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [CALL("新建 a.txt"), { text: "建好了" }, { text: "收到" }], tasks: [[{ text: "想想", delayMs: 300 }, ...CREATE()]] });
+    s.send({ type: "say", text: "新建 a.txt 写 hi", client_id: "c0" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "say", text: "一", client_id: "c1" });
+    expect(s.kinds("session.queue").at(-1).items).toEqual([{ id: expect.any(String), text: "一", client_id: "c1" }]);
+    await s.h.idle();
+    const msgs = s.stored().filter((e: any) => e.kind === "session.message" && e.role === "user").map((e: any) => [e.text, e.client_id, e.via]);
+    expect(msgs).toEqual([["新建 a.txt 写 hi", "c0", undefined], ["一", "c1", "queue"]]);
+    // the queue went to the model: an app that reconnects now gets the empty queue
+    const mark = s.evs.length;
+    s.send({ type: "attach", after_seq: 0 });
+    expect(s.evs.slice(mark).at(-1)).toMatchObject({ kind: "session.queue", items: [] });
+
+    // after a stop the entry is held; sent now while a reply runs: busy, naming its client_id; then sent: the message carries it
+    const t = session({ scope: tmp(), model: [CALL("新建 b.txt"), { text: "停下了" }, { text: "好的三", delayMs: 200 }, { text: "嗯" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE("b.txt")]] });
+    t.send({ type: "say", text: "新建 b.txt" });
+    await waitFor(() => t.kinds("start").length);
+    t.send({ type: "say", text: "三", client_id: "c3" });
+    t.send({ type: "stop" });
+    await t.h.idle();
+    const q = t.kinds("session.queue").at(-1).items;
+    expect(q[0]).toMatchObject({ text: "三", held: true, client_id: "c3" });
+    t.send({ type: "say", text: "先说别的", client_id: "c4" });
+    t.send({ type: "queue_send_now", id: q[0].id });
+    expect(t.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "queue_send_now", client_id: "c3" });
+    await t.h.idle();
+    t.send({ type: "queue_send_now", id: q[0].id });
+    await t.h.idle();
+    expect(t.stored().filter((e: any) => e.kind === "session.message" && e.role === "user").map((e: any) => [e.text, e.client_id])).toEqual([["新建 b.txt", undefined], ["先说别的", "c4"], ["三", "c3"]]);
+  });
+});
+
 describe("session tasks: undo, the machine lock, the app going away", () => {
   it("undo: respond with the undo option → undone == total; the executor then closes (linger)", async () => {
     const scope = tmp();

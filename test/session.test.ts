@@ -104,6 +104,21 @@ describe("session: one reply", () => {
     expect(parseSessionControl(JSON.stringify({ type: "attach", after_seq: -3 }))).toEqual({ type: "attach", after_seq: 0 });
   });
 
+  it("client_id: given back on the stored message and on a refusal of the line; a long one is ignored", async () => {
+    const { h, evs } = host([{ text: "慢慢说", chunks: ["慢", "慢说"], delayMs: 30 }]);
+    h.handle(JSON.stringify({ type: "say", text: "一", client_id: "c1" }));
+    h.handle(JSON.stringify({ type: "say", text: "二", client_id: "c2" }));                 // busy: a reply is coming
+    h.handle(JSON.stringify({ type: "say", text: "x".repeat(MAX_USER_CHARS + 1), client_id: "c3" }));
+    h.handle(JSON.stringify({ type: "cua", text: "开个文件", client_id: "c4" }));
+    h.handle(JSON.stringify({ type: "steer", text: "改", client_id: "c5" }));
+    await h.idle();
+    expect(kinds(evs, "session.message").find((m) => m.role === "user")).toMatchObject({ text: "一", client_id: "c1", seq: 1 });
+    expect(kinds(evs, "session.error").map((e) => [e.code, e.control, e.client_id])).toEqual([["busy", "say", "c2"], ["too_long", "say", "c3"], ["busy", "cua", "c4"], ["no_task", "steer", "c5"]]);
+    expect(parseSessionControl(JSON.stringify({ type: "say", text: "a", client_id: "z".repeat(101) }))).toEqual({ type: "say", text: "a" });
+    expect(parseSessionControl(JSON.stringify({ type: "say", text: "a", client_id: 7 }))).toEqual({ type: "say", text: "a" });
+    expect(new SessionLog(h.log.dir, "ses_t").events.find((e) => e.kind === "session.message")).toMatchObject({ client_id: "c1" });
+  });
+
   it("a reply over 64k characters is cut there and marked truncated", async () => {
     const big = "字".repeat(40_000);
     const { evs, say } = host([{ text: big + big, chunks: [big, big] }]);
@@ -160,20 +175,21 @@ describe("session: attach and resume", () => {
     const before = evs.length;
     h.handle(JSON.stringify({ type: "attach", after_seq: 2 }));
     const replay = evs.slice(before);
-    expect(replay.map((e) => e.seq)).toEqual([3, 4]);
-    expect([...seenByApp, ...replay].map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+    expect(replay.map((e) => e.seq)).toEqual([3, 4, undefined]);
+    expect(replay.at(-1)).toMatchObject({ kind: "session.queue", items: [] });       // the queue, always (empty included)
+    expect([...seenByApp, ...replay].filter((e) => e.seq).map((e) => e.seq)).toEqual([1, 2, 3, 4]);
     // attach during a reply: the text so far, as one delta at offset 0, after the stored events
     h.handle(JSON.stringify({ type: "say", text: "u3" }));
     await new Promise<void>((res) => { const t = setInterval(() => { if (kinds(evs, "session.delta").some((d) => d.text === "a")) { clearInterval(t); res(); } }, 5); });
     const mark = evs.length;
     h.handle(JSON.stringify({ type: "attach", after_seq: 4 }));
     const r2 = evs.slice(mark);
-    expect(r2.map((e) => [e.kind, e.seq, e.text, e.offset])).toEqual([["session.message", 5, "u3", undefined], ["session.delta", undefined, "a", 0]]);
+    expect(r2.map((e) => [e.kind, e.seq, e.text, e.offset])).toEqual([["session.message", 5, "u3", undefined], ["session.delta", undefined, "a", 0], ["session.queue", undefined, undefined, undefined]]);
     await h.idle();
     const last = kinds(evs, "session.delta").at(-1);
     expect(last).toMatchObject({ text: "3", offset: 1 });
     h.handle(JSON.stringify({ type: "attach", after_seq: 0 }));
-    expect(evs.slice(-6).map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(evs.slice(-7).map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, undefined]);
   });
 
   it("a session reopened from its file reads the same history and continues the seq", async () => {
