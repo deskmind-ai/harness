@@ -973,7 +973,7 @@ describe("a task start that fails part-way lets go of what it took (the disk is 
    *  sees it through its own `import * as fs` (syncBuiltinESMExports). Undone after each test. */
   const undoFs: (() => void)[] = [];
   afterEach(() => { for (const u of undoFs.splice(0)) u(); });
-  const failFs = (name: "openSync" | "writeFileSync" | "renameSync" | "fsyncSync", when: (...a: any[]) => boolean, times = 1) => {
+  const failFs = (name: "openSync" | "writeFileSync" | "renameSync" | "fsyncSync" | "closeSync" | "ftruncateSync", when: (...a: any[]) => boolean, times = 1) => {
     const orig = (fsCjs as any)[name];
     let left = times;
     const hit = { n: 0 };
@@ -1210,6 +1210,31 @@ rl.on("close",()=>process.exit(0));`;
     log.emit({ kind: "session.task_closed", run_id: "run_x", why: "new_task" });
     const back = new SessionLog(dir, "ses_l").events;
     expect(back.map((e) => [e.seq, e.kind])).toEqual([[1, "session.retry"], [2, "session.task_closed"]]);
+  });
+
+  it("a short write (a full disk writes part of the line) fails and is cut back; a close error after the sync is not a failure; a cut that fails leaves the next line on its own", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_w");
+    const orig = fsCjs.writeSync;
+    const short = (fd: number, data: any) => orig(fd, String(data).slice(0, 10));
+    (fsCjs as any).writeSync = short; syncBuiltinESMExports();
+    undoFs.push(() => { (fsCjs as any).writeSync = orig; syncBuiltinESMExports(); });
+    expect(() => log.emit({ kind: "session.retry", reply_to: "m0" })).toThrow(/short write/);
+    (fsCjs as any).writeSync = orig; syncBuiltinESMExports();
+    expect(fs.readFileSync(log.file, "utf-8")).toBe("");
+    // synced, then the close fails: stored (not reported as a failure, so never stored twice)
+    const c = failFs("closeSync", () => true);
+    log.emit({ kind: "session.retry", reply_to: "m1" });
+    c.restore();
+    expect(c.hit.n).toBe(1);
+    // short again, and the cut back fails too: the partial line stays, the next event begins a line of its own
+    (fsCjs as any).writeSync = short; syncBuiltinESMExports();
+    const t = failFs("ftruncateSync", () => true);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "m2" })).toThrow(/short write/);
+    (fsCjs as any).writeSync = orig; syncBuiltinESMExports();
+    t.restore();
+    log.emit({ kind: "session.retry", reply_to: "m3" });
+    expect(new SessionLog(dir, "ses_w").events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "m1"], [2, "m3"]]);
   });
 
   it("resume: the ends cannot be stored: the old executor is still ended, recovery does not reject, the next task starts", async () => {

@@ -115,6 +115,8 @@ export function sessionDir(dir: string, sessionId: string): string {
 export class SessionLog {
   events: SessionEvent[] = [];
   readonly file: string;
+  /** A failed write could not be cut back: the file may end mid-line. */
+  private partial = false;
 
   constructor(readonly dir: string, readonly sessionId: string, private readonly sink?: (ev: SessionEvent) => void) {
     const d = sessionDir(dir, sessionId);
@@ -134,13 +136,26 @@ export class SessionLog {
   emit(body: SessionBody): SessionEvent {
     const parsed = SessionBody.parse(body);
     const ev = { seq: this.events.length + 1, t: Date.now() / 1000, session_id: this.sessionId, ...parsed } as SessionEvent;
+    // all or nothing: a write that fails or is short, or lands and then cannot be synced, is cut off again — an event
+    // the caller was told failed is never in the file (stored once more later, or said to have happened when it did
+    // not); one synced is stored, whatever closing the file says. A cut that failed leaves a partial line: the next
+    // event starts on a line of its own (the reader skips the partial one).
+    const line = (this.partial ? "\n" : "") + JSON.stringify(ev) + "\n";
     const fd = fs.openSync(this.file, "a", 0o600);
-    // all or nothing: a write that fails part-way, or lands and then cannot be synced, is cut off again — an event the
-    // caller was told failed is never in the file (stored once more later, or said to have happened when it did not)
-    let size = -1;
-    try { size = fs.fstatSync(fd).size; fs.writeSync(fd, JSON.stringify(ev) + "\n"); fs.fsyncSync(fd); }
-    catch (e) { if (size >= 0) { try { fs.ftruncateSync(fd, size); } catch { /* the reader skips a cut-off line */ } } throw e; }
-    finally { fs.closeSync(fd); }
+    let size = -1, synced = false;
+    try {
+      size = fs.fstatSync(fd).size;
+      const want = Buffer.byteLength(line), n = fs.writeSync(fd, line);
+      if (n !== want) throw Object.assign(new Error(`short write to ${path.basename(this.file)}: ${n} of ${want} bytes`), { code: "ENOSPC" });
+      fs.fsyncSync(fd);
+      synced = true;
+      this.partial = false;
+    } catch (e) {
+      if (size >= 0) { try { fs.ftruncateSync(fd, size); } catch { this.partial = true; } }
+      throw e;
+    } finally {
+      try { fs.closeSync(fd); } catch (e) { if (!synced) throw e; }
+    }
     this.events.push(ev);
     this.sink?.(ev);
     return ev;
