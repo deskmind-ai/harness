@@ -595,8 +595,9 @@ export class SessionHost {
     const t = this.current;
     if (!t || (runId && runId !== t.runId)) return this.refuse("no_task", "no task is running", "steer", cid);
     if (t.card) return this.refuseCard("steer", cid);
-    t.handle.write(JSON.stringify({ type: "steer", text }));
+    // stored first: should storing fail, the executor never has words the history (or the queue) does not account for
     this.log.emit({ kind: "session.steer", run_id: t.runId, text, ...(cid ? { client_id: cid } : {}) });
+    t.handle.write(JSON.stringify({ type: "steer", text }));
   }
 
   private sendNow(id: string) {
