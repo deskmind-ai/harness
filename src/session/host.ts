@@ -24,7 +24,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Type } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
-import { configTable, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
+import { configSyntaxProblem, configTable, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
 import { loopModel } from "../runtime/model.js";
 import { PROTOCOL } from "../protocol/version.js";
 import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
@@ -366,7 +366,7 @@ export class SessionHost {
   handle(line: string) {
     if (this.exited || !line.trim()) return;
     const c = parseSessionControl(line);
-    if (!c) return;
+    if (!c || this.refusedNoModel(c)) return;
     switch (c.type) {
       case "say": return this.say(c.text, c.client_id);
       case "stop": return this.stop(c.run_id);
@@ -388,10 +388,11 @@ export class SessionHost {
   /** `set_config{config, lang?}`, in the order of stdin like every control. The config is for every model turn that
    *  starts after this line (a turn streaming now ends on the one it began with; a running task keeps the config it was
    *  started with) and every task started after it; the lang for everything rendered after it. Stored (session.config:
-   *  the ack, and what a reopen takes). Nothing is restarted or stopped by a config — except by null, no model: no model
-   *  turn starts any more (say, cua, retry refused no_model; a task's follow-up turn skipped, its end stored; the queue
-   *  kept), and a running task is stopped by the normal stop (its executor calls the cloud's judges every step). Its
-   *  result card, undo and card answers go on: they need no model. A config again: the queue goes on as usual. */
+   *  the ack, and what a reopen takes). Nothing is restarted or stopped by a config — except by null, no model: the reply
+   *  under way is stopped (as by stop), no model turn starts any more (say, cua, retry, steer, queue_send_now refused
+   *  no_model at once; a task's follow-up turn skipped, its end stored; the queue kept), and a running task is stopped by
+   *  the normal stop (its executor calls the cloud's judges every step). Its result card, undo and card answers go on:
+   *  they need no model. A config again: the queue (what is not held) goes to the model as usual. */
   setConfig(line: Record<string, unknown>, cid?: string) {
     const bad = this.configProblem(line);
     if (bad) return this.refuse("bad_config", bad, "set_config", cid);
@@ -402,6 +403,10 @@ export class SessionHost {
     try { this.storeConfig("set_config", cid); }
     catch (e) { this.refuse("busy", `the settings apply to this session now, but could not be stored (a reopen takes the earlier ones): ${errText(e)}`, "set_config", cid); }
     if (this.config === null) {
+      // the reply under way is stopped, as by the user's stop (what it said so far is stored, stopped: true): a turn
+      // streaming sends nothing more, and a request the service retries (a 429, a 5xx: the provider's backoff, which
+      // never comes back through the turn's model check) is not sent again with the whole conversation
+      this.running?.abort.abort();
       const t = this.current;
       if (t && t.state === "running" && !t.end) t.handle.write(JSON.stringify({ type: "stop" }));
     } else if (was === null) this.afterActivity();
@@ -414,9 +419,9 @@ export class SessionHost {
     const c = line.config;
     if (line.lang !== undefined && line.lang !== "zh" && line.lang !== "en") return "lang must be zh or en";
     if (c === null) return null;
-    if (typeof c !== "string" || !c.trim() || c.length > 200) return "config must be a config name or openai:<provider>|<model> (at most 200 characters), or null";
-    if (carriesKey(c)) return "a config never carries a key: keys come from the environment";
-    if (this.o.model) return null;                       // tests: the model given stands for every config
+    if (typeof c !== "string") return "config must be a config name or openai:<service>|<model>, or null";
+    const bad = configSyntaxProblem(c);
+    if (bad) return bad;
     const m = goalOf(c);
     return "code" in m ? m.text : null;
   }
@@ -426,6 +431,22 @@ export class SessionHost {
     if (this.o.model) { const m = typeof this.o.model === "function" ? this.o.model(config) : this.o.model; return `${m.model.provider}|${m.model.id}`; }
     const g = goalOf(config);
     return "spec" in g ? g.spec : null;
+  }
+
+  /** No model (set_config null): a control that needs one — say, cua, retry, steer, queue_send_now — is refused
+   *  no_model at once, whatever the session is doing (a task still stopping, a recover): never queued, so nothing is
+   *  left waiting that no control could send. Words already taken (a repeated client_id) are said so as ever; an empty
+   *  line and a closing session answer as they always do. Entries already queued stay. */
+  private refusedNoModel(c: SessionControl): boolean {
+    if (this.config !== null || this.closing) return false;
+    switch (c.type) {
+      case "say": case "cua": case "steer":
+        if (c.text.trim() && !this.sendsDuplicate(c.client_id, c.type)) this.refuseNoModel(c.type, c.client_id);
+        return true;
+      case "retry": this.refuseNoModel("retry"); return true;
+      case "queue_send_now": { const it = this.queue.find((q) => q.id === c.id); if (it) this.refuseNoModel("queue_send_now", it.client_id); else this.emitQueue(); return true; }
+      default: return false;
+    }
   }
 
   private refuseNoModel(control: string, cid?: string) { this.refuse("no_model", this.t("模型已关闭：在模型设置里打开后再试", "no model is set (the model is turned off); turn one on in the model settings"), control, cid); }
@@ -461,7 +482,6 @@ export class SessionHost {
       this.queue.push({ id: `q_${randomUUID().slice(0, 8)}`, text, ...(cid ? { client_id: cid } : {}) });
       return this.emitQueue();
     }
-    if (this.config === null) return this.refuseNoModel("say", cid);
     if (this.running || this.flows) return this.refuseBusy("say", cid);
     const user = this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>;
     this.startReply(user.msg_id);
@@ -470,7 +490,6 @@ export class SessionHost {
   /** Answer the last user message again: the replies to it so far leave the context (tasks stay: they happened); the
    *  message is not stored twice. */
   retry() {
-    if (this.config === null && !this.closing) return this.refuseNoModel("retry");
     if (this.closing) return;
     if (this.current || this.running || this.flows) return this.refuseBusy("retry");
     const last = [...this.log.events].reverse().find((e): e is Extract<SessionEvent, { kind: "session.message" }> => e.kind === "session.message" && e.role === "user");
@@ -581,8 +600,6 @@ export class SessionHost {
     if (this.closing || !text.trim() || this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
     if (this.current || this.running || this.flows) return this.refuseBusy("cua", cid);
     let userId = "";
-    // (its executor calls the cloud's judges at every step)
-    if (this.config === null) return this.refuseNoModel("cua", cid);
     const t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
       userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua", ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
       return userId;
@@ -900,8 +917,6 @@ export class SessionHost {
     if (this.closing || !text.trim() || (!fromQueue && this.sendsDuplicate(cid, "steer")) || this.tooLong(text, "steer", cid)) return;
     const t = this.current;
     if (!t || (runId && runId !== t.runId)) return this.refuse("no_task", "no task is running", "steer", cid);
-    // no model: the running task is being stopped; nothing more goes into it
-    if (this.config === null) return this.refuseNoModel("steer", cid);
     if (t.card) return this.refuseCard("steer", cid);
     // stored first: should storing fail, the executor never has words the history (or the queue) does not account for
     this.log.emit({ kind: "session.steer", run_id: t.runId, text, ...(cid ? { client_id: cid } : {}) });
@@ -913,8 +928,6 @@ export class SessionHost {
     if (!it) return this.emitQueue();
     // the session is ending: the entry stays where it is (its words are never dropped on the way out of the queue)
     if (this.closing) return this.refuse("busy", this.t("会话正在结束", "the session is ending"), "queue_send_now", it.client_id);
-    // no model: the entry stays queued (it goes once a config is set)
-    if (this.config === null) return this.refuseNoModel("queue_send_now", it.client_id);
     // (stored first, then out of the queue: should storing fail, the words are still queued, never in neither place)
     if (this.current) {
       if (this.current.card) return this.refuseCard("queue_send_now", it.client_id);
@@ -1091,13 +1104,10 @@ export function headerProblem(h: Record<string, unknown>): string | null {
   for (const k of ["session_id", "config", "lang", "driver", "scope"]) if (h[k] !== undefined && typeof h[k] !== "string") return `${k} must be a string`;
   if (typeof h.session_id === "string" && !SESSION_ID.test(h.session_id)) return `bad session id ${JSON.stringify(h.session_id).slice(0, 80)}: letters, digits, _ and - only, at most 64`;
   if (h.lang !== undefined && h.lang !== "zh" && h.lang !== "en") return `lang must be zh or en`;
-  if (typeof h.config === "string" && carriesKey(h.config)) return "a config never carries a key: keys come from the environment";
+  // (a config is stored as it is — session.config: only what its grammar allows, never a key of the environment)
+  if (typeof h.config === "string") { const bad = configSyntaxProblem(h.config); if (bad) return `config: ${bad}`; }
   return null;
 }
-
-/** A config string that holds something key-like (a key value from the environment, `sk-…`, `Bearer …`): it is
- *  refused, so no key reaches session.jsonl through a config (session.config stores the config as it is). */
-export const carriesKey = (config: string) => redactKeys(config) !== config;
 
 /** A config's goal model, `<provider>|<model>` (a keyed service), or why it cannot be the session's. */
 function goalOf(config: string): { spec: string } | { code: ErrorCode; text: string } {

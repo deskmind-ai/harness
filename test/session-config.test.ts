@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { Message } from "@earendil-works/pi-ai";
 import { SessionHost } from "../src/session/host.js";
 import { SessionLog } from "../src/session/log.js";
+import { configSyntaxProblem } from "../src/gateway/index.js";
 import type { SessionModel } from "../src/session/loop.js";
 import type { ExecutorHandle, Launcher } from "../src/session/task.js";
 import { appRun, LineReader } from "../src/cli/app.js";
@@ -65,8 +66,8 @@ function session(o: { models: Record<string, Step[]>; config?: string; lang?: "z
   const ex = inproc(o.tasks ?? [], o.sim);
   const seen: Record<string, Message[][]> = {}, made: Record<string, SessionModel> = {};
   for (const k of Object.keys(o.models)) seen[k] = [];
-    // (the executor knows a config name of the form openai:<provider>|<model>: config C("A") is "openai:a|m")
-  const model = (c: string): SessionModel => { const k = /^openai:(\w+)\|m$/.exec(c)?.[1]?.toUpperCase() ?? c; return (made[k] ??= { model: modelOf(k.toLowerCase()), streamFn: scriptedStream(o.models[k] ?? [], seen[k] ??= []) }); };
+    // (a config must be one by its grammar: config C("A") is "openai:openrouter|model-a", its turns go to A's script)
+  const model = (c: string): SessionModel => { const k = /^openai:openrouter\|model-(\w+)$/.exec(c)?.[1]?.toUpperCase() ?? c; return (made[k] ??= { model: modelOf(k.toLowerCase()), streamFn: scriptedStream(o.models[k] ?? [], seen[k] ??= []) }); };
   let onEvent: ((e: any) => void) | null = null;
   const h = new SessionHost({ dir, sessionId: "ses_c", out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model, launch: ex.launch,
     ...(o.config ? { config: o.config } : {}), ...(o.lang ? { lang: o.lang } : {}), ...(o.scope ? { scope: o.scope } : {}) });
@@ -95,7 +96,7 @@ const EDIT = (w: string): Step[] => [
 ];
 const editorSim = () => (scope?: string) => { const s = new SimComputer(scope); s.addEditor("编辑器", { title: "笔记.txt", text: "旧的", path: null }); return s; };
 /** The config name of test model `k` (A, B): its turns go to that model's script, `<k>|m`. */
-const C = (k: string) => `openai:${k.toLowerCase()}|m`;
+const C = (k: string) => `openai:openrouter|model-${k.toLowerCase()}`;
 const CALL = (goal: string): Step => ({ calls: [{ name: "computer_task", args: { goal } }] });
 const assistants = (s: { stored: () => any[] }) => s.stored().filter((e) => e.kind === "session.message" && e.role === "assistant").map((e) => [e.text, e.model]);
 
@@ -196,17 +197,35 @@ describe("set_config: the model and lang of a live session", () => {
     expect(s.ex.requests[0].lang).toBe("en");
   });
 
-  it("a bad set_config is refused (bad_config) and changes nothing: no config, a wrong type, an unknown config, a bad lang", () => {
+  it("a bad set_config is refused (bad_config) and changes nothing: no config, a wrong type, not the config grammar, a bad lang", () => {
     const evs: any[] = [];
     const h = new SessionHost({ dir: tmp(), sessionId: "ses_c", out: (e) => evs.push(e), config: "ds-flash" });
     hosts.push(h);
     h.start();
-    for (const c of [{ lang: "en" }, { config: 3 }, { config: "" }, { config: "no-such-config" }, { config: "ds-flash", lang: "fr" }]) h.handle(JSON.stringify({ type: "set_config", ...c, client_id: "x" }));
-    expect(evs.filter((e) => e.kind === "session.error").map((e) => [e.code, e.control, e.client_id, e.seq])).toEqual(Array(5).fill(["bad_config", "set_config", "x", undefined]));
+    const bad = [{ lang: "en" }, { config: 3 }, { config: "" }, { config: "no-such-config" }, { config: "ds-flash", lang: "fr" }, { config: "openai:nosuch|m" },
+      { config: "openai:custom|m?api_key=abcdef0123" }, { config: "openai:custom|two words" }, { config: "openai:custom|https://x.example/v1" }, { config: `openai:custom|${"m".repeat(129)}` }];
+    for (const c of bad) h.handle(JSON.stringify({ type: "set_config", ...c, client_id: "x" }));
+    expect(evs.filter((e) => e.kind === "session.error").map((e) => [e.code, e.control, e.client_id, e.seq])).toEqual(Array(bad.length).fill(["bad_config", "set_config", "x", undefined]));
+    // the refusal never repeats the config
+    expect(JSON.stringify(evs)).not.toContain("abcdef0123");
     expect([h.config, h.lang]).toEqual(["ds-flash", "zh"]);
     expect(h.log.events).toHaveLength(0);
     h.handle(JSON.stringify({ type: "set_config", config: "ds-flash" }));
     expect(h.log.events.at(-1)).toMatchObject({ kind: "session.config", config: "ds-flash", model: expect.stringMatching(/^deepseek\|/) });
+    // names that only look like a key prefix (risk-…, desk-…) are names
+    for (const c of ["openai:openrouter|risk-classifier-v2", "openai:local|desk-assistant-7b", "openai:openrouter|anthropic/claude-sonnet-4", "openai:local|qwen3:30b"]) {
+      h.handle(JSON.stringify({ type: "set_config", config: c }));
+      expect(h.log.events.at(-1)).toMatchObject({ kind: "session.config", config: c });
+    }
+  });
+
+  it("the config grammar, exactly; a key of the environment is matched as a whole part, not as a substring", () => {
+    const env = { LOCAL_API_KEY: "qwen30", CUSTOM_API_KEY: "0123456789abcdef0123456789abcdef", MY_TOKEN: "AIzaSyDummyKey123" } as NodeJS.ProcessEnv;
+    const ok = (c: string) => configSyntaxProblem(c, env);
+    for (const c of ["ds-flash", "openai:local|local-qwen30b", "openai:custom|risk-classifier-v2", "openai:volcengine|doubao-seed-1.6", "openai:local|qwen30b"]) expect(ok(c), c).toBeNull();
+    for (const c of ["openai:local|qwen30", "openai:custom|0123456789abcdef0123456789abcdef", "openai:custom|org/0123456789abcdef0123456789abcdef", "openai:custom|AIzaSyDummyKey123",
+      "openai:custom|m?api_key=x", "openai:custom|m#frag", "openai:custom|m=1", "openai:custom|", "openai:custom|-m", "custom|m", "openai:Custom|m", "Ds-flash", "ds-flash "]) expect(ok(c), c).not.toBeNull();
+    expect(ok("openai:local|qwen30")).toMatch(/never carries a key/);
   });
 });
 
@@ -284,7 +303,7 @@ describe("set_config null: no model, nothing more goes to it", () => {
     expect(assistants(s)).toEqual([]);
   });
 
-  it("a turn streaming when the model is turned off ends on its own, and the computer_task it calls does not start; a turn not yet sent is not sent", async () => {
+  it("a turn streaming when the model is turned off is stopped, and the computer_task it calls does not start; a turn not yet sent is not sent", async () => {
     // (the line comes while the turn's request is out: the step's function runs as the service is asked)
     let t: ReturnType<typeof session> | null = null;
     t = session({ config: C("A"), models: { A: [(_m) => { t!.send({ type: "set_config", config: null }); return CALL("新建 a.txt"); }, { text: "不该有这一轮" }] } });
@@ -313,12 +332,14 @@ describe("set_config null: no model, nothing more goes to it", () => {
     s.send({ type: "say", text: "新建 a.txt" });
     await waitFor(() => s.kinds("start").length);
     s.send({ type: "say", text: "一", client_id: "q1" });
-    // the turn after the task is streaming when the model is turned off: it ends on its own; the queue stays
+    // the turn after the task is streaming when the model is turned off: it is stopped (stored as far as it came,
+    // stopped: true); the queue stays
     await waitFor(() => s.kinds("session.delta").some((d) => d.text === "建"));
     s.send({ type: "set_config", config: null });
     await s.h.idle();
     await sleep(50);
-    expect(assistants(s)).toEqual([["建好了", "a|m"]]);
+    expect(assistants(s)).toEqual([["建", "a|m"]]);
+    expect(s.stored().find((e) => e.kind === "session.message" && e.role === "assistant")).toMatchObject({ text: "建", stopped: true });
     const q = s.kinds("session.queue").at(-1).items;
     expect(q).toEqual([{ id: expect.any(String), text: "一", client_id: "q1" }]);
     expect(s.stored().some((e) => e.kind === "session.message" && e.text === "一")).toBe(false);
@@ -328,8 +349,33 @@ describe("set_config null: no model, nothing more goes to it", () => {
     // a config again: the queue goes to the model as usual
     s.send({ type: "set_config", config: C("A") });
     await s.h.idle();
-    expect(s.stored().filter((e) => e.kind === "session.message").map((e) => `${e.role}:${e.text}${e.via ? `(${e.via})` : ""}`)).toEqual(["user:新建 a.txt", "assistant:建好了", "user:一(queue)", "assistant:收到一"]);
+    expect(s.stored().filter((e) => e.kind === "session.message").map((e) => `${e.role}:${e.text}${e.via ? `(${e.via})` : ""}`)).toEqual(["user:新建 a.txt", "assistant:建", "user:一(queue)", "assistant:收到一"]);
     expect(s.kinds("session.queue").at(-1).items).toEqual([]);
+  });
+
+  it("no model while a task is still stopping: say, cua, steer, retry, queue_send_now are refused at once — never queued (held for ever)", async () => {
+    const s = session({ config: C("A"), scope: tmp(), models: { A: [CALL("新建 a.txt"), { text: "不该有" }] }, tasks: [[SLOW(400), ...CREATE()]] });
+    s.send({ type: "say", text: "新建 a.txt" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "say", text: "一", client_id: "q0" });              // queued before: it stays queued
+    s.send({ type: "set_config", config: null });
+    // the task has been told to stop and has not ended yet
+    expect(s.stored().some((e) => e.kind === "session.task_end")).toBe(false);
+    s.send({ type: "say", text: "二", client_id: "s1" });
+    s.send({ type: "cua", text: "新建 b.txt", client_id: "c1" });
+    s.send({ type: "steer", text: "写 hi", client_id: "t1" });
+    s.send({ type: "retry" });
+    const q0 = s.kinds("session.queue").at(-1).items[0];
+    s.send({ type: "queue_send_now", id: q0.id });
+    expect(s.kinds("session.error").map((e) => [e.code, e.control, e.client_id])).toEqual([["no_model", "say", "s1"], ["no_model", "cua", "c1"], ["no_model", "steer", "t1"], ["no_model", "retry", undefined], ["no_model", "queue_send_now", "q0"]]);
+    expect(s.kinds("session.queue").at(-1).items.map((q: any) => q.text)).toEqual(["一"]);
+    await s.h.idle();
+    expect(s.stored().some((e) => e.kind === "session.steer")).toBe(false);
+    // once the queue is cancelled the session is idle: end_if_idle ends it
+    s.send({ type: "queue_cancel", id: q0.id });
+    await waitFor(() => !s.h.notIdle().length);
+    s.send({ type: "end_if_idle" });
+    expect(s.kinds("session.error").filter((e) => e.code === "not_idle")).toEqual([]);
   });
 
   it("undo on a lingering result card still works with no model (the executor's receipts; no model call)", async () => {
@@ -346,6 +392,45 @@ describe("set_config null: no model, nothing more goes to it", () => {
     expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
     expect(s.calls("A")).toBe(2);
     expect(s.kinds("session.error")).toEqual([]);
+  });
+});
+
+describe("set_config null during the service's retry backoff", () => {
+  it("a request that failed and waits to be retried is not sent again: the reply is stopped, zero further requests", async () => {
+    const requests: number[] = [];
+    const server = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        requests.push(Date.now());
+        // the first answer: busy, retry in 800 ms (the provider's backoff); the second would answer
+        if (requests.length === 1) { res.writeHead(503, { "content-type": "application/json", "retry-after-ms": "800" }); res.end(JSON.stringify({ error: { message: "busy" } })); return; }
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "fake", choices: [{ index: 0, delta: { content: "整段对话又发出去了" }, finish_reason: "stop" }] })}\n\n`);
+        res.end("data: [DONE]\n\n");
+      });
+    });
+    const url = await new Promise<string>((r) => server.listen(0, "127.0.0.1", () => r(`http://127.0.0.1:${(server.address() as any).port}`)));
+    const saved = { u: process.env.LOCAL_URL, k: process.env.LOCAL_API_KEY };
+    process.env.LOCAL_URL = url; process.env.LOCAL_API_KEY = "k-test-123";
+    try {
+      const evs: any[] = [];
+      const dir = tmp();
+      const h = new SessionHost({ dir, sessionId: "ses_r", out: (e) => evs.push(e), config: "openai:local|fake", coalesceMs: 5 });
+      hosts.push(h);
+      h.start();
+      h.handle(JSON.stringify({ type: "say", text: "你好" }));
+      await waitFor(() => requests.length === 1);
+      await sleep(50);
+      h.handle(JSON.stringify({ type: "set_config", config: null }));
+      await h.idle();
+      await sleep(1200);
+      expect(requests).toHaveLength(1);
+      const stored = new SessionLog(dir, "ses_r").events as any[];
+      expect(stored.map((e) => e.kind === "session.message" ? `${e.role}:${e.text}:${e.stopped ?? ""}` : e.kind)).toEqual(["user:你好:", "session.config", "assistant::true"]);
+    } finally {
+      for (const [k, v] of [["LOCAL_URL", saved.u], ["LOCAL_API_KEY", saved.k]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      server.close();
+    }
   });
 });
 
@@ -397,9 +482,9 @@ describe("set_config: keys stay in the environment (the real process)", () => {
     A.send({ type: "set_config", config: "openai:custom|fake-b", client_id: "k1" });
     await A.until(() => A.evs.some((e) => e.kind === "session.config"));
     expect(A.evs.find((e) => e.kind === "session.config")).toMatchObject({ config: "openai:custom|fake-b", model: "custom|fake-b", lang: "zh", by: "set_config", client_id: "k1", seq: 3 });
-    // a config that would carry a key (a key value of the environment, or one that looks like a key) is refused
+    // a config that would carry a key (a key value of the environment, or anything outside the config grammar) is refused
     A.send({ type: "set_config", config: "openai:custom|sk-customSECRET0002" });
-    A.send({ type: "set_config", config: "openai:custom|sk-abcdefghijklmnop" });
+    A.send({ type: "set_config", config: "openai:custom|m?api_key=abcdefghijklmnop" });
     await A.until(() => A.evs.filter((e) => e.kind === "session.error").length === 2);
     expect(A.evs.filter((e) => e.kind === "session.error").map((e) => [e.code, e.control])).toEqual([["bad_config", "set_config"], ["bad_config", "set_config"]]);
     A.send({ type: "say", text: "u2" });
@@ -417,7 +502,7 @@ describe("set_config: keys stay in the environment (the real process)", () => {
     B.child.stdin!.end();
     expect(await B.exited).toBe(0);
     // a config carrying a key at open is refused too (the header, the command line)
-    const C = proc(["session", "--dir", dir, "--config", "openai:local|sk-abcdefghijklmnop"], env);
+    const C = proc(["session", "--dir", dir, "--config", "openai:local|m?api_key=abcdefghijklmnop"], env);
     expect(await C.exited).toBe(2);
 
     const files = ["session.jsonl", "model_calls.jsonl"].map((f) => fs.readFileSync(path.join(dir, "sessions", "ses_k", f), "utf-8"));

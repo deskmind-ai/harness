@@ -59,6 +59,26 @@ export function redactKeys(text: string, env: NodeJS.ProcessEnv = process.env): 
   }
   return out.replace(/(sk-|Bearer )[A-Za-z0-9_-]{8,}/g, "$1…");
 }
+/** What a model id in a config spec may be: letters and digits first, then those and `. _ - : / @ +`, at most 128. */
+export const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:\/@+-]{0,127}$/;
+
+/** Why a config the app names (a session's header, `--config`, set_config) is not one, or null. Its grammar, exactly:
+ *  a configuration name (CONFIGS), or `openai:<provider>|<model>` with a provider of PROVIDERS and a model id of
+ *  MODEL_ID — nothing else (a URL, a query, spaces, `=`…). And none of its parts (split at the characters a key never
+ *  holds) is the value of a key in `env`, matched whole: a config is stored as it is. The text never repeats the
+ *  config (it may hold what it should not). A model id that is itself some other key cannot be told from a name. */
+export function configSyntaxProblem(config: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  if (!Object.prototype.hasOwnProperty.call(CONFIGS, config)) {
+    const m = /^openai:([a-z]+)\|(.*)$/s.exec(config);
+    if (!m) return "a config is a configuration name or openai:<service>|<model>";
+    if (!Object.prototype.hasOwnProperty.call(PROVIDERS, m[1]!)) return `no such service (one of ${Object.keys(PROVIDERS).join(", ")})`;
+    if (!MODEL_ID.test(m[2]!)) return "the model id may hold letters, digits and . _ - : / @ + only (at most 128, a letter or digit first)";
+  }
+  const keys = new Set(Object.entries(env).filter(([k, v]) => !!v && (Object.values(PROVIDERS).some((p) => p.keyEnv === k) || /(_API_KEY|_TOKEN|_SECRET)$/.test(k))).map(([, v]) => v!));
+  if (config.split(/[^A-Za-z0-9._-]+/).some((t) => keys.has(t))) return "a config never carries a key: keys come from the environment";
+  return null;
+}
+
 /** A model configuration by name (CONFIGS) or by spec: `openai:<provider>|<model>` — every role on that model. */
 export function configTable(spec: string): RoleTable | null {
   if (CONFIGS[spec]) return CONFIGS[spec]!;

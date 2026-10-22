@@ -164,7 +164,8 @@ export class ExecutorService {
       begin: () => (this.begun ? Promise.reject(new Error("begin was already called for this task")) : this.begin()),
       // where a window is on screen is the app's (its cursor), not the caller's
       snapshot: () => this.o.executor.snapshot(), observe: async (w) => { const o = await this.o.executor.observe(w); return { ...o, window: withoutFrame(o.window) }; },
-      classify: async (p): Promise<Classified> => { const ex = this.o.executor; const c = await ex.classify(p.action, p.epoch ?? ex.currentEpoch, p.consequence); return { consequence: c.consequence, object: c.object, why: c.why, by: c.by, needs_consent: NEEDS_CONSENT.has(c.consequence) }; },
+      // (as live: once the task is settled — a stop among them — no judge is asked for it; the caller is told so)
+      classify: async (p): Promise<Classified> => { const s = this.settled(); if (s) throw new Error((await s).text); const ex = this.o.executor; const c = await ex.classify(p.action, p.epoch ?? ex.currentEpoch, p.consequence); return { consequence: c.consequence, object: c.object, why: c.why, by: c.by, needs_consent: NEEDS_CONSENT.has(c.consequence) }; },
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
       act: live((p) => ((p.action as { kind?: string }).kind === "file" ? Promise.resolve(err("文件动作用 file 工具，不用 act")) : this.step(p.action, p, () => this.act(p)))),
       file: live((p) => this.step({ kind: "file", capability: p.capability, args: p.args }, { purpose: this.o.registry?.get(p.capability)?.description.split("；")[0] ?? p.capability }, () => this.file(p))),
@@ -483,8 +484,10 @@ export class ExecutorService {
     const d = cap.derive(ws, args);
     const ctx = this.o.gateway.contextBudget("transform");
     if ([...d.source].length > ctx) return `the source is ${[...d.source].length} characters; the rewriting model reads at most about ${ctx} tokens`;
+    // (a stop before it goes out: not asked; a stop while it is out: aborted)
+    if (this.stopped.signal.aborted) return "the task was stopped";
     this.count("model_calls");
-    const rep = await this.o.gateway.ask("transform", P.SYSTEM, P.transformPrompt(this.o.executor.opts.raw ?? this.o.raw, d.instruction, d.source), R.TransformAnswer, this.o.task);
+    const rep = await this.o.gateway.ask("transform", P.SYSTEM, P.transformPrompt(this.o.executor.opts.raw ?? this.o.raw, d.instruction, d.source), R.TransformAnswer, this.o.task, this.stopped.signal);
     this.emit("transform", { cap: cap.id, outcome: rep.outcome, error: rep.error.slice(0, 200) });
     if (rep.outcome !== "answered") return `the rewrite could not be made (${rep.outcome}: ${rep.error.slice(0, 200)})`;
     return { ...args, ...(d.also ?? {}), [d.field]: rep.data!.text };
