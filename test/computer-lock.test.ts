@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { acquire, computerLockFile, free, held, linger, ORPHAN_S, readHolder, startOf, undo, type Holder } from "../src/session/computer.js";
+import { acquire, computerLockFile, free, held, linger, ORPHAN_S, readHolder, release, startOf, undo, type Holder } from "../src/session/computer.js";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "dm-lock-"));
 const kids: ChildProcess[] = [];
@@ -164,5 +164,27 @@ describe("the machine lock", () => {
     expect(held(readHolder(dir)!)).toBe(true);          // A's executor was not ended by B
     expect(readHolder(dir)!.run_id).toBe("run_a");
     process.kill(-ra.ok, "SIGKILL");
+  });
+
+  it("release (a start that failed): ends the group it started and removes the lock — only from the exact holder it wrote", async () => {
+    const dir = tmp();
+    let p!: ChildProcess;
+    const a = holderOf(acquire(dir, who("run_a"), () => { p = group("sleep 30 & sleep 30; wait"); return { pid: p.pid }; }));
+    // the lock changed since (another generation): left as it is, and the group too
+    expect(release(dir, { ...a, gen: 7 })).toBe(false);
+    expect(readHolder(dir)).toMatchObject({ run_id: "run_a", gen: 1 });
+    expect(held(a)).toBe(true);
+    // another run's holder: not this start's to touch
+    expect(release(dir, { ...a, run_id: "run_other" })).toBe(true);
+    expect(readHolder(dir)!.run_id).toBe("run_a");
+    // its own: the whole group (the leader's child too) is ended, the lock removed
+    expect(release(dir, a)).toBe(true);
+    expect(fs.existsSync(computerLockFile(dir))).toBe(false);
+    expect(held(a)).toBe(false);
+    await gone(p);
+    // an in-process holder (pgid 0): the lock only
+    const b = holderOf(acquire(dir, who("run_b"), () => ({})));
+    expect(release(dir, b)).toBe(true);
+    expect(readHolder(dir)).toBeNull();
   });
 });
