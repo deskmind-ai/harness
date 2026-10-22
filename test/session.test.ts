@@ -119,6 +119,33 @@ describe("session: one reply", () => {
     expect(new SessionLog(h.log.dir, "ses_t").events.find((e) => e.kind === "session.message")).toMatchObject({ client_id: "c1" });
   });
 
+  it("client_id: a say sent again with a stored client_id is not stored again (session.duplicate), also by a new process", async () => {
+    const dir = tmp();
+    const a = host([{ text: "好" }, { text: "再好" }], { dir });
+    await (async () => { a.h.handle(JSON.stringify({ type: "say", text: "一", client_id: "d1" })); await a.h.idle(); })();
+    a.h.handle(JSON.stringify({ type: "say", text: "一", client_id: "d1" }));
+    await a.h.idle();
+    expect(kinds(a.evs, "session.message").filter((m) => m.role === "user").map((m) => [m.text, m.client_id])).toEqual([["一", "d1"]]);
+    expect(kinds(a.evs, "session.duplicate")).toMatchObject([{ client_id: "d1", control: "say", seq: 1 }]);
+    expect(kinds(a.evs, "session.duplicate")[0].seq).toBeTypeOf("number");
+    // a new process on the same session reads the client_ids back: the repeat is still a repeat
+    const b = host([{ text: "不该回" }], { dir });
+    b.h.handle(JSON.stringify({ type: "say", text: "一", client_id: "d1" }));
+    b.h.handle(JSON.stringify({ type: "cua", text: "一", client_id: "d1" }));
+    await b.h.idle();
+    expect(kinds(b.evs, "session.duplicate").map((e) => [e.client_id, e.control, e.seq])).toEqual([["d1", "say", 1], ["d1", "cua", 1]]);
+    expect(new SessionLog(dir, "ses_t").events.filter((e) => e.kind === "session.message" && e.role === "user").length).toBe(1);
+    // a refused one is not taken: sent again, it is acted on
+    const c = host([{ text: "慢慢说", chunks: ["慢", "慢说"], delayMs: 30 }, { text: "好的" }]);
+    c.h.handle(JSON.stringify({ type: "say", text: "甲", client_id: "e1" }));
+    c.h.handle(JSON.stringify({ type: "say", text: "乙", client_id: "e2" }));          // busy
+    await c.h.idle();
+    c.h.handle(JSON.stringify({ type: "say", text: "乙", client_id: "e2" }));
+    await c.h.idle();
+    expect(kinds(c.evs, "session.message").filter((m) => m.role === "user").map((m) => m.client_id)).toEqual(["e1", "e2"]);
+    expect(kinds(c.evs, "session.duplicate")).toEqual([]);
+  });
+
   it("a reply over 64k characters is cut there and marked truncated", async () => {
     const big = "字".repeat(40_000);
     const { evs, say } = host([{ text: big + big, chunks: [big, big] }]);

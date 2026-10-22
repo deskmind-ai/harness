@@ -307,6 +307,36 @@ describe("session tasks: client_id on steer, /cua, the card, the queue's edits, 
   });
 });
 
+describe("session tasks: a repeated client_id is done once", () => {
+  it("a /cua sent twice starts one task; a steer twice is one steer; a queued say twice is one entry; across a new process too", async () => {
+    const scope = tmp(), dir = tmp();
+    const s = session({ dir, scope, model: [{ text: "好的" }, { text: "又一句" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE()]] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi", client_id: "u1" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "cua", text: "新建 a.txt 写 hi", client_id: "u1" });
+    s.send({ type: "steer", text: "内容就写 hi 吧", client_id: "u2" });
+    s.send({ type: "steer", text: "内容就写 hi 吧", client_id: "u2" });
+    s.send({ type: "say", text: "排着", client_id: "u3" });
+    s.send({ type: "say", text: "排着", client_id: "u3" });
+    expect(s.kinds("session.queue").at(-1).items.map((q: any) => q.client_id)).toEqual(["u3"]);
+    await s.h.idle();
+    expect(s.stored().filter((e: any) => e.kind === "session.task")).toHaveLength(1);
+    expect(s.stored().filter((e: any) => e.kind === "session.steer").map((e: any) => e.client_id)).toEqual(["u2"]);
+    expect(s.stored().filter((e: any) => e.kind === "session.message" && e.role === "user").map((e: any) => e.client_id)).toEqual(["u1", "u3"]);
+    expect(s.kinds("session.duplicate").map((e: any) => [e.client_id, e.control])).toEqual([["u1", "cua"], ["u2", "steer"]]);
+    expect(s.ex.requests).toHaveLength(1);
+    // a new process: the /cua's client_id is still known — no second task
+    s.h.handle(JSON.stringify({ type: "end" }));
+    await waitFor(() => s.exited());
+    const t = session({ dir, scope, model: [{ text: "不该有" }], tasks: [CREATE("b.txt")] });
+    t.send({ type: "cua", text: "新建 a.txt 写 hi", client_id: "u1" });
+    await t.h.idle();
+    expect(t.kinds("session.duplicate")).toMatchObject([{ client_id: "u1", control: "cua" }]);
+    expect(t.stored().filter((e: any) => e.kind === "session.task")).toHaveLength(1);
+    expect(t.ex.requests).toHaveLength(0);
+  });
+});
+
 describe("session tasks: undo, the machine lock, the app going away", () => {
   it("undo: respond with the undo option → undone == total; the executor then closes (linger)", async () => {
     const scope = tmp();

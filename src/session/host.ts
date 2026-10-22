@@ -172,7 +172,28 @@ export class SessionHost {
     this.config = o.config ?? "ds-flash";       // the app's default (cli/app.ts)
     this.lang = o.lang === "en" ? "en" : "zh";
     this.resumed = fs.existsSync(path.join(sessionDir(o.dir, o.sessionId), "session.jsonl"));
-    this.log = new SessionLog(o.dir, o.sessionId, (ev) => o.out(ev));
+    this.log = new SessionLog(o.dir, o.sessionId, (ev) => { this.noteTaken(ev); o.out(ev); });
+    for (const ev of this.log.events) this.noteTaken(ev);
+  }
+
+  /** The client_ids of the app's words the history holds (a stored user message or session.steer), with their seq:
+   *  read back from session.jsonl on start, kept as new ones are stored. A say / cua / steer naming one of them is a
+   *  repeat (the app sent again words whose answer it missed): it is not acted on again (sendsDuplicate). */
+  private readonly taken = new Map<string, number>();
+  private noteTaken(ev: SessionEvent) {
+    const cid = (ev as { client_id?: unknown }).client_id;
+    if (typeof cid !== "string" || !cid) return;
+    if ((ev.kind === "session.message" && ev.role === "user") || ev.kind === "session.steer") this.taken.set(cid, ev.seq);
+  }
+
+  /** The app's words with this client_id were taken already (stored, or waiting in the queue): say so again, with
+   *  where they are (`session.duplicate` with the stored seq, or the queue as it is), and do nothing else. */
+  private sendsDuplicate(cid: string | undefined, control: string): boolean {
+    if (!cid) return false;
+    const seq = this.taken.get(cid);
+    if (seq !== undefined) { this.send({ kind: "session.duplicate", client_id: cid, control, seq }); return true; }
+    if (this.queue.some((q) => q.client_id === cid)) { this.emitQueue(); return true; }
+    return false;
   }
 
   get busy(): boolean { return this.running !== null || this.current !== null || this.flows > 0; }
@@ -304,8 +325,9 @@ export class SessionHost {
   private refuseBusy(control: string, cid?: string) { this.refuse("busy", this.t("上一条回复还没完：先停下它，或者等它说完", "a reply is still coming; stop it first or wait"), control, cid); }
   private refuseCard(control: string, cid?: string) { this.refuse("card_open", this.t("任务在等你回答卡片：先在卡片上回答", "the task is waiting for your answer on its card; answer it there first"), control, cid); }
 
-  say(text: string, cid?: string) {
-    if (this.closing || !text.trim() || this.tooLong(text, "say", cid)) return;
+  /** `fromQueue`: the queue's own entry sent now (queue_send_now): not a repeat of itself. */
+  say(text: string, cid?: string, fromQueue = false) {
+    if (this.closing || !text.trim() || (!fromQueue && this.sendsDuplicate(cid, "say")) || this.tooLong(text, "say", cid)) return;
     // a task runs: the words wait in the queue (sent to the model after it), unless a card waits for the user
     if (this.current) {
       if (this.current.card) return this.refuseCard("say", cid);
@@ -413,7 +435,7 @@ export class SessionHost {
   /** `/cua <text>`: a computer task with the user's words, no model in between; then the model speaks one turn with
    *  the task's call and result in its context. */
   cua(text: string, scope?: string, cid?: string) {
-    if (this.closing || !text.trim() || this.tooLong(text, "cua", cid)) return;
+    if (this.closing || !text.trim() || this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
     if (this.current || this.running || this.flows) return this.refuseBusy("cua", cid);
     let userId = "";
     let t: Task | { busy: true };
@@ -593,8 +615,8 @@ export class SessionHost {
   }
 
   /** The user's words into the running task (control v1 steer). */
-  steer(text: string, runId?: string, cid?: string) {
-    if (this.closing || !text.trim() || this.tooLong(text, "steer", cid)) return;
+  steer(text: string, runId?: string, cid?: string, fromQueue = false) {
+    if (this.closing || !text.trim() || (!fromQueue && this.sendsDuplicate(cid, "steer")) || this.tooLong(text, "steer", cid)) return;
     const t = this.current;
     if (!t || (runId && runId !== t.runId)) return this.refuse("no_task", "no task is running", "steer", cid);
     if (t.card) return this.refuseCard("steer", cid);
@@ -611,12 +633,12 @@ export class SessionHost {
     // (stored first, then out of the queue: should storing fail, the words are still queued, never in neither place)
     if (this.current) {
       if (this.current.card) return this.refuseCard("queue_send_now", it.client_id);
-      this.steer(it.text, undefined, it.client_id);
+      this.steer(it.text, undefined, it.client_id, true);
       this.queue = this.queue.filter((q) => q !== it);
       return this.emitQueue();
     }
     if (this.running || this.flows) return this.refuseBusy("queue_send_now", it.client_id);
-    this.say(it.text, it.client_id);
+    this.say(it.text, it.client_id, true);
     this.queue = this.queue.filter((q) => q !== it);
     this.emitQueue();
   }
