@@ -2,9 +2,9 @@
  * The chat session's commands (docs/protocol.md 「会话（第 1 版）」):
  *
  *   session [--dir <d>] [--config <c>] [--lang zh|en]    stdin line 1: {session_id?, config?, lang?, driver?, scope?};
- *                                                        then control lines (say, stop, attach, end; H2: cua, steer,
- *                                                        answer, respond, retry, queue_edit / queue_cancel /
- *                                                        queue_send_now). A known session_id resumes it; none starts
+ *                                                        then control lines (say, stop, attach, end, end_if_idle;
+ *                                                        H2: cua, steer, answer, respond, retry, queue_edit /
+ *                                                        queue_cancel / queue_send_now). A known session_id resumes it; none starts
  *                                                        a new one. Computer tasks run as `executor` children
  *   session --session <id> [--dir <d>]                   resume <id> at once; a first line without `type` is still
  *                                                        read as the header (config, lang)
@@ -12,7 +12,8 @@
  *
  * `--dir`: the folder that holds `sessions/` (default ~/Library/Application Support/DeskMind). The process exits when
  * stdin closes or `end` comes and no reply or task is running (a running task is stopped first, its end waited for up
- * to 12 s); SIGINT / SIGTERM are an `end`. A run's end or closure that cannot be stored halts the session: its
+ * to 12 s) and recover has written what it was waiting to write; `end_if_idle` is an `end` only when the session is
+ * idle, else refused (not_idle); SIGINT / SIGTERM are an `end`. A run's end or closure that cannot be stored halts the session: its
  * executors are ended, the machine lock let go, and the process exits 3 (the reason on stderr); the next open records
  * what is missing.
  */
