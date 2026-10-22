@@ -23,6 +23,7 @@ function group(script = "sleep 30"): ChildProcess {
   kids.push(p);
   return p;
 }
+const holderOf = (r: ReturnType<typeof acquire>): Holder => { if (!("ok" in r) || !r.holder) throw new Error("not taken"); return r.holder; };
 const who = (run: string) => ({ run_id: run, session_id: "ses_t", by: "session" });
 const gone = (p: ChildProcess) => new Promise<void>((r) => { if (p.exitCode !== null || p.signalCode !== null) r(); else p.on("exit", () => r()); });
 
@@ -42,8 +43,8 @@ describe("the machine lock", () => {
   it("acquire: a lingering holder is ended (its undo expires) — a group deaf to SIGTERM by SIGKILL — and the lock is the new task's", async () => {
     const dir = tmp();
     const deaf = group("trap '' TERM; while :; do sleep 0.1; done");
-    acquire(dir, who("run_a"), () => ({ pid: deaf.pid }));
-    expect(linger(dir, "run_a", deaf.pid!)).toBe(true);
+    const a = acquire(dir, who("run_a"), () => ({ pid: deaf.pid }));
+    expect(linger(dir, holderOf(a))).toMatchObject({ state: "lingering", gen: 2 });
     let p!: ChildProcess;
     const b = acquire(dir, who("run_b"), () => { p = group(); return { pid: p.pid }; }, { termMs: 300, killMs: 2000 });
     expect("ok" in b).toBe(true);
@@ -118,17 +119,26 @@ describe("the machine lock", () => {
     expect(readHolder(dir)).toBeNull();
   });
 
-  it("undo: only for its own lingering run (then acting until its result_response); another's or a run gone: expired", () => {
+  it("undo: only from its own lingering holder, exactly as last written (then acting until its result_response); another's or a run gone: expired", () => {
     const dir = tmp();
     const p = group();
-    acquire(dir, who("run_a"), () => ({ pid: p.pid }));
-    expect(undo(dir, "run_a", p.pid!)).toBe("busy");   // still acting: no undo before its task_done
-    linger(dir, "run_a", p.pid!);
-    expect(undo(dir, "run_x", p.pid!)).toBe("expired");
-    expect(undo(dir, "run_a", p.pid!)).toBe("ok");
-    expect(readHolder(dir)!.state).toBe("acting");
-    expect(undo(dir, "run_a", p.pid!)).toBe("busy");
-    expect(linger(dir, "run_a", p.pid!)).toBe(true);
+    const a = acquire(dir, who("run_a"), () => ({ pid: p.pid }));
+    const h1 = holderOf(a);
+    expect(h1.gen).toBe(1);
+    expect(undo(dir, h1)).toBe("busy");                // still acting: no undo before its task_done
+    const h2 = linger(dir, h1)!;
+    expect(h2).toMatchObject({ state: "lingering", gen: 2 });
+    expect(linger(dir, h1)).toBeNull();                // a second change from the same old holder: refused
+    expect(undo(dir, { ...h2, run_id: "run_x" })).toBe("expired");
+    const u = undo(dir, h2);
+    expect(u).toMatchObject({ ok: { state: "acting", gen: 3 } });
+    expect(undo(dir, h2)).toBe("busy");
+    // the exact race of a cleanup after the executor exits: a writer still holding the acquired (h1) or task_done (h2)
+    // holder cannot write lingering over the undo that acts now
+    expect(linger(dir, h1)).toBeNull();
+    expect(linger(dir, h2)).toBeNull();
+    expect(readHolder(dir)).toMatchObject({ state: "acting", gen: 3 });
+    expect(linger(dir, (u as { ok: Holder }).ok)).toMatchObject({ state: "lingering", gen: 4 });   // its result_response
   });
 
   it("two acquires at once from two processes (forced interleaving inside the guard): one takes the lock, the other is busy, and nothing it started is ended", async () => {

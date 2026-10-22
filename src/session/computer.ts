@@ -45,6 +45,10 @@ export interface Holder {
   /** When a task first found it orphaned (acting, its owner and its leader gone, something of its group still up),
    *  seconds since 1970: `ORPHAN_S` later the next task ends it. */
   orphan_since?: number;
+  /** Bumped on every change of state (acting → lingering at task_done, → acting for an undo, back at its
+   *  result_response): a writer changes the lock only from the exact holder and generation it saw (compare-and-set).
+   *  1 when a task takes the lock; absent (0) in a lock of an earlier build. */
+  gen?: number;
 }
 
 /** How long an orphaned acting holder keeps the Mac before the next task ends it (as long as a stop is waited for). */
@@ -167,7 +171,7 @@ export function acquire(dir: string, who: { run_id: string; session_id: string; 
     const r = spawn();
     if (!r) return { ok: true, holder: null };
     const pgid = r.pid ?? 0;
-    const holder: Holder = { v: 2, state: "acting", pgid, pid: pgid, start: pgid ? startOf(pgid) ?? 0 : 0, ...who, owner: process.pid, t: Date.now() / 1000 };
+    const holder: Holder = { v: 2, state: "acting", pgid, pid: pgid, start: pgid ? startOf(pgid) ?? 0 : 0, ...who, owner: process.pid, t: Date.now() / 1000, gen: 1 };
     try { write(dir, holder); } catch (e) {
       // not recorded: the executor never gets its task (the caller sees the error); its group is ended at once
       if (pgid > 0) { try { process.kill(-pgid, "SIGKILL"); } catch { /* gone */ } }
@@ -179,25 +183,33 @@ export function acquire(dir: string, who: { run_id: string; session_id: string; 
 
 const mine = (h: Holder | null, run: string, pgid: number): h is Holder => !!h && h.run_id === run && h.pgid === pgid;
 
-/** Its task_done: the run no longer acts, its result card may be answered (and a new task may end it). */
-export function linger(dir: string, run: string, pgid: number): boolean {
+const same = (h: Holder | null, from: Holder): h is Holder => mine(h, from.run_id, from.pgid) && h.state === from.state && (h.gen ?? 0) === (from.gen ?? 0);
+
+/** Its task_done (or an undo's result_response): the run no longer acts, its result card may be answered (and a new
+ *  task may end it). Only from the acting holder `from` its writer last saw — compare-and-set: a lock changed since (an
+ *  undo, a new task) is not written over. The new holder, or null. */
+export function linger(dir: string, from: Holder): Holder | null {
+  if (from.state !== "acting") return null;
   return guarded(dir, () => {
     const h = readHolder(dir);
-    if (!mine(h, run, pgid) || h.state === "lingering") return false;
-    write(dir, { ...h, state: "lingering", t: Date.now() / 1000 });
-    return true;
+    if (!same(h, from)) return null;
+    const next: Holder = { ...h, state: "lingering", gen: (h.gen ?? 0) + 1, t: Date.now() / 1000 };
+    write(dir, next);
+    return next;
   });
 }
 
-/** An undo for `run`: only while it is the lingering holder; then it acts again. `expired`: another task has started
- *  since (or its tree is gone); `busy`: an undo of it is going. */
-export function undo(dir: string, run: string, pgid: number): "ok" | "busy" | "expired" {
+/** An undo: only while the lock is still exactly the lingering holder `from`; it acts again (the next generation).
+ *  `expired`: another task has started since (or its tree is gone); `busy`: the lock changed under it otherwise (an
+ *  answer of it is being carried out). */
+export function undo(dir: string, from: Holder): { ok: Holder } | "busy" | "expired" {
   return guarded(dir, () => {
     const h = readHolder(dir);
-    if (!mine(h, run, pgid) || !held(h)) return "expired";
-    if (h.state === "acting") return "busy";
-    write(dir, { ...h, state: "acting", t: Date.now() / 1000 });
-    return "ok";
+    if (!mine(h, from.run_id, from.pgid) || !held(h)) return "expired";
+    if (h.state === "acting" || (h.gen ?? 0) !== (from.gen ?? 0)) return "busy";
+    const next: Holder = { ...h, state: "acting", gen: (h.gen ?? 0) + 1, t: Date.now() / 1000 };
+    write(dir, next);
+    return { ok: next };
   });
 }
 
