@@ -178,6 +178,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `card_open` | 任务在等用户回答卡片时来了 `say`、`steer` 或 `queue_send_now`（H2）。卡片要在卡片上答：app 这时禁用输入框，要打字的卡有自己的输入框（`answer{text}`） | 否 |
 | `no_task` | `steer`、`answer`、`respond`、`stop{run_id}`、`attach{run_id}` 说的任务不是这个会话的、已经关了，或者没有任务在跑（H2） | 否 |
 | `undo_expired` | `respond` 来的时候这台 Mac 上已经开始了别的电脑任务，撤回过期了（H2）。这个任务同时关掉（`task_closed new_task`） | 否 |
+| `not_idle` | `end_if_idle` 来的时候会话不是闲着的（见控制表）：多带一个 `why`，列出 `busy`、`queue`、`task`、`recovering` 里成立的几条。会话照旧，什么都没动 | 否 |
 | `bad_control` | 控制行缺它要的东西（H2）：`respond` 没有 `option`，或者它不是结果卡上某个选项的下标（整数）。什么都不占、不转发，之后合格的 `respond` 照常 | 否 |
 | `not_yet` | H1 用过（H2 的控制还没做时），现在不再发 | 否 |
 
@@ -190,7 +191,8 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `say` | `{"type":"say","text":"…","client_id"?:"…"}` | 用户发一条消息：先入库，再开始回复。一次只回复一条。有任务在跑时不入库，进排队（见下）；有卡片在等时拒绝（`card_open`） |
 | `stop` | `{"type":"stop","run_id"?:"…"}` | 带 `run_id`：转给那个任务的执行层（在跑的停下；还在等结果卡的，结果卡放下）。不带：有任务在跑就停那个任务，否则停下正在进行的回复——已经说出的部分作为 `stopped: true` 的消息入库；没有回复在进行时什么也不做。模型已经说完、只是结果还没处理时到的 stop 不算，那条消息照常入库，不带 `stopped` |
 | `attach` | `{"type":"attach","after_seq":n,"run_id"?:"…"}` | 补发：把 `seq` 大于 n 的入库事件按顺序重发一遍（不重复、不跳号）。如果正有回复在进行，再发一条 `offset:0` 的 delta，内容是到现在为止说出的全部文字，之后的 delta 接着这个 offset 往下；最后总发一条 `session.queue`（空的也发：它是完整的排队，app 用它整个替换自己手上的，重连期间排队已经交给模型的，app 就不会还留着）。带 `run_id`（H2）：改为从那个任务的 `events.jsonl` 补发它 `seq` 大于 n 的事件（带 `session_id`） |
-| `end` | `{"type":"end"}` | 结束：有任务在跑就先停它（同 stdin 关闭，见下），停下正在进行的回复（同 `stop`，部分入库），然后退出 |
+| `end` | `{"type":"end"}` | 结束：有任务在跑就先停它（同 stdin 关闭，见下），停下正在进行的回复（同 `stop`，部分入库），然后退出。重新打开时还在等旧执行层的补记（见「重新打开」）先写完再退出，不会丢下没写的结局 |
+| `end_if_idle` | `{"type":"end_if_idle","client_id"?:"…"}` | 闲着才结束（加的，不升版本）：处理到这一行的那一刻会话是闲着的，就和 `end` 完全一样地结束（进程退出就是回答）；不是闲着的，什么都不动，回一条不入库的 `session.error{code:"not_idle", control:"end_if_idle", why:[…], client_id?}`。闲着 = 下面四条都不成立，`why` 按这个顺序列出成立的那几条：`busy` 有回复在进行（包括 `/cua` 的任务和它之后的那一轮回复）；`queue` 排队里有话（包括任务停下后 `held` 的）；`task` 有任务还没关（在跑、有卡片在等、结果卡还能撤回、执行层正在自己退出——还没有 `session.task_closed` 的）；`recovering` 重新打开时的补记还没写完（正在等旧执行层，最多 12 秒）。app 只看 `code` 和 `why`，不读 `text`。**顺序保证：** stdin 的控制行严格按顺序处理，一行处理完才处理下一行，而且 `say`、`cua`、`retry`、`queue_send_now` 处理完时它们开始的事已经算在上面四条里了（回复已经开始、任务已经开始、话已经排上）。所以写在 `say` / `cua` 之后的 `end_if_idle` 一定看到那件事、回 `not_idle`，没有「已经发了、还没开始」的空档；没被接受的（被拒绝的 `say`，或者模型没 key 而入库了错误的）本来就没有事在做。会话已经在结束（之前来过 `end`、stdin 关了）时：还有事在等就同样回 `not_idle`，没有了就不回（进程随后退出） |
 | `cua` | `{"type":"cua","text":"…","scope"?:"…","client_id"?:"…"}` | `/cua`（H2）：不经过模型，直接开电脑任务，`raw` 就是 `text`。`scope` 是这一次的任务目录（不给就用头一行的）。有回复或任务在跑时 `busy` |
 | `steer` | `{"type":"steer","text":"…","run_id"?:"…","client_id"?:"…"}` | 任务进行中补充要求（H2）：原样转给执行层（控制第 1 版的 steer，执行层的规则照旧：两步之间生效，生效时发 `steered`），同时入库 `session.steer` |
 | `answer` | 执行层的 answer 行，加 `run_id` | 回答卡片（H2）：整行原样转给那个任务（不带 `run_id` 就是正在跑的那个）；多出来的字段执行层不看。按选项下标答：`{"type":"answer","run_id":"…","ask_id":"…","option":n}`；卡上自己写：`…,"text":"…"}` |
@@ -220,7 +222,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - **`/cua` 之后：** 任务结束，模型说一轮：它的上下文里这个任务是一次 `computer_task` 调用和结果，用户消息是 `/cua` 的原话（`via: "cua"`）。这一轮不能再开任务。
 - **电脑被占：** 另一个会话的任务正占着锁时，模型的工具返回「电脑正被另一个会话使用，等它做完再试。」，`/cua` 回 `session.error{code:"computer_busy"}`。
 - **转发：** 执行层的每个事件原样发到会话的 stdout，加上 `session_id`。`answer`、`respond`、`stop`（带 `run_id`）和 `steer` 转到那个执行层的 stdin（控制第 1 版的行，多的字段执行层不看）。
-- **client_id（加的可选字段，不升版本）：** `say`、`cua`、`steer` 可以带 app 自己给这段话起的 id（字符串，最长 100 个字符，更长的当没有）。会话把它原样带回到这段话的结局上：入库的用户消息（`session.message`，包括排队后按 `via: "queue"` 入库的）或 `session.steer`、它排着的那条 `session.queue` 项（`queue_send_now` 发出时也带着）、拒绝这一行的 `session.error`（busy、too_long、card_open、computer_busy、no_task），以及重发时的 `session.duplicate`（见下）。app 据此知道自己的话落到了哪里：小助手回的 ok 只说明这一行写进去了，不说明会话收下了。几处细节：`queue_send_now` 被拒（`control: "queue_send_now"`，带那一项的 `client_id`）时，那一项照旧在排队里，话的主人还是排队；会话正在结束时，`queue_send_now` 被拒（busy），那一项留在排队里，而 `say`、`cua`、`steer` 不回任何东西（进程随后退出）；`text` 是空的或只有空白的 `say`、`cua`、`steer` 也不回任何东西（app 不该发这样的）；`client_id` 是空字符串也当没有。进程退出时还在排队的话不会入库，也不会再有事件提到它们：它最后发的 `session.queue` 就是它们最后的去处，app 把它们当成没发出去（重连后 attach 发的是新进程的排队，通常是空的）。
+- **client_id（加的可选字段，不升版本）：** `say`、`cua`、`steer` 可以带 app 自己给这段话起的 id（字符串，最长 100 个字符，更长的当没有）。会话把它原样带回到这段话的结局上：入库的用户消息（`session.message`，包括排队后按 `via: "queue"` 入库的）或 `session.steer`、它排着的那条 `session.queue` 项（`queue_send_now` 发出时也带着）、拒绝这一行的 `session.error`（busy、too_long、card_open、computer_busy、no_task；`end_if_idle` 也可以带 `client_id`，它的 not_idle 带回来），以及重发时的 `session.duplicate`（见下）。app 据此知道自己的话落到了哪里：小助手回的 ok 只说明这一行写进去了，不说明会话收下了。几处细节：`queue_send_now` 被拒（`control: "queue_send_now"`，带那一项的 `client_id`）时，那一项照旧在排队里，话的主人还是排队；会话正在结束时，`queue_send_now` 被拒（busy），那一项留在排队里，而 `say`、`cua`、`steer` 不回任何东西（进程随后退出）；`text` 是空的或只有空白的 `say`、`cua`、`steer` 也不回任何东西（app 不该发这样的）；`client_id` 是空字符串也当没有。进程退出时还在排队的话不会入库，也不会再有事件提到它们：它最后发的 `session.queue` 就是它们最后的去处，app 把它们当成没发出去（重连后 attach 发的是新进程的排队，通常是空的）。
 - **按 client_id 只做一次（加的，不升版本）：** 会话记得收下过的 `client_id`（入库的用户消息和 `session.steer` 上的；进程启动时从 `session.jsonl` 读回，所以换了进程也算）。同一个 `client_id` 的 `say`、`cua`、`steer` 再来（app 没收到上次的结局又发了一次）：已经入库的，不再执行，回一条 `session.duplicate`（带那条入库事件的 `seq`）；还在排队里的，不再排一次，回一条当前的 `session.queue`。所以重发不会存两次，也不会开两个任务。被拒绝过的、被 `queue_cancel` 撤掉的、进程退出时还在排队没入库的，不算收下：再发照常处理。一个例外：`/cua` 的用户消息入库之后、任务没能记下（写盘失败）而被拒（busy，不带 `client_id`）的，消息已经入库，算收下：再发回 `session.duplicate`。因此 `client_id` 在一个会话的整个生命里（跨 app 的重启）都要唯一，比如用 UUID；重复用的 id 会被当成重发。
 - **任务进行时打字：** `say` 排进队（`session.queue`，每次都发完整列表），可以 `queue_edit`、`queue_cancel`、`queue_send_now`（有任务时等于 steer）。`steer` 直接转给执行层。任务结束、模型说完之后，排队的话按顺序作为用户消息（`via: "queue"`）入库，模型对它们回一次；任务是被停下的（status `stopped`），就不自动发，每条标上「任务已停，要发吗？」（`held: true`），等用户 `queue_send_now` 或撤掉。
 - **卡片在等时（负责人 10-21）：** app 禁用输入框（同 Claude Code）；要打字的卡有自己的输入框，用 `answer{text}` 答。所以任务里有卡在等（`ask` 之后还没有同一 `ask_id` 的 `resumed` / `ask_void`）时，`say`、`steer`、`queue_send_now` 回 `card_open`。
@@ -243,6 +245,6 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - **放锁：** 开始失败的那一次（执行层还没收到请求）：SIGKILL 它的组，确认没了，锁还正是它写的那个（同一 `gen`）就删掉。其他时候只在进程组确认没了之后：启动它的一方看到执行层退出时，锁还是这个任务、组里没人了，就删掉；组里还有子进程，锁照旧（`acting` 的话，下一个任务就是 `computer_busy`）。没人占的锁下一个人直接接过来。
 - 以前的 `computer.last` 不再用：新任务拿锁时直接结束 `lingering` 的那一个，这台 Mac 上最多只有一个等结果卡的执行层。
 
-**退出：** stdin 关了（app 走了）或收到 `end`，而且没有回复、任务在进行，进程就关掉还在等结果卡的执行层，最多等它们 2 秒，然后退出（退出码 0）。这时哪条 `task_closed session_end`（或等不到停下时记的结局）写不进去，就按「任务的结局写不进去」结束执行层、放锁，退出码 3。stdin 关的时候正有回复，就等它说完、入库之后再退出；正有任务，见上面「app 走了」。SIGINT / SIGTERM 等同 `end`。
+**退出：** stdin 关了（app 走了）或收到 `end`（或闲着时的 `end_if_idle`），而且没有回复、任务在进行，重新打开时的补记也写完了（还在等旧执行层就等它，最多 12 秒；补记写不进去就按「任务的结局写不进去」退出码 3），进程就关掉还在等结果卡的执行层，最多等它们 2 秒，然后退出（退出码 0）。这时哪条 `task_closed session_end`（或等不到停下时记的结局）写不进去，就按「任务的结局写不进去」结束执行层、放锁，退出码 3。stdin 关的时候正有回复，就等它说完、入库之后再退出；正有任务，见上面「app 走了」。SIGINT / SIGTERM 等同 `end`。
 
 **会话列表：** `harness.mjs sessions list [--dir <d>]` 输出一个 JSON 数组，最新的在前：`{session_id, title, updated_at, last_message}`。`title` 是第一条用户消息的前 40 个字（超出加「…」，空白压成一个空格），`updated_at` 是最后一条入库事件的 `t`（秒），`last_message` 是 `{role, text}`（前 200 个字），没有消息时为 null。只读，不加锁。

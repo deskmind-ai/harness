@@ -29,11 +29,12 @@ export const MAX_ASSISTANT_CHARS = 64_000;
 /** The model's errors (stored) and the refusals of a control line (sent, not stored). H2 adds computer_busy (another
  *  session holds the computer), card_open (say / steer while the running task's card waits), no_task (a task control
  *  naming no task of this session), undo_expired (a respond after another task started on this Mac) and bad_control
- *  (a control line without what it needs: a respond with no valid option index). */
-export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control"] as const;
+ *  (a control line without what it needs: a respond with no valid option index). not_idle: end_if_idle while the
+ *  session is not idle (the refusal's `why` says what holds). */
+export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 /** Codes that refuse a control line: sent without a seq, never in the history. */
-export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control"];
+export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle"];
 
 /** How a computer task ended, as the session keeps it: the executor's task_done status, or `interrupted` (the process
  *  went away and the run has no task_done). */

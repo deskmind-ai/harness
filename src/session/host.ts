@@ -49,6 +49,7 @@ export type SessionControl =
   | { type: "stop"; run_id?: string }
   | { type: "attach"; after_seq: number; run_id?: string }
   | { type: "end" }
+  | ({ type: "end_if_idle" } & ClientId)
   | ({ type: "cua"; text: string; scope?: string } & ClientId)
   | ({ type: "steer"; text: string; run_id?: string } & ClientId)
   | { type: "answer"; run_id?: string; line: Record<string, unknown> }
@@ -77,6 +78,7 @@ export function parseSessionControl(line: string): SessionControl | null {
     case "stop": return { type: "stop", ...runId };
     case "attach": return { type: "attach", after_seq: typeof o.after_seq === "number" && Number.isFinite(o.after_seq) && o.after_seq > 0 ? Math.floor(o.after_seq) : 0, ...runId };
     case "end": return { type: "end" };
+    case "end_if_idle": return { type: "end_if_idle", ...cid };
     case "cua": return str("text") ? { type: "cua", text: o.text as string, ...(str("scope") ? { scope: o.scope as string } : {}), ...cid } : null;
     case "steer": return str("text") ? { type: "steer", text: o.text as string, ...runId, ...cid } : null;
     // the executor's own control lines (control v1), forwarded as they came: extra fields (run_id) are ignored there
@@ -117,6 +119,13 @@ export interface HostOptions {
 
 const newId = () => `msg_${randomUUID().slice(0, 8)}`;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Why a session is not idle (end_if_idle's refusal names each that holds), in this order: `busy` a reply is under
+ *  way (or a /cua's task and the reply after it), `queue` words wait in the queue (held ones too), `task` a task is not
+ *  closed (running, its card open, its result card lingering for undo, or exiting by itself), `recovering` recover is
+ *  still writing an old run's records (waiting for an old executor). */
+export const NOT_IDLE = ["busy", "queue", "task", "recovering"] as const;
+export type NotIdle = (typeof NOT_IDLE)[number];
 
 /** At most this many computer tasks per user message. */
 export const MAX_TASKS = 3;
@@ -266,7 +275,8 @@ export class SessionHost {
           // the executor itself is asked to stop when it never said task_done (after it, a signal ends it at once and
           // would cut an undo short); the lock stays its group's until all of it is gone
           if (!doneAlready) { try { process.kill(own.pid, "SIGTERM"); } catch { /* gone meanwhile */ } }
-          this.recovering.push(this.awaitOld(runId, own, need));
+          this.recoverPending += 1;
+          this.recovering.push(this.awaitOld(runId, own, need).finally(() => { this.recoverPending -= 1; this.maybeExit(); }));
           continue;
         }
         this.recordRecovered(runId, need);
@@ -296,6 +306,8 @@ export class SessionHost {
 
   /** Records recover makes later (an old executor that was still running). Tests wait on them. */
   readonly recovering: Promise<void>[] = [];
+  /** How many of them are not done: the session is not idle, and does not exit, while one is (end waits for it). */
+  private recoverPending = 0;
   /** An old executor that still runs: waited for until it finished what it was doing (its task_done; its undo's
    *  result_response), its group is gone, or the stop budget is over; then what is left of its group is ended and the
    *  run's missing records written (recordRecovered). Never rejects. */
@@ -334,6 +346,7 @@ export class SessionHost {
       case "stop": return this.stop(c.run_id);
       case "attach": return c.run_id ? this.attachRun(c.run_id, c.after_seq) : this.attach(c.after_seq);
       case "end": return this.end();
+      case "end_if_idle": return this.endIfIdle(c.client_id);
       case "cua": return this.cua(c.text, c.scope, c.client_id);
       case "steer": return this.steer(c.text, c.run_id, c.client_id);
       case "answer": return this.answer(c.line, c.run_id);
@@ -897,8 +910,28 @@ export class SessionHost {
     for (const ev of readRunEvents(path.join(this.runs, runId, "events.jsonl"))) if (typeof ev.seq === "number" && ev.seq > afterSeq) this.o.out({ ...ev, session_id: this.o.sessionId });
   }
 
+  /** What keeps the session from being idle now (empty: idle). Every stdin line is handled whole before the next, and
+   *  each control that starts something (say, cua, retry, queue_send_now) has made it a reply, a task or a queue entry
+   *  by the time it returns: so a line read before this one is never a start that has not begun yet. */
+  notIdle(): NotIdle[] {
+    const why: NotIdle[] = [];
+    if (this.running || this.flows > 0) why.push("busy");
+    if (this.queue.length) why.push("queue");
+    if ([...this.tasks.values()].some((t) => t.state !== "closed")) why.push("task");
+    if (this.recoverPending > 0) why.push("recovering");
+    return why;
+  }
+
+  /** `end_if_idle`: end exactly as `end` does, only if the session is idle as this line is handled; otherwise refuse
+   *  with not_idle and `why` (each reason that holds, NOT_IDLE). One check, in the order of stdin: no probe, no race. */
+  endIfIdle(cid?: string) {
+    const why = this.notIdle();
+    if (!why.length) return this.end();
+    this.send({ kind: "session.error", code: "not_idle", text: this.t(`会话还有事没做完：${why.join("、")}`, `not idle: ${why.join(", ")}`), control: "end_if_idle", why, ...(cid ? { client_id: cid } : {}) });
+  }
+
   /** The app said end (or a signal): the running task is stopped (as when the app goes away), the reply stopped and
-   *  stored, then exit. */
+   *  stored, then exit (after recover has written what it is still waiting to write). */
   end() { this.closing = true; this.stopForExit(); this.running?.abort.abort(); this.maybeExit(); }
 
   /** stdin closed: a running task is stopped and its end waited for (12 s); a reply is let finish and stored; then exit. */
@@ -921,7 +954,8 @@ export class SessionHost {
   async idle(): Promise<void> { while (this.busy) { if (this.running) await this.running.done; else await sleep(10); } }
 
   private maybeExit() {
-    if (!this.closing || this.running || this.current || this.flows || this.exited) return;
+    // (a recover still waiting for an old executor writes its records first: an exit now would abandon them)
+    if (!this.closing || this.running || this.current || this.flows || this.recoverPending || this.exited) return;
     this.exited = true;
     const open = [...this.tasks.values()];
     for (const t of open) this.closeTask(t, "session_end");
