@@ -95,8 +95,12 @@ export const spawnExecutor: Launcher = (request, o) => {
   const [cmd, ...args] = selfCommand(["executor", "--linger", String(o.linger), "--runs", o.runs]);
   const p = spawn(cmd!, args, { stdio: ["pipe", "pipe", err], detached: true });
   fs.closeSync(err);
+  // exited once its stdout is drained too ('close'): every line it wrote has been handed on before its exit is acted
+  // on (an undo's result_response is never taken for missing). Its own children have pipes of their own, so 'close'
+  // follows 'exit' at once; should anything still hold its stdout, 2 s after 'exit' counts all the same
   const exited = new Promise<{ code: number | null; signal: string | null }>((res) => {
-    p.on("exit", (code, signal) => res({ code, signal }));
+    p.on("close", (code, signal) => res({ code, signal }));
+    p.on("exit", (code, signal) => { setTimeout(() => res({ code, signal }), 2000).unref(); });
     p.on("error", (e) => res({ code: null, signal: `spawn: ${e.message}` }));
   });
   p.stdin!.on("error", () => { /* it went away: its exit says so */ });
