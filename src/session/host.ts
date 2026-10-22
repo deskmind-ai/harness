@@ -10,6 +10,12 @@
  * waits in its tool call; what the user types meanwhile is queued, and sent to the model after the task (not after a
  * stop). The task's end is `session.task_end` (what the model is told); its executor lingers for the result card (undo)
  * until it ends by itself, another computer task starts on this Mac, or the session ends (`session.task_closed`).
+ *
+ * Terminal records (one rule, every path): the app learns that a run ended only from its session.task_end and
+ * session.task_closed (or from this process exiting). A session that cannot store one does not carry on as if it had:
+ * it halts — every executor group it has is ended and confirmed gone, the machine lock removed only while it still
+ * names that run (compare-and-set), and the process exits non-zero (onExit with the reason). The next open's recover
+ * writes what is missing.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -93,8 +99,8 @@ export interface HostOptions {
   /** Every event line, stored or not. */
   out: (ev: Record<string, unknown>) => void;
   /** Called once when the session has nothing left to do: the app went away (stdin closed) or said end, and no reply
-   *  or task runs. */
-  onExit?: () => void;
+   *  or task runs. `failure`: it halted instead — a terminal record could not be stored (the process exits non-zero). */
+  onExit?: (failure?: string) => void;
   /** Tests: a model in place of the config's. */
   model?: SessionModel;
   /** How long deltas are gathered before they are sent (ms). */
@@ -125,6 +131,7 @@ interface Running {
 }
 
 type TaskEnd = Extract<SessionBody, { kind: "session.task_end" }>;
+type TaskClosed = Extract<SessionBody, { kind: "session.task_closed" }>;
 interface Task {
   runId: string; handle: ExecutorHandle;
   /** Its process group, as the machine lock names it (0: an executor inside this process). */
@@ -149,8 +156,6 @@ interface Task {
   /** Steps it began (`step`) with no `step_result` yet: an end the session writes itself while one is open says its
    *  result is unknown (cause last_step_unknown). */
   openSteps: Set<string>;
-  /** Closed (its stdin) but its session.task_closed could not be stored then: stored when its executor exits. */
-  unrecordedClose: "new_task" | "session_end" | null;
   /** Its lock could not be set lingering at task_done: it does not linger (its card is not offered; it exits now). */
   noLinger?: boolean;
   /** Why its executor could not be sent its task (the end its exit records says so). */
@@ -173,6 +178,8 @@ export class SessionHost {
   private flows = 0;
   private closing = false;
   private exited = false;
+  /** Why the session halted (a terminal record could not be stored), or null. */
+  private halted: string | null = null;
 
   constructor(private readonly o: HostOptions) {
     this.config = o.config ?? "ds-flash";       // the app's default (cli/app.ts)
@@ -223,9 +230,11 @@ export class SessionHost {
     if (this.resumed) this.recover();
   }
 
-  /** The last process went away mid-task or while an executor lingered: a task with no session.task_end gets one, from
-   *  its run's task_done when the run has one, else `interrupted` (its executor, if it still runs, is stopped first); a
-   *  task with no session.task_closed is closed (session_end: that executor is gone with its process). */
+  /** The last process went away mid-task or while an executor lingered (or halted): a task with no session.task_end
+   *  gets one, from its run's task_done when the run has one (undo none: its executor is gone), else `interrupted` (its
+   *  executor, if it still runs, is stopped first); a task with no session.task_closed is closed (session_end: that
+   *  executor is gone with its process). A record that cannot be stored halts this process too, once every old
+   *  executor is ended: the next open tries again. */
   private recover() {
     const ended = new Set<string>(), closed = new Set<string>(), started: string[] = [];
     for (const e of this.log.events) {
@@ -240,7 +249,7 @@ export class SessionHost {
           const evs = readRunEvents(path.join(this.runs, runId, "events.jsonl"));
           const done = [...evs].reverse().find((e) => e.kind === "task_done");
           const steers = evs.filter((e) => e.kind === "steered").map((e) => String(e.text));
-          if (done) this.log.emit(endFrom(runId, done, "none", steers));
+          if (done) this.terminal(endFrom(runId, done, "none", steers));
           else {
             // its executor still runs (the lock names it): stopped, and its own end waited for (its changes are the truth)
             const own = readHolder(this.o.dir);
@@ -251,10 +260,10 @@ export class SessionHost {
               this.recovering.push(this.awaitOldEnd(runId, () => held(own), !closed.has(runId)));
               continue;
             }
-            this.log.emit(interrupted(runId, steers, evs));
+            this.terminal(interrupted(runId, steers, evs));
           }
         }
-        if (!closed.has(runId)) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
+        if (!closed.has(runId)) this.terminal({ kind: "session.task_closed", run_id: runId, why: "session_end" });
       } catch (e) { process.stderr.write(`session: recovering ${runId}: ${errText(e)}\n`); }
     }
   }
@@ -262,7 +271,7 @@ export class SessionHost {
   /** Ends recorded later by recover (an old executor that was still running). Tests wait on it. */
   readonly recovering: Promise<void>[] = [];
   /** Never rejects: the old group is ended first (when it did not end in time), then its end recorded — a record that
-   *  cannot be stored is logged (the next resume tries again). */
+   *  cannot be stored halts the session (the next resume tries again). */
   private async awaitOldEnd(runId: string, up: () => boolean, close: boolean) {
     const file = path.join(this.runs, runId, "events.jsonl");
     const t0 = Date.now();
@@ -276,10 +285,7 @@ export class SessionHost {
         if (!done) done = [...readRunEvents(file)].reverse().find((e) => e.kind === "task_done");
         const steers = readRunEvents(file).filter((e) => e.kind === "steered").map((e) => String(e.text));
         if (this.log.events.some((e) => e.kind === "session.task_end" && e.run_id === runId)) return;
-        try {
-          this.log.emit(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, readRunEvents(file)));
-          if (close) this.log.emit({ kind: "session.task_closed", run_id: runId, why: "session_end" });
-        } catch (e) { process.stderr.write(`session: recovering ${runId}: ${errText(e)}\n`); }
+        if (this.terminal(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, readRunEvents(file))) && close) this.terminal({ kind: "session.task_closed", run_id: runId, why: "session_end" });
         return;
       }
       await sleep(100);
@@ -386,6 +392,7 @@ export class SessionHost {
     r.done = reply({ model, context, signal: r.abort.signal, maxChars: MAX_ASSISTANT_CHARS, onDelta, tools: [this.computerTask(r)], onTurnStart, onTurnEnd, endNow: () => this.closing || r.final, ...(o.oneTurn ? { oneTurn: true } : {}) }).then((res) => {
       if (r.timer) { clearTimeout(r.timer); r.timer = null; }
       this.recordCalls(r, res);
+      if (this.halted) return;                           // halted: this process stores nothing more
       if (res.ended === "error") {
         r.buffer = "";
         this.fail(res.error!.code, res.error!.text, { msg_id: r.msgId, reply_to: r.replyTo });
@@ -396,6 +403,7 @@ export class SessionHost {
           ...(res.ended === "stopped" ? { stopped: true } : {}), ...(res.ended === "truncated" ? { truncated: true } : {}) });
       }
     }, (e) => {
+      if (this.halted) return;
       this.fail("network", String(e instanceof Error ? e.message : e), { msg_id: r.msgId, reply_to: r.replyTo });
     }).finally(() => { this.running = null; this.afterActivity(); this.maybeExit(); });
   }
@@ -499,7 +507,8 @@ export class SessionHost {
       if (started) this.abandon(runId, started, own, true, started.pid ?? 0);
       else if (own && !release(this.o.dir, own)) reapLater(this.o.dir, runId, own.pgid, 2000);
       // acquire may have ended this session's lingering executor before it failed: that card is closed (new_task)
-      for (const t of [...this.tasks.values()]) if (t.state === "lingering" && t.pgid > 0 && t.holder && !held(t.holder)) { try { this.closeTask(t, "new_task"); } catch { /* recorded at its exit */ } }
+      // (a close that cannot be stored halts the session)
+      for (const t of [...this.tasks.values()]) if (t.state === "lingering" && t.pgid > 0 && t.holder && !held(t.holder)) this.closeTask(t, "new_task");
       return { failed: errText(e) };
     }
     if (!("ok" in got)) return { busy: true };
@@ -510,10 +519,9 @@ export class SessionHost {
     if (started && !h.pid) inProcess.set(runId, () => h.close());
     try {
       // this session's result cards can no longer be answered: a new task started (the lock ended a lingering one).
-      // Every one is closed even if recording one fails; then the failure stops this start.
-      let failure: unknown = null;
-      for (const t of [...this.tasks.values()]) if (t.state !== "running") { try { this.closeTask(t, "new_task"); } catch (e) { failure ??= e; } }
-      if (failure) throw failure;
+      // A close that cannot be stored halts the session (every executor of it is ended): this start stops too.
+      for (const t of [...this.tasks.values()]) if (t.state !== "running") this.closeTask(t, "new_task");
+      if (this.halted) throw new Error(this.halted);
       const replyTo = o.before?.() ?? o.replyTo;
       this.log.emit({ kind: "session.task", msg_id: newId(), run_id: runId, raw: o.raw, ...(o.goal ? { goal: o.goal } : {}), by: o.by, ...(replyTo ? { reply_to: replyTo } : {}) });
     } catch (e) {
@@ -523,7 +531,7 @@ export class SessionHost {
     }
     let resolve!: (e: TaskEnd) => void;
     const ended = new Promise<TaskEnd>((res) => { resolve = res; });
-    const task: Task = { runId, handle: h, pgid, holder, responded: false, sawDone: false, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set(), unrecordedClose: null };
+    const task: Task = { runId, handle: h, pgid, holder, responded: false, sawDone: false, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set() };
     this.current = task;
     this.tasks.set(runId, task);
     void h.exited.then((x) => this.onExecutorExit(task, x));
@@ -550,6 +558,7 @@ export class SessionHost {
 
   /** An executor's event: to the app as it is (plus the session), and what the session follows of it. */
   private onExecutorLine(task: Task, line: string) {
+    if (this.halted) return;                             // halted: its executor is being ended; nothing more is said
     let ev: Record<string, unknown>;
     try { const j = JSON.parse(line); if (!j || typeof j !== "object" || Array.isArray(j)) return; ev = j; } catch { return; }
     // done acting: the lock and the task say so before anyone hears of it (an undo sent at once finds it lingering)
@@ -601,16 +610,16 @@ export class SessionHost {
     this.recordEnd(task, endFrom(task.runId, ev, undo, task.steers));
   }
 
-  /** The task's end: stored, then the task is over for the session whatever happens to the write — the model's call
-   *  returns, the session is free again. An end that could not be stored is not in the history: a resumed session
-   *  finds the task without one and takes it from the run (its task_done, else interrupted). */
+  /** The task's end: stored, then the task is over for the session — the model's call returns. An end that cannot be
+   *  stored halts the session (terminal): the next open finds the task without one and takes it from the run (its
+   *  task_done, else interrupted). */
   private recordEnd(task: Task, body: TaskEnd) {
     if (task.exitTimer) { clearTimeout(task.exitTimer); task.exitTimer = null; }
-    try { this.log.emit(body); } catch (e) { process.stderr.write(`session: the end of ${task.runId} could not be stored: ${errText(e)}\n`); }
+    const stored = this.terminal(body);
     task.end = body;
     if (this.current === task) this.current = null;
     // after a stop the queued words are not sent by themselves: the user says whether to
-    if (body.status === "stopped" && this.queue.length) {
+    if (stored && body.status === "stopped" && this.queue.length) {
       for (const q of this.queue) { q.held = true; q.note = this.t("任务已停，要发吗？", "The task was stopped. Send this?"); }
       this.emitQueue();
     }
@@ -623,6 +632,7 @@ export class SessionHost {
       // until that child ends — or is ended after the stop wait)
       inProcess.delete(task.runId);
       try { free(this.o.dir, task.runId, task.pgid); } catch { /* the next task finds its group gone */ }
+      if (this.halted) return;                           // halted: halt lets go of it; this process records nothing more
       // the lock still says it acts (no task_done of its own, or it died during an undo): what is left of its group is
       // ended after the stop wait (and by the next task, if this process is gone by then: orphaned)
       reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
@@ -634,30 +644,74 @@ export class SessionHost {
         // a lingering executor ended by a new task elsewhere on this Mac (the lock names another run now): undo expired
         const other = task.state === "lingering" && readHolder(this.o.dir)?.run_id !== undefined && readHolder(this.o.dir)?.run_id !== task.runId;
         task.state = "closed";
-        this.storeClosed(task, other ? "new_task" : "linger");
-      } else if (task.unrecordedClose) this.storeClosed(task, task.unrecordedClose);
+        this.terminal({ kind: "session.task_closed", run_id: task.runId, why: other ? "new_task" : "linger" });
+      }
     } finally {
       this.tasks.delete(task.runId);
       this.maybeExit();
     }
   }
 
-  /** session.task_closed; one that cannot be stored is logged (the history then lacks it: a resumed session adds
-   *  session_end). */
-  private storeClosed(task: Task, why: "linger" | "new_task" | "session_end") {
-    try { this.log.emit({ kind: "session.task_closed", run_id: task.runId, why }); task.unrecordedClose = null; }
-    catch (e) { process.stderr.write(`session: task_closed of ${task.runId} could not be stored: ${errText(e)}\n`); }
-  }
-
   /** Close an executor's stdin: its result card can no longer be answered. The executor is let go first, whatever
-   *  happens to the record; a record that cannot be stored throws (after the executor was let go), and is stored again
-   *  when the executor exits. */
+   *  happens to the record; a record that cannot be stored halts the session (terminal). */
   private closeTask(task: Task, why: "new_task" | "session_end") {
     if (task.state === "closed") return;
     task.state = "closed";
     try { task.handle.close(); } catch { /* gone */ }
-    try { this.log.emit({ kind: "session.task_closed", run_id: task.runId, why }); }
-    catch (e) { task.unrecordedClose = why; throw e; }
+    this.terminal({ kind: "session.task_closed", run_id: task.runId, why });
+  }
+
+  /** A run's terminal record — session.task_end or session.task_closed — stored; false when it could not be, and the
+   *  session halts. One rule for every path that writes one (an executor's task_done or exit, a card closed by a new
+   *  task, an undo that expired, the app going away, the session's exit, recover): the app learns that a run ended
+   *  only from these records or from this process exiting, so a session whose history lacks one does not carry on. */
+  private terminal(body: TaskEnd | TaskClosed): boolean {
+    if (this.halted) return false;
+    try { this.log.emit(body); return true; }
+    catch (e) { this.halt(`${body.kind} of ${body.run_id} could not be stored: ${errText(e)}`); return false; }
+  }
+
+  /** Fail-stop: this process stores nothing more, passes on no executor event and handles no later control line (the
+   *  line that led here still gets its answer: a refusal). The reply is stopped; every executor's stdin is closed, its
+   *  group ended (SIGTERM, then SIGKILL: an acting one stops with its receipt first) and confirmed gone, and the machine
+   *  lock removed only while it is still what this session wrote for that run (compare-and-set); old executors recover
+   *  is ending are waited for. Then onExit with the reason: the process exits non-zero, the helper says the session
+   *  exited, and the next open's recover writes the missing end and closure. The model's call and a /cua flow waiting on
+   *  a task are let go with an end that is not stored. */
+  private halt(why: string) {
+    if (this.halted) return;
+    this.halted = why;
+    this.closing = true;
+    this.exited = true;
+    process.stderr.write(`session: stopping: ${why}; the next open records what is missing\n`);
+    const open = [...this.tasks.values()];
+    this.current = null;
+    for (const t of open) {
+      if (t.exitTimer) { clearTimeout(t.exitTimer); t.exitTimer = null; }
+      t.state = "closed";
+      try { t.handle.close(); } catch { /* gone */ }
+    }
+    this.running?.abort.abort();
+    for (const t of open) if (!t.end) { t.end = { kind: "session.task_end", run_id: t.runId, status: "interrupted", reason: "the session stopped: its history could not be written", summary: "", undo: "none" }; t.resolve(t.end); }
+    void (async () => {
+      await Promise.all(open.map((t) => this.letGo(t)));
+      await Promise.allSettled(this.recovering);
+      this.o.onExit?.(why);
+    })();
+  }
+
+  /** Halting: the task's executor group is ended and confirmed gone, then the lock is let go — removed only while it
+   *  is still the holder this session last wrote for the run (release: run, group, state, gen), or else only when it
+   *  names this run and nothing of its group is left (free). A group that will not end keeps the lock. Never rejects. */
+  private async letGo(t: Task) {
+    try {
+      const h = t.holder;
+      if (t.pgid > 0 && h) { if (held(h)) endTree(h); }
+      else inProcess.get(t.runId)?.();
+      await Promise.race([t.handle.exited, sleep(3000)]);
+      inProcess.delete(t.runId);
+      if (!(h && release(this.o.dir, h))) free(this.o.dir, t.runId, t.pgid);
+    } catch (e) { process.stderr.write(`session: letting go of ${t.runId}: ${errText(e)}\n`); }
   }
 
   /** The executor's control lines, to the task they name (or the running one). */
@@ -686,7 +740,7 @@ export class SessionHost {
     let u: ReturnType<typeof undo>;
     try { u = t.holder ? undo(this.o.dir, t.holder) : "expired"; }
     catch (e) { return this.refuse("busy", `the machine lock: ${e instanceof Error ? e.message : String(e)}`, "respond"); }
-    if (u === "expired") { try { this.closeTask(t, "new_task"); } catch { /* let go; recorded at its exit */ } return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
+    if (u === "expired") { this.closeTask(t, "new_task"); return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
     if (u === "busy") return this.refuse("busy", this.t("这个任务的撤回正在进行", "an answer to this task's card is being carried out"), "respond");
     t.holder = u.ok;
     t.responded = true;
@@ -816,9 +870,10 @@ export class SessionHost {
     if (!this.closing || this.running || this.current || this.flows || this.exited) return;
     this.exited = true;
     const open = [...this.tasks.values()];
-    for (const t of open) { try { this.closeTask(t, "session_end"); } catch { /* let go; recorded at its exit */ } }
+    for (const t of open) this.closeTask(t, "session_end");
+    if (this.halted) return;                             // a close could not be stored: halt ends them and exits
     // the executors read their stdin's end and exit; one that does not is not waited for long
-    void Promise.race([Promise.all(open.map((t) => t.handle.exited)), sleep(2000)]).then(() => this.o.onExit?.());
+    void Promise.race([Promise.all(open.map((t) => t.handle.exited)), sleep(2000)]).then(() => { if (!this.halted) this.o.onExit?.(); });   // (halted meanwhile: halt calls it, with the reason)
   }
 }
 
