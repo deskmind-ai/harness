@@ -418,7 +418,10 @@ export class SessionHost {
     try { t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
       userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua", ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
       return userId;
-    } }); } catch (e) { return this.refuse("busy", `the task could not start: ${e instanceof Error ? e.message : String(e)}`, "cua", cid); }
+    } }); } catch (e) {
+      // (the words were stored before the failure: they are the history's, so the refusal does not name them again)
+      return this.refuse("busy", `the task could not start: ${e instanceof Error ? e.message : String(e)}`, "cua", userId ? undefined : cid);
+    }
     if ("busy" in t) return this.refuse("computer_busy", this.t("电脑正被另一个会话使用", "the computer is being used by another session"), "cua", cid);
     this.flows += 1;
     void t.ended.then(() => {
@@ -599,6 +602,8 @@ export class SessionHost {
   private sendNow(id: string) {
     const it = this.queue.find((q) => q.id === id);
     if (!it) return this.emitQueue();
+    // the session is ending: the entry stays where it is (its words are never dropped on the way out of the queue)
+    if (this.closing) return this.refuse("busy", this.t("会话正在结束", "the session is ending"), "queue_send_now", it.client_id);
     if (this.current) {
       if (this.current.card) return this.refuseCard("queue_send_now", it.client_id);
       this.queue = this.queue.filter((q) => q !== it);

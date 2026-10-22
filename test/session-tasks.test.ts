@@ -256,6 +256,51 @@ describe("session tasks: client_id on the queue (the app's words have one owner)
   });
 });
 
+describe("session tasks: client_id on steer, /cua, the card, the queue's edits, closing", () => {
+  it("a steer and a queued entry sent now as a steer store it on session.steer; /cua's message carries it; card_open names it; queue_edit keeps it", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [{ text: "好的" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE()]] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi", client_id: "k0" });
+    await waitFor(() => s.kinds("start").length);
+    expect(s.stored().find((e: any) => e.kind === "session.message")).toMatchObject({ text: "新建 a.txt 写 hi", via: "cua", client_id: "k0" });
+    s.send({ type: "steer", text: "内容就写 hi 吧", client_id: "k1" });
+    s.send({ type: "say", text: "一", client_id: "k2" });
+    const q = s.kinds("session.queue").at(-1).items;
+    s.send({ type: "queue_edit", id: q[0].id, text: "一改" });
+    expect(s.kinds("session.queue").at(-1).items[0]).toMatchObject({ text: "一改", client_id: "k2" });
+    s.send({ type: "queue_send_now", id: q[0].id });
+    await s.h.idle();
+    expect(s.stored().filter((e: any) => e.kind === "session.steer").map((e: any) => [e.text, e.client_id])).toEqual([["内容就写 hi 吧", "k1"], ["一改", "k2"]]);
+
+    // a card waits: a say and a steer are refused card_open, naming their client_id
+    const ed = editorSim();
+    const t = session({ scope: tmp(), sim: ed.make, model: [CALL("改笔记"), { text: "改好了" }], tasks: [EDIT("editor-1")] });
+    t.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await waitFor(() => t.kinds("ask").length);
+    t.send({ type: "say", text: "顺便", client_id: "k3" });
+    t.send({ type: "steer", text: "改成别的", client_id: "k4" });
+    expect(t.kinds("session.error").slice(-2).map((e: any) => [e.code, e.control, e.client_id])).toEqual([["card_open", "say", "k3"], ["card_open", "steer", "k4"]]);
+    const ask = t.kinds("ask").at(-1);
+    t.send({ type: "answer", run_id: ask.run_id, ask_id: ask.ask_id, option: 0 });
+    await t.h.idle();
+  });
+
+  it("closing: queue_send_now is refused and the entry stays queued (never dropped on the way out)", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [{ text: "好的" }], tasks: [[{ text: "想想", delayMs: 600 }, ...CREATE()]] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "say", text: "以后", client_id: "k5" });
+    const id = s.kinds("session.queue").at(-1).items[0].id;
+    s.send({ type: "end" });
+    const mark = s.evs.length;
+    s.send({ type: "queue_send_now", id });
+    expect(s.evs.slice(mark).filter((e: any) => e.kind === "session.error" || e.kind === "session.queue").map((e: any) => [e.kind, e.code, e.client_id])).toEqual([["session.error", "busy", "k5"]]);
+    expect(s.stored().some((e: any) => e.kind === "session.steer")).toBe(false);
+    await waitFor(() => s.exited());
+  });
+});
+
 describe("session tasks: undo, the machine lock, the app going away", () => {
   it("undo: respond with the undo option → undone == total; the executor then closes (linger)", async () => {
     const scope = tmp();
