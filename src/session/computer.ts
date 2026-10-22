@@ -42,7 +42,13 @@ export interface Holder {
   /** The process that started it (a session, the helper). */
   owner: number;
   t: number;
+  /** When a task first found it orphaned (acting, its owner and its leader gone, something of its group still up),
+   *  seconds since 1970: `ORPHAN_S` later the next task ends it. */
+  orphan_since?: number;
 }
+
+/** How long an orphaned acting holder keeps the Mac before the next task ends it (as long as a stop is waited for). */
+export const ORPHAN_S = 12;
 
 export const computerLockFile = (dir: string) => path.join(dir, "sessions", "computer.lock");
 export const computerGuardFile = (dir: string) => path.join(dir, "sessions", "computer.guard");
@@ -64,7 +70,7 @@ function groupAlive(pgid: number): boolean {
   if (!(pgid > 1)) return false;
   try { process.kill(-pgid, 0); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "EPERM") return false; }
   try {
-    const rows = execFileSync("/bin/ps", ["-A", "-o", "pgid=,stat="], { env: { LC_ALL: "C", PATH: "/usr/bin:/bin" }, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+    const rows = execFileSync("/bin/ps", ["-A", "-o", "pgid=,stat="], { env: { LC_ALL: "C", PATH: "/usr/bin:/bin" }, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 });
     return rows.split("\n").some((r) => { const [g, st] = r.trim().split(/\s+/); return Number(g) === pgid && !!st && !st.startsWith("Z"); });
   } catch { return true; }                              // cannot tell: held
 }
@@ -73,8 +79,10 @@ function groupAlive(pgid: number): boolean {
 export function startOf(pid: number): number | null {
   if (!(pid > 0)) return null;
   try {
-    const t = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { env: { LC_ALL: "C", PATH: "/usr/bin:/bin" }, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    const ms = Date.parse(t);
+    // in UTC, read as UTC: the same seconds the helper reads from the kernel, whatever this process's time zone
+    const t = execFileSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], { env: { LC_ALL: "C", TZ: "UTC0", PATH: "/usr/bin:/bin" }, encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 }).trim();
+    if (!t) return null;
+    const ms = Date.parse(`${t} GMT`);
     return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
   } catch { return null; }
 }
@@ -124,7 +132,7 @@ export const inProcess = new Map<string, () => void>();
 
 /** End a lingering holder's tree: SIGTERM to its group, then SIGKILL. True once it is gone. */
 export function endTree(h: Holder, o: { termMs?: number; killMs?: number } = {}): boolean {
-  if (h.pgid === 0) { inProcess.get(h.run_id)?.(); return true; }
+  if (h.pgid === 0) { const close = inProcess.get(h.run_id); close?.(); return !!close || !held(h); }
   try { process.kill(-h.pgid, "SIGTERM"); } catch { /* gone */ }
   if (waitGone(h, o.termMs ?? 1500)) return true;
   try { process.kill(-h.pgid, "SIGKILL"); } catch { /* gone */ }
@@ -138,18 +146,28 @@ export type Acquired = { ok: true; holder: Holder | null } | { busy: Holder } | 
  *  the lock names it, acting. `spawn` returning null (it could not start) writes nothing. The caller sends the
  *  executor its task only after this returns. */
 export function acquire(dir: string, who: { run_id: string; session_id: string; by: string },
-  spawn: () => { pid?: number } | null, o: { termMs?: number; killMs?: number } = {}): Acquired {
+  spawn: () => { pid?: number } | null, o: { termMs?: number; killMs?: number; now?: number } = {}): Acquired {
   return guarded(dir, () => {
     const h = readHolder(dir);
     if (h && held(h)) {
-      if (h.state === "acting") return { busy: h };
+      if (h.state === "acting") {
+        // orphaned (its owner and its leader gone, a process of its group still up): refused for ORPHAN_S, then ended
+        if (!(h.pgid > 0 && !alive(h.owner) && startOf(h.pid) === null)) return { busy: h };
+        const now = o.now ?? Date.now() / 1000;
+        if (h.orphan_since === undefined) { write(dir, { ...h, orphan_since: now }); return { busy: h }; }
+        if (now - h.orphan_since < ORPHAN_S) return { busy: h };
+      }
       if (!endTree(h, o)) return { alive: h };
     }
     const r = spawn();
     if (!r) return { ok: true, holder: null };
     const pgid = r.pid ?? 0;
     const holder: Holder = { v: 2, state: "acting", pgid, pid: pgid, start: pgid ? startOf(pgid) ?? 0 : 0, ...who, owner: process.pid, t: Date.now() / 1000 };
-    write(dir, holder);
+    try { write(dir, holder); } catch (e) {
+      // not recorded: the executor never gets its task (the caller sees the error); its group is ended at once
+      if (pgid > 0) { try { process.kill(-pgid, "SIGKILL"); } catch { /* gone */ } }
+      throw e;
+    }
     return { ok: true, holder };
   });
 }

@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { acquire, computerLockFile, free, held, linger, readHolder, startOf, undo, type Holder } from "../src/session/computer.js";
+import { acquire, computerLockFile, free, held, linger, ORPHAN_S, readHolder, startOf, undo, type Holder } from "../src/session/computer.js";
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "dm-lock-"));
 const kids: ChildProcess[] = [];
@@ -74,6 +74,40 @@ describe("the machine lock", () => {
     expect(held(h)).toBe(true);
     expect(held({ ...h, start: h.start - 3600 })).toBe(false);
     expect(held({ ...h, pgid: 999_999, pid: 999_999 })).toBe(false);
+  });
+
+  it("start time: the same seconds whatever this process's time zone (the helper reads the kernel's)", async () => {
+    const p = group();
+    const here = startOf(p.pid!);
+    const there = await new Promise<string>((r) => {
+      const c = spawn(process.execPath, ["--import", "tsx", "-e", `import { startOf } from ${JSON.stringify(path.resolve("src/session/computer.ts"))}; console.log(startOf(${p.pid}))`],
+        { env: { ...process.env, TZ: "America/New_York" }, stdio: ["ignore", "pipe", "inherit"] });
+      let s = ""; c.stdout!.on("data", (d) => (s += d)); c.on("exit", () => r(s.trim()));
+    });
+    expect(here).not.toBeNull();
+    expect(Number(there)).toBe(here);
+    expect(Math.abs(here! - Date.now() / 1000)).toBeLessThan(10);
+  });
+
+  it("an orphaned acting holder (its owner and leader gone, a child of its group up) is refused for ORPHAN_S, then ended by the next task", async () => {
+    const dir = tmp();
+    const p = group("sleep 30 & exit 0");
+    await gone(p);
+    // as a killed helper left it: acting, its owner gone
+    fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
+    const h: Holder = { v: 2, state: "acting", pgid: p.pid!, pid: p.pid!, start: 0, run_id: "run_o", session_id: "", by: "helper", owner: 999_999, t: 0 };
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify(h));
+    const t0 = Date.now() / 1000;
+    expect("busy" in acquire(dir, who("run_b"), () => ({ pid: 1 }), { now: t0 })).toBe(true);
+    expect(readHolder(dir)!.orphan_since).toBe(t0);
+    expect("busy" in acquire(dir, who("run_b"), () => ({ pid: 1 }), { now: t0 + ORPHAN_S - 1 })).toBe(true);
+    let q!: ChildProcess;
+    const r = acquire(dir, who("run_b"), () => { q = group(); return { pid: q.pid }; }, { now: t0 + ORPHAN_S, termMs: 500, killMs: 1000 });
+    expect("ok" in r).toBe(true);
+    expect(held(h)).toBe(false);
+    expect(readHolder(dir)!.run_id).toBe("run_b");
+    // a live owner's acting run is never orphaned
+    expect("busy" in acquire(dir, who("run_c"), () => ({ pid: 1 }), { now: t0 + 999 })).toBe(true);
   });
 
   it("undo: only for its own lingering run (then acting until its result_response); another's or a run gone: expired", () => {

@@ -223,11 +223,13 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 
 **电脑锁（第 2 版，会话和 DeskMind helper 共用；`src/session/computer.ts`，helper 里 `ComputerLock` 是同一协议的 Swift 版）：**
 - **两个文件**，都在 `<--dir>/sessions/` 下：`computer.guard`（空文件，只用来加 flock：读改写锁的每一步都在这个排他锁里做，进程之间不会交错；Node 用 macOS 的 `O_EXLOCK` 打开它）；`computer.lock`（占着的人，JSON，整个文件换掉：先写自己的临时文件再 rename 过去）：
-  `{"v":2, "state":"acting"|"lingering", "pgid":N, "pid":N, "start":S, "run_id":"…", "session_id":"…", "by":"session"|"helper"|"hands", "owner":P, "t":T}`
+  `{"v":2, "state":"acting"|"lingering", "pgid":N, "pid":N, "start":S, "run_id":"…", "session_id":"…", "by":"session"|"helper"|"hands", "owner":P, "t":T, "orphan_since"?:T}`
 - **占着的是能动电脑的那棵进程树：** 执行层作为一个进程组的组长启动（`pgid` = 它的 pid），它启动的都在这个组里。组里还有任何一个（不算僵尸）进程活着，锁就算占着——不管启动它的会话或 helper（`owner`）还在不在。`start` 是组长的启动时间（1970 年起的秒）：组长的 pid 活着但启动时间对不上，说明这个号已经是别人的了，算没人占。`pgid: 0` 只用于测试（执行层跑在 owner 进程里面），owner 活着就算占着。
 - **拿锁（新任务）：** 在 guard 里一步做完：锁里是 `acting` 且占着 → `computer_busy`；是 `lingering` 且占着 → 结束它（给整个组 SIGTERM，最多 1.5 秒，再 SIGKILL，最多 1 秒；还在就拒绝，helper 回 `previous_run_alive`，会话回 `computer_busy`）——它的撤回过期；然后启动执行层，写 `acting`。执行层在锁写好之后才收到请求。
 - **`task_done`：** 改成 `lingering`，在把 `task_done` 转给任何人之前。
 - **撤回：** 只有锁里正是这个任务且 `lingering` 才行，改回 `acting`；`result_response` 后改回 `lingering`。
+- **没人管的占用：** 锁是 `acting`、组里还有进程活着，但 `owner` 和组长都不在了（比如 helper 被直接杀掉、执行层自己先退出了）：下一个任务先被拒（`computer_busy`），同时在锁里记下 `orphan_since`（1970 年起的秒）；过了 12 秒（和等 stop 一样长）再来的任务就结束这个组、接过锁——不能让它永远占着。启动它的一方还在时，自己在执行层没 `task_done` 就退出后等 12 秒，组里还有人就结束它们。
+- **启动时间：** 两边算的都是内核里的秒数（Swift 读 `pbi_start_tvsec`；Node 用 `ps -o lstart` 时设 `TZ=UTC0`，按 GMT 解析），和所在时区无关。
 - **放锁：** 只在进程组确认没了之后：启动它的一方看到执行层退出时，锁还是这个任务、组里没人了，就删掉；组里还有子进程，锁照旧（`acting` 的话，下一个任务就是 `computer_busy`）。没人占的锁下一个人直接接过来。
 - 以前的 `computer.last` 不再用：新任务拿锁时直接结束 `lingering` 的那一个，这台 Mac 上最多只有一个等结果卡的执行层。
 
