@@ -1572,3 +1572,117 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
     }, 30_000);
   });
 });
+
+describe("end_if_idle: the session ends only when nothing is under way, checked in one step (no probe)", () => {
+  const notIdle = (s: ReturnType<typeof session>) => s.kinds("session.error").filter((e) => e.code === "not_idle");
+  const kids: number[] = [];
+  afterEach(() => { for (const p of kids.splice(0)) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } } });
+
+  /** A resumed session whose last process left run_old without an end, its executor still running: on SIGTERM it
+   *  writes its own task_done `stopMs` later and exits (as E3). The lock names it, acting. */
+  const resumeWithOldExecutor = async (sid: string, stopMs: number) => {
+    const dir = tmp();
+    const log = new SessionLog(dir, sid);
+    log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_old", raw: "新建 a.txt", by: "slash" });
+    const file = path.join(dir, "sessions", sid, "runs", "run_old", "events.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ seq: 1, t: 1, run_id: "run_old", kind: "start", raw: "新建 a.txt" }) + "\n");
+    const done = JSON.stringify({ seq: 2, t: 2, run_id: "run_old", kind: "task_done", status: "stopped", reason: "stopped by SIGTERM", summary: "", result_card: null });
+    const old = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{setTimeout(()=>{require("fs").appendFileSync(${JSON.stringify(file)},${JSON.stringify(done + "\n")});process.exit(0)},${stopMs})});setInterval(()=>{},1000)`], { detached: true });
+    kids.push(old.pid!);
+    await new Promise((r) => setTimeout(r, 300));
+    fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 2, state: "acting", pgid: old.pid, pid: old.pid, start: 0, session_id: sid, run_id: "run_old", by: "session", owner: 999999, t: 0 }));
+    return session({ dir, sid, model: [] });
+  };
+
+  it("idle: it ends the session as end does (onExit, no refusal)", async () => {
+    const s = session({ model: [{ text: "好" }] });
+    s.send({ type: "say", text: "你好" });
+    await s.h.idle();
+    s.send({ type: "end_if_idle", client_id: "c1" });
+    await waitFor(() => s.exited(), 3000);
+    expect(s.failure()).toBeUndefined();
+    expect(notIdle(s)).toEqual([]);
+  });
+
+  it("a say written just before it is a reply under way: not_idle [busy], with the client_id; the reply goes on and is stored", async () => {
+    const s = session({ model: [{ text: "好", delayMs: 100 }] });
+    s.send({ type: "say", text: "你好" });
+    s.send({ type: "end_if_idle", client_id: "c2" });
+    expect(notIdle(s)).toEqual([expect.objectContaining({ kind: "session.error", code: "not_idle", control: "end_if_idle", why: ["busy"], client_id: "c2" })]);
+    await s.h.idle();
+    expect(s.exited()).toBe(false);
+    expect(s.stored().filter((e: any) => e.kind === "session.message").map((e: any) => e.text)).toEqual(["你好", "好"]);
+    // a /cua written just before it: its task and its follow-up reply
+    const c = session({ scope: tmp(), model: [{ text: "建好了" }], tasks: [CREATE()] });
+    c.send({ type: "cua", text: "新建 a.txt" });
+    c.send({ type: "end_if_idle" });
+    expect(notIdle(c).at(-1).why).toEqual(["busy", "task"]);
+    expect(c.exited()).toBe(false);
+  });
+
+  it("a task running with words queued: not_idle [busy, queue, task]; after a stop, a held queue alone is [queue]; once the queue is empty it ends", async () => {
+    const t = session({ scope: tmp(), model: [CALL("新建 b.txt"), { text: "停下了" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE("b.txt")]] });
+    t.send({ type: "say", text: "新建 b.txt" });
+    await waitFor(() => t.kinds("start").length);
+    t.send({ type: "say", text: "三" });
+    t.send({ type: "end_if_idle" });
+    expect(notIdle(t).at(-1).why).toEqual(["busy", "queue", "task"]);
+    t.send({ type: "stop" });
+    await t.h.idle();
+    await waitFor(() => t.stored().some((e: any) => e.kind === "session.task_closed"));
+    const q = t.kinds("session.queue").at(-1).items;
+    expect(q).toEqual([expect.objectContaining({ text: "三", held: true })]);
+    t.send({ type: "end_if_idle" });
+    expect(notIdle(t).at(-1).why).toEqual(["queue"]);
+    expect(t.exited()).toBe(false);
+    t.send({ type: "queue_cancel", id: q[0].id });
+    t.send({ type: "end_if_idle" });
+    await waitFor(() => t.exited(), 3000);
+    expect(notIdle(t)).toHaveLength(2);
+  });
+
+  it("a result card lingering (its undo can still be clicked): not_idle [task]; the card stays answerable", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [{ text: "建好了" }], tasks: [CREATE()] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi" });
+    await s.h.idle();
+    const done = s.evs.find((e) => e.kind === "task_done");
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ undo: "open" });
+    s.send({ type: "end_if_idle" });
+    expect(notIdle(s).at(-1).why).toEqual(["task"]);
+    expect(s.exited()).toBe(false);
+    expect(s.stored().some((e: any) => e.kind === "session.task_closed")).toBe(false);
+    s.send({ type: "respond", run_id: done.run_id, option: done.result_card.options.findIndex((x: any) => x.kind === "undo") });
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
+    s.send({ type: "end_if_idle" });
+    await waitFor(() => s.exited(), 3000);
+  });
+
+  it("a recover still waiting for an old executor: not_idle [recovering]; once its records are written it ends", async () => {
+    const s = await resumeWithOldExecutor("ses_ri", 1000);
+    s.send({ type: "end_if_idle" });
+    expect(notIdle(s).at(-1)).toMatchObject({ code: "not_idle", why: ["recovering"] });
+    expect(s.exited()).toBe(false);
+    await Promise.all(s.h.recovering);
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ run_id: "run_old", status: "stopped" });
+    s.send({ type: "end_if_idle" });
+    await waitFor(() => s.exited(), 3000);
+    expect(notIdle(s)).toHaveLength(1);
+  }, 20_000);
+
+  it("plain end while recover waits for an old executor: the session exits only after the run's end and closure are stored", async () => {
+    const s = await resumeWithOldExecutor("ses_re", 1000);
+    let atExit: any[] | null = null;
+    const h = s.h as any;
+    const onExit = h.o.onExit;
+    h.o.onExit = (f?: string) => { atExit = s.stored(); onExit(f); };
+    s.send({ type: "end" });
+    await waitFor(() => s.exited(), 15_000);
+    expect(s.failure()).toBeUndefined();
+    expect(atExit!.filter((e: any) => e.kind === "session.task_end")).toEqual([expect.objectContaining({ run_id: "run_old", status: "stopped", reason: "stopped by SIGTERM" })]);
+    expect(atExit!.filter((e: any) => e.kind === "session.task_closed")).toEqual([expect.objectContaining({ run_id: "run_old", why: "session_end" })]);
+  }, 20_000);
+});
