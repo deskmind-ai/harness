@@ -132,16 +132,17 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 **会话**是左栏的一行：一段和云端模型的聊天。每个会话一个常驻进程 `harness.mjs session`，app 往它的 stdin 写控制行，从 stdout 读事件，每行一个 JSON。代码在 `src/session/`（`host.ts` 进程本体、`loop.ts` 一次回复、`context.ts` 上下文和压缩、`log.ts` 历史记录、`task.ts` 电脑任务用的锁和执行层进程），命令行在 `src/cli/session.ts`。H1 只聊天；H2（10-22）把电脑任务接进来：模型有一个工具 `computer_task`，用户有 `/cua`，见下面「电脑任务（H2）」。H2 的东西都是加的（新的事件种类、控制类型、可选字段），按第四节不升版本。
 
 **启动：**
-- 新会话或按 id 打开：`harness.mjs session [--dir <d>] [--config <c>] [--lang zh|en]`，stdin 第一行是 `{session_id?, config?, lang?, driver?, scope?}`。这个 `session_id` 已经有记录就是接着原来的会话，没有就是新会话；不给就生成一个 `ses_xxxxxxxx`。`config` 默认 `ds-flash`（和 `app-run` 一样），`lang` 默认 `zh`。`driver`（`sim` / `hands`）和 `scope`（任务目录）原样放进每个电脑任务的请求；不给时执行层用它自己的默认（`sim`，没有任务目录）。
+- 新会话或按 id 打开：`harness.mjs session [--dir <d>] [--config <c>] [--lang zh|en]`，stdin 第一行是 `{session_id?, config?, lang?, driver?, scope?}`。这个 `session_id` 已经有记录就是接着原来的会话，没有就是新会话；不给就生成一个 `ses_xxxxxxxx`。`config` 默认 `ds-flash`（和 `app-run` 一样），`lang` 默认 `zh`（重新打开时的默认见下一条「设置的先后」）。`driver`（`sim` / `hands`）和 `scope`（任务目录）原样放进每个电脑任务的请求；不给时执行层用它自己的默认（`sim`，没有任务目录）。
 - 恢复：`harness.mjs session --session <id> [--dir <d>]`，立即开始；之后来的第一行如果不带 `type`，仍然当作上面那种头一行（只用它的 `config`、`lang`、`driver`、`scope`）。没有这个会话就退出，退出码 2。
-- `session_id` 只能是字母、数字、`_`、`-`，最长 64 个字符（它是文件夹名）。头一行里的 `session_id`、`config`、`lang`、`driver`、`scope` 有值就必须是字符串，`lang` 只能是 `zh` 或 `en`。不合格时：启动阶段发一条不入库的 `session.error{code:"bad_config"}` 并退出（退出码 2）；恢复后才来的头一行不合格，只回这条错误，设置不变。
+- **设置的先后（`config`、`lang`，加的，不升版本）：** 会话的设置可以在进程活着时用 `set_config` 改（见控制表），每次都入库一条 `session.config`。打开（新开、按 id 打开、`--session` 恢复后的头一行）时，每一项各自按这个顺序取：① 这次打开自己给的（头一行的 `config` / `lang`，或命令行的 `--config` / `--lang`）；② 没给就取历史里最后一条 `session.config` 的；③ 都没有就是默认（`ds-flash`、`zh`）。① 和最后一条 `session.config` 不一样时，进程一开始（`session.start` 之后、补记之前；恢复后才来的头一行，在读到它时）再入库一条 `session.config{by:"open"}`，所以之后不带设置的打开拿到的是最近用过的那个，不会退回更早的 `set_config`。历史里还没有 `session.config` 时什么都不存（和以前一样）。所以：app 想沿用会话里存着的设置（比如用户关掉了模型，`config: null`），重新打开时就**不要**带 `config` / `lang`；带了就以带的为准。头一行不能表示「没有模型」（`config` 只能是字符串）：要以没有模型的状态打开，就在头一行之后紧接着发 `set_config{config:null}`，控制按顺序处理，它前面没有别的控制行时不会有任何一轮模型调用。
+- `session_id` 只能是字母、数字、`_`、`-`，最长 64 个字符（它是文件夹名）。头一行里的 `session_id`、`config`、`lang`、`driver`、`scope` 有值就必须是字符串，`lang` 只能是 `zh` 或 `en`，`config`（以及命令行的 `--config`）里不能有像 key 的东西（`sk-…`、`Bearer …`、环境变量里某个 key 的值：`config` 会原样入库）。不合格时：启动阶段发一条不入库的 `session.error{code:"bad_config"}` 并退出（退出码 2）；恢复后才来的头一行不合格，只回这条错误，设置不变。
 - 同一个会话同时只能有一个进程：`sessions/<id>/lock` 里写着进程号。锁是一次建好的：先把进程号写进自己的临时文件，再硬链接成 `lock`（名字已存在就失败），所以谁也读不到一个空的锁。另一个活着的进程占着时，发一条不入库的 `session.error{code:"busy"}` 后退出，退出码 1。占着它的进程已经不在了（被杀掉了），就先把旧锁改名挪开，确认挪走的确实是那个死掉的进程的锁再接过来；挪走的如果是别人刚建的锁，就放回去，自己算 busy。
 - 恢复的会话里，上一个进程留下的、没有 `session.task_end` 或 `session.task_closed` 的电脑任务，进程一开始就补上（见「电脑任务（H2）」的「重新打开」）。
 - 一个任务的 `session.task_end` 或 `session.task_closed` 写不进去时，进程结束它的执行层、放掉锁，然后以退出码 3 退出，下次打开时补上（见「电脑任务（H2）」的「任务的结局写不进去」）。
 
 **历史放在哪：** `<--dir，默认 ~/Library/Application Support/DeskMind>/sessions/<session_id>/session.jsonl`。文件夹权限 0700，文件 0600，只在这台 Mac 上。写法和运行的 `events.jsonl` 一样（`src/protocol/events.ts` 的 EventLog）：每条入库的事件带 `seq`（从 1 起，连续）、`t`（秒）、`session_id`，先写盘、fsync，再发到 stdout。电脑任务的运行目录在同一个文件夹的 `runs/<run_id>/`（执行层的 `--runs`，里面有它自己的 `events.jsonl`、trace 等，另有执行层的 stderr `executor.log`）。整台 Mac 共用的电脑锁在 `sessions/` 下：`computer.guard` 和 `computer.lock`（这台 Mac 一次只跑一个电脑任务，见下面「电脑锁」）。会话不删运行目录。
-- **入库：** 用户和助手的最终消息（`session.message`），模型出的错（`session.error` 里的 no_key、key_invalid、network、quota、bad_config），以及 H2 的 `session.task`、`session.task_end`、`session.task_closed`、`session.task_respond`、`session.task_undo`、`session.steer`、`session.retry`。
-- **不入库（没有 `seq`）：** `session.start`、流式的 `session.delta`、对某一行控制的拒绝（busy、too_long、computer_busy、card_open、no_task、undo_expired）、排队的样子 `session.queue`，以及转发的执行层事件（它们在运行目录的 `events.jsonl` 里，有自己的 `seq`）。
+- **入库：** 用户和助手的最终消息（`session.message`），模型出的错（`session.error` 里的 no_key、key_invalid、network、quota、bad_config），以及 H2 的 `session.task`、`session.task_end`、`session.task_closed`、`session.task_respond`、`session.task_undo`、`session.steer`、`session.retry`，还有设置 `session.config`。
+- **不入库（没有 `seq`）：** `session.start`、流式的 `session.delta`、对某一行控制的拒绝（busy、too_long、computer_busy、card_open、no_task、undo_expired、not_idle、bad_control、no_model，以及 `set_config` 的 bad_config）、排队的样子 `session.queue`，以及转发的执行层事件（它们在运行目录的 `events.jsonl` 里，有自己的 `seq`）。
 - 进程在回复中途被杀掉：那段回复从没入库，就没了；用户的那条消息已经入库，留着。重新打开后，这条没得到回复的消息和用户的下一条消息在上下文里连成一条（中间空一行），模型看到的仍然是一问一答交替。进程不会自己补答。
 
 **事件（进程 → app）：**
@@ -159,6 +160,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `session.task_undo` | `run_id, undone, total, refused, unknown?` | 是 | 结果卡的撤回做了（H2）：执行层 `result_response` 里的那三项。`unknown: true`（加的，不升版本）：重新打开时补记的、撤回开始了却被中断、没有 `result_response` 的那种——做了多少不知道，`undone`、`total` 这时是 0，`refused` 写原因；模型读到的是 `unknown (…)`，不会当成过期 |
 | `session.steer` | `run_id, text, client_id?` | 是 | 用户在任务进行中补充的话，已经发给执行层（H2）。执行层采用时另发 `steered` |
 | `session.retry` | `reply_to` | 是 | 用户要求重答最后一条用户消息（H2）：从上下文里拿掉之前对它的回答 |
+| `session.config` | `config, model?, lang, by: set_config\|open, client_id?` | 是 | 会话的设置，从这里起生效（加的，不升版本）：`set_config` 的回答（`by:"set_config"`，带那一行的 `client_id`），或打开时给的设置和存着的不一样（`by:"open"`，见「设置的先后」）。`config` 是配置名或 `openai:<服务>\|<模型>`，`null` 是没有模型；`model` 是它的 goal 模型 `<服务>\|<模型>`（没有模型时不带）。**从不带 key**：key 只在环境变量里（见「模型和上下文」），带 key 的 `config` 进不来。重新打开时不带设置就用最后一条的 |
 | `session.duplicate` | `client_id, control, seq` | 否 | 一行 `say`、`cua`、`steer` 带的 `client_id` 已经入库过（`seq` 是那条 `session.message` 或 `session.steer`）：这一行不再执行，这条就是它的回答（见下「client_id」） |
 | `session.queue` | `items: [{id, text, held?, note?, client_id?}]` | 否 | 任务进行时打字排队的样子（H2），每次变化都发完整的列表（空的也发）。`held: true` 是任务被停下了、不会自己发出去，`note` 是给用户看的一句话（「任务已停，要发吗？」） |
 | 执行层的事件 | 原样，加 `session_id` | 否 | 任务的每一个事件（`start`、`ask`、`step`、`task_done`、`result_response` …，第二节）原样转发，只多一个 `session_id`；它们带自己的 `run_id` 和 `seq` |
@@ -171,7 +173,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `key_invalid` | 服务拒绝了 key（HTTP 401 / 403） | 是 |
 | `quota` | 余额或额度不够、被限流（HTTP 402 / 429） | 是 |
 | `network` | 连不上、超时、服务出错（5xx），以及其他没归类的失败 | 是 |
-| `bad_config` | 不认识的配置名，配置里不是带 key 的服务，或者服务说没有这个模型（404） | 是 |
+| `bad_config` | 不认识的配置名，配置里不是带 key 的服务，或者服务说没有这个模型（404） | 是。拒绝 `set_config` 的那种（`control:"set_config"`）否 |
 | `busy` | 上一条回复还没完就又来了 `say`、`cua`、`retry`（先 `stop` 或等它说完）；或者会话被另一个进程占着 | 否 |
 | `too_long` | 用户消息超过 32k 字（字符数）。这条消息不入库，app 留着输入框里的字 | 否 |
 | `computer_busy` | `/cua` 或撤回时电脑正被另一个会话的任务占着（H2）。`/cua` 的话不入库 | 否 |
@@ -180,6 +182,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `undo_expired` | `respond` 来的时候这台 Mac 上已经开始了别的电脑任务，撤回过期了（H2）。这个任务同时关掉（`task_closed new_task`） | 否 |
 | `not_idle` | `end_if_idle` 来的时候会话不是闲着的（见控制表）：多带一个 `why`，列出 `busy`、`queue`、`task`、`recovering` 里成立的几条。会话照旧，什么都没动 | 否 |
 | `bad_control` | 控制行缺它要的东西（H2）：`respond` 没有 `option`，或者它不是结果卡上某个选项的下标（整数）。什么都不占、不转发，之后合格的 `respond` 照常 | 否 |
+| `no_model` | 会话没有模型（`set_config{config:null}`）时来了要用模型的控制：`say`、`cua`、`retry`、`steer`、`queue_send_now`（加的，不升版本）。这一行什么都不做、不入库，排队的那一项还在排队。另一种：回复的这一轮在请求发出去之前发现模型被关了（`say` 之后紧接着来了 `set_config null`），这一轮不发，回一条带 `msg_id`、`reply_to` 的 `no_model`（不入库），app 把那个气泡去掉；用户那条消息已经入库 | 否 |
 | `not_yet` | H1 用过（H2 的控制还没做时），现在不再发 | 否 |
 
 前五个出现时，用户那条消息已经入库了（`reply_to` 指向它）。错误的 `text` 最多 300 字，而且去掉了 key：环境变量里各家服务 key 的实际值（服务可能把收到的 key 原样写进错误里），以及看起来像 key 的 `sk-…`、`Bearer …`。`model-check` 用的是同一个函数（`src/gateway/index.ts` 的 `redactKeys`）。
@@ -201,11 +204,12 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 | `queue_edit` | `{"type":"queue_edit","id":"…","text":"…"}` | 改一条排队的话（H2） |
 | `queue_cancel` | `{"type":"queue_cancel","id":"…"}` | 撤掉一条排队的话（H2） |
 | `queue_send_now` | `{"type":"queue_send_now","id":"…"}` | 立刻发一条排队的话（H2）：有任务在跑就作为 `steer` 发给任务（有卡片在等时 `card_open`）；没有任务就作为 `say` 发给模型 |
+| `set_config` | `{"type":"set_config","config":"…"\|null,"lang"?:"zh"\|"en","client_id"?:"…"}` | 不重启进程，改会话的模型配置和语言（加的，不升版本）。`config` 必须有：和头一行的 `config` 是同一种值（配置名，或 `openai:<服务>\|<模型>`），或者 `null`（没有模型）。不带 key：key 照旧从进程的环境变量来，所以换到一个启动时环境里没有它的 key 的服务，下一轮是 `no_key`（要新 key 生效仍然要新进程）。不认识的配置、不是带 key 的服务、类型不对、像 key 的、`lang` 不是 zh / en：回 `bad_config`（`control:"set_config"`，不入库），什么都不变。合格的：先生效，再入库 `session.config` 作为回答（写不进去时照样生效，另回一条 `busy` 说明没存上，重新打开会用之前存的）。**按 stdin 的顺序生效：** 这一行之后要发出请求的每一轮模型调用都用新的（包括同一次回复里任务结束后的下一轮）；已经发出请求、正在流式输出的那一轮用旧的说完。`lang` 管这之后说出来的一切：下一次回复的系统提示和工具说明、会话自己的拒绝文字、之后开始的任务的请求。不是 `null` 的 `config` 不重启、不停任何东西：正在跑的任务用它开始时的配置做完，新的从下一个任务起。**`null`（没有模型）：** 再也不发起任何一轮模型调用——`say`、`cua`、`retry`（以及 `steer`、`queue_send_now`）回 `no_model`；任务结束后本来要接着说的那一轮（模型的 `computer_task` 返回之后、`/cua` 之后的那一轮）不跑，任务的结局照常入库，以后有模型时下一轮能看到；正在流式输出的那一轮说完后不再有下一轮，它要开的 `computer_task` 不开（工具返回「模型已关闭，任务没有开始」）；排队的话留在排队里，不交给模型。正在跑的电脑任务按普通的 `stop` 停下（`cause: user_stopped`，因为执行层每一步都要调云端的判官），排队的话照停下的规矩标成 `held`。不需要模型的照常：结果卡的 `respond`（撤回只用执行层的回执）、卡片的 `answer`、`stop`、`queue_edit` / `queue_cancel`、`attach`、`end`。之后再来一条不是 `null` 的 `set_config`，一切恢复：没 `held` 的排队话照常交给模型 |
 
 别的 `type`、不是 JSON 的行、没有 `type` 的对象一律忽略（兼容规则同第四节）。
 
 **模型和上下文：**
-- 用配置里 `goal` 角色的模型，经 pi-agent-core 的 `runAgentLoop` 调，流式收 `text_delta`。工具只有一个 `computer_task({goal})`（声明在开头的系统消息上，所以服务的提示缓存不受影响）。key 和服务地址从环境变量来（和 `app-run` 一样）。
+- 用配置里 `goal` 角色的模型，经 pi-agent-core 的 `runAgentLoop` 调，流式收 `text_delta`。用哪个配置在每一轮发请求之前现取（`set_config` 改了就用新的，见控制表）；这一轮的服务、key、DeepSeek 的补丁都跟着这一轮的模型走，`model_calls.jsonl` 每行的 `model` 是那一轮的模型，助手消息的 `model` 是说这条话的那一轮的。工具只有一个 `computer_task({goal})`（声明在开头的系统消息上，所以服务的提示缓存不受影响）。key 和服务地址从环境变量来（和 `app-run` 一样）：配置里只有服务名和模型名，从来没有 key；`session.jsonl`、`model_calls.jsonl`、事件里都不会出现 key（出错的文字也去掉了 key，见上）。
 - 系统提示：DeskMind 是用户 Mac 上的个人助手（末尾写着今天的本地日期）；它只能通过 `computer_task` 操作电脑；goal 写它的转述，用户原话会原样交给任务；改用户东西、往外发之前任务自己会出卡征得同意，不用先问；一条用户消息最多开 3 个任务；它看不到屏幕和文件，只看得到任务的结果；**只有 status 是 succeeded 才能说做成了**，其他状态如实说；不调 `computer_task` 时不能说自己在电脑上做了什么。`lang` 决定系统提示用中文还是英文。
 - 上下文 = 系统提示 + 入库的消息 + 电脑任务。每个任务在上下文里是模型的一次 `computer_task` 调用（`goal`；`/cua` 的是用户的原话）加上它的结果（`session.task_end` 的那些字段，撤回后来做了写成 `undone n/m`，过期了写成 `expired`），结果紧跟在调用后面。还在跑、没有结果的调用不放进去。超过模型窗口的 60%（按一个字算一个 token）时，从最早的开始整轮丢掉（一轮 = 用户的话和对它的回复，包括其间的任务），一次丢到这个额度的一半左右，系统提示末尾加一句「更早的 n 条对话已省略」（n 是丢掉的条数）。这样丢的位置隔好几轮才动一次，模型读到的开头在这几轮里不变，服务的提示缓存用得上。丢到哪里是把对话一轮一轮重放算出来的（每轮的长度只算一次），同样的历史总得到同样的结果。最新的那一轮（含最新的用户消息）永远不丢。停下前一个字都没说的回复不进上下文；说了一半的进上下文，并注明「这条回复被用户中途停下了」。
 - DeepSeek 在思考模式下，送回去的带工具调用的助手消息必须有 `reasoning_content`，否则回 400。从历史重建的调用（以及 `/cua` 代表的那次调用）没有，会话给它一个空的 `reasoning_content`（服务接受）；这次回复里模型自己的调用带着它自己的。只对 DeepSeek 这样做：服务是 DeepSeek 自己的，或者模型名里有 deepseek（经代理的）。

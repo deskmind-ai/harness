@@ -30,11 +30,12 @@ export const MAX_ASSISTANT_CHARS = 64_000;
  *  session holds the computer), card_open (say / steer while the running task's card waits), no_task (a task control
  *  naming no task of this session), undo_expired (a respond after another task started on this Mac) and bad_control
  *  (a control line without what it needs: a respond with no valid option index). not_idle: end_if_idle while the
- *  session is not idle (the refusal's `why` says what holds). */
-export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle"] as const;
+ *  session is not idle (the refusal's `why` says what holds). no_model: a control that needs the model (say, cua,
+ *  retry, steer, a queued entry sent now) while the session has no model (set_config null). */
+export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 /** Codes that refuse a control line: sent without a seq, never in the history. */
-export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle"];
+export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model"];
 
 /** How a computer task ended, as the session keeps it: the executor's task_done status, or `interrupted` (the process
  *  went away and the run has no task_done). */
@@ -77,6 +78,11 @@ export const SessionBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.steer"), run_id: z.string(), text: z.string(), client_id: z.string().optional() }),
   // H2: the user asked for the last user message to be answered again: the replies to it so far leave the context
   z.object({ kind: z.literal("session.retry"), reply_to: z.string() }),
+  // the session's model config and lang from here on (additive): `config` a config name or `openai:<provider>|<model>`
+  // (never a key: keys come from the environment), null for no model; `model` the goal model it names
+  // (`<provider>|<model>`); `by` set_config (the app's control) or open (an open that named other settings than the
+  // last stored ones). A reopen with no config / lang of its own takes the last one stored
+  z.object({ kind: z.literal("session.config"), config: z.string().nullable(), model: z.string().optional(), lang: z.enum(["zh", "en"]), by: z.enum(["set_config", "open"]), client_id: z.string().optional() }),
 ]);
 export type SessionBody = z.infer<typeof SessionBody>;
 export type SessionEvent = { seq: number; t: number; session_id: string } & SessionBody;

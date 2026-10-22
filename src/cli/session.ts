@@ -4,7 +4,8 @@
  *   session [--dir <d>] [--config <c>] [--lang zh|en]    stdin line 1: {session_id?, config?, lang?, driver?, scope?};
  *                                                        then control lines (say, stop, attach, end, end_if_idle;
  *                                                        H2: cua, steer, answer, respond, retry, queue_edit /
- *                                                        queue_cancel / queue_send_now). A known session_id resumes it; none starts
+ *                                                        queue_cancel / queue_send_now; set_config: the model config
+ *                                                        and lang, or no model). A known session_id resumes it; none starts
  *                                                        a new one. Computer tasks run as `executor` children
  *   session --session <id> [--dir <d>]                   resume <id> at once; a first line without `type` is still
  *                                                        read as the header (config, lang)
@@ -61,6 +62,8 @@ export async function sessionMain(argv: string[]): Promise<number> {
   // a start that cannot go on: said on stdout as the app reads it (bad_config, not stored), and on stderr; exit 2
   const refuse = (text: string, sessionId?: string) => { out({ t: Date.now() / 1000, ...(sessionId ? { session_id: sessionId } : {}), kind: "session.error", code: "bad_config", text }); console.error(text); return 2; };
 
+  // (a config is stored as it is — session.config — so none may carry a key)
+  if (a.config !== undefined) { const bad = headerProblem({ config: a.config }); if (bad) return refuse(bad); }
   let header: SessionHeader = {};
   let sid: string;
   if (a.session) {
