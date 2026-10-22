@@ -1252,6 +1252,19 @@ rl.on("close",()=>process.exit(0));`;
     expect(back.lastSeq).toBe(log.lastSeq);
   });
 
+  it("a close that fails after a failed sync does not hide the sync's error; a line that is not an object is skipped", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_e");
+    const f = failFs("fsyncSync", () => true), c = failFs("closeSync", () => true);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "x" })).toThrow(/fsyncSync/);
+    f.restore(); c.restore();
+    expect(c.hit.n).toBe(1);
+    log.emit({ kind: "session.retry", reply_to: "a" });
+    fs.appendFileSync(log.file, "null\n[1]\n");
+    log.emit({ kind: "session.retry", reply_to: "b" });
+    expect(new SessionLog(dir, "ses_e").events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "a"], [2, "b"]]);
+  });
+
   it("resume: the ends cannot be stored: the old executor is still ended, recovery does not reject, the next task starts", async () => {
     const dir = tmp();
     const log = new SessionLog(dir, "ses_r");

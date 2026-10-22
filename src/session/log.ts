@@ -128,17 +128,7 @@ export class SessionLog {
     // own, and its seq is used again (as EventLog)
     const raw = fs.readFileSync(this.file, "utf-8");
     if (raw && !raw.endsWith("\n")) fs.appendFileSync(this.file, "\n");
-    // a seq used again (a failed write that could not be cut back, then the next event with its seq): the later line
-    // is the event; the earlier ones from that seq on were reported as failed and never sent
-    const events: SessionEvent[] = [];
-    for (const l of raw.split("\n")) {
-      if (!l.trim()) continue;
-      let ev: SessionEvent;
-      try { ev = JSON.parse(l) as SessionEvent; } catch { continue; }
-      if (typeof ev?.seq === "number") while (events.length && events[events.length - 1]!.seq >= ev.seq) events.pop();
-      events.push(ev);
-    }
-    this.events = events;
+    this.events = parseEvents(raw);
   }
 
   get lastSeq(): number { return this.events.length; }
@@ -152,21 +142,20 @@ export class SessionLog {
     // event starts on a line of its own (the reader skips the partial one).
     const line = (this.partial ? "\n" : "") + JSON.stringify(ev) + "\n";
     const fd = fs.openSync(this.file, "a", 0o600);
-    let size = -1, synced = false, failure: unknown = null;
+    let size = -1;
     try {
       size = fs.fstatSync(fd).size;
       const want = Buffer.byteLength(line), n = fs.writeSync(fd, line);
       if (n !== want) throw Object.assign(new Error(`short write to ${path.basename(this.file)}: ${n} of ${want} bytes`), { code: "ENOSPC" });
       fs.fsyncSync(fd);
-      synced = true;
       this.partial = false;
     } catch (e) {
-      failure = e;
       if (size >= 0) { try { fs.ftruncateSync(fd, size); } catch { this.partial = true; } }
       throw e;
     } finally {
-      // (the first error is the one thrown: a close that fails after it does not hide it)
-      try { fs.closeSync(fd); } catch (e) { if (!synced && !failure) throw e; }
+      // (an error closing the file never counts: after a synced write the event is stored; after an error, that error
+      // is the one thrown)
+      try { fs.closeSync(fd); } catch { /* see above */ }
     }
     this.events.push(ev);
     this.sink?.(ev);
@@ -218,6 +207,24 @@ export class SessionLog {
   }
 }
 
+/** A session.jsonl's events, as the session reads them: lines that are not an event (a cut-off write, an empty line)
+ *  are skipped; a seq used again (a failed write that could not be cut back, then the next event with its seq) is the
+ *  later line's — the earlier ones from that seq on were reported as failed and never sent. (A failed line that is the
+ *  file's last when the process ends, with nothing after it to use its seq again, is read as an event: two disk faults
+ *  and an exit; not guarded against.) */
+function parseEvents(raw: string): SessionEvent[] {
+  const events: SessionEvent[] = [];
+  for (const l of raw.split("\n")) {
+    if (!l.trim()) continue;
+    let ev: SessionEvent;
+    try { ev = JSON.parse(l) as SessionEvent; } catch { continue; }
+    if (!ev || typeof ev !== "object" || Array.isArray(ev)) continue;
+    if (typeof ev.seq === "number") while (events.length && events[events.length - 1]!.seq >= ev.seq) events.pop();
+    events.push(ev);
+  }
+  return events;
+}
+
 /** One row of `sessions list`. */
 export interface SessionSummary { session_id: string; title: string; updated_at: number; last_message: { role: "user" | "assistant"; text: string } | null }
 
@@ -233,7 +240,7 @@ export function listSessions(dir: string): SessionSummary[] {
     if (!SESSION_ID.test(id)) continue;
     const file = path.join(root, id, "session.jsonl");
     if (!fs.existsSync(file)) continue;
-    const evs = fs.readFileSync(file, "utf-8").split("\n").filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l) as SessionEvent]; } catch { return []; } });
+    const evs = parseEvents(fs.readFileSync(file, "utf-8"));
     const msgs = evs.filter((e): e is Extract<SessionEvent, { kind: "session.message" }> => e.kind === "session.message");
     const first = msgs.find((m) => m.role === "user"), last = msgs[msgs.length - 1];
     out.push({ session_id: id, title: first ? cut(first.text, 40) : "", updated_at: evs.length ? evs[evs.length - 1]!.t : fs.statSync(file).mtimeMs / 1000, last_message: last ? { role: last.role, text: cut(last.text, 200) } : null });
