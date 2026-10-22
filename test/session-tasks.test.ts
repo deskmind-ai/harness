@@ -307,6 +307,72 @@ describe("session tasks: client_id on steer, /cua, the card, the queue's edits, 
   });
 });
 
+describe("session tasks: a repeated client_id is done once", () => {
+  it("a /cua sent twice starts one task; a steer twice is one steer; a queued say twice is one entry; across a new process too", async () => {
+    const scope = tmp(), dir = tmp();
+    const s = session({ dir, scope, model: [{ text: "好的" }, { text: "又一句" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE()]] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi", client_id: "u1" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "cua", text: "新建 a.txt 写 hi", client_id: "u1" });
+    s.send({ type: "steer", text: "内容就写 hi 吧", client_id: "u2" });
+    s.send({ type: "steer", text: "内容就写 hi 吧", client_id: "u2" });
+    s.send({ type: "say", text: "排着", client_id: "u3" });
+    s.send({ type: "say", text: "排着", client_id: "u3" });
+    expect(s.kinds("session.queue").at(-1).items.map((q: any) => q.client_id)).toEqual(["u3"]);
+    await s.h.idle();
+    expect(s.stored().filter((e: any) => e.kind === "session.task")).toHaveLength(1);
+    expect(s.stored().filter((e: any) => e.kind === "session.steer").map((e: any) => e.client_id)).toEqual(["u2"]);
+    expect(s.stored().filter((e: any) => e.kind === "session.message" && e.role === "user").map((e: any) => e.client_id)).toEqual(["u1", "u3"]);
+    expect(s.kinds("session.duplicate").map((e: any) => [e.client_id, e.control])).toEqual([["u1", "cua"], ["u2", "steer"]]);
+    expect(s.ex.requests).toHaveLength(1);
+    // a new process: the /cua's client_id is still known — no second task
+    s.h.handle(JSON.stringify({ type: "end" }));
+    await waitFor(() => s.exited());
+    const t = session({ dir, scope, model: [{ text: "不该有" }], tasks: [CREATE("b.txt")] });
+    t.send({ type: "cua", text: "新建 a.txt 写 hi", client_id: "u1" });
+    await t.h.idle();
+    expect(t.kinds("session.duplicate")).toMatchObject([{ client_id: "u1", control: "cua" }]);
+    expect(t.stored().filter((e: any) => e.kind === "session.task")).toHaveLength(1);
+    expect(t.ex.requests).toHaveLength(0);
+    // the task over: a steer with its client_id again is a repeat (duplicate), not no_task
+    t.send({ type: "steer", text: "内容就写 hi 吧", client_id: "u2" });
+    expect(t.kinds("session.duplicate").at(-1)).toMatchObject({ client_id: "u2", control: "steer" });
+    expect(t.kinds("session.error").filter((e: any) => e.client_id === "u2")).toEqual([]);
+  });
+
+  it("not taken: a /cua refused computer_busy, sent again, starts its task; words queued when the process ended are new to the next one", async () => {
+    const dir = tmp(), ed = editorSim();
+    const a = session({ dir, sid: "ses_a", sim: ed.make, model: [CALL("改笔记"), { text: "好" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+    a.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await waitFor(() => a.kinds("ask").length);
+    const b = session({ dir, sid: "ses_b", model: [{ text: "建好了" }], tasks: [CREATE("b.txt")], scope: tmp() });
+    b.send({ type: "cua", text: "新建 b.txt", client_id: "v1" });
+    expect(b.kinds("session.error").at(-1)).toMatchObject({ code: "computer_busy", client_id: "v1" });
+    const ask = a.kinds("ask").at(-1);
+    a.send({ type: "answer", run_id: ask.run_id, ask_id: ask.ask_id, option: ask.card.options.findIndex((o: any) => o.kind === "cancel") });
+    await a.h.idle();
+    await waitFor(() => { const h = readHolder(dir); return !h || !held(h); });
+    b.send({ type: "cua", text: "新建 b.txt", client_id: "v1" });
+    await waitFor(() => b.stored().some((e: any) => e.kind === "session.task"));
+    expect(b.kinds("session.duplicate")).toEqual([]);
+    await b.h.idle();
+
+    // words queued when a process ended (never stored): a new process takes them as new
+    const scope = tmp(), d2 = tmp();
+    const s = session({ dir: d2, scope, model: [{ text: "好的" }], tasks: [[{ text: "想想", delayMs: 600 }, ...CREATE()]] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi" });
+    await waitFor(() => s.kinds("start").length);
+    s.send({ type: "say", text: "排着", client_id: "w9" });
+    s.h.handle(JSON.stringify({ type: "end" }));
+    await waitFor(() => s.exited());
+    const t = session({ dir: d2, scope, model: [{ text: "收到" }] });
+    t.send({ type: "say", text: "排着", client_id: "w9" });
+    await t.h.idle();
+    expect(t.kinds("session.duplicate")).toEqual([]);
+    expect(t.stored().filter((e: any) => e.kind === "session.message" && e.client_id === "w9")).toHaveLength(1);
+  });
+});
+
 describe("session tasks: undo, the machine lock, the app going away", () => {
   it("undo: respond with the undo option → undone == total; the executor then closes (linger)", async () => {
     const scope = tmp();
