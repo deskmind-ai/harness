@@ -12,7 +12,9 @@
  * until it ends by itself, another computer task starts on this Mac, or the session ends (`session.task_closed`).
  *
  * Terminal records (one rule, every path): the app learns that a run ended only from its session.task_end and
- * session.task_closed (or from this process exiting). A session that cannot store one does not carry on as if it had:
+ * session.task_closed (or from this process exiting). A session that cannot store one — or cannot set the machine
+ * lock back after an answer it did not send (respond), which would leave the Mac held for a run that acts no more —
+ * does not carry on as if it had:
  * it halts — every executor is let finish what it is doing (its stop, an undo) within the stop budget, then its group
  * is ended and confirmed gone, the machine lock removed only while it still names that run (compare-and-set), and the
  * process exits non-zero (onExit with the reason). The next open's recover writes what is missing.
@@ -769,15 +771,22 @@ export class SessionHost {
     catch (e) { return this.refuse("busy", `the machine lock: ${e instanceof Error ? e.message : String(e)}`, "respond"); }
     if (u === "expired") { this.closeTask(t, "new_task"); return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
     if (u === "busy") return this.refuse("busy", this.t("这个任务的撤回正在进行", "an answer to this task's card is being carried out"), "respond");
+    // the lock is now the acting holder this answer wrote: every later change of it is made from that (compare-and-set)
+    t.holder = u.ok;
     // stored before the executor has it: a session that stops while an undo is under way leaves this in its history,
     // and the next open records what came of the undo (its result_response, else unknown). Not stored: the answer is
-    // not sent, the lock is set lingering again (compare-and-set), the card can still be answered
+    // not sent, the lock is set lingering again (compare-and-set), the card can still be answered. If the lock cannot
+    // be set back either, it would say acting for an executor that never got the answer — nothing would ever set it
+    // back (no result_response comes) and the Mac would stay busy until the linger ends: the session halts (as for a
+    // terminal record), which ends that executor and removes the lock by compare-and-set; the history has no answer,
+    // so the next open records no undo
     try { this.log.emit({ kind: "session.task_respond", run_id: t.runId, option: opt, undo: t.optionKinds[opt] === "undo" }); }
     catch (e) {
-      try { const n = linger(this.o.dir, u.ok); if (n) t.holder = n; } catch (x) { process.stderr.write(`computer lock: ${errText(x)}\n`); }
-      return this.refuse("busy", `the answer could not be stored: ${errText(e)}`, "respond");
+      this.refuse("busy", `the answer could not be stored: ${errText(e)}`, "respond");
+      try { const n = linger(this.o.dir, u.ok); if (n) t.holder = n; }
+      catch (x) { this.halt(`the machine lock of ${t.runId} could not be set back to lingering after its answer was not stored: ${errText(x)}`); }
+      return;
     }
-    t.holder = u.ok;
     t.responded = true;
     t.handle.write(JSON.stringify(line));
   }

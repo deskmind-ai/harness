@@ -1486,6 +1486,29 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       expect(s.stored().filter((e: any) => e.kind === "session.task_respond")).toHaveLength(1);
     }, 20_000);
 
+    it("a respond whose record cannot be stored, and whose lock cannot be set back to lingering either: the session halts, the lock is let go, and reopened no undo is recorded", async () => {
+      const ex = realExec();
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      const f = failFs("writeSync", lineOf("session.task_respond"), 1000);
+      const l = failFs("writeFileSync", (_file, data) => typeof data === "string" && data.includes('"state":"lingering"'), 1000);
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      expect(f.hit.n).toBe(1);
+      expect(l.hit.n).toBe(1);
+      expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "respond", text: expect.stringContaining("ENOSPC") });
+      await waitFor(() => s.exited(), 15_000);
+      f.restore(); l.restore();
+      expect(s.failure()).toMatch(/^the machine lock of run_\w+ could not be set back to lingering .*ENOSPC/);
+      expect(groupUp(ex.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      expect(runEvents(s.dir, runA).some((e) => e.kind === "result_response")).toBe(false);   // the executor never got it
+      const s2 = await recovered(s, ex, runA, "kept");
+      expect(s2.stored().some((e: any) => e.kind === "session.task_respond" || e.kind === "session.task_undo")).toBe(false);
+      expect(JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toBe("expired");
+    }, 20_000);
+
     it("an undo under way when the session halts is let finish (no signal cuts it); reopened, what it did is recorded", async () => {
       const ex = realExec({ undoMs: 2500 });
       const s = session({ model: [{ text: "好" }], launch: ex.launch });
