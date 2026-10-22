@@ -2,15 +2,7 @@
  * Computer tasks in a chat session (H2, docs/protocol.md 「会话（第 1 版）」): the machine lock, the executor process a
  * task runs in, and one task's life as the session follows it.
  *
- * The machine lock: `<dir>/sessions/computer.lock`, one computer task at a time on this Mac, whichever session asks.
- * It is taken the way a session's own lock is (a file of our own hard-linked to the name, a holder that is gone taken
- * over by renaming it aside first). It holds `{pid, session_id, run_id, executor_pid?, undo?}`: it counts as held while
- * the session's process or the task's executor lives. A session killed mid-task leaves its executor running until it
- * has stopped: its stdin closes (or its next event finds stdout's reader gone, EPIPE), which stops the run like a stop
- * line (cli/app.ts) — the step in flight still gets its receipt. Nobody else may start meanwhile. Taken when a task starts, released at its task_done; taken again for the
- * moment an undo runs. Beside it, `computer.last` names the last task that started on this Mac: undo expires when any
- * new computer task starts (owner 10-21), so a session with an executor lingering for its result card watches that file
- * and closes the executor when another run appears there.
+ * The machine lock (one computer task at a time on this Mac, whoever starts it) is session/computer.ts.
  *
  * The executor: `harness.mjs executor --linger <s> --runs <dir>/sessions/<sid>/runs` (cli/app.ts, unchanged), the
  * request on its stdin's first line, its events on its stdout, its stderr in the run folder's `executor.log`.
@@ -76,47 +68,15 @@ export function linkLock(file: string, content: string, live: (held: string) => 
   }
 }
 
-// --- the machine lock ----------------------------------------------------------------------------------------------
-
-export interface ComputerOwner { pid: number; session_id: string; run_id: string; executor_pid?: number; undo?: boolean }
-export const computerLockFile = (dir: string) => path.join(dir, "sessions", "computer.lock");
-export const computerLastFile = (dir: string) => path.join(dir, "sessions", "computer.last");
-
-export function readOwner(text: string | null): ComputerOwner | null {
-  if (!text) return null;
-  try { const j = JSON.parse(text); return j && typeof j === "object" && typeof j.pid === "number" ? j as ComputerOwner : null; } catch { return Number(text) > 0 ? { pid: Number(text), session_id: "", run_id: "" } : null; }
-}
-/** Held while the session's process or the task's executor lives. */
-const ownerLive = (held: string) => { const o = readOwner(held); return !!o && (alive(o.pid) || alive(o.executor_pid ?? 0)); };
-
-export interface ComputerLock { owner: ComputerOwner; release: () => void; setExecutor: (pid: number | undefined) => void }
-
-/** Take the machine lock for `owner`, or say who holds it. */
-export function takeComputer(dir: string, owner: ComputerOwner): ComputerLock | { busy: ComputerOwner | null } {
-  const l = linkLock(computerLockFile(dir), JSON.stringify(owner), ownerLive);
-  if (!l.ok) return { busy: readOwner(l.held) };
-  const o = { ...owner };
-  return { owner: o, release: l.release, setExecutor: (pid) => { if (pid) { o.executor_pid = pid; l.replace(JSON.stringify(o)); } } };
-}
-export function computerOwner(dir: string): ComputerOwner | null { return readOwner(readFile(computerLockFile(dir))); }
-
-/** The last task that started on this Mac (any session). */
-export function lastTask(dir: string): { run_id: string; session_id: string; t: number } | null {
-  const t = readFile(computerLastFile(dir));
-  try { return t ? JSON.parse(t) : null; } catch { return null; }
-}
-export function setLastTask(dir: string, runId: string, sessionId: string) {
-  const file = computerLastFile(dir);
-  const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}`;
-  fs.writeFileSync(tmp, JSON.stringify({ run_id: runId, session_id: sessionId, t: Date.now() / 1000 }), { mode: 0o600 });
-  fs.renameSync(tmp, file);
-}
-
 // --- the executor process -------------------------------------------------------------------------------------------
 
 /** One executor, however it runs: lines to its stdin, its stdout lines, its end. */
 export interface ExecutorHandle {
+  /** Its process, the leader of its own process group (none: it runs inside this process, tests). */
   pid?: number;
+  /** Send it its task (the request line): only once the machine lock names it (computer.ts acquire). An executor in
+   *  this process has its request already. */
+  start?: () => void;
   write(line: string): void;
   /** End its stdin: an executor lingering for its result card exits; a running one lets go of an open card. */
   close(): void;
@@ -125,25 +85,27 @@ export interface ExecutorHandle {
 }
 export type Launcher = (request: Record<string, unknown>, o: { runs: string; runId: string; linger: number }) => ExecutorHandle;
 
-/** The real one: this harness's `executor` as a child process; its environment is the session's (keys, hands). */
+/** The real one: this harness's `executor` as a child process, the leader of a process group of its own (what it
+ *  starts is in it: the machine lock holds that group), its environment the session's (keys, hands). It waits for its
+ *  request, sent by `start`. */
 export const spawnExecutor: Launcher = (request, o) => {
   const dir = path.join(o.runs, o.runId);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const err = fs.openSync(path.join(dir, "executor.log"), "a", 0o600);
   const [cmd, ...args] = selfCommand(["executor", "--linger", String(o.linger), "--runs", o.runs]);
-  const p = spawn(cmd!, args, { stdio: ["pipe", "pipe", err] });
+  const p = spawn(cmd!, args, { stdio: ["pipe", "pipe", err], detached: true });
   fs.closeSync(err);
   const exited = new Promise<{ code: number | null; signal: string | null }>((res) => {
     p.on("exit", (code, signal) => res({ code, signal }));
     p.on("error", (e) => res({ code: null, signal: `spawn: ${e.message}` }));
   });
   p.stdin!.on("error", () => { /* it went away: its exit says so */ });
-  p.stdin!.write(JSON.stringify(request) + "\n");
   let cb: ((l: string) => void) | null = null;
   const early: string[] = [];
   readline.createInterface({ input: p.stdout!, terminal: false }).on("line", (l) => { if (cb) cb(l); else early.push(l); });
   return {
     pid: p.pid,
+    start: () => { if (p.stdin!.writable) p.stdin!.write(JSON.stringify(request) + "\n"); },
     write: (l) => { if (p.stdin!.writable) p.stdin!.write(l + "\n"); },
     close: () => { try { p.stdin!.end(); } catch { /* gone */ } },
     onLine: (f) => { cb = f; for (const l of early.splice(0)) f(l); },
