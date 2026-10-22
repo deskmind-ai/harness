@@ -15,7 +15,7 @@ import { SessionHost } from "../src/session/host.js";
 import { SessionLog } from "../src/session/log.js";
 import { reasoningBack, withReasoningBack, reply } from "../src/session/loop.js";
 import { cutRaw, MAX_RAW, type ExecutorHandle, type Launcher } from "../src/session/task.js";
-import { computerLockFile, held, readHolder } from "../src/session/computer.js";
+import { computerLockFile, held, readHolder, reapLater } from "../src/session/computer.js";
 import { execFileSync, spawn } from "node:child_process";
 import fsCjs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -68,15 +68,15 @@ function session(o: { model: Step[]; tasks?: Step[][]; dir?: string; sid?: strin
   const dir = o.dir ?? tmp();
   const ex = inproc(o.tasks ?? [], o.sim);
   let onEvent: ((e: any) => void) | null = null;
-  let exitedFlag = false, failure: string | undefined;
+  let exitedFlag = false, failure: string | undefined, exits = 0;
   const h = new SessionHost({ dir, sessionId: o.sid ?? "ses_t", out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(o.model, seen) },
-    launch: o.launch ?? ex.launch, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: (f) => { exitedFlag = true; failure = f; } });
+    launch: o.launch ?? ex.launch, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: (f) => { exitedFlag = true; failure = f; exits += 1; } });
   hosts.push(h);
   h.start();
   const send = (c: Record<string, unknown>) => h.handle(JSON.stringify(c));
   const kinds = (k: string) => evs.filter((e) => e.kind === k);
   const stored = () => new SessionLog(dir, o.sid ?? "ses_t").events;
-  return { h, evs, seen, dir, ex, send, kinds, stored, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exitedFlag, failure: () => failure };
+  return { h, evs, seen, dir, ex, send, kinds, stored, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exitedFlag, failure: () => failure, exits: () => exits };
 }
 
 const CREATE = (name = "a.txt", text = "hi"): Step[] => [
@@ -1011,7 +1011,8 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
       const p = spawn(process.execPath, ["-e", SCRIPT], { stdio: ["pipe", "pipe", "ignore"], detached: true, env });
       pgids.push(p.pid!); groups.push(p.pid!);
       p.stdin!.on("error", () => {});
-      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("exit", (code, signal) => r({ code, signal })));
+      // (as spawnExecutor: exited once its stdout is drained)
+      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("close", (code, signal) => r({ code, signal })));
       let cb: ((l: string) => void) | null = null;
       const early: string[] = [];
       let buf = "";
@@ -1174,7 +1175,7 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     await recovered(s, ex, runA, "interrupted");
   }, 20_000);
 
-  it("undo: the lock cannot be set acting (busy, the lock stays the lingering run's); the undo's record cannot be stored (the lock is set lingering all the same); then the next task starts", async () => {
+  it("undo: the lock cannot be set acting (busy, the lock stays the lingering run's); the undo's record cannot be stored (the lock is set lingering all the same, the session halts); reopened, the undo is recorded from the run and the next task starts", async () => {
     const ex = realExec();
     const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
     s.send({ type: "cua", text: "第一件" });
@@ -1199,9 +1200,11 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     await waitFor(() => !groupUp(ex.pgids[0]!) && lockState(s.dir) === "free");
     expect(hit).toBe(1);
     expect(lockAtResponse).toBe("lingering");
-    s.send({ type: "cua", text: "第二件" });
-    await waitFor(() => doneRuns(s.evs).length === 2);
-  });
+    await halted(s, "session.task_undo");
+    (s.h.log as any).emit = orig;
+    const s2 = await recovered(s, ex, runA, "kept");
+    expect(s2.stored().filter((e: any) => e.kind === "session.task_undo")).toEqual([expect.objectContaining({ run_id: runA, undone: 1, total: 1, refused: null })]);
+  }, 20_000);
 
   it("acquire throws after its lock write landed (closing the guard fails): the lock naming this run is released and its group ended", async () => {
     const ex = realExec();
@@ -1334,8 +1337,16 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     const f = failFs("openSync", historyAppend, 100);
     const ex = realExec();
     const s = session({ dir, sid: "ses_r", model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+    // halted while recover still waits for the old executor: a halted process answers nothing (never not_idle), and
+    // exits once, after that executor is ended
+    expect(s.exited()).toBe(false);
+    s.send({ type: "end_if_idle", client_id: "e1" });
+    s.send({ type: "end" });
+    expect(s.kinds("session.error").filter((e: any) => e.control === "end_if_idle")).toEqual([]);
     await Promise.all(s.h.recovering);
     await halted(s, "session.task_end");
+    await new Promise((r) => setTimeout(r, 2200));
+    expect(s.exits()).toBe(1);
     f.restore();
     expect(groupUp(old.pid!)).toBe(false);
     expect(held(readHolder(dir)!)).toBe(false);
@@ -1348,6 +1359,90 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     s2.send({ type: "cua", text: "新建 a.txt" });
     await waitFor(() => doneRuns(s2.evs).length === 1);
     expect(readHolder(dir)).toMatchObject({ pgid: ex.pgids[0], state: "lingering" });
+  }, 20_000);
+
+  it("resume: while recover still waits for an old executor, the user's words wait in the queue (no model reads a half-recovered history); /cua and retry are busy; then they are sent", async () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_q");
+    log.emit({ kind: "session.message", msg_id: "m1", role: "user", text: "开始" });
+    log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_old", raw: "新建 a.txt", by: "slash" });
+    const old = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{});setInterval(()=>{},1000)`], { detached: true, stdio: "ignore" });
+    groups.push(old.pid!);
+    await new Promise((r) => setTimeout(r, 300));
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 2, state: "acting", pgid: old.pid, pid: old.pid, start: 0, session_id: "ses_q", run_id: "run_old", by: "session", owner: 999999, t: 0, gen: 1 }));
+    const s = session({ dir, sid: "ses_q", model: [{ text: "在的" }], exitWaitMs: 800 });
+    s.send({ type: "say", text: "在吗", client_id: "w1" });
+    expect(s.kinds("session.queue").at(-1).items).toEqual([expect.objectContaining({ text: "在吗", client_id: "w1" })]);
+    s.send({ type: "cua", text: "新建 b.txt", client_id: "c1" });
+    s.send({ type: "retry" });
+    expect(s.kinds("session.error").filter((e: any) => e.code === "busy").map((e: any) => [e.control, e.why])).toEqual([["cua", ["recovering"]], ["retry", ["recovering"]]]);
+    expect(s.stored().filter((e: any) => e.kind === "session.message")).toHaveLength(1);
+    await Promise.all(s.h.recovering);
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.message" && e.role === "assistant"));
+    const ev = s.stored();
+    const at = (f: (e: any) => boolean) => ev.findIndex(f);
+    expect(at((e) => e.kind === "session.task_end" && e.run_id === "run_old")).toBeLessThan(at((e) => e.kind === "session.message" && e.text === "在吗"));
+    expect(at((e) => e.kind === "session.task_closed" && e.run_id === "run_old")).toBeLessThan(at((e) => e.kind === "session.message" && e.text === "在吗"));
+    expect(ev.find((e: any) => e.text === "在吗")).toMatchObject({ via: "queue", client_id: "w1" });
+  }, 20_000);
+
+  it("reapLater: closing the guard fails after it read an acting leftover: the leftover group is still ended and the lock let go", async () => {
+    const dir = tmp();
+    fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
+    const left = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { detached: true, stdio: "ignore" });
+    groups.push(left.pid!);
+    await new Promise((r) => setTimeout(r, 300));
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 2, state: "acting", pgid: left.pid, pid: left.pid, start: 0, session_id: "ses_x", run_id: "run_left", by: "session", owner: process.pid, t: 0, gen: 1 }));
+    const guardFds = new Set<number>();
+    const origOpen = fsCjs.openSync;
+    const undoOpen = () => { (fsCjs as any).openSync = origOpen; syncBuiltinESMExports(); };
+    (fsCjs as any).openSync = (...a: any[]) => { const fd = (origOpen as any)(...a); if (String(a[0]).endsWith("computer.guard")) guardFds.add(fd); return fd; };
+    syncBuiltinESMExports();
+    undoFs.push(undoOpen);
+    const c = failFs("closeSync", (fd) => guardFds.has(fd));
+    reapLater(dir, "run_left", left.pid!, 20);
+    await waitFor(() => c.hit.n === 1);
+    c.restore(); undoOpen();
+    await waitFor(() => !groupUp(left.pid!), 8000);
+    await waitFor(() => !fs.existsSync(computerLockFile(dir)));
+  }, 20_000);
+
+  it("an end the session writes without task_done carries the run's changes so far: on reopen (interrupted) from its run's last changes event, and live when its executor dies", async () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_c");
+    log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_note", raw: "新建 note.txt", by: "slash" });
+    const runDir = path.join(dir, "sessions", "ses_c", "runs", "run_note");
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, "events.jsonl"), [
+      { seq: 1, t: 1, run_id: "run_note", kind: "changes", created: ["note.txt"], modified: [], deleted: [], external: [], unconfirmed: [] },
+    ].map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const ex = realExec();
+    const s = session({ dir, sid: "ses_c", model: [{ text: "好" }], launch: ex.launch });
+    const end = s.stored().find((e: any) => e.kind === "session.task_end");
+    expect(end).toMatchObject({ run_id: "run_note", status: "interrupted", changes: { created: ["note.txt"], modified: [], deleted: [], external: [] } });
+    expect(s.h.log.messages().find((m) => m.msg_id === "end_run_note")!.text).toContain("note.txt");
+    // live: the executor records what it changed in its run (its events.jsonl: not a line the session saw), then is
+    // killed with no task_done — the end the session writes (failed, "the executor exited (SIGKILL)") carries it
+    const CHANGER = `let rid="";require("readline").createInterface({input:process.stdin}).on("line",(l)=>{const j=JSON.parse(l);if(!rid){rid=j.run_id;const f=process.env.DM_EVENTS;require("fs").mkdirSync(require("path").dirname(f),{recursive:true});require("fs").appendFileSync(f,JSON.stringify({seq:1,t:1,run_id:rid,kind:"changes",created:["note.txt"],modified:[],deleted:[],external:[],unconfirmed:[]})+"\\n");console.log(JSON.stringify({seq:2,t:2,run_id:rid,kind:"step",text:"wrote"}))}});setInterval(()=>{},1000);`;
+    const pg: number[] = [];
+    const launch: Launcher = (req, lo) => {
+      const p = spawn(process.execPath, ["-e", CHANGER], { stdio: ["pipe", "pipe", "ignore"], detached: true, env: { ...process.env, DM_EVENTS: path.join(lo.runs, lo.runId, "events.jsonl") } });
+      pg.push(p.pid!); groups.push(p.pid!);
+      p.stdin!.on("error", () => {});
+      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("close", (code, signal) => r({ code, signal })));
+      let cb: ((l: string) => void) | null = null; let buf = "";
+      p.stdout!.on("data", (d) => { buf += String(d); const ls = buf.split("\n"); buf = ls.pop()!; for (const l of ls.filter(Boolean)) cb?.(l); });
+      return { pid: p.pid, start: () => { p.stdin!.write(JSON.stringify(req) + "\n"); }, write: () => {}, close: () => { try { p.stdin!.end(); } catch { /* gone */ } }, onLine: (f) => { cb = f; }, exited };
+    };
+    const s2 = session({ model: [{ text: "好" }], launch });
+    s2.send({ type: "cua", text: "新建 b.txt" });
+    await waitFor(() => s2.evs.some((e) => e.kind === "step"));
+    expect(s2.evs.some((e) => e.kind === "changes")).toBe(false);
+    process.kill(-pg[0]!, "SIGKILL");
+    await waitFor(() => s2.stored().some((e: any) => e.kind === "session.task_end"));
+    const live = s2.stored().find((e: any) => e.kind === "session.task_end") as any;
+    expect(live).toMatchObject({ status: "failed", reason: expect.stringContaining("SIGKILL"), changes: { created: ["note.txt"] } });
+    expect(s2.h.log.messages().find((m) => m.msg_id === `end_${live.run_id}`)!.text).toContain("note.txt");
   }, 20_000);
 
   describe("a run's end or closure that cannot be stored halts the session on every path (fail-stop)", () => {
@@ -1509,6 +1604,206 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       expect(JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toBe("expired");
     }, 20_000);
 
+    it("undo: closing the lock's guard fails after the acting write landed: the change is taken as made — the answer is sent, the undo is done and recorded, the lock let go (not held for an executor that never got it)", async () => {
+      const ex = realExec();
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      const guardFds = new Set<number>();
+      const origOpen = fsCjs.openSync;
+      const undoOpen = () => { (fsCjs as any).openSync = origOpen; syncBuiltinESMExports(); };
+      (fsCjs as any).openSync = (...a: any[]) => { const fd = (origOpen as any)(...a); if (String(a[0]).endsWith("computer.guard")) guardFds.add(fd); return fd; };
+      syncBuiltinESMExports();
+      undoFs.push(undoOpen);
+      const c = failFs("closeSync", (fd) => guardFds.has(fd));
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      c.restore(); undoOpen();
+      expect(c.hit.n).toBe(1);
+      expect(s.kinds("session.error").filter((e: any) => e.control === "respond")).toEqual([]);
+      await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_undo"));
+      expect(s.stored().find((e: any) => e.kind === "session.task_undo")).toMatchObject({ run_id: runA, undone: 1, total: 1 });
+      await waitFor(() => !groupUp(ex.pgids[0]!) && lockState(s.dir) === "free");
+      expect(s.exited()).toBe(false);
+    }, 20_000);
+
+    it("the executor dies while carrying out an undo: the undo is recorded as unknown before its closure (never read as expired), the session goes on", async () => {
+      const ex = realExec({ undoMs: 5000 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      expect(readHolder(s.dir)).toMatchObject({ run_id: runA, state: "acting" });
+      process.kill(-ex.pgids[0]!, "SIGKILL");
+      await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+      const recs = s.stored().filter((e: any) => e.run_id === runA && (e.kind === "session.task_undo" || e.kind === "session.task_closed"));
+      expect(recs.map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
+      expect(recs[0]).toMatchObject({ unknown: true, refused: expect.stringContaining("not known") });
+      expect(JSON.parse(s.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toMatch(/^unknown/);
+      await waitFor(() => lockState(s.dir) === "free");
+      expect(s.exited()).toBe(false);
+      s.send({ type: "cua", text: "第二件" });
+      await waitFor(() => doneRuns(s.evs).length === 2);
+    }, 20_000);
+
+    /** The run's records of these kinds, in the order stored. */
+    const recsOf = (s: ReturnType<typeof session>, runId: string, ...kinds: string[]) => s.stored().filter((e: any) => e.run_id === runId && kinds.includes(e.kind));
+
+    it("the session ends during an undo: the undo is let finish and recorded before its closure; then the process exits (cleanly)", async () => {
+      const ex = realExec({ undoMs: 2500 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      s.h.inputClosed();
+      await waitFor(() => s.exited(), 15_000);
+      expect(s.failure()).toBeUndefined();
+      const recs = recsOf(s, runA, "session.task_undo", "session.task_closed");
+      expect(recs.map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
+      expect(recs[0]).toMatchObject({ undone: 1, total: 1 });
+      await waitFor(() => !groupUp(ex.pgids[0]!) && lockState(s.dir) === "free");
+    }, 20_000);
+
+    it("the session ends during an undo that outlasts the stop budget: it exits cleanly without cutting the undo or closing the run; the undo finishes holding the lock; reopened, its real result is recorded, then the closure", async () => {
+      const ex = realExec({ undoMs: 2500 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 400 });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      s.h.inputClosed();
+      await waitFor(() => s.exited(), 15_000);
+      expect(s.failure()).toBeUndefined();
+      expect(recsOf(s, runA, "session.task_undo", "session.task_closed")).toEqual([]);   // the run stays open
+      expect(groupUp(ex.pgids[0]!)).toBe(true);                                          // the undo goes on
+      expect(readHolder(s.dir)).toMatchObject({ run_id: runA, state: "acting" });
+      await waitFor(() => !groupUp(ex.pgids[0]!), 10_000);
+      expect(runEvents(s.dir, runA).filter((e) => e.kind === "result_response")).toEqual([expect.objectContaining({ undone: 1, total: 1 })]);
+      const s2 = await recovered(s, ex, runA, "kept");
+      const recs = recsOf(s2, runA, "session.task_undo", "session.task_closed");
+      expect(recs.map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
+      expect(recs[0]).toMatchObject({ undone: 1, total: 1 });
+      expect(recs[0]).not.toHaveProperty("unknown");
+    }, 20_000);
+
+    /** A session that ended during an undo past the budget (the run left open), reopened while the undo still runs:
+     *  recover's wait is over and it watches the undo. */
+    const reopenedDuringUndo = async () => {
+      const ex = realExec({ undoMs: 3000 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      s.h.inputClosed();
+      await waitFor(() => s.exited(), 15_000);
+      const s2 = session({ dir: s.dir, model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+      await Promise.all(s2.h.recovering);
+      expect(groupUp(ex.pgids[0]!)).toBe(true);
+      expect(recsOf(s2, runA, "session.task_undo", "session.task_closed")).toEqual([]);
+      return { ex, s2, runA };
+    };
+
+    it("while recover watches an old executor's undo, the session is not idle: end_if_idle is refused (recovering) and it does not exit", async () => {
+      const { ex, s2, runA } = await reopenedDuringUndo();
+      s2.send({ type: "end_if_idle", client_id: "i1" });
+      expect(s2.kinds("session.error").at(-1)).toMatchObject({ code: "not_idle", control: "end_if_idle", why: ["recovering"], client_id: "i1" });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(s2.exited()).toBe(false);
+      await waitFor(() => recsOf(s2, runA, "session.task_closed").length === 1, 10_000);
+      await waitFor(() => !groupUp(ex.pgids[0]!));
+      s2.send({ type: "end_if_idle", client_id: "i2" });
+      await waitFor(() => s2.exited());
+    }, 20_000);
+
+    it("while an undo asked for has no outcome recorded, the model reads it as undoing (not open: never offered again, no result promised)", async () => {
+      const { s2, runA } = await reopenedDuringUndo();
+      const view = () => JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo;
+      expect(view()).toBe("undoing");
+      await waitFor(() => recsOf(s2, runA, "session.task_undo").length === 1, 10_000);
+      expect(view()).toBe("undone 1/1");
+    }, 20_000);
+
+    it("reopened while an undo left open still runs: recover waits, then watches it without cutting it (the model may speak meanwhile), and records its real result before the closure, once", async () => {
+      const ex = realExec({ undoMs: 3000 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      s.h.inputClosed();
+      await waitFor(() => s.exited(), 15_000);
+      expect(groupUp(ex.pgids[0]!)).toBe(true);
+      const s2 = session({ dir: s.dir, model: [{ text: "撤回还在做" }], launch: ex.launch, exitWaitMs: 300 });
+      await Promise.all(s2.h.recovering);
+      expect(recsOf(s2, runA, "session.task_undo", "session.task_closed")).toEqual([]);   // not cut, not guessed
+      expect(groupUp(ex.pgids[0]!)).toBe(true);
+      s2.send({ type: "say", text: "在吗" });                                          // recover's wait is over: the model speaks
+      await waitFor(() => s2.stored().some((e: any) => e.kind === "session.message" && e.role === "assistant"));
+      await waitFor(() => recsOf(s2, runA, "session.task_closed").length === 1, 10_000);
+      const recs = recsOf(s2, runA, "session.task_undo", "session.task_closed");
+      expect(recs.map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
+      expect(recs[0]).toMatchObject({ undone: 1, total: 1 });
+      expect(recs[0]).not.toHaveProperty("unknown");
+      await waitFor(() => !groupUp(ex.pgids[0]!));                  // it exits by itself after its undo
+    }, 20_000);
+
+    it("a new task finds the Mac free because the undoing executor died, before its exit is seen: the undo is recorded unknown before the closure (new_task)", async () => {
+      const ex = realExec({ undoMs: 6000 });
+      const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      process.kill(-ex.pgids[0]!, "SIGKILL");
+      // (no turn of the event loop: its exit is not seen yet when the new task starts)
+      const t0 = Date.now();
+      while (groupUp(ex.pgids[0]!)) if (Date.now() - t0 > 5000) throw new Error("the group did not end");
+      s.send({ type: "cua", text: "第二件" });
+      const recs = recsOf(s, runA, "session.task_undo", "session.task_closed");
+      expect(recs.map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
+      expect(recs[0]).toMatchObject({ unknown: true });
+      expect(recs[1]).toMatchObject({ why: "new_task" });
+      await waitFor(() => doneRuns(s.evs).length === 2);
+      await new Promise((r) => setTimeout(r, 100));
+      expect(recsOf(s, runA, "session.task_undo", "session.task_closed")).toHaveLength(2);   // its exit records nothing again
+    }, 20_000);
+
+    it("the undo's result_response is in its run file but its exit is seen before its line: the real result is recorded (not unknown), once — the line that comes later writes nothing", async () => {
+      const ex = realExec({ undoMs: 300 });
+      // the result_response line is held back past the executor's exit (its exit is seen first)
+      const launch: Launcher = (req, o) => { const h = ex.launch(req, o); return { ...h, onLine: (f) => h.onLine((l) => (l.includes('"result_response"') ? void setTimeout(() => f(l), 500) : f(l))) }; };
+      const s = session({ model: [{ text: "好" }], launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      await waitFor(() => recsOf(s, runA, "session.task_closed").length === 1);
+      await new Promise((r) => setTimeout(r, 800));                 // the held-back line has come by now
+      const recs = recsOf(s, runA, "session.task_undo", "session.task_closed");
+      expect(recs.map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
+      expect(recs[0]).toMatchObject({ undone: 1, total: 1 });
+      expect(recs[0]).not.toHaveProperty("unknown");
+      expect(s.kinds("result_response")).toHaveLength(1);
+    }, 20_000);
+
+    it("ending while a reply runs, the user answers the card (undo) before the session exits: the undo runs under the same rule — its outcome, then the closure, then a clean exit", async () => {
+      const ex = realExec({ undoMs: 300 });
+      const s = session({ model: [{ text: "好" }, { text: "慢慢说完", chunks: ["慢慢", "说完"], delayMs: 400 }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "say", text: "再说说" });
+      s.h.inputClosed();                                             // the reply is let finish first
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      expect(s.kinds("session.error").filter((e: any) => e.control === "respond")).toEqual([]);
+      await waitFor(() => s.exited(), 15_000);
+      expect(s.failure()).toBeUndefined();
+      expect(recsOf(s, runA, "session.task_undo", "session.task_closed").map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
+    }, 20_000);
+
     it("an undo under way when the session halts is let finish (no signal cuts it); reopened, what it did is recorded", async () => {
       const ex = realExec({ undoMs: 2500 });
       const s = session({ model: [{ text: "好" }], launch: ex.launch });
@@ -1526,31 +1821,14 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       expect(groupUp(ex.pgids[0]!)).toBe(false);
       expect(lockState(s.dir)).toBe("free");
       expect(s.stored().find((e: any) => e.kind === "session.task_respond")).toMatchObject({ run_id: runA, option: 0, undo: true });
-      expect(s.stored().some((e: any) => e.kind === "session.task_undo")).toBe(false);
+      // the session's end waited for the undo: its record is stored before the closure that failed (no closure)
+      expect(recsOf(s, runA, "session.task_undo", "session.task_closed").map((e: any) => e.kind)).toEqual(["session.task_undo"]);
       const s2 = await recovered(s, ex, runA, "kept");
       expect(s2.stored().filter((e: any) => e.kind === "session.task_undo")).toEqual([expect.objectContaining({ run_id: runA, undone: 1, total: 1, refused: null })]);
       expect(s2.stored().find((e: any) => e.kind === "session.task_undo")).not.toHaveProperty("unknown");
       expect(JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toBe("undone 1/1");
     }, 20_000);
 
-    it("an undo that outlasts the stop budget is ended after it; reopened, the undo is recorded as unknown (never as expired)", async () => {
-      const ex = realExec({ undoMs: 6000 });
-      const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 400 });
-      s.send({ type: "cua", text: "第一件" });
-      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
-      const runA = doneRuns(s.evs)[0];
-      s.send({ type: "respond", run_id: runA, option: 0 });
-      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
-      s.h.inputClosed();
-      await halted(s, "session.task_closed");
-      f.restore();
-      expect(groupUp(ex.pgids[0]!)).toBe(false);
-      expect(lockState(s.dir)).toBe("free");
-      expect(runEvents(s.dir, runA).some((e) => e.kind === "result_response")).toBe(false);
-      const s2 = await recovered(s, ex, runA, "kept");
-      expect(s2.stored().filter((e: any) => e.kind === "session.task_undo")).toEqual([expect.objectContaining({ run_id: runA, unknown: true, refused: expect.stringContaining("not known") })]);
-      expect(JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toMatch(/^unknown/);
-    }, 20_000);
 
     it("a task still acting when the session halts gets its own stop (SIGTERM to the executor alone, not its group, waited for past endTree's 1.5 s): its task_done is the end recorded on reopen", async () => {
       const stop = stopperExec(2200);

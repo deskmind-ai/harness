@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { Message } from "@earendil-works/pi-ai";
 import { SessionHost } from "../src/session/host.js";
 import { SessionLog } from "../src/session/log.js";
+import { computerLockFile } from "../src/session/computer.js";
 import { configSyntaxProblem } from "../src/gateway/index.js";
 import type { SessionModel } from "../src/session/loop.js";
 import type { ExecutorHandle, Launcher } from "../src/session/task.js";
@@ -60,7 +61,7 @@ afterEach(async () => { for (const h of hosts.splice(0)) h.end(); await sleep(50
 
 /** A session whose model is chosen by config name: `models[name]` is that config's script, and `seen[name]` every
  *  request that config's model got (its length: how many model calls it made). */
-function session(o: { models: Record<string, Step[]>; config?: string; lang?: "zh" | "en"; tasks?: Step[][]; dir?: string; scope?: string; sim?: (scope?: string) => SimComputer }) {
+function session(o: { models: Record<string, Step[]>; config?: string; lang?: "zh" | "en"; tasks?: Step[][]; dir?: string; sid?: string; scope?: string; sim?: (scope?: string) => SimComputer; exitWaitMs?: number }) {
   const evs: any[] = [];
   const dir = o.dir ?? tmp();
   const ex = inproc(o.tasks ?? [], o.sim);
@@ -69,15 +70,17 @@ function session(o: { models: Record<string, Step[]>; config?: string; lang?: "z
     // (a config must be one by its grammar: config C("A") is "openai:openrouter|model-a", its turns go to A's script)
   const model = (c: string): SessionModel => { const k = /^openai:openrouter\|model-(\w+)$/.exec(c)?.[1]?.toUpperCase() ?? c; return (made[k] ??= { model: modelOf(k.toLowerCase()), streamFn: scriptedStream(o.models[k] ?? [], seen[k] ??= []) }); };
   let onEvent: ((e: any) => void) | null = null;
-  const h = new SessionHost({ dir, sessionId: "ses_c", out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model, launch: ex.launch,
+  const sid = o.sid ?? "ses_c";
+  let exited = false;
+  const h = new SessionHost({ dir, sessionId: sid, out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model, launch: ex.launch, onExit: () => { exited = true; }, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}),
     ...(o.config ? { config: o.config } : {}), ...(o.lang ? { lang: o.lang } : {}), ...(o.scope ? { scope: o.scope } : {}) });
   hosts.push(h);
   h.start();
   const send = (c: Record<string, unknown>) => h.handle(JSON.stringify(c));
   const kinds = (k: string) => evs.filter((e) => e.kind === k);
-  const stored = () => new SessionLog(dir, "ses_c").events as any[];
+  const stored = () => new SessionLog(dir, sid).events as any[];
   const calls = (c: string) => seen[c]?.length ?? 0;
-  return { h, evs, seen, dir, ex, send, kinds, stored, calls, on: (f: (e: any) => void) => { onEvent = f; } };
+  return { h, evs, seen, dir, ex, send, kinds, stored, calls, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exited };
 }
 
 const CREATE = (name = "a.txt", text = "hi"): Step[] => [
@@ -377,6 +380,33 @@ describe("set_config null: no model, nothing more goes to it", () => {
     s.send({ type: "end_if_idle" });
     expect(s.kinds("session.error").filter((e) => e.code === "not_idle")).toEqual([]);
   });
+
+  it("reopened with no model while recover still waits for an old executor: say is no_model at once (not queued for after recover), cua and retry too; nothing reaches a model; the session ends when idle", async () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_q");
+    log.emit({ kind: "session.message", msg_id: "m1", role: "user", text: "开始" });
+    log.emit({ kind: "session.config", config: null, lang: "zh", by: "set_config" });
+    log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_old", raw: "新建 a.txt", by: "slash" });
+    const old = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{});setInterval(()=>{},1000)`], { detached: true, stdio: "ignore" });
+    try {
+      await sleep(300);
+      fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 2, state: "acting", pgid: old.pid, pid: old.pid, start: 0, session_id: "ses_q", run_id: "run_old", by: "session", owner: 999999, t: 0, gen: 1 }));
+      const s = session({ dir, sid: "ses_q", models: { A: [{ text: "不该有" }] }, exitWaitMs: 800 });
+      expect(s.h.config).toBeNull();
+      expect(s.h.notIdle()).toEqual(["recovering"]);
+      s.send({ type: "say", text: "在吗", client_id: "w1" });
+      s.send({ type: "cua", text: "新建 b.txt", client_id: "c1" });
+      s.send({ type: "retry" });
+      expect(s.kinds("session.error").map((e) => [e.code, e.control, e.client_id])).toEqual([["no_model", "say", "w1"], ["no_model", "cua", "c1"], ["no_model", "retry", undefined]]);
+      expect(s.kinds("session.queue")).toEqual([]);
+      await Promise.all(s.h.recovering);
+      expect(s.stored().find((e) => e.kind === "session.task_end" && e.run_id === "run_old")).toBeTruthy();
+      expect(s.stored().filter((e) => e.kind === "session.message").map((e) => e.text)).toEqual(["开始"]);
+      expect(s.calls("A")).toBe(0);
+      s.send({ type: "end_if_idle" });
+      await waitFor(() => s.exited(), 3000);
+    } finally { try { process.kill(-old.pid!, "SIGKILL"); } catch { /* gone */ } }
+  }, 20_000);
 
   it("undo on a lingering result card still works with no model (the executor's receipts; no model call)", async () => {
     const scope = tmp();
