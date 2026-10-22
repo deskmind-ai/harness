@@ -978,7 +978,7 @@ describe("a task start that fails part-way lets go of what it took (the disk is 
     let left = times;
     const hit = { n: 0 };
     (fsCjs as any)[name] = (...a: any[]) => {
-      if (left > 0 && when(...a)) { left -= 1; hit.n += 1; throw Object.assign(new Error(`ENOSPC: no space left on device, ${name}`), { code: "ENOSPC" }); }
+      if (left > 0 && when(...a)) { left -= 1; hit.n += 1; if (name === "closeSync") { try { orig(...a); } catch { /* closed all the same */ } } throw Object.assign(new Error(`ENOSPC: no space left on device, ${name}`), { code: "ENOSPC" }); }
       return orig(...a);
     };
     syncBuiltinESMExports();
@@ -1235,6 +1235,21 @@ rl.on("close",()=>process.exit(0));`;
     t.restore();
     log.emit({ kind: "session.retry", reply_to: "m3" });
     expect(new SessionLog(dir, "ses_w").events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "m1"], [2, "m3"]]);
+  });
+
+  it("two faults at once (the sync fails, and so does the cut back): the failed lines stay in the file, but the reader takes the later line for a seq used again", () => {
+    const dir = tmp();
+    const log = new SessionLog(dir, "ses_d");
+    log.emit({ kind: "session.retry", reply_to: "m0" });
+    const f = failFs("fsyncSync", () => true, 2), t = failFs("ftruncateSync", () => true, 2);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "failed_a" })).toThrow(/ENOSPC/);
+    expect(() => log.emit({ kind: "session.retry", reply_to: "failed_b" })).toThrow(/ENOSPC/);
+    f.restore(); t.restore();
+    log.emit({ kind: "session.retry", reply_to: "ok" });
+    expect(fs.readFileSync(log.file, "utf-8")).toContain("failed_a");
+    const back = new SessionLog(dir, "ses_d");
+    expect(back.events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "m0"], [2, "ok"]]);
+    expect(back.lastSeq).toBe(log.lastSeq);
   });
 
   it("resume: the ends cannot be stored: the old executor is still ended, recovery does not reject, the next task starts", async () => {

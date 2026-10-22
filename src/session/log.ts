@@ -128,7 +128,17 @@ export class SessionLog {
     // own, and its seq is used again (as EventLog)
     const raw = fs.readFileSync(this.file, "utf-8");
     if (raw && !raw.endsWith("\n")) fs.appendFileSync(this.file, "\n");
-    this.events = raw.split("\n").filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l) as SessionEvent]; } catch { return []; } });
+    // a seq used again (a failed write that could not be cut back, then the next event with its seq): the later line
+    // is the event; the earlier ones from that seq on were reported as failed and never sent
+    const events: SessionEvent[] = [];
+    for (const l of raw.split("\n")) {
+      if (!l.trim()) continue;
+      let ev: SessionEvent;
+      try { ev = JSON.parse(l) as SessionEvent; } catch { continue; }
+      if (typeof ev?.seq === "number") while (events.length && events[events.length - 1]!.seq >= ev.seq) events.pop();
+      events.push(ev);
+    }
+    this.events = events;
   }
 
   get lastSeq(): number { return this.events.length; }
@@ -142,7 +152,7 @@ export class SessionLog {
     // event starts on a line of its own (the reader skips the partial one).
     const line = (this.partial ? "\n" : "") + JSON.stringify(ev) + "\n";
     const fd = fs.openSync(this.file, "a", 0o600);
-    let size = -1, synced = false;
+    let size = -1, synced = false, failure: unknown = null;
     try {
       size = fs.fstatSync(fd).size;
       const want = Buffer.byteLength(line), n = fs.writeSync(fd, line);
@@ -151,10 +161,12 @@ export class SessionLog {
       synced = true;
       this.partial = false;
     } catch (e) {
+      failure = e;
       if (size >= 0) { try { fs.ftruncateSync(fd, size); } catch { this.partial = true; } }
       throw e;
     } finally {
-      try { fs.closeSync(fd); } catch (e) { if (!synced) throw e; }
+      // (the first error is the one thrown: a close that fails after it does not hide it)
+      try { fs.closeSync(fd); } catch (e) { if (!synced && !failure) throw e; }
     }
     this.events.push(ev);
     this.sink?.(ev);
