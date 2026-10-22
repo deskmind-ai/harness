@@ -24,7 +24,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { Type } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
-import { configSyntaxProblem, configTable, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
+import { configSyntaxProblem, configTable, normalizeConfig, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
 import { loopModel } from "../runtime/model.js";
 import { PROTOCOL } from "../protocol/version.js";
 import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
@@ -218,7 +218,7 @@ export class SessionHost {
     for (const ev of this.log.events) this.noteTaken(ev);
     // the open's own settings win; without them, the last stored (set_config, or an earlier open's); else the defaults
     const last = this.lastConfig();
-    this.config = o.config !== undefined ? o.config : last ? last.config : "ds-flash";     // the app's default (cli/app.ts)
+    this.config = o.config !== undefined ? normalizeConfig(o.config) : last ? last.config : "ds-flash";     // the app's default (cli/app.ts)
     this.lang = o.lang === "en" || o.lang === "zh" ? o.lang : last ? last.lang : "zh";
   }
 
@@ -390,7 +390,7 @@ export class SessionHost {
   configure(h: Record<string, unknown>) {
     const bad = headerProblem(h);
     if (bad) return this.refuse("bad_config", bad);
-    if (typeof h.config === "string") this.config = h.config;
+    if (typeof h.config === "string") this.config = normalizeConfig(h.config);
     if (h.lang === "zh" || h.lang === "en") this.lang = h.lang;
     if (typeof h.driver === "string") this.o.driver = h.driver;
     if (typeof h.scope === "string") this.o.scope = h.scope;
@@ -431,7 +431,7 @@ export class SessionHost {
     const bad = this.configProblem(line);
     if (bad) return this.refuse("bad_config", bad, "set_config", cid);
     const was = this.config;
-    this.config = line.config as string | null;
+    this.config = typeof line.config === "string" ? normalizeConfig(line.config) : null;
     if (line.lang === "zh" || line.lang === "en") this.lang = line.lang;
     // (applied whatever the record: no model must hold in this process even when the disk does not take the record)
     try { this.storeConfig("set_config", cid); }
@@ -1211,9 +1211,10 @@ export function headerProblem(h: Record<string, unknown>): string | null {
 /** A config's goal model, `<provider>|<model>` (a keyed service), or why it cannot be the session's. */
 function goalOf(config: string): { spec: string } | { code: ErrorCode; text: string } {
   const table = configTable(config);
-  if (!table) return { code: "bad_config", text: `unknown config ${config.slice(0, 80)}` };
+  // (the text never repeats the config: see configSyntaxProblem)
+  if (!table) return { code: "bad_config", text: "unknown config" };
   const goal = table.goal;
-  if (goal.backend !== "openai") return { code: "bad_config", text: `config ${config.slice(0, 80)}: the session needs a keyed service (<provider>|<model>), not ${goal.backend}` };
+  if (goal.backend !== "openai") return { code: "bad_config", text: `this config's model is not a keyed service (<provider>|<model>) but ${goal.backend}` };
   const p = providerOf(goal.model);
   if ("error" in p) return { code: "bad_config", text: p.error };
   return { spec: goal.model };

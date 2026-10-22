@@ -15,7 +15,8 @@ import type { Message } from "@earendil-works/pi-ai";
 import { SessionHost } from "../src/session/host.js";
 import { SessionLog } from "../src/session/log.js";
 import { computerLockFile } from "../src/session/computer.js";
-import { configSyntaxProblem } from "../src/gateway/index.js";
+import { configSyntaxProblem, normalizeConfig } from "../src/gateway/index.js";
+import { modelCheck } from "../src/cli/app.js";
 import type { SessionModel } from "../src/session/loop.js";
 import type { ExecutorHandle, Launcher } from "../src/session/task.js";
 import { appRun, LineReader } from "../src/cli/app.js";
@@ -222,13 +223,34 @@ describe("set_config: the model and lang of a live session", () => {
     }
   });
 
-  it("the config grammar, exactly; a key of the environment is matched as a whole part, not as a substring", () => {
-    const env = { LOCAL_API_KEY: "qwen30", CUSTOM_API_KEY: "0123456789abcdef0123456789abcdef", MY_TOKEN: "AIzaSyDummyKey123" } as NodeJS.ProcessEnv;
+  it("the config grammar, exactly; a key of the environment (12 characters or more) is matched whole, never as a substring", () => {
+    const env = { LOCAL_API_KEY: "qwen30-local-key", CUSTOM_API_KEY: "custom", OPENROUTER_API_KEY: "0123456789abcdef0123456789abcdef", MY_TOKEN: "AIzaSyDummyKey123", QIANFAN_API_KEY: "bce-v3/ALTAK-abc123/def456789+xyz", SHORT_TOKEN: "qwen30" } as NodeJS.ProcessEnv;
     const ok = (c: string) => configSyntaxProblem(c, env);
-    for (const c of ["ds-flash", "openai:local|local-qwen30b", "openai:custom|risk-classifier-v2", "openai:volcengine|doubao-seed-1.6", "openai:local|qwen30b"]) expect(ok(c), c).toBeNull();
-    for (const c of ["openai:local|qwen30", "openai:custom|0123456789abcdef0123456789abcdef", "openai:custom|org/0123456789abcdef0123456789abcdef", "openai:custom|AIzaSyDummyKey123",
-      "openai:custom|m?api_key=x", "openai:custom|m#frag", "openai:custom|m=1", "openai:custom|", "openai:custom|-m", "custom|m", "openai:Custom|m", "Ds-flash", "ds-flash "]) expect(ok(c), c).not.toBeNull();
-    expect(ok("openai:local|qwen30")).toMatch(/never carries a key/);
+    for (const c of ["ds-flash", "openai:local|local-qwen30b", "openai:local|qwen30", "openai:local|qwen30-local-key-v2", "openai:custom|risk-classifier-v2", "openai:volcengine|doubao-seed-1.6",
+      // a placeholder key (custom) is not a key; Cloudflare's @cf models; a pasted name with spaces around it
+      "openai:custom|custom", "openai:custom|@cf/meta/llama-3.1-8b-instruct", "openai:custom|deepseek-chat ", "openai:custom|  deepseek-chat\t"]) expect(ok(c), c).toBeNull();
+    for (const c of ["openai:local|qwen30-local-key", "openai:custom|0123456789abcdef0123456789abcdef", "openai:custom|org/0123456789abcdef0123456789abcdef", "openai:custom|AIzaSyDummyKey123",
+      "openai:custom|bce-v3/ALTAK-abc123/def456789+xyz", "openai:custom| bce-v3/ALTAK-abc123/def456789+xyz ",
+      "openai:custom|m?api_key=x", "openai:custom|m#frag", "openai:custom|m=1", "openai:custom|", "openai:custom|   ", "openai:custom|-m", "openai:custom|two words", "custom|m", "openai:Custom|m", "Ds-flash", "ds-flash "]) expect(ok(c), c).not.toBeNull();
+    expect(ok("openai:local|qwen30-local-key")).toMatch(/never carries a key/);
+    expect(normalizeConfig("openai:custom| deepseek-chat \n")).toBe("openai:custom|deepseek-chat");
+    expect(normalizeConfig("ds-flash")).toBe("ds-flash");
+  });
+
+  it("a model name with spaces around it is taken trimmed: stored, used and sent to the executor without them", async () => {
+    const s = session({ config: C("A"), scope: tmp(), models: { A: [], B: [CALL("新建 a.txt"), { text: "好" }] }, tasks: [CREATE()] });
+    s.send({ type: "set_config", config: `${C("B").replace("|", "|  ")} ` });
+    expect(s.stored().at(-1)).toMatchObject({ kind: "session.config", config: C("B"), model: "b|m" });
+    expect(s.h.config).toBe(C("B"));
+    s.send({ type: "say", text: "新建 a.txt" });
+    await s.h.idle();
+    expect(s.ex.requests[0].config).toBe(C("B"));
+    // reopened with a padded config of its own: the same config, nothing new stored
+    s.h.end();
+    const n = s.stored().length;
+    const t = session({ dir: s.dir, config: `${C("B")} `, models: { B: [] } });
+    expect(t.h.config).toBe(C("B"));
+    expect(t.stored()).toHaveLength(n);
   });
 });
 
@@ -538,5 +560,30 @@ describe("set_config: keys stay in the environment (the real process)", () => {
     const files = ["session.jsonl", "model_calls.jsonl"].map((f) => fs.readFileSync(path.join(dir, "sessions", "ses_k", f), "utf-8"));
     for (const text of [...files, A.all(), B.all(), C.all()]) for (const key of ["SECRET0001", "SECRET0002", "abcdefghijklmnop"]) expect(text).not.toContain(key);
     expect(JSON.parse(files[0]!.trim().split("\n").at(-1)!)).toMatchObject({ kind: "session.message", role: "assistant", model: "custom|fake-b" });
+  }, 60_000);
+
+  it("a Cloudflare model (@cf/…) or a pasted name with a trailing space opens the session; model-check takes exactly what the session takes", async () => {
+    const url = await svc.ready;
+    const dir = tmp();
+    const env = { CUSTOM_URL: url, CUSTOM_API_KEY: "custom" };          // a placeholder key: not compared
+    for (const config of ["openai:custom|@cf/meta/llama-3.1-8b-instruct", "openai:custom|deepseek-chat "]) {
+      const P = proc(["session", "--dir", dir], env);
+      P.send({ session_id: `ses_cf${config.length}`, config });
+      P.send({ type: "say", text: "hi" });
+      await P.until(() => P.evs.some((e) => e.kind === "session.message" && e.role === "assistant"));
+      expect(svc.requests.at(-1)!.model).toBe(config.split("|")[1]!.trim());
+      P.child.stdin!.end();
+      expect(await P.exited).toBe(0);
+    }
+    // model-check: refused for what a session refuses (no request made), and the same normalisation for the rest
+    const n = svc.requests.length;
+    expect(await modelCheck("openai:custom|m?api_key=abcdefghijklmnop")).toMatchObject({ ok: false });
+    expect(svc.requests).toHaveLength(n);
+    const saved = { u: process.env.CUSTOM_URL, k: process.env.CUSTOM_API_KEY };
+    process.env.CUSTOM_URL = url; process.env.CUSTOM_API_KEY = "custom";
+    try {
+      await modelCheck("openai:custom| @cf/meta/llama-3.1-8b-instruct ");
+      expect(svc.requests.at(-1)!.model).toBe("@cf/meta/llama-3.1-8b-instruct");
+    } finally { for (const [k, v] of [["CUSTOM_URL", saved.u], ["CUSTOM_API_KEY", saved.k]] as const) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
   }, 60_000);
 });

@@ -1620,6 +1620,8 @@ export class Executor {
       const judgedOn: Record<string, string> = {};
       for (const p of new Set([...fp.reads, ...reach(ws, fp.writes)])) if (!ws.isDir(p)) judgedOn[p] = ws.version(p);
       const judged = await this.judgeIntent(a, consequence, object, evidence, text);
+      // stopped while the judge was asked: the step ends here (no card), as act's
+      if (this.stopped) return { ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch };
       // the screen first: locked meanwhile, the task stops, a file action as much as a window one. It is the last
       // wait: from the versions read below to the write there is none, or another program's edit made during it
       // would be overwritten unchecked (review of #16: the lock look, put after the checks, opened just that gap)

@@ -24,7 +24,7 @@ import * as path from "node:path";
 import * as readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
-import { configTable, Gateway, redactKeys } from "../gateway/index.js";
+import { configSyntaxProblem, configTable, Gateway, normalizeConfig, redactKeys } from "../gateway/index.js";
 import * as R from "../protocol/roles.js";
 import { ConsentSigner } from "../executor/consent.js";
 import { Executor } from "../executor/executor.js";
@@ -393,7 +393,11 @@ export async function selftest(): Promise<Record<string, unknown>> {
 
 /** Can the configured model be reached with the keys in the environment? One choice question; the key never
  *  appears in the answer (a service's error text is cut and stripped of anything that looks like one). */
-export async function modelCheck(config: string): Promise<{ ok: boolean; model?: string; ms?: number; error?: string }> {
+export async function modelCheck(config0: string): Promise<{ ok: boolean; model?: string; ms?: number; error?: string }> {
+  // the same check a session's open makes: Test says connected only for a config a session will take
+  const bad = configSyntaxProblem(config0);
+  if (bad) return { ok: false, error: bad };
+  const config = normalizeConfig(config0);
   const table = configTable(config);
   if (!table) return { ok: false, error: `unknown config ${config}` };
   const t0 = Date.now();

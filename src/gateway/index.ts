@@ -59,28 +59,44 @@ export function redactKeys(text: string, env: NodeJS.ProcessEnv = process.env): 
   }
   return out.replace(/(sk-|Bearer )[A-Za-z0-9_-]{8,}/g, "$1…");
 }
-/** What a model id in a config spec may be: letters and digits first, then those and `. _ - : / @ +`, at most 128. */
-export const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:\/@+-]{0,127}$/;
+/** What a model id in a config spec may be: a letter, a digit or `@` first (Cloudflare's `@cf/…`), then letters,
+ *  digits and `. _ - : / @ +`, at most 128. */
+export const MODEL_ID = /^[A-Za-z0-9@][A-Za-z0-9._:\/@+-]{0,127}$/;
+/** A key value shorter than this is not compared (a placeholder such as `custom` or `openai` would refuse every
+ *  config that names it). */
+export const MIN_KEY_CHARS = 12;
 
-/** Why a config the app names (a session's header, `--config`, set_config) is not one, or null. Its grammar, exactly:
- *  a configuration name (CONFIGS), or `openai:<provider>|<model>` with a provider of PROVIDERS and a model id of
- *  MODEL_ID — nothing else (a URL, a query, spaces, `=`…). And none of its parts (split at the characters a key never
- *  holds) is the value of a key in `env`, matched whole: a config is stored as it is. The text never repeats the
- *  config (it may hold what it should not). A model id that is itself some other key cannot be told from a name. */
-export function configSyntaxProblem(config: string, env: NodeJS.ProcessEnv = process.env): string | null {
+/** A config as the app sends it, normalised before anything reads it: the model of `openai:<service>|<model>` without
+ *  the spaces around it (a model name pasted into the settings keeps them). Anything else as it is. */
+export function normalizeConfig(spec: string): string {
+  const m = /^openai:([a-z]+)\|([\s\S]*)$/.exec(spec);
+  return m ? `openai:${m[1]}|${m[2]!.trim()}` : spec;
+}
+
+/** Why a config the app names (a session's header, `--config`, set_config, model-check) is not one, or null — read
+ *  after normalizeConfig. Its grammar, exactly: a configuration name (CONFIGS), or `openai:<provider>|<model>` with a
+ *  provider of PROVIDERS and a model id of MODEL_ID — nothing else (a URL, a query, spaces inside, `=`…). And it does not
+ *  hold the value of a key in `env` (of MIN_KEY_CHARS or more): neither the whole model id, nor any part of the config
+ *  cut at the characters outside `A-Za-z0-9._-`, is equal to one. A config is stored as it is. The text never repeats
+ *  the config (it may hold what it should not). A model id that is itself some other key cannot be told from a name. */
+export function configSyntaxProblem(config0: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const config = normalizeConfig(config0);
+  let model: string | null = null;
   if (!Object.prototype.hasOwnProperty.call(CONFIGS, config)) {
     const m = /^openai:([a-z]+)\|(.*)$/s.exec(config);
     if (!m) return "a config is a configuration name or openai:<service>|<model>";
     if (!Object.prototype.hasOwnProperty.call(PROVIDERS, m[1]!)) return `no such service (one of ${Object.keys(PROVIDERS).join(", ")})`;
-    if (!MODEL_ID.test(m[2]!)) return "the model id may hold letters, digits and . _ - : / @ + only (at most 128, a letter or digit first)";
+    if (!MODEL_ID.test(m[2]!)) return "the model id may hold letters, digits and . _ - : / @ + only (at most 128, a letter, a digit or @ first)";
+    model = m[2]!;
   }
-  const keys = new Set(Object.entries(env).filter(([k, v]) => !!v && (Object.values(PROVIDERS).some((p) => p.keyEnv === k) || /(_API_KEY|_TOKEN|_SECRET)$/.test(k))).map(([, v]) => v!));
-  if (config.split(/[^A-Za-z0-9._-]+/).some((t) => keys.has(t))) return "a config never carries a key: keys come from the environment";
+  const keys = new Set(Object.entries(env).filter(([k, v]) => !!v && v.length >= MIN_KEY_CHARS && (Object.values(PROVIDERS).some((p) => p.keyEnv === k) || /(_API_KEY|_TOKEN|_SECRET)$/.test(k))).map(([, v]) => v!));
+  if ((model !== null && keys.has(model)) || config.split(/[^A-Za-z0-9._-]+/).some((t) => keys.has(t))) return "a config never carries a key: keys come from the environment";
   return null;
 }
 
 /** A model configuration by name (CONFIGS) or by spec: `openai:<provider>|<model>` — every role on that model. */
-export function configTable(spec: string): RoleTable | null {
+export function configTable(spec0: string): RoleTable | null {
+  const spec = normalizeConfig(spec0);
   if (CONFIGS[spec]) return CONFIGS[spec]!;
   const m = /^(\w+):(.+)$/s.exec(spec);
   return m ? all(m[1] as Backend, m[2]!) : null;
@@ -98,7 +114,7 @@ export function providerOf(model: string): { url: string; key: string | undefine
   if (!p || !rest.length) return { error: `openai backend needs <provider>|<model>; providers: ${Object.keys(PROVIDERS).join(", ")}` };
   const url = process.env[p.urlEnv] ?? p.url;
   if (!url) return { error: `${p.urlEnv} not set` };
-  return { url: versionedBase(url), key: process.env[p.keyEnv], model: rest.join("|"), name: name! };
+  return { url: versionedBase(url), key: process.env[p.keyEnv], model: rest.join("|").trim(), name: name! };
 }
 /** Per role, beyond backend and model: maxOutputTokens, the most it may write in one answer (sent as max_tokens);
  *  contextTokens, how much it can read; timeoutMs, how long one call may take. Unset, the backend's defaults below. */

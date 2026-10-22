@@ -129,6 +129,27 @@ describe("a stop mid-step: no judge call after it", () => {
     expect(asked).toHaveLength(0);
   });
 
+  it("a file action: the stop comes while the intent judge answers: the step ends stopped, no consent card is asked for, nothing written", async () => {
+    const fs = await import("node:fs"), os = await import("node:os"), path = await import("node:path");
+    const { Workspace, build } = await import("../src/registry/workspace.js");
+    const { fileRegistry } = await import("../src/registry/fs.js");
+    const { SimComputer } = await import("../src/executor/sim.js");
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "stop-file-"));
+    build(root, { "todo.txt": "交房租\n" });
+    let ex!: Executor;
+    const { gw, asked } = countingGateway((u) => { if (isIntent(u)) ex.stop(); return { choice: "matches" }; });
+    const app = ConsentSigner.fresh(), events: string[] = [];
+    ex = new Executor(new SimComputer(root), { task: "t1", publicKey: app.publicKey, files: { workspace: new Workspace(root), registry: fileRegistry() }, judge: new Judge([{ name: "frontier", gateway: gw }]), raw: "在 todo.txt 末尾加一行 买牛奶", onEvent: (k) => events.push(k) });
+    await ex.begin();
+    await ex.plan({ steps: [] });
+    const r = await ex.act({ action: { kind: "file", capability: "fs.append_line", args: { target: "todo.txt", line: "买牛奶" } }, epoch: ex.currentEpoch });
+    expect(r.status).toBe("stopped");
+    expect(r.challenge).toBeUndefined();
+    expect(events).not.toContain("executor.consent_needed");
+    expect(asked.filter(isIntent)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(root, "todo.txt"), "utf-8")).toBe("交房租\n");
+  });
+
   it("the port: classify after the stop is refused, no judge asked", async () => {
     const { gw, asked } = countingGateway(() => ({ choice: "sends" }));
     const desk = new FakeDesk([chat()]), signer = ConsentSigner.fresh();
