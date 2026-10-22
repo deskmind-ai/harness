@@ -68,15 +68,15 @@ function session(o: { model: Step[]; tasks?: Step[][]; dir?: string; sid?: strin
   const dir = o.dir ?? tmp();
   const ex = inproc(o.tasks ?? [], o.sim);
   let onEvent: ((e: any) => void) | null = null;
-  let exitedFlag = false, failure: string | undefined;
+  let exitedFlag = false, failure: string | undefined, exits = 0;
   const h = new SessionHost({ dir, sessionId: o.sid ?? "ses_t", out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(o.model, seen) },
-    launch: o.launch ?? ex.launch, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: (f) => { exitedFlag = true; failure = f; } });
+    launch: o.launch ?? ex.launch, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: (f) => { exitedFlag = true; failure = f; exits += 1; } });
   hosts.push(h);
   h.start();
   const send = (c: Record<string, unknown>) => h.handle(JSON.stringify(c));
   const kinds = (k: string) => evs.filter((e) => e.kind === k);
   const stored = () => new SessionLog(dir, o.sid ?? "ses_t").events;
-  return { h, evs, seen, dir, ex, send, kinds, stored, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exitedFlag, failure: () => failure };
+  return { h, evs, seen, dir, ex, send, kinds, stored, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exitedFlag, failure: () => failure, exits: () => exits };
 }
 
 const CREATE = (name = "a.txt", text = "hi"): Step[] => [
@@ -1336,8 +1336,16 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     const f = failFs("openSync", historyAppend, 100);
     const ex = realExec();
     const s = session({ dir, sid: "ses_r", model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+    // halted while recover still waits for the old executor: a halted process answers nothing (never not_idle), and
+    // exits once, after that executor is ended
+    expect(s.exited()).toBe(false);
+    s.send({ type: "end_if_idle", client_id: "e1" });
+    s.send({ type: "end" });
+    expect(s.kinds("session.error").filter((e: any) => e.control === "end_if_idle")).toEqual([]);
     await Promise.all(s.h.recovering);
     await halted(s, "session.task_end");
+    await new Promise((r) => setTimeout(r, 2200));
+    expect(s.exits()).toBe(1);
     f.restore();
     expect(groupUp(old.pid!)).toBe(false);
     expect(held(readHolder(dir)!)).toBe(false);
