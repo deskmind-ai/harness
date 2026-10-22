@@ -116,6 +116,8 @@ describe("session: one reply", () => {
     expect(kinds(evs, "session.error").map((e) => [e.code, e.control, e.client_id])).toEqual([["busy", "say", "c2"], ["too_long", "say", "c3"], ["busy", "cua", "c4"], ["no_task", "steer", "c5"]]);
     expect(parseSessionControl(JSON.stringify({ type: "say", text: "a", client_id: "z".repeat(101) }))).toEqual({ type: "say", text: "a" });
     expect(parseSessionControl(JSON.stringify({ type: "say", text: "a", client_id: 7 }))).toEqual({ type: "say", text: "a" });
+    expect(parseSessionControl(JSON.stringify({ type: "end_if_idle", client_id: "c6" }))).toEqual({ type: "end_if_idle", client_id: "c6" });
+    expect(parseSessionControl(JSON.stringify({ type: "end_if_idle" }))).toEqual({ type: "end_if_idle" });
     expect(new SessionLog(h.log.dir, "ses_t").events.find((e) => e.kind === "session.message")).toMatchObject({ client_id: "c1" });
   });
 

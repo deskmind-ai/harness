@@ -68,15 +68,15 @@ function session(o: { model: Step[]; tasks?: Step[][]; dir?: string; sid?: strin
   const dir = o.dir ?? tmp();
   const ex = inproc(o.tasks ?? [], o.sim);
   let onEvent: ((e: any) => void) | null = null;
-  let exitedFlag = false;
+  let exitedFlag = false, failure: string | undefined;
   const h = new SessionHost({ dir, sessionId: o.sid ?? "ses_t", out: (e) => { evs.push(e); onEvent?.(e); }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(o.model, seen) },
-    launch: o.launch ?? ex.launch, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: () => { exitedFlag = true; } });
+    launch: o.launch ?? ex.launch, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.scope ? { scope: o.scope } : {}), onExit: (f) => { exitedFlag = true; failure = f; } });
   hosts.push(h);
   h.start();
   const send = (c: Record<string, unknown>) => h.handle(JSON.stringify(c));
   const kinds = (k: string) => evs.filter((e) => e.kind === k);
   const stored = () => new SessionLog(dir, o.sid ?? "ses_t").events;
-  return { h, evs, seen, dir, ex, send, kinds, stored, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exitedFlag };
+  return { h, evs, seen, dir, ex, send, kinds, stored, on: (f: (e: any) => void) => { onEvent = f; }, exited: () => exitedFlag, failure: () => failure };
 }
 
 const CREATE = (name = "a.txt", text = "hi"): Step[] => [
@@ -973,7 +973,7 @@ describe("a task start that fails part-way lets go of what it took (the disk is 
    *  sees it through its own `import * as fs` (syncBuiltinESMExports). Undone after each test. */
   const undoFs: (() => void)[] = [];
   afterEach(() => { for (const u of undoFs.splice(0)) u(); });
-  const failFs = (name: "openSync" | "writeFileSync" | "renameSync" | "fsyncSync" | "closeSync" | "ftruncateSync", when: (...a: any[]) => boolean, times = 1) => {
+  const failFs = (name: "openSync" | "writeSync" | "writeFileSync" | "renameSync" | "fsyncSync" | "closeSync" | "ftruncateSync", when: (...a: any[]) => boolean, times = 1) => {
     const orig = (fsCjs as any)[name];
     let left = times;
     const hit = { n: 0 };
@@ -995,16 +995,20 @@ describe("a task start that fails part-way lets go of what it took (the disk is 
   afterEach(() => { for (const g of groups.splice(0)) { try { process.kill(-g, "SIGKILL"); } catch { /* gone */ } } });
 
   /** A real executor, the leader of its own process group with a child in it (`sleep`, killed when the leader exits
-   *  by itself): takes its request, says task_done with an undo card, then lingers until its stdin ends. `got`: the
-   *  runs whose request reached it. */
+   *  by itself): takes its request, says task_done with an undo card, then lingers until its stdin ends (or for
+   *  `lingerMs`, then exits by itself, as at the end of its linger). A respond is an undo that takes `undoMs`; as the
+   *  real executor, its stdin's end does not cut it (it exits once the undo is done) but a signal does (after task_done
+   *  it exits at once on one). Its result_response goes to the run's events.jsonl too, as the real one's. */
   const SCRIPT = `const c=require("child_process").spawn("sleep",["30"],{stdio:"ignore"});process.on("exit",()=>{try{c.kill("SIGKILL")}catch{}});
-const rl=require("readline").createInterface({input:process.stdin});let first=true;
-rl.on("line",(l)=>{if(!first){const j=JSON.parse(l);if(j.type==="respond"){console.log(JSON.stringify({seq:2,t:2,run_id:"",kind:"result_response",option:j.option,undone:1,total:1,refused:null}));setTimeout(()=>process.exit(0),50)}return}first=false;const r=JSON.parse(l);console.log(JSON.stringify({seq:1,t:1,run_id:r.run_id,kind:"task_done",status:"succeeded",summary:"ok",result_card:{options:[{kind:"undo",label:"撤回"},{kind:"keep",label:"保留"}]}}))});
-rl.on("close",()=>process.exit(0));`;
-  const realExec = () => {
+const rl=require("readline").createInterface({input:process.stdin});let first=true,undoing=false;
+const rec=(o)=>{const f=process.env.DM_EVENTS;if(f){require("fs").mkdirSync(require("path").dirname(f),{recursive:true});require("fs").appendFileSync(f,JSON.stringify(o)+"\\n")}};
+rl.on("line",(l)=>{if(!first){const j=JSON.parse(l);if(j.type==="respond"&&!undoing){undoing=true;setTimeout(()=>{const r={seq:2,t:2,run_id:"",kind:"result_response",option:j.option,undone:1,total:1,refused:null};rec(r);console.log(JSON.stringify(r));setTimeout(()=>process.exit(0),50)},Number(process.env.DM_UNDO_MS||0))}return}first=false;const r=JSON.parse(l);console.log(JSON.stringify({seq:1,t:1,run_id:r.run_id,kind:"task_done",status:"succeeded",summary:"ok",result_card:{options:[{kind:"undo",label:"撤回"},{kind:"keep",label:"保留"}]}}));if(process.env.DM_LINGER_MS)setTimeout(()=>process.exit(0),Number(process.env.DM_LINGER_MS))});
+rl.on("close",()=>{if(!undoing)process.exit(0)});`;
+  const realExec = (o: { lingerMs?: number; undoMs?: number } = {}) => {
     const pgids: number[] = [];
-    const launch: Launcher = (req) => {
-      const p = spawn(process.execPath, ["-e", SCRIPT], { stdio: ["pipe", "pipe", "ignore"], detached: true });
+    const launch: Launcher = (req, lo) => {
+      const env = { ...process.env, DM_EVENTS: path.join(lo.runs, lo.runId, "events.jsonl"), ...(o.lingerMs ? { DM_LINGER_MS: String(o.lingerMs) } : {}), ...(o.undoMs ? { DM_UNDO_MS: String(o.undoMs) } : {}) };
+      const p = spawn(process.execPath, ["-e", SCRIPT], { stdio: ["pipe", "pipe", "ignore"], detached: true, env });
       pgids.push(p.pid!); groups.push(p.pid!);
       p.stdin!.on("error", () => {});
       const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("exit", (code, signal) => r({ code, signal })));
@@ -1019,6 +1023,43 @@ rl.on("close",()=>process.exit(0));`;
   };
   const lockState = (dir: string) => readHolder(dir)?.state ?? "free";
   const doneRuns = (evs: any[]) => evs.filter((e) => e.kind === "task_done").map((e) => e.run_id);
+  /** A history write (SessionLog.emit's one writeSync of the whole line) of one of these kinds. */
+  const lineOf = (...kinds: string[]) => (_fd: unknown, data: unknown) => kinds.some((k) => String(data).includes(`"kind":"${k}"`));
+  const TERMINAL = ["session.task_end", "session.task_closed"];
+  /** The session halted (onExit with the reason; the process exits non-zero) because `kind` of a run could not be
+   *  stored. */
+  const halted = async (s: ReturnType<typeof session>, kind: string, ms = 15_000) => {
+    await waitFor(() => s.exited(), ms);
+    expect(s.failure()).toMatch(new RegExp(`^${kind.replace(".", "\\.")} of run_\\w+ could not be stored: .*ENOSPC`));
+  };
+  /** After storage works again, the session reopened: recover gives the run one end — `end` "interrupted" where none
+   *  was stored, else the stored one unchanged — and one closure (session_end); a replay has both; its undo is not
+   *  offered (no executor: no_task; the model reads it as not open); and the next task starts and lingers. */
+  const recovered = async (s: ReturnType<typeof session>, ex: ReturnType<typeof realExec>, runId: string, end: "interrupted" | "kept" | { from_run: Record<string, unknown> }) => {
+    const before = s.stored().filter((e: any) => e.kind === "session.task_end" && e.run_id === runId);
+    expect(before).toHaveLength(end === "kept" ? 1 : 0);
+    expect(s.stored().filter((e: any) => e.kind === "session.task_closed" && e.run_id === runId)).toEqual([]);
+    const s2 = session({ dir: s.dir, model: [{ text: "好" }], launch: ex.launch });
+    await Promise.all(s2.h.recovering);
+    expect(s2.exited()).toBe(false);
+    const ends = s2.stored().filter((e: any) => e.kind === "session.task_end" && e.run_id === runId);
+    expect(ends).toHaveLength(1);
+    if (end === "interrupted") expect(ends[0]).toMatchObject({ status: "interrupted", undo: "none" });
+    else if (end === "kept") expect(ends[0]).toEqual(before[0]);
+    else expect(ends[0]).toMatchObject({ ...end.from_run, undo: "none" });
+    expect(s2.stored().filter((e: any) => e.kind === "session.task_closed" && e.run_id === runId)).toEqual([expect.objectContaining({ why: "session_end" })]);
+    const from = s2.evs.length;
+    s2.send({ type: "attach", after_seq: 0 });
+    expect(s2.evs.slice(from).filter((e) => e.run_id === runId && TERMINAL.includes(e.kind)).map((e) => e.kind)).toEqual(TERMINAL);
+    s2.send({ type: "respond", run_id: runId, option: 0 });
+    expect(s2.kinds("session.error").at(-1)).toMatchObject({ code: "no_task", control: "respond" });
+    const result = s2.h.log.messages().find((m) => m.role === "result" && m.msg_id === `end_${runId}`)!;
+    expect(JSON.parse(result.text).undo).not.toBe("open");
+    s2.send({ type: "cua", text: "下一件" });
+    await waitFor(() => doneRuns(s2.evs).length === 1);
+    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids.at(-1), state: "lingering" });
+    return s2;
+  };
 
   it("the lock's own write fails at acquire: the executor it started is ended, nothing is stored, the next task starts", async () => {
     const ex = realExec();
@@ -1037,31 +1078,28 @@ rl.on("close",()=>process.exit(0));`;
     expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[1], state: "lingering" });
   });
 
-  it("closing the earlier lingering task fails to store: the new executor is ended and its lock released; the earlier one is ended too; the next task starts", async () => {
+  it("closing the earlier lingering task fails to store: the new executor is ended and its lock released; the session halts (the earlier group ended); reopened, the run is closed and the next task starts", async () => {
     const ex = realExec();
-    const s = session({ model: [{ text: "好" }, { text: "好" }, { text: "好" }], launch: ex.launch });
+    const s = session({ model: [{ text: "好" }, { text: "好" }], launch: ex.launch });
     s.send({ type: "cua", text: "第一件" });
     await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
     const runA = doneRuns(s.evs)[0];
     expect(readHolder(s.dir)).toMatchObject({ run_id: runA, state: "lingering" });
-    const f = failFs("openSync", historyAppend);             // the first write of the start: session.task_closed
+    const f = failFs("openSync", historyAppend, 1000);       // the first write of the start: session.task_closed; the disk stays full
     s.send({ type: "cua", text: "第二件", client_id: "k2" });
-    f.restore();
     expect(f.hit.n).toBe(1);
     expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "cua", client_id: "k2", text: expect.stringContaining("ENOSPC") });
     // released at once (compare-and-set on the holder it wrote), not when the executor gets round to exiting
     expect(fs.existsSync(computerLockFile(s.dir))).toBe(false);
+    await halted(s, "session.task_closed");
+    f.restore();
     expect(s.stored().some((e: any) => e.kind === "session.message" && e.text === "第二件")).toBe(false);
     expect(s.stored().filter((e: any) => e.kind === "session.task")).toHaveLength(1);
-    await waitFor(() => !groupUp(ex.pgids[0]!) && !groupUp(ex.pgids[1]!));
+    expect(groupUp(ex.pgids[0]!) || groupUp(ex.pgids[1]!)).toBe(false);
     expect(doneRuns(s.evs)).toEqual([runA]);                 // the second executor never got its task
-    // the earlier task's close is stored once its executor has exited (the write works again)
-    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed" && e.run_id === runA));
-    expect(s.stored().find((e: any) => e.kind === "session.task_closed")).toMatchObject({ run_id: runA, why: "new_task" });
-    s.send({ type: "cua", text: "第三件" });
-    await waitFor(() => doneRuns(s.evs).length === 2);
-    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[2], state: "lingering" });
-  });
+    expect(lockState(s.dir)).toBe("free");
+    await recovered(s, ex, runA, "kept");
+  }, 20_000);
 
   it("/cua: session.task fails to store after the user's words: the executor is ended and the lock released at once", async () => {
     const ex = realExec();
@@ -1119,25 +1157,22 @@ rl.on("close",()=>process.exit(0));`;
     await waitFor(() => doneRuns(s.evs).length === 2);
   });
 
-  it("the task's end cannot be stored: the session is not left waiting, the lock is the lingering run's, and the next task ends it and starts", async () => {
+  it("the task's end cannot be stored at task_done (the model's call): the session halts, the lingering group is ended and the lock released; reopened, the end is interrupted and the run closed", async () => {
     const ex = realExec();
-    const s = session({ model: [CALL("第一件"), { text: "好" }, CALL("第二件"), { text: "好" }], launch: ex.launch });
-    // the one write that fails is the task's end (the store itself throws, as on a full disk)
-    const orig = s.h.log.emit.bind(s.h.log);
-    let hit = 0;
-    (s.h.log as any).emit = (body: any) => { if (body.kind === "session.task_end" && !hit++) throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" }); return orig(body); };
+    const s = session({ model: [CALL("第一件"), { text: "好" }], launch: ex.launch });
+    const f = failFs("writeSync", lineOf(...TERMINAL), 1000);   // a full disk for the run's end and closure
     s.send({ type: "say", text: "第一件" });
+    await halted(s, "session.task_end");
     await s.h.idle();
-    expect(hit).toBe(1);
-    expect(textOf(s.seen[1]!.find((m: any) => m.role === "toolResult"))).toContain("\"status\":\"succeeded\"");
-    expect(s.stored().some((e: any) => e.kind === "session.task_end")).toBe(false);   // nothing false stored
-    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[0], state: "lingering" });
-    s.send({ type: "say", text: "第二件" });
-    await s.h.idle();
-    expect(s.stored().filter((e: any) => e.kind === "session.task_end")).toHaveLength(1);
+    f.restore();
+    const runA = doneRuns(s.evs)[0];
+    expect(s.stored().map((e: any) => e.kind)).toEqual(["session.message", "session.task"]);   // nothing after: no reply stored
     expect(groupUp(ex.pgids[0]!)).toBe(false);
-    expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[1], state: "lingering" });
-  });
+    expect(lockState(s.dir)).toBe("free");
+    s.send({ type: "say", text: "还在吗" });                   // a halted session takes nothing more
+    expect(s.stored()).toHaveLength(2);
+    await recovered(s, ex, runA, "interrupted");
+  }, 20_000);
 
   it("undo: the lock cannot be set acting (busy, the lock stays the lingering run's); the undo's record cannot be stored (the lock is set lingering all the same); then the next task starts", async () => {
     const ex = realExec();
@@ -1286,7 +1321,7 @@ rl.on("close",()=>process.exit(0));`;
     expect(new SessionLog(dir, "ses_e").events.map((e: any) => [e.seq, e.reply_to])).toEqual([[1, "a"], [2, "b"]]);
   });
 
-  it("resume: the ends cannot be stored: the old executor is still ended, recovery does not reject, the next task starts", async () => {
+  it("resume: the ends cannot be stored: the old executor is still ended and the session halts; reopened once the disk works, the ends are written and the next task starts", async () => {
     const dir = tmp();
     const log = new SessionLog(dir, "ses_r");
     log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_old", raw: "新建 a.txt", by: "slash" });
@@ -1300,11 +1335,354 @@ rl.on("close",()=>process.exit(0));`;
     const ex = realExec();
     const s = session({ dir, sid: "ses_r", model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
     await Promise.all(s.h.recovering);
+    await halted(s, "session.task_end");
     f.restore();
     expect(groupUp(old.pid!)).toBe(false);
     expect(held(readHolder(dir)!)).toBe(false);
-    s.send({ type: "cua", text: "新建 a.txt" });
-    await waitFor(() => doneRuns(s.evs).length === 1);
+    expect(s.stored().filter((e: any) => e.kind !== "session.task")).toEqual([]);
+    const s2 = session({ dir, sid: "ses_r", model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
+    await Promise.all(s2.h.recovering);
+    expect(s2.exited()).toBe(false);
+    expect(s2.stored().filter((e: any) => e.kind === "session.task_end").map((e: any) => [e.run_id, e.status]).sort()).toEqual([["run_gone", "interrupted"], ["run_old", "interrupted"]]);
+    expect(s2.stored().filter((e: any) => e.kind === "session.task_closed").map((e: any) => e.run_id).sort()).toEqual(["run_gone", "run_old"]);
+    s2.send({ type: "cua", text: "新建 a.txt" });
+    await waitFor(() => doneRuns(s2.evs).length === 1);
     expect(readHolder(dir)).toMatchObject({ pgid: ex.pgids[0], state: "lingering" });
+  }, 20_000);
+
+  describe("a run's end or closure that cannot be stored halts the session on every path (fail-stop)", () => {
+    /** An executor that takes its request and never answers: no task_done, it ignores a stop, its stdin's end and
+     *  SIGTERM (a child in its group too). */
+    const STUCK = `require("child_process").spawn("sleep",["30"],{stdio:"ignore"});process.on("SIGTERM",()=>{});process.stdin.on("data",()=>{});process.stdin.on("end",()=>{});setInterval(()=>{},1000);`;
+    const stuckExec = () => {
+      const pgids: number[] = [];
+      const launch: Launcher = () => {
+        const p = spawn(process.execPath, ["-e", STUCK], { stdio: ["pipe", "ignore", "ignore"], detached: true });
+        pgids.push(p.pid!); groups.push(p.pid!);
+        p.stdin!.on("error", () => {});
+        const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("exit", (code, signal) => r({ code, signal })));
+        return { pid: p.pid, start: () => { p.stdin!.write("{}\n"); }, write: (l) => { if (p.stdin!.writable) p.stdin!.write(l + "\n"); }, close: () => { try { p.stdin!.end(); } catch { /* gone */ } }, onLine: () => {}, exited };
+      };
+      return { launch, pgids };
+    };
+    /** An executor that takes its request and acts until it is signalled: it does not take a stop line, but SIGTERM
+     *  is its own stop — `stopMs` later (its step's receipt) it writes task_done (stopped) to its run's events.jsonl and
+     *  stdout and exits. Its group has a child too. */
+    const STOPPER = `const c=require("child_process").spawn("sleep",["30"],{stdio:"ignore"});process.on("exit",()=>{try{c.kill("SIGKILL")}catch{}});
+let rid="";require("readline").createInterface({input:process.stdin}).on("line",(l)=>{try{const j=JSON.parse(l);if(!rid&&j.run_id)rid=j.run_id}catch{}});
+process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"task_done",status:"stopped",reason:"stopped by SIGTERM",summary:"",result_card:null};const f=process.env.DM_EVENTS;require("fs").mkdirSync(require("path").dirname(f),{recursive:true});require("fs").appendFileSync(f,JSON.stringify(d)+"\\n");console.log(JSON.stringify(d));process.exit(0)},Number(process.env.DM_STOP_MS)));setInterval(()=>{},1000);`;
+    const stopperExec = (stopMs: number) => {
+      const pgids: number[] = [];
+      const launch: Launcher = (req, lo) => {
+        const p = spawn(process.execPath, ["-e", STOPPER], { stdio: ["pipe", "ignore", "ignore"], detached: true, env: { ...process.env, DM_EVENTS: path.join(lo.runs, lo.runId, "events.jsonl"), DM_STOP_MS: String(stopMs) } });
+        pgids.push(p.pid!); groups.push(p.pid!);
+        p.stdin!.on("error", () => {});
+        const exited = new Promise<{ code: number | null; signal: string | null }>((r) => p.on("exit", (code, signal) => r({ code, signal })));
+        return { pid: p.pid, start: () => { p.stdin!.write(JSON.stringify(req) + "\n"); }, write: (l) => { if (p.stdin!.writable) p.stdin!.write(l + "\n"); }, close: () => { try { p.stdin!.end(); } catch { /* gone */ } }, onLine: () => {}, exited };
+      };
+      return { launch, pgids };
+    };
+    const runEvents = (dir: string, runId: string): any[] => { try { return fs.readFileSync(path.join(dir, "sessions", "ses_t", "runs", runId, "events.jsonl"), "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+    const runOf = (s: ReturnType<typeof session>) => (s.stored().find((e: any) => e.kind === "session.task") as any).run_id as string;
+
+    it("its executor ends by itself (linger) and the closure cannot be stored: the session halts; reopened, the run is closed and undo is not offered", async () => {
+      const ex = realExec({ lingerMs: 1500 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ run_id: runA, undo: "open" });
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      await halted(s, "session.task_closed");
+      f.restore();
+      expect(groupUp(ex.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      await recovered(s, ex, runA, "kept");
+    }, 20_000);
+
+    it("its executor exits with no task_done and its end cannot be stored: the session halts; reopened, the end is interrupted", async () => {
+      const ex = realExec();
+      // the request never reaches it (it waits); then it dies
+      const launch: Launcher = (req, o) => ({ ...ex.launch(req, o), start: () => {} });
+      const s = session({ model: [{ text: "好" }], launch });
+      s.send({ type: "cua", text: "第一件" });
+      expect(readHolder(s.dir)).toMatchObject({ pgid: ex.pgids[0], state: "acting" });
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      process.kill(-ex.pgids[0]!, "SIGKILL");
+      await halted(s, "session.task_end");
+      await s.h.idle();
+      f.restore();
+      expect(lockState(s.dir)).toBe("free");
+      await recovered(s, ex, runOf(s), "interrupted");
+    }, 20_000);
+
+    it("the app goes away, the task does not confirm the stop and its end cannot be stored: the session halts, the acting group is ended (not left holding the Mac)", async () => {
+      const stuck = stuckExec();
+      const ex = realExec();
+      let n = 0;
+      const launch: Launcher = (req, o) => (n++ === 0 ? stuck.launch(req, o) : ex.launch(req, o));
+      const s = session({ model: [{ text: "好" }], launch, exitWaitMs: 300 });
+      s.send({ type: "cua", text: "第一件" });
+      expect(readHolder(s.dir)).toMatchObject({ pgid: stuck.pgids[0], state: "acting" });
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      s.h.inputClosed();
+      await halted(s, "session.task_end");
+      f.restore();
+      expect(groupUp(stuck.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      await recovered(s, ex, runOf(s), "interrupted");
+    }, 20_000);
+
+    it("the app goes away while a card lingers and its closure (session_end) cannot be stored: the session halts, not a clean exit; reopened, the run is closed", async () => {
+      const ex = realExec();
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      s.h.inputClosed();
+      await halted(s, "session.task_closed");
+      f.restore();
+      expect(groupUp(ex.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      await recovered(s, ex, runA, "kept");
+    }, 20_000);
+
+    it("an undo that expired (another task holds the Mac) and its closure cannot be stored: the session halts, its lingering group is ended, the other task's lock is left as it is", async () => {
+      const ex = realExec();
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      // another session's task holds the Mac now (pgid 0: held while its owner, this process, lives)
+      const other = { v: 2, state: "acting", pgid: 0, pid: 0, start: 0, run_id: "run_other", session_id: "ses_other", by: "session", owner: process.pid, t: 0, gen: 1 };
+      fs.writeFileSync(computerLockFile(s.dir), JSON.stringify(other));
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "undo_expired", control: "respond" });
+      await halted(s, "session.task_closed");
+      f.restore();
+      expect(groupUp(ex.pgids[0]!)).toBe(false);
+      expect(readHolder(s.dir)).toEqual(other);              // not this session's: not touched
+      fs.unlinkSync(computerLockFile(s.dir));                 // (the other task ends)
+      await recovered(s, ex, runA, "kept");
+    }, 20_000);
+
+    it("a respond whose record cannot be stored is not sent: busy, the lock is lingering again, the card can still be answered", async () => {
+      const ex = realExec();
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      const f = failFs("writeSync", lineOf("session.task_respond"));
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      f.restore();
+      expect(f.hit.n).toBe(1);
+      expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "respond", text: expect.stringContaining("ENOSPC") });
+      expect(readHolder(s.dir)).toMatchObject({ run_id: runA, state: "lingering" });
+      expect(s.exited()).toBe(false);
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_undo"));
+      expect(s.stored().filter((e: any) => e.kind === "session.task_respond")).toHaveLength(1);
+    }, 20_000);
+
+    it("a respond whose record cannot be stored, and whose lock cannot be set back to lingering either: the session halts, the lock is let go, and reopened no undo is recorded", async () => {
+      const ex = realExec();
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      const f = failFs("writeSync", lineOf("session.task_respond"), 1000);
+      const l = failFs("writeFileSync", (_file, data) => typeof data === "string" && data.includes('"state":"lingering"'), 1000);
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      expect(f.hit.n).toBe(1);
+      expect(l.hit.n).toBe(1);
+      expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "respond", text: expect.stringContaining("ENOSPC") });
+      await waitFor(() => s.exited(), 15_000);
+      f.restore(); l.restore();
+      expect(s.failure()).toMatch(/^the machine lock of run_\w+ could not be set back to lingering .*ENOSPC/);
+      expect(groupUp(ex.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      expect(runEvents(s.dir, runA).some((e) => e.kind === "result_response")).toBe(false);   // the executor never got it
+      const s2 = await recovered(s, ex, runA, "kept");
+      expect(s2.stored().some((e: any) => e.kind === "session.task_respond" || e.kind === "session.task_undo")).toBe(false);
+      expect(JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toBe("expired");
+    }, 20_000);
+
+    it("an undo under way when the session halts is let finish (no signal cuts it); reopened, what it did is recorded", async () => {
+      const ex = realExec({ undoMs: 2500 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      expect(readHolder(s.dir)).toMatchObject({ run_id: runA, state: "acting" });
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      s.h.inputClosed();                                      // the app goes away; the session_end closure cannot be stored
+      await halted(s, "session.task_closed");
+      f.restore();
+      // the undo was carried out to its end: its result is in the run, the group is gone, the lock free
+      expect(runEvents(s.dir, runA).filter((e) => e.kind === "result_response")).toEqual([expect.objectContaining({ undone: 1, total: 1 })]);
+      expect(groupUp(ex.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      expect(s.stored().find((e: any) => e.kind === "session.task_respond")).toMatchObject({ run_id: runA, option: 0, undo: true });
+      expect(s.stored().some((e: any) => e.kind === "session.task_undo")).toBe(false);
+      const s2 = await recovered(s, ex, runA, "kept");
+      expect(s2.stored().filter((e: any) => e.kind === "session.task_undo")).toEqual([expect.objectContaining({ run_id: runA, undone: 1, total: 1, refused: null })]);
+      expect(s2.stored().find((e: any) => e.kind === "session.task_undo")).not.toHaveProperty("unknown");
+      expect(JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toBe("undone 1/1");
+    }, 20_000);
+
+    it("an undo that outlasts the stop budget is ended after it; reopened, the undo is recorded as unknown (never as expired)", async () => {
+      const ex = realExec({ undoMs: 6000 });
+      const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 400 });
+      s.send({ type: "cua", text: "第一件" });
+      await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
+      const runA = doneRuns(s.evs)[0];
+      s.send({ type: "respond", run_id: runA, option: 0 });
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      s.h.inputClosed();
+      await halted(s, "session.task_closed");
+      f.restore();
+      expect(groupUp(ex.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      expect(runEvents(s.dir, runA).some((e) => e.kind === "result_response")).toBe(false);
+      const s2 = await recovered(s, ex, runA, "kept");
+      expect(s2.stored().filter((e: any) => e.kind === "session.task_undo")).toEqual([expect.objectContaining({ run_id: runA, unknown: true, refused: expect.stringContaining("not known") })]);
+      expect(JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo).toMatch(/^unknown/);
+    }, 20_000);
+
+    it("a task still acting when the session halts gets its own stop (SIGTERM to the executor alone, not its group, waited for past endTree's 1.5 s): its task_done is the end recorded on reopen", async () => {
+      const stop = stopperExec(2200);
+      const ex = realExec();
+      let n = 0;
+      const launch: Launcher = (req, o) => (n++ === 0 ? stop.launch(req, o) : ex.launch(req, o));
+      const s = session({ model: [{ text: "好" }], launch, exitWaitMs: 4000 });
+      s.send({ type: "cua", text: "第一件" });
+      expect(readHolder(s.dir)).toMatchObject({ pgid: stop.pgids[0], state: "acting" });
+      const f = failFs("writeSync", lineOf(...TERMINAL), 1000);
+      s.h.inputClosed();                                      // it does not take the stop line: its end (stopped) cannot be stored
+      await halted(s, "session.task_end");
+      f.restore();
+      const runA = runOf(s);
+      expect(runEvents(s.dir, runA).filter((e) => e.kind === "task_done")).toEqual([expect.objectContaining({ status: "stopped", reason: "stopped by SIGTERM" })]);
+      expect(groupUp(stop.pgids[0]!)).toBe(false);
+      expect(lockState(s.dir)).toBe("free");
+      await recovered(s, ex, runA, { from_run: { status: "stopped", reason: "stopped by SIGTERM" } });
+    }, 30_000);
   });
+});
+
+describe("end_if_idle: the session ends only when nothing is under way, checked in one step (no probe)", () => {
+  const notIdle = (s: ReturnType<typeof session>) => s.kinds("session.error").filter((e) => e.code === "not_idle");
+  const kids: number[] = [];
+  afterEach(() => { for (const p of kids.splice(0)) { try { process.kill(p, "SIGKILL"); } catch { /* gone */ } } });
+
+  /** A resumed session whose last process left run_old without an end, its executor still running: on SIGTERM it
+   *  writes its own task_done `stopMs` later and exits (as E3). The lock names it, acting. */
+  const resumeWithOldExecutor = async (sid: string, stopMs: number) => {
+    const dir = tmp();
+    const log = new SessionLog(dir, sid);
+    log.emit({ kind: "session.task", msg_id: "t1", run_id: "run_old", raw: "新建 a.txt", by: "slash" });
+    const file = path.join(dir, "sessions", sid, "runs", "run_old", "events.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ seq: 1, t: 1, run_id: "run_old", kind: "start", raw: "新建 a.txt" }) + "\n");
+    const done = JSON.stringify({ seq: 2, t: 2, run_id: "run_old", kind: "task_done", status: "stopped", reason: "stopped by SIGTERM", summary: "", result_card: null });
+    const old = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{setTimeout(()=>{require("fs").appendFileSync(${JSON.stringify(file)},${JSON.stringify(done + "\n")});process.exit(0)},${stopMs})});setInterval(()=>{},1000)`], { detached: true });
+    kids.push(old.pid!);
+    await new Promise((r) => setTimeout(r, 300));
+    fs.mkdirSync(path.join(dir, "sessions"), { recursive: true });
+    fs.writeFileSync(computerLockFile(dir), JSON.stringify({ v: 2, state: "acting", pgid: old.pid, pid: old.pid, start: 0, session_id: sid, run_id: "run_old", by: "session", owner: 999999, t: 0 }));
+    return session({ dir, sid, model: [] });
+  };
+
+  it("idle: it ends the session as end does (onExit, no refusal)", async () => {
+    const s = session({ model: [{ text: "好" }] });
+    s.send({ type: "say", text: "你好" });
+    await s.h.idle();
+    s.send({ type: "end_if_idle", client_id: "c1" });
+    await waitFor(() => s.exited(), 3000);
+    expect(s.failure()).toBeUndefined();
+    expect(notIdle(s)).toEqual([]);
+  });
+
+  it("a say written just before it is a reply under way: not_idle [busy], with the client_id; the reply goes on and is stored", async () => {
+    const s = session({ model: [{ text: "好", delayMs: 100 }] });
+    s.send({ type: "say", text: "你好" });
+    s.send({ type: "end_if_idle", client_id: "c2" });
+    expect(notIdle(s)).toEqual([expect.objectContaining({ kind: "session.error", code: "not_idle", control: "end_if_idle", why: ["busy"], client_id: "c2" })]);
+    await s.h.idle();
+    expect(s.exited()).toBe(false);
+    expect(s.stored().filter((e: any) => e.kind === "session.message").map((e: any) => e.text)).toEqual(["你好", "好"]);
+    // a /cua written just before it: its task and its follow-up reply
+    const c = session({ scope: tmp(), model: [{ text: "建好了" }], tasks: [CREATE()] });
+    c.send({ type: "cua", text: "新建 a.txt" });
+    c.send({ type: "end_if_idle" });
+    expect(notIdle(c).at(-1).why).toEqual(["busy", "task"]);
+    expect(c.exited()).toBe(false);
+  });
+
+  it("a task running with words queued: not_idle [busy, queue, task]; after a stop, a held queue alone is [queue]; once the queue is empty it ends", async () => {
+    const t = session({ scope: tmp(), model: [CALL("新建 b.txt"), { text: "停下了" }], tasks: [[{ text: "想想", delayMs: 400 }, ...CREATE("b.txt")]] });
+    t.send({ type: "say", text: "新建 b.txt" });
+    await waitFor(() => t.kinds("start").length);
+    t.send({ type: "say", text: "三" });
+    t.send({ type: "end_if_idle" });
+    expect(notIdle(t).at(-1).why).toEqual(["busy", "queue", "task"]);
+    t.send({ type: "stop" });
+    await t.h.idle();
+    await waitFor(() => t.stored().some((e: any) => e.kind === "session.task_closed"));
+    const q = t.kinds("session.queue").at(-1).items;
+    expect(q).toEqual([expect.objectContaining({ text: "三", held: true })]);
+    t.send({ type: "end_if_idle" });
+    expect(notIdle(t).at(-1).why).toEqual(["queue"]);
+    expect(t.exited()).toBe(false);
+    t.send({ type: "queue_cancel", id: q[0].id });
+    t.send({ type: "end_if_idle" });
+    await waitFor(() => t.exited(), 3000);
+    expect(notIdle(t)).toHaveLength(2);
+  });
+
+  it("a result card lingering (its undo can still be clicked): not_idle [task]; the card stays answerable", async () => {
+    const scope = tmp();
+    const s = session({ scope, model: [{ text: "建好了" }], tasks: [CREATE()] });
+    s.send({ type: "cua", text: "新建 a.txt 写 hi" });
+    await s.h.idle();
+    const done = s.evs.find((e) => e.kind === "task_done");
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ undo: "open" });
+    s.send({ type: "end_if_idle" });
+    expect(notIdle(s).at(-1).why).toEqual(["task"]);
+    expect(s.exited()).toBe(false);
+    expect(s.stored().some((e: any) => e.kind === "session.task_closed")).toBe(false);
+    s.send({ type: "respond", run_id: done.run_id, option: done.result_card.options.findIndex((x: any) => x.kind === "undo") });
+    await waitFor(() => s.stored().some((e: any) => e.kind === "session.task_closed"));
+    expect(fs.existsSync(path.join(scope, "a.txt"))).toBe(false);
+    s.send({ type: "end_if_idle" });
+    await waitFor(() => s.exited(), 3000);
+  });
+
+  it("a recover still waiting for an old executor: not_idle [recovering]; once its records are written it ends", async () => {
+    const s = await resumeWithOldExecutor("ses_ri", 1000);
+    s.send({ type: "end_if_idle" });
+    expect(notIdle(s).at(-1)).toMatchObject({ code: "not_idle", why: ["recovering"] });
+    expect(s.exited()).toBe(false);
+    await Promise.all(s.h.recovering);
+    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ run_id: "run_old", status: "stopped" });
+    s.send({ type: "end_if_idle" });
+    await waitFor(() => s.exited(), 3000);
+    expect(notIdle(s)).toHaveLength(1);
+  }, 20_000);
+
+  it("plain end while recover waits for an old executor: the session exits only after the run's end and closure are stored", async () => {
+    const s = await resumeWithOldExecutor("ses_re", 1000);
+    let atExit: any[] | null = null;
+    const h = s.h as any;
+    const onExit = h.o.onExit;
+    h.o.onExit = (f?: string) => { atExit = s.stored(); onExit(f); };
+    s.send({ type: "end" });
+    await waitFor(() => s.exited(), 15_000);
+    expect(s.failure()).toBeUndefined();
+    expect(atExit!.filter((e: any) => e.kind === "session.task_end")).toEqual([expect.objectContaining({ run_id: "run_old", status: "stopped", reason: "stopped by SIGTERM" })]);
+    expect(atExit!.filter((e: any) => e.kind === "session.task_closed")).toEqual([expect.objectContaining({ run_id: "run_old", why: "session_end" })]);
+  }, 20_000);
 });

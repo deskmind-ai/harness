@@ -2,9 +2,9 @@
  * The chat session's commands (docs/protocol.md 「会话（第 1 版）」):
  *
  *   session [--dir <d>] [--config <c>] [--lang zh|en]    stdin line 1: {session_id?, config?, lang?, driver?, scope?};
- *                                                        then control lines (say, stop, attach, end; H2: cua, steer,
- *                                                        answer, respond, retry, queue_edit / queue_cancel /
- *                                                        queue_send_now). A known session_id resumes it; none starts
+ *                                                        then control lines (say, stop, attach, end, end_if_idle;
+ *                                                        H2: cua, steer, answer, respond, retry, queue_edit /
+ *                                                        queue_cancel / queue_send_now). A known session_id resumes it; none starts
  *                                                        a new one. Computer tasks run as `executor` children
  *   session --session <id> [--dir <d>]                   resume <id> at once; a first line without `type` is still
  *                                                        read as the header (config, lang)
@@ -12,7 +12,10 @@
  *
  * `--dir`: the folder that holds `sessions/` (default ~/Library/Application Support/DeskMind). The process exits when
  * stdin closes or `end` comes and no reply or task is running (a running task is stopped first, its end waited for up
- * to 12 s); SIGINT / SIGTERM are an `end`.
+ * to 12 s) and recover has written what it was waiting to write; `end_if_idle` is an `end` only when the session is
+ * idle, else refused (not_idle); SIGINT / SIGTERM are an `end`. A run's end or closure that cannot be stored halts the session: its
+ * executors are ended, the machine lock let go, and the process exits 3 (the reason on stderr); the next open records
+ * what is missing.
  */
 import * as path from "node:path";
 import * as readline from "node:readline";
@@ -79,9 +82,9 @@ export async function sessionMain(argv: string[]): Promise<number> {
     out({ t: Date.now() / 1000, session_id: sid, kind: "session.error", code: "busy", text: `another process (pid ${lock.pid}) has this session open` });
     return 1;
   }
-  let exit!: () => void;
-  const exited = new Promise<void>((res) => { exit = res; });
-  const host = new SessionHost({ dir, sessionId: sid, config: header.config ?? a.config, lang: (header.lang ?? a.lang) as never, ...(header.driver ? { driver: header.driver } : {}), ...(header.scope ? { scope: header.scope } : {}), out, onExit: () => exit() });
+  let exit!: (failure?: string) => void;
+  const exited = new Promise<string | undefined>((res) => { exit = res; });
+  const host = new SessionHost({ dir, sessionId: sid, config: header.config ?? a.config, lang: (header.lang ?? a.lang) as never, ...(header.driver ? { driver: header.driver } : {}), ...(header.scope ? { scope: header.scope } : {}), out, onExit: (failure) => exit(failure) });
   host.start();
   // resume with --session: the first line, whenever it comes, may still be a header (config, lang); after it, controls
   let first = !!a.session;
@@ -94,8 +97,8 @@ export async function sessionMain(argv: string[]): Promise<number> {
   onLine = feed;
   onClose = () => host.inputClosed();
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => host.end());
-  await exited;
+  const failure = await exited;
   lock.release();
   rl.close();
-  return 0;
+  return failure ? 3 : 0;
 }
