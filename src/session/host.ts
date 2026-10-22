@@ -23,7 +23,7 @@ import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
 import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loop.js";
 import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, capChanges, sessionDir, taskView, type ErrorCode, type SessionBody, type SessionEvent } from "./log.js";
 import { EXIT_WAIT_MS, LINGER_S, alive, cutRaw, linkLock, spawnExecutor, type ExecutorHandle, type Launcher } from "./task.js";
-import { acquire, endTree, free, held, inProcess, linger, readHolder, reapLater, undo } from "./computer.js";
+import { acquire, endTree, free, held, inProcess, linger, readHolder, reapLater, undo, type Holder } from "./computer.js";
 import type { ModelCallRecord } from "../otel/context.js";
 import { STOP_CAUSES, type StopCause } from "../protocol/computer.js";
 
@@ -120,6 +120,8 @@ interface Task {
   runId: string; handle: ExecutorHandle;
   /** Its process group, as the machine lock names it (0: an executor inside this process). */
   pgid: number;
+  /** The machine lock as this task last wrote it: every change of it is made from exactly this (compare-and-set). */
+  holder: Holder | null;
   /** An answer to its result card was sent (the executor reads only the first). */
   responded: boolean;
   /** Its executor said task_done (not only the session, when the app went away). */
@@ -449,7 +451,7 @@ export class SessionHost {
     }
     let resolve!: (e: TaskEnd) => void;
     const ended = new Promise<TaskEnd>((res) => { resolve = res; });
-    const task: Task = { runId, handle: h, pgid, responded: false, sawDone: false, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set() };
+    const task: Task = { runId, handle: h, pgid, holder: got.holder, responded: false, sawDone: false, options: 0, state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set() };
     this.current = task;
     this.tasks.set(runId, task);
     h.onLine((l) => this.onExecutorLine(task, l));
@@ -481,7 +483,7 @@ export class SessionHost {
 
   /** The lock says the task acts no more (a lock file that cannot be written is logged, not thrown into the reader). */
   private lockLinger(task: Task) {
-    try { linger(this.o.dir, task.runId, task.pgid); } catch (e) { process.stderr.write(`computer lock: ${e instanceof Error ? e.message : String(e)}\n`); }
+    try { if (task.holder) { const n = linger(this.o.dir, task.holder); if (n) task.holder = n; } } catch (e) { process.stderr.write(`computer lock: ${e instanceof Error ? e.message : String(e)}\n`); }
   }
 
   /** task_done, before it is passed on: its result card's options, and whether it lingers for it. */
@@ -567,10 +569,11 @@ export class SessionHost {
     // one respond per card: the executor reads only the first
     if (t.responded) return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
     let u: ReturnType<typeof undo>;
-    try { u = undo(this.o.dir, t.runId, t.pgid); }
+    try { u = t.holder ? undo(this.o.dir, t.holder) : "expired"; }
     catch (e) { return this.refuse("busy", `the machine lock: ${e instanceof Error ? e.message : String(e)}`, "respond"); }
     if (u === "expired") { this.closeTask(t, "new_task"); return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
     if (u === "busy") return this.refuse("busy", this.t("这个任务的撤回正在进行", "an answer to this task's card is being carried out"), "respond");
+    t.holder = u.ok;
     t.responded = true;
     t.handle.write(JSON.stringify(line));
   }
