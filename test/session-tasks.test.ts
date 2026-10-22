@@ -274,9 +274,15 @@ describe("session tasks: client_id on steer, /cua, the card, the queue's edits, 
 
     // a card waits: a say and a steer are refused card_open, naming their client_id
     const ed = editorSim();
-    const t = session({ scope: tmp(), sim: ed.make, model: [CALL("改笔记"), { text: "改好了" }], tasks: [EDIT("editor-1")] });
+    const t = session({ scope: tmp(), sim: ed.make, model: [CALL("改笔记"), { text: "改好了" }, { text: "嗯" }], tasks: [[{ text: "想想", delayMs: 300 }, ...EDIT("editor-1")]] });
     t.send({ type: "say", text: "把笔记的正文改成「新的」" });
+    await waitFor(() => t.kinds("start").length);
+    t.send({ type: "say", text: "排着的", client_id: "k6" });        // queued before the card
     await waitFor(() => t.kinds("ask").length);
+    const qid = t.kinds("session.queue").at(-1).items[0].id;
+    t.send({ type: "queue_send_now", id: qid });
+    expect(t.kinds("session.error").at(-1)).toMatchObject({ code: "card_open", control: "queue_send_now", client_id: "k6" });
+    expect(t.kinds("session.queue").at(-1).items).toEqual([{ id: qid, text: "排着的", client_id: "k6" }]);
     t.send({ type: "say", text: "顺便", client_id: "k3" });
     t.send({ type: "steer", text: "改成别的", client_id: "k4" });
     expect(t.kinds("session.error").slice(-2).map((e: any) => [e.code, e.control, e.client_id])).toEqual([["card_open", "say", "k3"], ["card_open", "steer", "k4"]]);
@@ -356,8 +362,8 @@ describe("session tasks: undo, the machine lock, the app going away", () => {
     a.send({ type: "say", text: "把笔记的正文改成「新的」" });
     await waitFor(() => asked);
     const b = session({ dir, sid: "ses_b", model: [CALL("新建 b.txt"), { text: "电脑在忙" }], tasks: [CREATE("b.txt")] });
-    b.send({ type: "cua", text: "新建 b.txt" });
-    expect(b.kinds("session.error").at(-1)).toMatchObject({ code: "computer_busy", control: "cua" });
+    b.send({ type: "cua", text: "新建 b.txt", client_id: "kb" });
+    expect(b.kinds("session.error").at(-1)).toMatchObject({ code: "computer_busy", control: "cua", client_id: "kb" });
     expect(b.stored()).toEqual([]);                  // nothing stored for a /cua that could not start
     b.send({ type: "say", text: "新建 b.txt" });
     await b.h.idle();

@@ -604,16 +604,17 @@ export class SessionHost {
     if (!it) return this.emitQueue();
     // the session is ending: the entry stays where it is (its words are never dropped on the way out of the queue)
     if (this.closing) return this.refuse("busy", this.t("会话正在结束", "the session is ending"), "queue_send_now", it.client_id);
+    // (stored first, then out of the queue: should storing fail, the words are still queued, never in neither place)
     if (this.current) {
       if (this.current.card) return this.refuseCard("queue_send_now", it.client_id);
+      this.steer(it.text, undefined, it.client_id);
       this.queue = this.queue.filter((q) => q !== it);
-      this.emitQueue();
-      return this.steer(it.text, undefined, it.client_id);
+      return this.emitQueue();
     }
     if (this.running || this.flows) return this.refuseBusy("queue_send_now", it.client_id);
+    this.say(it.text, it.client_id);
     this.queue = this.queue.filter((q) => q !== it);
     this.emitQueue();
-    this.say(it.text, it.client_id);
   }
 
   private emitQueue() { this.send({ kind: "session.queue", items: this.queue.map((q) => ({ ...q })) }); }
@@ -623,10 +624,14 @@ export class SessionHost {
     if (this.closing || this.running || this.current || this.flows) return;
     const go = this.queue.filter((q) => !q.held);
     if (!go.length) return;
-    this.queue = this.queue.filter((q) => q.held);
-    this.emitQueue();
+    // each stored, then out of the queue; the queue sent after (should storing fail, what is left is still queued)
     let last = "";
-    for (const q of go) last = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text: q.text, via: "queue", ...(q.client_id ? { client_id: q.client_id } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
+    try {
+      for (const q of go) {
+        last = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text: q.text, via: "queue", ...(q.client_id ? { client_id: q.client_id } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
+        this.queue = this.queue.filter((x) => x !== q);
+      }
+    } finally { this.emitQueue(); }
     this.startReply(last);
   }
 
