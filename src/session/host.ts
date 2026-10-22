@@ -155,6 +155,10 @@ interface Task {
   /** That answer was the card's undo (stored: session.task_respond), and its result_response came. */
   undoAsked?: boolean;
   sawResponse?: boolean;
+  /** Its undo was recorded as unknown (no result_response came). */
+  undoUnknown?: boolean;
+  /** The session is ending and waits for its undo: the stop budget, after which its group is ended. */
+  undoTimer?: NodeJS.Timeout;
   /** Its executor said task_done (not only the session, when the app went away). */
   sawDone: boolean;
   /** How many options its result card has (a respond's option must be one of them), and their kinds. */
@@ -276,7 +280,12 @@ export class SessionHost {
           // would cut an undo short); the lock stays its group's until all of it is gone
           if (!doneAlready) { try { process.kill(own.pid, "SIGTERM"); } catch { /* gone meanwhile */ } }
           this.recoverPending += 1;
-          this.recovering.push(this.awaitOld(runId, own, need).finally(() => { this.recoverPending -= 1; this.maybeExit(); }));
+          this.recovering.push(this.awaitOld(runId, own, need).finally(() => {
+            this.recoverPending -= 1;
+            // what waited for recover (words queued meanwhile) goes on now
+            try { this.afterActivity(); } catch (e) { process.stderr.write(`session: the queue could not be sent: ${errText(e)}\n`); }
+            this.maybeExit();
+          }));
           continue;
         }
         this.recordRecovered(runId, need);
@@ -382,9 +391,10 @@ export class SessionHost {
   /** `fromQueue`: the queue's own entry sent now (queue_send_now): not a repeat of itself. */
   say(text: string, cid?: string, fromQueue = false) {
     if (this.closing || !text.trim() || (!fromQueue && this.sendsDuplicate(cid, "say")) || this.tooLong(text, "say", cid)) return;
-    // a task runs: the words wait in the queue (sent to the model after it), unless a card waits for the user
-    if (this.current) {
-      if (this.current.card) return this.refuseCard("say", cid);
+    // a task runs, or recover is still writing an old run's records: the words wait in the queue (sent to the model
+    // after it — a model never reads a history recover has not finished), unless a card waits for the user
+    if (this.current || this.recoverPending) {
+      if (this.current?.card) return this.refuseCard("say", cid);
       this.queue.push({ id: `q_${randomUUID().slice(0, 8)}`, text, ...(cid ? { client_id: cid } : {}) });
       return this.emitQueue();
     }
@@ -397,7 +407,7 @@ export class SessionHost {
    *  message is not stored twice. */
   retry() {
     if (this.closing) return;
-    if (this.current || this.running || this.flows) return this.refuseBusy("retry");
+    if (this.current || this.running || this.flows || this.recoverPending) return this.refuseBusy("retry");
     const last = [...this.log.events].reverse().find((e): e is Extract<SessionEvent, { kind: "session.message" }> => e.kind === "session.message" && e.role === "user");
     if (!last) return;
     this.log.emit({ kind: "session.retry", reply_to: last.msg_id });
@@ -494,7 +504,7 @@ export class SessionHost {
    *  the task's call and result in its context. */
   cua(text: string, scope?: string, cid?: string) {
     if (this.closing || !text.trim() || this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
-    if (this.current || this.running || this.flows) return this.refuseBusy("cua", cid);
+    if (this.current || this.running || this.flows || this.recoverPending) return this.refuseBusy("cua", cid);
     let userId = "";
     const t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
       userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua", ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
@@ -617,7 +627,9 @@ export class SessionHost {
         this.lockLinger(task);                           // the answer carried out: it acts no more (first: whatever the record)
         // what the undo did is the run's record of a change to the user's things: one that cannot be stored halts the
         // session (terminal) — never read as "expired" meanwhile; the next open records it from the run
+        if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
         if (typeof ev.undone === "number" && typeof ev.total === "number") this.terminal({ kind: "session.task_undo", run_id: task.runId, undone: ev.undone, total: ev.total, refused: typeof ev.refused === "string" ? ev.refused : null });
+        this.maybeExit();                                // a session ending waited for this undo's outcome
         break;
     }
   }
@@ -676,9 +688,10 @@ export class SessionHost {
         // no task_done: a step it had begun and not ended may or may not have taken effect
         this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...(task.steers.length ? { steers: task.steers } : {}) });
       }
+      if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
       // it died while carrying out an undo (asked for, no result_response): how much of it was done is not known — said
       // so before its closure, never left to read as "expired"
-      if (task.undoAsked && !task.sawResponse && !this.terminal(undoUnknown(task.runId))) return;
+      if (!this.settleUndo(task)) return;
       if (task.state !== "closed") {
         // a lingering executor ended by a new task elsewhere on this Mac (the lock names another run now): undo expired
         const other = task.state === "lingering" && readHolder(this.o.dir)?.run_id !== undefined && readHolder(this.o.dir)?.run_id !== task.runId;
@@ -697,7 +710,19 @@ export class SessionHost {
     if (task.state === "closed") return;
     task.state = "closed";
     try { task.handle.close(); } catch { /* gone */ }
+    if (!this.settleUndo(task)) return;
     this.terminal({ kind: "session.task_closed", run_id: task.runId, why });
+  }
+
+  /** An undo this session asked for whose outcome is not recorded (no result_response, no unknown). A run's closure is
+   *  never written while one is open: the session's exit waits for it (maybeExit), and a closure that comes first all
+   *  the same (its executor died before its exit was seen: a new task found the Mac free) records it unknown first. */
+  private undoOpen(t: Task): boolean { return !!t.undoAsked && !t.sawResponse && !t.undoUnknown; }
+  /** Before a run's closure: an undo with no outcome is recorded as unknown. False: it could not be (halted). */
+  private settleUndo(t: Task): boolean {
+    if (!this.undoOpen(t)) return true;
+    t.undoUnknown = true;
+    return this.terminal(undoUnknown(t.runId));
   }
 
   /** A run's terminal record — session.task_end, session.task_closed, or session.task_undo (what an undo did, or that
@@ -730,6 +755,7 @@ export class SessionHost {
     this.current = null;
     for (const t of open) {
       if (t.exitTimer) { clearTimeout(t.exitTimer); t.exitTimer = null; }
+      if (t.undoTimer) { clearTimeout(t.undoTimer); t.undoTimer = undefined; }
       t.state = "closed";
       try { t.handle.close(); } catch { /* gone */ }
     }
@@ -837,7 +863,7 @@ export class SessionHost {
       this.queue = this.queue.filter((q) => q !== it);
       return this.emitQueue();
     }
-    if (this.running || this.flows) return this.refuseBusy("queue_send_now", it.client_id);
+    if (this.running || this.flows || this.recoverPending) return this.refuseBusy("queue_send_now", it.client_id);
     this.say(it.text, it.client_id, true);
     this.queue = this.queue.filter((q) => q !== it);
     this.emitQueue();
@@ -847,7 +873,7 @@ export class SessionHost {
 
   /** Nothing runs any more: the queued words (not held after a stop) go to the model, in order, as one turn. */
   private afterActivity() {
-    if (this.closing || this.running || this.current || this.flows) return;
+    if (this.closing || this.running || this.current || this.flows || this.recoverPending) return;
     const go = this.queue.filter((q) => !q.held);
     if (!go.length) return;
     // each stored, then out of the queue; the queue sent after (should storing fail, what is left is still queued)
@@ -956,6 +982,18 @@ export class SessionHost {
   private maybeExit() {
     // (a recover still waiting for an old executor writes its records first: an exit now would abandon them)
     if (!this.closing || this.running || this.current || this.flows || this.recoverPending || this.exited) return;
+    // an undo under way is let finish (its result_response) before any closure, within the stop budget; then what is
+    // left of its group is ended, and its exit records the undo unknown (onExecutorExit) — this runs again then
+    const undoing = [...this.tasks.values()].filter((t) => this.undoOpen(t));
+    if (undoing.length) {
+      for (const t of undoing) t.undoTimer ??= setTimeout(() => {
+        t.undoTimer = undefined;
+        if (this.halted || !this.undoOpen(t)) return;
+        try { if (t.holder && t.pgid > 0 && held(t.holder)) endTree(t.holder); else inProcess.get(t.runId)?.(); }
+        catch (e) { process.stderr.write(`session: ending ${t.runId}: ${errText(e)}\n`); }
+      }, this.o.exitWaitMs ?? EXIT_WAIT_MS);
+      return;
+    }
     this.exited = true;
     const open = [...this.tasks.values()];
     for (const t of open) this.closeTask(t, "session_end");

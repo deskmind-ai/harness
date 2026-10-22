@@ -274,7 +274,7 @@ export function reapLater(dir: string, run: string, pgid: number, ms: number): v
   if (!(pgid > 0)) return;
   const t = setTimeout(() => {
     try {
-      const h = guarded(dir, () => { const x = readHolder(dir); return mine(x, run, pgid) && x.state === "acting" && held(x) ? x : null; });
+      const h = landed(() => guarded(dir, () => { const x = readHolder(dir); return mine(x, run, pgid) && x.state === "acting" && held(x) ? x : null; }));
       if (!h) return;
       endTree(h, { termMs: 2000, killMs: 2000 });
       free(dir, run, pgid);
