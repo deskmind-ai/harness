@@ -115,6 +115,9 @@ export interface ActResult {
   /** Set by the branch that found it: `screen_locked` when the screen was locked (status environment: nothing was done
    *  and the task ends; unverified: the action went through, then the screen locked). Absent otherwise. */
   cause?: StopCause;
+  /** Could this act have done something (executor/possibly.ts, from the journal: an intent and no receipt that says
+   *  nothing happened)? For the step's result (step_result.possibly_done); never shown to the caller. */
+  possibly_done?: boolean;
   epoch: number;                     // after the action
   consequence: Consequence;          // the class the executor settled on
   object: string;                    // what it touched (a window id, a tab id, a path)

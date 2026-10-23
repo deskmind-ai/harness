@@ -26,6 +26,14 @@ import type { Clock } from "../src/executor/clock.js";
 import type { Action } from "../src/executor/types.js";
 import { SessionHost } from "../src/session/host.js";
 import type { ExecutorHandle, Launcher } from "../src/session/task.js";
+import { fallbackCard } from "../src/session/host.js";
+import { journalSteps, parseJournal, possiblyDone } from "../src/executor/possibly.js";
+import { Executor } from "../src/executor/executor.js";
+import { ConsentSigner } from "../src/executor/consent.js";
+import { Workspace } from "../src/registry/workspace.js";
+import { fileRegistry } from "../src/registry/fs.js";
+import fsCjs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 
 /** Wall time and timers apart (see card-expiry.test.ts): `sleep` moves the wall clock only, as a Mac's sleep does. */
 class FakeClock implements Clock {
@@ -92,7 +100,7 @@ type End = "succeeded" | "failed" | "unconfirmed" | "cancelled" | "stopped" | "a
 
 /** app-run in process: `steps` then the end. After task_done the app either answers the result card's undo
  *  (`undo: true`, when it offers one) or closes stdin. */
-function runTask(d: Desk, steps: Step[], end: End, o: { undo?: boolean; linger?: number; stopAfterSteps?: number; clock?: Clock } = {}) {
+function runTask(d: Desk, steps: Step[], end: End, o: { undo?: boolean; linger?: number; stopAfterSteps?: number; clock?: Clock; signalAfterMs?: number } = {}) {
   const input = new PassThrough();
   const events: AppEvent[] = [];
   const write = (c: unknown) => input.write(JSON.stringify(c) + "\n");
@@ -118,12 +126,20 @@ function runTask(d: Desk, steps: Step[], end: End, o: { undo?: boolean; linger?:
     : end === "unconfirmed" ? [{ calls: [{ name: "finish", args: { outcome: "unconfirmed", summary: "没法确认", missing: ["结果"] } }] }]
     : end === "environment" ? [() => { d.sim.lock(); return { calls: [{ name: "computer_act", args: { action: { kind: "wait", ms: 1 }, epoch: 1, consequence: "read", purpose: "等一下" } }] }; }]
     : [{ calls: [{ name: "ask_user", args: { question: "还要接着做吗？", options: ["接着做"] } }] }];
-  const done = appRun({ run_id: "run_h2", raw: "整理一下笔记和文件", config: "ds-flash", scope: d.scope }, {
-    runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out, input: new LineReader(input), linger: o.linger ?? 5,
+  const runs = fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-"));
+  // signalAfterMs: the executor is ended by a signal that long after the first step began (it dies with what is out)
+  let signal: ((sig: string) => void) | null = null, exited!: () => void;
+  const exitedP = new Promise<void>((res) => { exited = res; });
+  if (o.signalAfterMs !== undefined) { let once = false; const t0 = setInterval(() => { if (!once && events.some((e) => e.kind === "step") && signal) { once = true; clearInterval(t0); setTimeout(() => signal!("SIGTERM"), o.signalAfterMs); } }, 5); }
+  const run = appRun({ run_id: "run_h2", raw: "整理一下笔记和文件", config: "ds-flash", scope: d.scope }, {
+    runs, out, input: new LineReader(input), linger: o.linger ?? 5,
+    ...(o.signalAfterMs !== undefined ? { signals: { onSignal: (h: (sig: string) => void) => { signal = h; }, exit: () => exited(), exitNow: () => exited(), deadlineMs: 50, waitMs: 100 } } : {}),
     inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream([...steps, ...tail, { calls: [{ name: "finish", args: { outcome: "done", summary: "做完了" } }] }]) }, ...(o.clock ? { clock: o.clock } : {}) },
   });
+  // (a signal's end returns from appRun only when the run does; the test waits for its exit instead)
+  const done = o.signalAfterMs !== undefined ? Promise.race([run, exitedP]) : run;
   const taskDone = () => events.find((e): e is Extract<AppEvent, { kind: "task_done" }> => e.kind === "task_done");
-  return { events, done, taskDone, input };
+  return { events, done, taskDone, input, dir: path.join(runs, "run_h2") };
 }
 
 /** The changes a task makes. file: one new file (its capability has an undo). gui: the user's editor's text set on
@@ -463,9 +479,35 @@ describe("H2, review of #68: undo only while something can carry it out; every e
   });
 });
 
-describe("H2, review of #68: the executor ends with no task_done — the session writes the result card", () => {
-  /** An executor that reports a few steps (and their changes) on stdout and in its events.jsonl, then dies. */
-  const crashing = (evs: Record<string, unknown>[]): Launcher => (_req, lo) => {
+describe("H2 round 2: could this step have done something — one rule, from the journal", () => {
+  it("the table: receipt kind × consequence → possibly done (only 'not performed' and a reconciled 'did not happen' say no)", () => {
+    const receipts: [string, Record<string, unknown> | null, boolean][] = [
+      ["no receipt (died, in flight, threw half way)", null, true],
+      ["ok", { kind: "receipt", status: "ok" }, true],
+      ["unverified", { kind: "receipt", status: "unverified" }, true],
+      ["error", { kind: "receipt", status: "error" }, true],
+      ["environment (locked after)", { kind: "receipt", status: "environment" }, true],
+      ["blocked", { kind: "receipt", status: "blocked" }, true],
+      ["unsupported", { kind: "receipt", status: "unsupported" }, true],
+      ["user_busy, performed:false", { kind: "receipt", status: "user_busy", performed: false }, false],
+      ["error, performed:false", { kind: "receipt", status: "error", performed: false }, false],
+      ["restart: not_happened", { kind: "receipt", recovered: true, finding: "not_happened" }, false],
+      ["restart: unknown", { kind: "receipt", recovered: true, finding: "unknown" }, true],
+      ["restart: happened", { kind: "receipt", recovered: true, finding: "happened" }, true],
+    ];
+    for (const consequence of ["create", "modify_user", "external"]) for (const [name, receipt, want] of receipts) {
+      expect(possiblyDone(receipt), `${name} × ${consequence}`).toBe(want);
+      const lines = [{ kind: "begin" }, { kind: "intent", consequence, text: "x" }, ...(receipt ? [receipt as { kind: string }] : [])];
+      expect(journalSteps(lines).map((st) => st.possibly), `${name} × ${consequence} (journal)`).toEqual([want]);
+    }
+    // a step refused before it was acted on wrote no intent: nothing to count. An intent whose receipt never came is
+    // not closed by the next intent's receipt
+    expect(journalSteps([{ kind: "begin" }])).toEqual([]);
+    expect(journalSteps([{ kind: "intent", text: "a" }, { kind: "intent", text: "b" }, { kind: "receipt", status: "ok", performed: false }]).map((x) => [x.text, x.possibly])).toEqual([["a", true], ["b", false]]);
+  });
+
+  /** An executor that reports a few steps on stdout and in its events.jsonl (and its journal, when given), then dies. */
+  const crashing = (evs: Record<string, unknown>[], journal?: Record<string, unknown>[]): Launcher => (_req, lo) => {
     const file = path.join(lo.runs, lo.runId, "events.jsonl");
     fs.mkdirSync(path.dirname(file), { recursive: true });
     let cb: ((l: string) => void) | null = null;
@@ -473,7 +515,12 @@ describe("H2, review of #68: the executor ends with no task_done — the session
     const exited = new Promise<{ code: number | null; signal: string | null }>((r) => { die = r; });
     const lines = evs.map((e, i) => JSON.stringify({ seq: i + 1, t: Date.now() / 1000, run_id: lo.runId, ...e }));
     return {
-      start: () => { setTimeout(() => { fs.writeFileSync(file, lines.join("\n") + "\n"); for (const l of lines) cb?.(l); setTimeout(() => die({ code: 1, signal: null }), 10); }, 5); },
+      start: () => { setTimeout(() => {
+        fs.writeFileSync(file, lines.join("\n") + "\n");
+        if (journal) fs.writeFileSync(path.join(path.dirname(file), "journal.jsonl"), journal.map((j) => JSON.stringify(j)).join("\n") + "\n");
+        for (const l of lines) cb?.(l);
+        setTimeout(() => die({ code: 1, signal: null }), 10);
+      }, 5); },
       write: () => {}, close: () => {}, onLine: (f) => { cb = f; }, exited,
     };
   };
@@ -485,48 +532,176 @@ describe("H2, review of #68: the executor ends with no task_done — the session
     h.start();
     return { h, evs };
   };
-
-  it("screen steps only (nothing in changes): the card lists them, says the process ended unexpectedly, offers no undo", async () => {
-    const s = ses(crashing([
-      { kind: "start", raw: "改一下笔记", lang: "zh", engine: "runtime" },
-      { kind: "step", step_id: "st_1", text: "{}", human: "在 编辑器「笔记.txt」 看一眼", consequence: "read" },
-      { kind: "step_result", step_id: "st_1", status: "ok", consequence: "read" },
-      { kind: "step", step_id: "st_2", text: "{}", human: "在 编辑器「笔记.txt」 把「正文」设为「新的」", consequence: "modify_user" },
-      { kind: "step_result", step_id: "st_2", status: "ok", consequence: "modify_user" },
-      { kind: "step", step_id: "st_3", text: "{}", human: "在 编辑器「笔记.txt」 按 cmd+s", consequence: "modify_user" },
-      { kind: "step_result", step_id: "st_3", status: "unverified", consequence: "modify_user" },
-      { kind: "step", step_id: "st_4", text: "{}", human: "在 编辑器「笔记.txt」 点「关闭」", consequence: "modify_user" },
-      { kind: "changes", created: [], modified: [], deleted: [], external: [], unconfirmed: [] },
-    ]));
+  const endOf = async (launch: Launcher) => {
+    const s = ses(launch);
     s.h.handle(JSON.stringify({ type: "cua", text: "改一下笔记" }));
     await waitFor(() => s.evs.some((e) => e.kind === "session.task_end"));
-    const end = s.evs.find((e) => e.kind === "session.task_end");
-    expect(end).toMatchObject({ status: "failed", undo: "none", cause: "last_step_unknown" });
-    expect(end.result_card).toMatchObject({ kind: "result", blocking: false, options: [{ kind: "approve", text: "好的" }] });
-    const text: string = end.result_card.text;
-    expect(text.split("\n")[0]).toBe("执行进程意外退出，撤不回");
-    expect(text).toContain("做了：在 编辑器「笔记.txt」 把「正文」设为「新的」");
-    expect(text).toContain("做没做成没法确认：在 编辑器「笔记.txt」 按 cmd+s；在 编辑器「笔记.txt」 点「关闭」");
-    expect(text).not.toContain("看一眼");
+    return s.evs.find((e) => e.kind === "session.task_end");
+  };
+  const SET = "在 编辑器「笔记.txt」 把「正文」设为「新的」", SAVE = "在 编辑器「笔记.txt」 按 cmd+s";
+
+  it("bug 1: screen steps that came back error, or refused because the screen was locked after them, then the executor dies — the card lists them", async () => {
+    const evs = [
+      { kind: "step", step_id: "st_1", text: "{}", human: SET, consequence: "modify_user" },
+      { kind: "step_result", step_id: "st_1", status: "error", executor_status: "error", consequence: "modify_user" },
+      { kind: "step", step_id: "st_2", text: "{}", human: SAVE, consequence: "modify_user" },
+      { kind: "step_result", step_id: "st_2", status: "refused", executor_status: "environment", consequence: "modify_user" },
+    ];
+    // from the journal (the executor's record), and from the events alone (no journal: a missing possibly_done counts)
+    for (const journal of [[{ kind: "begin" }, { kind: "intent", consequence: "modify_user", text: SET }, { kind: "receipt", status: "error", seq: 1 }, { kind: "intent", consequence: "modify_user", text: SAVE }, { kind: "receipt", status: "environment", seq: 2 }], undefined]) {
+      const end = await endOf(crashing(evs, journal));
+      expect(end.result_card, journal ? "journal" : "events").toMatchObject({ kind: "result", options: [{ kind: "approve", text: "好的" }] });
+      expect(end.result_card.text.split("\n")[0]).toBe("执行进程意外退出，撤不回");
+      expect(end.result_card.text).toContain(`做没做成没法确认：${SET}；${SAVE}`);
+    }
   });
 
-  it("files in changes are listed; a run that only looked has no card", async () => {
-    const s = ses(crashing([
-      { kind: "step", step_id: "st_1", text: "fs.create_text {}", human: "新建 a.txt", consequence: "create" },
-      { kind: "step_result", step_id: "st_1", status: "ok", consequence: "create" },
-      { kind: "changes", created: ["a.txt"], modified: ["b.txt"], deleted: [], external: [], unconfirmed: [] },
-    ]));
-    s.h.handle(JSON.stringify({ type: "cua", text: "新建 a.txt" }));
-    await waitFor(() => s.evs.some((e) => e.kind === "session.task_end"));
-    const end = s.evs.find((e) => e.kind === "session.task_end");
-    expect(end.result_card.text).toContain("文件：新建 a.txt；改了 b.txt");
-    expect(end.result_card.options.map((x: any) => x.kind)).toEqual(["approve"]);
-    const s2 = ses(crashing([
-      { kind: "step", step_id: "st_1", text: "{}", human: "看一眼", consequence: "read" },
-      { kind: "step_result", step_id: "st_1", status: "ok", consequence: "read" },
-    ]));
-    s2.h.handle(JSON.stringify({ type: "cua", text: "看一下" }));
-    await waitFor(() => s2.evs.some((e) => e.kind === "session.task_end"));
-    expect(s2.evs.find((e) => e.kind === "session.task_end").result_card).toBeUndefined();
+  it("only looks, or steps the driver said it never performed: no card; a step with no result counts", async () => {
+    const look = [{ kind: "step", step_id: "st_1", text: "{}", human: "看一眼", consequence: "read" }, { kind: "step_result", step_id: "st_1", status: "ok", consequence: "read", possibly_done: false }];
+    expect((await endOf(crashing(look, [{ kind: "begin" }]))).result_card).toBeUndefined();
+    expect((await endOf(crashing(look))).result_card).toBeUndefined();
+    const notPerformed = [{ kind: "begin" }, { kind: "intent", consequence: "modify_user", text: SET }, { kind: "receipt", status: "user_busy", performed: false, seq: 1 }];
+    expect((await endOf(crashing([], notPerformed))).result_card).toBeUndefined();
+    const dangling = [{ kind: "begin" }, { kind: "intent", consequence: "modify_user", text: SAVE }];
+    expect((await endOf(crashing([], dangling))).result_card.text).toContain(`做没做成没法确认：${SAVE}`);
+  });
+
+  /** fs.writeFileSync of a file named boom*.txt writes "par" and then fails, as a full disk would half way. */
+  const halfWrite = () => {
+    const orig = fsCjs.writeFileSync;
+    (fsCjs as any).writeFileSync = (file: any, data: any, o?: any) => {
+      if (typeof file === "string" && /boom[^/]*\.txt$/.test(file)) { orig(file, "par", o); throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" }); }
+      return orig(file, data, o);
+    };
+    syncBuiltinESMExports();
+    return () => { (fsCjs as any).writeFileSync = orig; syncBuiltinESMExports(); };
+  };
+
+  it("bug 2: a file step whose capability wrote half its file and then threw is possibly done with no recipe: no undo, the card says why, and the live card, a dead executor's card and a restart agree", async () => {
+    const d = desk();
+    const restore = halfWrite();
+    let r: ReturnType<typeof runTask>;
+    try {
+      r = runTask(d, [{ calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] }, { calls: [{ name: "fs_create_text", args: { parent: ".", name: "boom.txt", text: "partial" } }] }], "succeeded", { undo: true });
+      await r.done;
+    } finally { restore(); }
+    const done = r!.taskDone()!;
+    expect(fs.readFileSync(path.join(d.scope, "boom.txt"), "utf-8")).toBe("par");
+    expect(done.result_card!.options.map((x) => x.kind)).toEqual(["approve"]);
+    expect(done.result_card!.text).toContain("有一步做没做成没法确认，撤不回");
+    const results = r!.events.filter((e) => e.kind === "step_result") as any[];
+    expect(results.map((x) => [x.status, x.possibly_done])).toEqual([["ok", true], ["error", true]]);
+    expect(r!.events.some((e) => e.kind === "result_response")).toBe(false);
+    expect(fs.readFileSync(path.join(d.scope, "boom.txt"), "utf-8")).toBe("par");
+    // the same journal, read by the session and by a restart
+    const journal = parseJournal(fs.readFileSync(path.join(r!.dir, "journal.jsonl"), "utf-8"));
+    const live = cardLines(done.result_card!.text), dead = cardLines(fallbackCard([], journal, "zh", "crashed")!.text);
+    expect(dead).toEqual(live);
+    expect(live.unsure.some((x) => x.includes("boom.txt"))).toBe(true);
+    const again = await restart(d, r!.dir);
+    expect(again.lines).toEqual(live);
+    expect(again.reversible).toBe(false);
+  });
+
+  it("property: random steps, random driver answers, random deaths — the live card, a dead executor's card and a restart list the same steps; undo only when the disk and the driver can be put back", async () => {
+    const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    type Answer = "ok" | "unverified" | "error" | "blocked" | "not_performed" | "locked_after" | "hang";
+    for (let seed = 1; seed <= 24; seed++) {
+      const rand = rng(seed);
+      const pick = <X,>(xs: X[]) => xs[Math.floor(rand() * xs.length)]!;
+      const d = desk();
+      // what the driver answers to each key press, in order (hang: it never answers — the executor dies with it out)
+      const answers: Answer[] = [];
+      let screen = 0;                                       // key presses the simulated driver actually carried out
+      const perform = d.sim.perform.bind(d.sim);
+      d.sim.perform = (a: Action) => {
+        if (a.kind !== "key") return perform(a);
+        const ans = answers.shift() ?? "ok";
+        if (ans === "hang") { screen += 1; return new Promise<never>(() => {}); }
+        if (ans === "not_performed") return { status: "error", why: "the user was busy", performed: false } as never;
+        perform(a); screen += 1;
+        if (ans === "locked_after") { d.sim.lock(); return { status: "unverified", window: d.w } as never; }
+        return { status: ans, why: ans, window: d.w } as never;
+      };
+      const steps: Step[] = [
+        { calls: [{ name: "plan", args: { steps: [{ purpose: "改笔记", objects: [`window:${d.w}`], consequence: "modify_user" }] } }] },
+      ];
+      const k = 2 + Math.floor(rand() * 4);
+      let n = 0, hung = false;
+      for (let i = 0; i < k && !hung; i++) {
+        const op = pick(["file", "file", "boom", "key"]);
+        if (op === "file") steps.push({ calls: [{ name: "fs_create_text", args: { parent: ".", name: `f${n++}.txt`, text: "hi" } }] });
+        else if (op === "boom") steps.push({ calls: [{ name: "fs_create_text", args: { parent: ".", name: `boom${n++}.txt`, text: "whole" } }] });
+        else {
+          const ans = pick<Answer>(["ok", "unverified", "error", "blocked", "not_performed", "locked_after", "hang"]);
+          answers.push(ans); hung = ans === "hang";
+          steps.push({ calls: [{ name: "computer_observe", args: { window: d.w } }] }, (m) => ({ calls: [{ name: "computer_act", args: { action: { kind: "key", window: d.w, chord: `cmd+${i}` }, epoch: lastJson(m).epoch, consequence: "modify_user", purpose: "按键" } }] }));
+        }
+      }
+      const restore = halfWrite();
+      let r: ReturnType<typeof runTask>;
+      try {
+        r = runTask(d, steps, "succeeded", { undo: true, ...(hung ? { signalAfterMs: 150 } : {}) });
+        await r.done;
+      } finally { restore(); }
+      const ctx = `seed ${seed}: ${JSON.stringify(steps.length)} steps, answers ${JSON.stringify(answers)} hung=${hung}`;
+      const done = r!.taskDone()!;
+      const journal = parseJournal(fs.readFileSync(path.join(r!.dir, "journal.jsonl"), "utf-8"));
+      const card = done.result_card;
+      const dead = fallbackCard([], journal, "zh", "crashed");
+      const again = await restart(d, r!.dir);
+      // all three list the same steps (or none)
+      expect(!!card, ctx).toBe(!!dead);
+      if (card) { expect(cardLines(dead!.text), ctx).toEqual(cardLines(card.text)); expect(again.lines, ctx).toEqual(cardLines(card.text)); }
+      else expect(again.lines, ctx).toEqual({ did: [], unsure: [] });
+      // undo: offered only when what the oracle sees can all be put back — no key the driver carried out, no half
+      // written file — and then it does put the disk back
+      const offered = !!card?.options.some((x) => x.kind === "undo");
+      const halfWritten = Object.keys(tree(d.scope)).some((p) => p.startsWith("boom"));
+      if (offered) {
+        expect(screen, ctx).toBe(0);
+        expect(halfWritten, ctx).toBe(false);
+        const resp = r!.events.find((e) => e.kind === "result_response") as any;
+        expect(resp, ctx).toMatchObject({ picked: "undo", refused: null });
+        expect(tree(d.scope), ctx).toEqual(d.before);
+      }
+      // and never "nothing changed" when something did
+      if (screen > 0 || halfWritten || Object.keys(tree(d.scope)).length !== Object.keys(d.before).length) expect(card, ctx).toBeTruthy();
+    }
+  }, 120_000);
+
+  it("the session refuses an undo sent after undo_until itself — never forwarded, never recorded as cut off", async () => {
+    const clock = new FakeClock();
+    clock.wall = Date.UTC(2020, 0, 1);                     // the executor's window ended long ago by the wall clock
+    const s = session({ clock, scripts: [() => CREATE()] });
+    s.send({ type: "cua", text: "新建 b.txt" });
+    await waitFor(() => s.of("session.task_end").length === 1);
+    const done = s.of("task_done")[0];
+    expect(s.of("session.task_end")[0]).toMatchObject({ undo: "open" });
+    s.send({ type: "respond", run_id: done.run_id, option: 1 });
+    await waitFor(() => s.of("session.error").some((e) => e.control === "respond"));
+    expect(s.of("session.error").find((e) => e.control === "respond")).toMatchObject({ code: "undo_expired" });
+    await sleep(50);
+    expect(s.of("session.task_respond")).toEqual([]);
+    expect(s.of("result_response")).toEqual([]);
+    expect(fs.existsSync(path.join(s.desks[0]!.scope, "b.txt"))).toBe(true);
   });
 });
+
+/** The step lines of a card's text: done, and not known. */
+function cardLines(text: string): { did: string[]; unsure: string[] } {
+  const of = (head: string) => text.split("\n").filter((l) => l.startsWith(head)).flatMap((l) => l.slice(head.length).split("；"));
+  return { did: of("做了："), unsure: of("做没做成没法确认：") };
+}
+
+/** A new executor on the same task folder and journal (a restart): the steps it reads as possibly done, as a card lists
+ *  them, and whether it could undo them. */
+async function restart(d: Desk, runDir: string) {
+  const signer = ConsentSigner.fresh();
+  const ex = new Executor(d.sim, { task: "restart", publicKey: signer.publicKey, journal: path.join(runDir, "journal.jsonl"), files: { workspace: new Workspace(d.scope), registry: fileRegistry() } });
+  d.sim.lock(false);
+  await ex.begin(Object.keys(new Workspace(d.scope).entries()), []);
+  const { stepLines } = await import("../src/executor/possibly.js");
+  const lines = stepLines(ex.possiblySteps());
+  return { lines, reversible: ex.undoable().reversible };
+}

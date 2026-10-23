@@ -34,6 +34,9 @@ export interface ActRequest {
 
 export interface PerformResult {
   status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo;
+  /** The driver's own word that it did not perform the action at all (e.g. the user was busy): the one driver answer
+   *  that says nothing happened (executor/possibly.ts). Absent: it may have. */
+  performed?: boolean;
   /** A window that appeared when the task launched an app, without proof the task made it (hands#54): the user's. */
   opened_window?: WindowInfo;
   /** Windows of the acted app that came on screen during the action and that the driver does not claim as made, with
@@ -79,5 +82,4 @@ export interface Driver {
 }
 
 /** What a run's receipts and verification can read back: the executor's own log of what it did. */
-/** `reached`: the action was handed to the driver (whatever the result says, it may have taken effect). */
-export interface Receipt { seq: number; t: number; request: Omit<ActRequest, "consent"> & { consent?: { scope: string; nonce: string } }; result: ActResult; reached?: true }
+export interface Receipt { seq: number; t: number; request: Omit<ActRequest, "consent"> & { consent?: { scope: string; nonce: string } }; result: ActResult }

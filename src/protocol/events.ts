@@ -55,7 +55,10 @@ export const EventBody = z.discriminatedUnion("kind", [
     // the window after the step as a small PNG (relative to the run folder; only steps that changed something), and
     // where the window and the element were on screen before acting (hands' receipt)
     // shot_pending: the picture is still being written there (a shot_ready follows when it is)
-    shot: z.string().optional(), shot_pending: z.boolean().optional(), target_frame: FrameEv.optional(), window_frame: FrameEv.optional() }),
+    shot: z.string().optional(), shot_pending: z.boolean().optional(), target_frame: FrameEv.optional(), window_frame: FrameEv.optional(),
+    // (M2 H2, additive) could this step have done something — the executor's one answer (executor/possibly.ts: an
+    // intent in its journal and no receipt that says nothing happened), whatever `status` says. Absent: count it as yes
+    possibly_done: z.boolean().optional() }),
   // a step's picture is on disk now (M0): it is taken after the step's result was sent, so it may come after later events
   // — even after task_done, while the process lives; if none comes, the file at step_result.shot is the answer
   z.object({ kind: z.literal("shot_ready"), step_id: z.string(), shot: z.string() }),

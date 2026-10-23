@@ -30,6 +30,7 @@ import { PROTOCOL } from "../protocol/version.js";
 import type { CardEvent as CardEventSchema } from "../protocol/events.js";
 type CardEvent = import("zod").infer<typeof CardEventSchema>;
 import { T } from "../executor/text.js";
+import { journalSteps, parseJournal, stepLines, type JournalLine } from "../executor/possibly.js";
 import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
 import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loop.js";
 import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, capChanges, sessionDir, taskView, type ErrorCode, type SessionBody, type SessionEvent } from "./log.js";
@@ -189,6 +190,8 @@ interface Task {
   /** Steps it began (`step`) with no `step_result` yet: an end the session writes itself while one is open says its
    *  result is unknown (cause last_step_unknown). */
   openSteps: Set<string>;
+  /** When its undo window ends, as its executor said (task_done.undo_until): an undo asked for after it is refused here. */
+  undoUntil?: number;
   /** Its lock could not be set lingering at task_done: it does not linger (its card is not offered; it exits now). */
   noLinger?: boolean;
   /** Why its executor could not be sent its task (the end its exit records says so). */
@@ -343,7 +346,7 @@ export class SessionHost {
     if (need.end && !this.stored("session.task_end", runId)) {
       const done = [...evs].reverse().find((e) => e.kind === "task_done");
       const steers = evs.filter((e) => e.kind === "steered").map((e) => String(e.text));
-      if (!this.terminal(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, evs, this.lang))) return;
+      if (!this.terminal(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, evs, readJournal(this.runFile(runId)), this.lang))) return;
     }
     if (need.undo && !this.stored("session.task_undo", runId) && !this.terminal(this.undoOfRun(runId))) return;
     if (need.close && !this.stored("session.task_closed", runId)) this.terminal({ kind: "session.task_closed", run_id: runId, why: "session_end" });
@@ -797,6 +800,7 @@ export class SessionHost {
     const card = ev.result_card as { options?: { kind?: string }[] } | null | undefined;
     const undo = this.linger > 0 && !task.noLinger && !!card?.options?.some((x) => x.kind === "undo") ? "open" : "none";
     const end = endFrom(task.runId, ev, undo, task.steers);
+    if (undo === "open" && typeof ev.undo_until === "number" && Number.isFinite(ev.undo_until)) task.undoUntil = ev.undo_until;
     // when the undo window ends by itself, as the executor that holds it said (shown as time left; closing is task_closed)
     this.recordEnd(task, undo === "open" && typeof ev.undo_until === "number" && Number.isFinite(ev.undo_until) ? { ...end, undo_until: ev.undo_until } : end);
   }
@@ -880,7 +884,7 @@ export class SessionHost {
   /** The session's own result card for an end written without task_done (fallbackCard), from the run's events.jsonl
    *  (the executor writes it before stdout). */
   private cardOfRun(runId: string, why: "crashed" | "unconfirmed_stop"): { result_card?: CardEvent } {
-    const card = fallbackCard(readRunEvents(this.runFile(runId)), this.lang, why);
+    const card = fallbackCard(readRunEvents(this.runFile(runId)), readJournal(this.runFile(runId)), this.lang, why);
     return card ? { result_card: card } : {};
   }
 
@@ -984,6 +988,10 @@ export class SessionHost {
     // checked before anything is held: only an option index of its card is a respond the executor acts on
     const opt = line.option;
     if (typeof opt !== "number" || !Number.isInteger(opt) || opt < 0 || opt >= t.options) return this.refuse("bad_control", `a respond needs option: the index of one of the result card's ${t.options} options`, "respond");
+    // the undo window is over by the wall clock (the executor's timer may not have run: the Mac slept, or it fired
+    // already): refused here, never forwarded — forwarded to an executor that has just exited, it would be recorded as
+    // an undo cut off (unknown) though nothing was undone
+    if (t.optionKinds[opt] === "undo" && t.undoUntil !== undefined && Date.now() / 1000 >= t.undoUntil) return this.refuse("undo_expired", this.t("撤回的时间已经过了", "the time to undo this task has passed"), "respond");
     // one respond per card: the executor reads only the first
     if (t.responded) return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
     let u: ReturnType<typeof undo>;
@@ -1203,7 +1211,7 @@ const undoFrom = (runId: string, r: Record<string, unknown>): Extract<SessionBod
 const undoUnknown = (runId: string): Extract<SessionBody, { kind: "session.task_undo" }> => ({ kind: "session.task_undo", run_id: runId, undone: 0, total: 0, refused: "the undo was cut off before it ended; how much of it was done is not known", unknown: true });
 /** A run's changes so far: its last `changes` event's (SessionHost.changesOf: every end written without task_done). */
 const changesIn = (evs: Record<string, unknown>[]) => { const c = [...evs].reverse().find((e) => e.kind === "changes"); return c ? capChanges(c) : undefined; };
-const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[], lang: Lang = "zh"): TaskEnd => { const changes = changesIn(evs), card = fallbackCard(evs, lang, "crashed"); return { kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}), ...(card ? { result_card: card } : {}) }; };
+const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[], journal: JournalLine[] | null, lang: Lang = "zh"): TaskEnd => { const changes = changesIn(evs), card = fallbackCard(evs, journal, lang, "crashed"); return { kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}), ...(card ? { result_card: card } : {}) }; };
 
 /** A result card whose undo nothing will carry out (its executor does not wait): the undo option left off, the reason
  *  said — as the executor does when it will not wait (cli/app.ts cardEvent). */
@@ -1214,31 +1222,42 @@ function withoutUndo(card: unknown, lang: Lang): unknown {
 }
 
 /** A result card for a run that ended with no task_done — its executor crashed or was killed, or did not confirm the app's
- *  stop in time (review of #68: a task that changed things always ends with a result card, and the app relies on it).
- *  Written by the session from the run's own events: every step that came back ok or unverified and was not a look,
- *  every step begun and never ended (it may have taken effect), and the files of the last `changes` — screen edits are
- *  never in `changes`, so a task that only acted on screen is never shown as having changed nothing. No undo: nothing
- *  is left to carry it out, and the card says so. Undefined when the run changed nothing. */
-function fallbackCard(evs: Record<string, unknown>[], lang: Lang, why: "crashed" | "unconfirmed_stop"): CardEvent | undefined {
+ *  stop in time (M2 H2: a task that changed things always ends with a result card, and the app relies on it). The
+ *  session writes it from the run's journal with the executor's own rule (executor/possibly.ts): every step with an
+ *  intent and no receipt that says nothing happened — the same set the executor's live card would have shown — plus the
+ *  files of the last `changes`. Screen edits are never in `changes`: they come from the journal, so a task that only
+ *  acted on screen is never shown as having changed nothing. No journal to read: the events' step_result.possibly_done,
+ *  a step with no result or no field counting as possibly done. No undo: nothing is left to carry it out. Undefined when
+ *  nothing was possibly done. */
+export function fallbackCard(evs: Record<string, unknown>[], journal: JournalLine[] | null, lang: Lang, why: "crashed" | "unconfirmed_stop"): CardEvent | undefined {
   const t = T(lang);
-  const steps = new Map<string, { text: string; consequence?: unknown }>(), results = new Map<string, { status: unknown; consequence?: unknown }>();
-  for (const e of evs) {
-    if (e.kind === "step" && typeof e.step_id === "string") steps.set(e.step_id, { text: String(e.human ?? e.text ?? ""), consequence: e.consequence });
-    if (e.kind === "step_result" && typeof e.step_id === "string") results.set(e.step_id, { status: e.status, consequence: e.consequence });
-  }
   const did: string[] = [], unsure: string[] = [];
-  for (const [id, st] of steps) {
-    const r = results.get(id), consequence = r?.consequence ?? st.consequence;
-    if (consequence === "read") continue;
-    if (!r) unsure.push(st.text);
-    else if (r.status === "ok") did.push(st.text);
-    else if (r.status === "unverified") unsure.push(st.text);
+  if (journal) {
+    // (a receipt's status only words the line: done, or not known; whether it is listed is possiblyDone's alone)
+    const lines = stepLines(journalSteps(journal));
+    did.push(...lines.did); unsure.push(...lines.unsure);
+  } else {
+    const steps = new Map<string, string>(), results = new Map<string, Record<string, unknown>>();
+    for (const e of evs) {
+      if (e.kind === "step" && typeof e.step_id === "string") steps.set(e.step_id, String(e.human ?? e.text ?? ""));
+      if (e.kind === "step_result" && typeof e.step_id === "string") results.set(e.step_id, e);
+    }
+    for (const [id, text] of steps) {
+      const r = results.get(id);
+      if (r?.possibly_done === false) continue;
+      (r?.status === "ok" ? did : unsure).push(text);
+    }
   }
   const c = changesIn(evs);
   const files = c ? [...c.created.map((p) => t.fileMade(p)), ...c.modified.map((p) => t.fileChanged(p)), ...c.deleted.map((p) => t.fileGone(p))] : [];
   if (!did.length && !unsure.length && !files.length) return undefined;
   const text = [why === "crashed" ? t.crashed : t.stopUnconfirmed, ...(did.length ? [t.did(did.slice(-6))] : []), ...(unsure.length ? [t.didUnsure(unsure.slice(-6))] : []), ...(files.length ? [t.files(files.slice(0, 12))] : [])].join("\n");
   return { kind: "result", text, options: [{ kind: "approve", text: t.fine }], free_text: false, blocking: false };
+}
+
+/** A run's journal (beside its events), or null when it has none to read. */
+function readJournal(runFile: string): JournalLine[] | null {
+  try { return parseJournal(fs.readFileSync(path.join(path.dirname(runFile), "journal.jsonl"), "utf-8")); } catch { return null; }
 }
 
 /** session.task_end from the executor's task_done: its cause is the field copied (one of the known values), never read
