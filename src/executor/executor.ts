@@ -93,6 +93,8 @@ const SMALL_TEXT = 1000;
 /** What the journal's begin record keeps of the folder's text: at most this many files and characters in all (the
  *  rest by version only), so a big folder does not make every task's journal big. */
 const BEGIN_TEXT_FILES = 200, BEGIN_TEXT_CHARS = 200_000;
+/** An uncertain-step list keeps the last this many (the card's fields), and a card shows at most this many lines. */
+const UNCERTAIN_KEPT = 20, UNCERTAIN_SHOWN = 5;
 /** A file's text when it is a small text file, else undefined (absent, a folder, not text, too long, unreadable). */
 function smallText(ws: Workspace, p: string): string | undefined {
   try { if (ws.exists(p) && !ws.isDir(p) && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= SMALL_TEXT) return t; } } catch { /* the version says it */ }
@@ -408,15 +410,25 @@ export class Executor {
     // while a step of this run is uncertain, the card names every one of them first, then what the model says (not
     // checked: it is not shown as fact), then the action — a yes is for this one action, seen against them
     const t = T(this.opts.lang);
-    const uncertain = this.uncertain.length ? [...this.uncertain] : null;
-    const said = uncertain && purpose?.trim() ? cardText(purpose.trim(), 200) : undefined;
-    const text = uncertain ? `${t.uncertainSteps(uncertain.map((u) => u.text))}${said ? `\n${t.modelSaysUnchecked(said)}` : ""}\n${text0}` : text0;
+    const uncertain = this.uncertainTotal ? [...this.uncertain] : null;
+    const said = uncertain && purpose?.trim() ? cardText(purpose.trim(), 200, this.opts.lang) : undefined;
+    let head = "";
+    if (uncertain) {
+      // the same step uncertain more than once is one line (with how many times); at most UNCERTAIN_SHOWN lines, the
+      // rest counted — the card stays readable, the fields keep up to UNCERTAIN_KEPT of them
+      const lines = new Map<string, number>();
+      for (const u of uncertain) lines.set(u.text, (lines.get(u.text) ?? 0) + 1);
+      const merged = [...lines].map(([x, n]) => (n > 1 ? `${x}${t.times(n)}` : x));
+      const hidden = Math.max(0, merged.length - UNCERTAIN_SHOWN) + (this.uncertainTotal - uncertain.length);
+      head = t.uncertainSteps(merged.slice(-UNCERTAIN_SHOWN), hidden);
+    }
+    const text = uncertain ? `${head}${said ? `\n${t.modelSaysUnchecked(said)}` : ""}\n${text0}` : text0;
     const base: ActionCardFacts = facts0 ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null };
-    const facts: ActionCardFacts = uncertain ? { ...base, uncertain, ...(said ? { model_says_unchecked: said } : {}) } : base;
+    const facts: ActionCardFacts = uncertain ? { ...base, uncertain, uncertain_total: this.uncertainTotal, ...(said ? { model_says_unchecked: said } : {}) } : base;
     const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
       // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
       facts };
-    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: this.uncertain.length });
+    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: this.uncertainTotal });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
     // a host asked about after the task read material: the yes approves the host for the rest of the task — not while a
@@ -432,24 +444,33 @@ export class Executor {
    *  covers it — the plan's object consents, a site's, a rule. Read-only actions and those in the task's own windows
    *  (create) go on as before. */
   private uncertain: NonNullable<ActionCardFacts["uncertain"]> = [];
+  /** Every uncertain step of the run, counted (the list keeps the last UNCERTAIN_KEPT). */
+  private uncertainTotal = 0;
   /** How many steps of this run are uncertain (the service holds no standing grant while there is one). */
-  get uncertainCount(): number { return this.uncertain.length; }
+  get uncertainCount(): number { return this.uncertainTotal; }
   /** Why `token` does not let a modify_user or external action go ahead while a step is uncertain, or null: only an
    *  action token answering a card issued after the last uncertain step (it named them all) does. */
   private uncertainGate(token: ConsentToken | undefined): string | null {
-    if (!this.uncertain.length) return null;
-    if (token?.scope === "action" && (this.challenges.get(token.nonce)?.uncertain ?? -1) >= this.uncertain.length) return null;
+    if (!this.uncertainTotal) return null;
+    if (token?.scope === "action" && (this.challenges.get(token.nonce)?.uncertain ?? -1) >= this.uncertainTotal) return null;
     return `an earlier step's result is unknown (it may have taken effect): every change or send asks the user again, naming it`;
   }
   /** Every act's end: a modify_user or external step that came back unverified joins the run's uncertain steps, with
    *  what the user would recognise it by (the step, what went out). */
   private noteOutcome(r: ActResult, step: { text: string; outgoing: ActionCardFacts["outgoing"] } | undefined, fallback: string) {
     if (r.status !== "unverified" || !NEEDS_CONSENT.has(r.consequence)) return;
-    const outgoing = step?.outgoing ?? [];
+    this.noteUncertain(r.consequence, r.object, step?.text ?? fallback, step?.outgoing ?? [], false);
+  }
+  /** One more uncertain step (`recovered`: found by a restart in the journal). The list is bounded: past
+   *  UNCERTAIN_KEPT entries the oldest give way, and `uncertainTotal` still counts every one (the gate keys on it). */
+  private noteUncertain(consequence: Consequence, object: string, step: string, outgoing0: ActionCardFacts["outgoing"], recovered: boolean) {
+    const outgoing = outgoing0.slice(0, 5).map((o) => ({ ...o, label: cardText(o.label, 40, this.opts.lang), value: cardText(o.value, 80, this.opts.lang) }));
     const said = outgoing.filter((o) => o.value).map((o) => o.value).join(" / ");
-    const text = cardText(`${step?.text ?? fallback}${said ? `：${said}` : ""}`, 160);
-    this.uncertain.push({ consequence: r.consequence, object: r.object, text, outgoing });
-    this.emit("executor.uncertain", { consequence: r.consequence, object: r.object, text, count: this.uncertain.length });
+    const text = cardText(`${step}${said ? T(this.opts.lang).stepSays(said) : ""}`, 160, this.opts.lang);
+    this.uncertain.push({ consequence, object, text, outgoing });
+    if (this.uncertain.length > UNCERTAIN_KEPT) this.uncertain.shift();
+    this.uncertainTotal += 1;
+    this.emit("executor.uncertain", { consequence, object, text, count: this.uncertainTotal, ...(recovered ? { recovered: true } : {}) });
   }
 
   /** The window each open_window really made (by receipt seq): what its undo closes. */
@@ -519,6 +540,16 @@ export class Executor {
     let pending: Record<string, unknown> | null = null;
     for (const l of lines) { if (l.kind === "reconcile_pending") pending = l; else if (l.kind === "reconciled") pending = null; }
     if (pending && this.opts.files) this.restorePending(pending);
+    // the run's uncertain steps, from every process of it: a change or a send whose receipt said unverified, or that a
+    // restart found with no receipt and could not tell happened (review of harness#66: told only to the model, a send
+    // that may have gone out before the crash was not named on the next send's card). The step being recovered now
+    // is added below, once its finding is known
+    const uncertainOf = (l: Record<string, unknown>) => { const c = l.consequence as Consequence; if (NEEDS_CONSENT.has(c)) this.noteUncertain(c, typeof l.object === "string" ? l.object : "", String(l.text ?? ""), [], true); };
+    for (let i = 0; i + 1 < lines.length; i += 1) {
+      const l = lines[i]!, next = lines[i + 1]!;
+      if (l.kind !== "intent" || next.kind !== "receipt") continue;
+      if (next.status === "unverified" || (next.recovered === true && next.finding === "unknown")) uncertainOf(l);
+    }
     const last = lines.at(-1);
     if (!last || last.kind !== "intent") { if (this.reconciliation) this.emit("executor.reconcile_needed", { object: this.reconciliation.object, paths: this.reconciliation.files.map((f) => f.path), still: true }); return; }
     const action = last.action as Action;
@@ -578,6 +609,7 @@ export class Executor {
       this.emit("executor.reconcile_needed", { object: rc.object, paths: rc.files.map((f) => f.path) });
     }
     this.journal("receipt", { recovered: true, finding, external });
+    if (finding === "unknown") uncertainOf(last);
     this.emit("executor.recovered", { action, finding, external });
   }
 
@@ -1108,7 +1140,7 @@ export class Executor {
     if (a.kind !== "open_window" || !a.url) return null;
     if (!this.readMaterial().length) return null;
     const host = siteOf(a.url);
-    if (host && this.sites.has(host) && !this.uncertain.length) return null;     // approved hosts: not while a step is uncertain
+    if (host && this.sites.has(host) && !this.uncertainTotal) return null;     // approved hosts: not while a step is uncertain
     if (host && this.provenance.get(this.provenanceKey(a.url))?.cleared) return null;
     return { host };
   }
@@ -1270,7 +1302,7 @@ export class Executor {
     const facts = (text: string, outgoingItems: ActionCardFacts["outgoing"], host: string | null): ActionCardFacts => ({
       action: a.kind, action_text: stepText(act, look, this.opts.lang), target: elementName(el ?? undefined), object,
       object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host });
-    if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!)) : t.openLink(a.app, shortUrl(a.url!)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
+    if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!, this.opts.lang)) : t.openLink(a.app, shortUrl(a.url!, this.opts.lang)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el, facts: facts(text, sending ? outgoingItems(look, typedLines) : [], null) };
   }
@@ -1526,6 +1558,9 @@ export class Executor {
         if (x.status === "error" || x.status === "unsupported") s?.fail(x.why ?? x.status);
         return x;
       });
+      // user_busy without the driver's word that nothing was sent (performed: false) is no "nothing done": hands says
+      // it only where no input went; anything else may have gone, so it is unverified (review of hands#64)
+      if (r.status === "user_busy" && r.performed !== false) r = { ...r, status: "unverified", why: `${r.why ?? "the user was busy"}; the step may have been partly carried out; observe the window before doing it again` };
     } catch (e) {
       // no answer in time is not a failure: the driver may still be acting (it answers one request at a time, and an
       // old hands did not stop at the deadline it was sent), so the effect may land after this — unverified, never
@@ -1538,9 +1573,11 @@ export class Executor {
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
-    // send that went through took it with it
+    // send that went through (ok) took it with it. One that came back unverified may not have: the text stays, so a
+    // send key tried again there is still asked about as a send (review of harness#66: cleared on unverified, the
+    // retried cmd+shift+d was classed create in the task's own window and went with no card)
     if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
-      if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) this.typed.delete(req.action.window);
+      if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) { if (r.status === "ok") this.typed.delete(req.action.window); }
       else if (req.action.kind === "type" || req.action.kind === "set_value") this.typed.set(req.action.window, this.typedIn(req.action));
     }
     // a window is the task's (and closing it takes the opening back) only on the driver's proof that the action made
@@ -2044,16 +2081,16 @@ const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u206
  *  after 160 characters with the full length said. The start (scheme and host) always stays. */
 /** Words for a card that came from a model (a plan's `sends`): control, line-break and bidi/format characters escaped
  *  as in shortUrl, so they cannot forge a line or reverse text; cut at `max` characters with the length said. */
-export function cardText(x: string, max = 80): string {
+export function cardText(x: string, max = 80, lang?: Lang): string {
   const chars = Array.from(x.replace(UNSAFE, (c) => encodeURIComponent(c)));
-  return chars.length > max ? chars.slice(0, max).join("") + `…（共 ${chars.length} 字）` : chars.join("");
+  return chars.length > max ? chars.slice(0, max).join("") + T(lang).cut(chars.length) : chars.join("");
 }
 
-export function shortUrl(u: string): string {
+export function shortUrl(u: string, lang?: Lang): string {
   let s = u;
   try { s = decodeURI(u); } catch { /* as it is */ }
   const chars = Array.from(s.replace(UNSAFE, (c) => encodeURIComponent(c)));
-  return chars.length > 160 ? chars.slice(0, 160).join("") + `…（共 ${chars.length} 字）` : chars.join("");
+  return chars.length > 160 ? chars.slice(0, 160).join("") + T(lang).cut(chars.length) : chars.join("");
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
@@ -2089,10 +2126,10 @@ export function elementName(el: Element | undefined): string | null {
  *  only; an element id or the action's JSON never shows. Values the task types are cut short. */
 export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, cap?: Capability): string {
   const t = T(lang);
-  if (a.kind === "file") return `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}${Object.keys(a.args).length ? "：" + Object.values(a.args).map((v) => `「${cardText(v, 40)}」`).join("，") : ""}`;
+  if (a.kind === "file") return `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}${Object.keys(a.args).length ? "：" + Object.values(a.args).map((v) => `「${cardText(v, 40, lang)}」`).join("，") : ""}`;
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
   const name = elementName(el) ?? t.anElement;
-  const short = (x: string) => cardText(x, 40);
+  const short = (x: string) => cardText(x, 40, lang);
   const where = obs ? windowLabel(obs.window, lang) : "";
   const what = a.kind === "click" ? t.click(name) : a.kind === "double_click" ? t.doubleClick(name)
     : a.kind === "set_value" ? t.set(name, short(a.value))
@@ -2100,7 +2137,7 @@ export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, c
     : a.kind === "select" ? t.select(name, short(a.option))
     : a.kind === "key" ? t.key(a.chord)
     : a.kind === "scroll" ? t.scroll : a.kind === "close_window" ? t.closeWindow : a.kind === "focus_window" ? t.focusWindow
-    : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, shortUrl(a.url)) : t.openWindow(a.app)) : t.wait;
+    : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, shortUrl(a.url, lang)) : t.openWindow(a.app)) : t.wait;
   return `${where && a.kind !== "open_window" && a.kind !== "wait" ? t.at(where) : ""}${what}`;
 }
 

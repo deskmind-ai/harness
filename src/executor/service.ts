@@ -743,7 +743,11 @@ export class ExecutorService {
     if (!got.option) return text(`用户没有同意，而是说：${got.text}。按这个改计划。`);
     // the user's objects the plan names, by the executor's view: covered up to modify_user (never a send). An object the
     // plan does not name is not covered: an action on it asks on its own card
-    for (const obj of signFor) {
+    // a step of this run is uncertain: the plan is accepted, but no standing grant is signed for it — every change or
+    // send asks on its own card naming that step (the executor would not take one anyway: uncertainGate), so the plan
+    // says no more than holds
+    const uncertain = ex.uncertainCount > 0;
+    for (const obj of uncertain ? [] : signFor) {
       const t = this.#signer.forObject(obj, "modify_user", this.o.task);
       this.tokens.set(obj, t);
       this.consents.push({ scope: "object", object: obj, consequence: "modify_user" });
@@ -759,7 +763,7 @@ export class ExecutorService {
       if (d.what && !(g.sends[d.host] ??= []).includes(d.what)) g.sends[d.host]!.push(d.what);
       siteGrants.set(d.object, g);
     }
-    for (const [obj, g] of siteGrants) {
+    for (const [obj, g] of uncertain ? [] : siteGrants) {
       const t = this.#signer.forSite(obj, [...g.hosts], this.o.task, "modify_user", undefined, g.sends);
       this.siteTokens.push(t);
       ex.acceptPlanSites(t);
@@ -767,7 +771,8 @@ export class ExecutorService {
     }
     // the plan the user accepted covers the request as it stands now
     this.steeredSincePlan = false;
-    this.emit("plan.confirmed", { objects: [...this.tokens.keys()], sites: Object.fromEntries([...siteGrants].map(([w, g]) => [w, { hosts: [...g.hosts], sends: g.sends }])) });
+    this.emit("plan.confirmed", { objects: [...this.tokens.keys()], sites: uncertain ? {} : Object.fromEntries([...siteGrants].map(([w, g]) => [w, { hosts: [...g.hosts], sends: g.sends }])), ...(uncertain ? { grants: "none: a step of this run is uncertain" } : {}) });
+    if (uncertain) return text("用户同意了计划。但这次任务里有一步结果不确定，所以改用户东西或往外发的每一步都会单独问用户，卡片上会写出那一步。");
     return text("用户同意了计划。改用户东西的步骤可以做了；往外发的步骤到时候会再确认一次。");
   }
 

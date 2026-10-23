@@ -122,8 +122,11 @@ describe("reconciliation on resume: an interrupted write, the file changed meanw
     const { rt, judged, seen } = resume(env, [PLAN, APPEND, finish("按用户的决定，在 plan.txt 现在的内容末尾加了一行「版本 2.1 发布」")], u,
       (m) => (JSON.stringify(m).includes("选择在现在的内容上继续") ? { choice: "pass", reason: "用户选择继续，末尾有这一行" } : { choice: "fail", reason: "没有用户的决定" }));
     const r = await rt.run();
-    expect(u.cards.map((c) => c.card.kind)).toEqual(["action", "plan"]);
+    // the interrupted write is one of the run's uncertain steps (review of harness#66): the append the plan covers
+    // still asks, on a card that names it
+    expect(u.cards.map((c) => c.card.kind)).toEqual(["action", "plan", "action"]);
     expect(u.cards[0]!.card.text).toContain("那一步是否生效：不知道");
+    expect(u.cards[2]!.card.text).toMatch(/^之前「.*」结果不确定，可能已经发出或生效了。/);
     expect(r.status).toBe("succeeded");
     expect(env.ws.read("plan.txt")).toBe("全被改了\n版本 2.1 发布\n");
     expect(intentsAfterRecovery(env.journal).length).toBe(1);
