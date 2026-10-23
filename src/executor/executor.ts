@@ -13,7 +13,7 @@
  *   end       collect the receipts
  */
 import type { ActionCardFacts } from "../protocol/cards.js";
-import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
@@ -23,7 +23,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
-import { NEEDS_CONSENT, higher, rank } from "./types.js";
+import { NEEDS_CONSENT, higher, isEffectUnknown, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
@@ -442,6 +442,17 @@ export class Executor {
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
     this.pixelPolicy = opts.pixelSendBinding ?? pixelSendBindingFrom(process.env.DESKMIND_PIXEL_SEND_BINDING);
+    driver.listen?.((ev) => this.fromDriver(ev));
+  }
+
+  /** The driver's own events. Its wait for the user (hands waits for a still Mac before a step that needs the app in
+   *  front) is the same "paused" the app shows for this side's own wait (waitForUser): user_wait, then always one
+   *  user_resumed. An answer that came after its timeout goes to the trace (executor.late_reply): the step was
+   *  recorded unverified, and this is what became of it. */
+  private fromDriver(ev: DriverEvent) {
+    if (ev.kind === "user_wait") this.emit("executor.user_wait", { object: this.flight?.object ?? "", by: "driver", ...(ev.app ? { app: ev.app } : {}), ...(ev.what ? { what: ev.what } : {}) });
+    else if (ev.kind === "user_resumed") this.emit("executor.user_resumed", { by: "driver", ...(ev.ended === "timeout" ? { timed_out: true } : {}), ...(ev.waited_s !== undefined ? { waited_s: ev.waited_s } : {}) });
+    else if (ev.kind === "late_reply") this.emit("executor.late_reply", { op: ev.op, id: ev.id, late_ms: ev.late_ms, ok: ev.ok, ...(ev.status ? { status: ev.status } : {}), ...(ev.why ? { why: ev.why } : {}) });
   }
 
   private journal(kind: "begin" | "intent" | "receipt" | "reconcile_pending" | "reconciled", body: Record<string, unknown>) {
@@ -1472,7 +1483,14 @@ export class Executor {
         if (x.status === "error" || x.status === "unsupported") s?.fail(x.why ?? x.status);
         return x;
       });
-    } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
+    } catch (e) {
+      // no answer in time is not a failure: the driver may still be acting (it answers one request at a time, and an
+      // old hands did not stop at the deadline it was sent), so the effect may land after this — unverified, never
+      // error, and a late answer is traced (executor.late_reply). The same for a driver that died mid-action. Any
+      // other throw: nothing went out
+      r = isEffectUnknown(e) ? { status: "unverified", why: `${e.message}${e.timedOut ? ": the step may have taken effect after that" : ""}; observe the window before doing it again` }
+        : { status: "error", why: e instanceof Error ? e.message : String(e) };
+    }
     finally { if (land) { this.flight = null; (land as () => void)(); } }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     if (consequence !== "read") this.journal("receipt", { status: r.status });
@@ -1517,11 +1535,16 @@ export class Executor {
     // another program" (rc.1 end-to-end: hello.txt, 10-18)
     const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles(this.fileChanges(filesBefore), r.files) : [];
     let after: Snapshot;
-    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
+    // went out, or may have (ok, unverified): whatever comes next, never reported as an error
+    const sent = r.status === "ok" || r.status === "unverified";
+    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: sent ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
     this.epoch = after.epoch;
-    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), cause: "screen_locked", epoch: after.epoch, ...madeField });
-    const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
-    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}), ...madeField };
+    if (after.locked) return done({ ...base, status: sent ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), cause: "screen_locked", epoch: after.epoch, ...madeField });
+    // user_busy (hands): the step waited for the user to pause until the deadline it was sent with, and nothing was
+    // done — the same end as this side's own wait for the user (waitForUser): blocked, try again later
+    const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" || r.status === "user_busy" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
+    const why = r.status === "user_busy" ? `the user kept using the computer while the step waited for a pause; nothing was done; try again later${r.why ? ` (${r.why})` : ""}` : r.why;
+    const out: ActResult = { ...base, status, why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}), ...madeField };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id ?? r.opened_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
       try {

@@ -33,7 +33,11 @@ export interface ActRequest {
 }
 
 export interface PerformResult {
-  status: "ok" | "error" | "unsupported" | "unverified" | "blocked"; why?: string; window?: string; new_window?: WindowInfo;
+  /** `user_busy` (hands): the step waited for the user to pause and they did not, before the deadline it was sent
+   *  with; nothing was done (`performed: false`). */
+  status: "ok" | "error" | "unsupported" | "unverified" | "blocked" | "user_busy"; why?: string; window?: string; new_window?: WindowInfo;
+  /** false: the driver says nothing was sent (hands: a wait for the user ran out, or the deadline came first). */
+  performed?: boolean;
   /** A window that appeared when the task launched an app, without proof the task made it (hands#54): the user's. */
   opened_window?: WindowInfo;
   /** Windows of the acted app that came on screen during the action and that the driver does not claim as made, with
@@ -62,6 +66,23 @@ export interface PerformResult {
   shot_pending?: boolean;
 }
 type Maybe<T> = T | Promise<T>;
+/** What a driver says besides its answers. `user_wait` / `user_resumed`: a request is waiting for the user to pause
+ *  (hands: before a step that needs the app in front, or reading a pop-up's choices) — the app shows "paused"; every
+ *  user_wait is followed by one user_resumed, also when the request ends without the driver saying so (`ended`: the
+ *  reply came, the caller gave up, the process died). `late_reply`: an answer to a request the caller had already given
+ *  up on (its timeout) — for the trace: what it says may have happened after the step was recorded. */
+export type DriverEvent =
+  | { kind: "user_wait"; op: string; app?: string; what?: string }
+  | { kind: "user_resumed"; op: string; waited_s?: number; ended: "driver" | "reply" | "timeout" | "exit" }
+  | { kind: "late_reply"; op: string; id: number; late_ms: number; ok: boolean; status?: string; why?: string };
+/** A request whose effect is unknown, unlike an error: the driver gave up waiting for it (it may still land after
+ *  this), or the driver's process died while it was out and not known to be only waiting for the user (it may have
+ *  acted before it died). An action that ends this way is unverified, never an error that invites doing it again. */
+export class EffectUnknown extends Error {
+  readonly effectUnknown = true;
+  constructor(readonly op: string, message: string, readonly timedOut: boolean) { super(message); }
+}
+export const isEffectUnknown = (e: unknown): e is EffectUnknown => e instanceof Error && (e as { effectUnknown?: unknown }).effectUnknown === true;
 /** The raw driver: sees and moves, decides nothing. The simulated one answers at once; a real one talks to a process. */
 export interface Driver {
   snapshot(): Maybe<Snapshot>;
@@ -70,6 +91,8 @@ export interface Driver {
    *  the user consented to); a driver that can act in the background may ignore it. */
   perform(action: Action, opts?: { foreground_ok?: boolean; shot?: string; frames?: boolean }): Maybe<PerformResult>;
   end?(): Maybe<void>;
+  /** Hear the driver's events (DriverEvent). A driver that has none need not offer it. */
+  listen?(cb: (ev: DriverEvent) => void): void;
   /** What the driver promises about where its actions land. `urlInOwnBrowserWindow`: an open_window with a url in a web
    *  browser (an app whose windows the driver marks `browser: true`) always loads in a browser window of the task's own,
    *  never in one of the user's — the executor then takes it for the task's own step. It says nothing of other apps: a
