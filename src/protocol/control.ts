@@ -6,6 +6,7 @@
  *   {"type":"stop", "app_gone":true}                                     the same, sent because the app ended or left (not the user)
  *   {"type":"respond", "option":<n>}                                                                     the result card's answer
  *   {"type":"steer", "text":"…"}                                                                         the user's words mid-run
+ *   {"type":"reask"}                                     「现在回答」: an action card expired (ask_void timeout); ask it again (additive, M2)
  *
  * Version 1 still reads the lines from before `type` (the Swift helper moves over later): `{"stop":true}` is a stop,
  * `{"respond":<n>}` a respond, and any other object (`{ask_id, option}`, `{ask_id, text}`, `{}`) an answer. A typed
@@ -15,9 +16,10 @@ export type Control =
   | { type: "answer"; ask_id?: string; option?: number; text?: string }
   | { type: "stop"; app_gone?: true }
   | { type: "respond"; option?: number; text?: string }
-  | { type: "steer"; text: string };
+  | { type: "steer"; text: string }
+  | { type: "reask" };
 
-export const CONTROL_TYPES = ["answer", "stop", "respond", "steer"] as const;
+export const CONTROL_TYPES = ["answer", "stop", "respond", "steer", "reask"] as const;
 
 /** One stdin line → a control, or null (not JSON, not an object, or a type this version does not know). */
 export function parseControl(line: string): Control | null {
@@ -38,6 +40,7 @@ export function parseControl(line: string): Control | null {
     case "stop": return { type: "stop", ...(o.app_gone === true ? { app_gone: true as const } : {}) };
     case "respond": return { type: "respond", ...num("option"), ...str("text") };
     case "steer": return typeof o.text === "string" ? { type: "steer", text: o.text } : null;
+    case "reask": return { type: "reask" };
     default: return null;
   }
 }

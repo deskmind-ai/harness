@@ -68,7 +68,9 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional(), why: z.enum(["", "stopped", "timed_out"]).optional() }),
   // an open card let go without an answer (M0): the user changed the request (steer), stopped the task (stop), or the app
   // went away (ended). An answer sent for it later is refused
-  z.object({ kind: z.literal("ask_void"), ask_id: z.string(), why: z.enum(["steer", "stop", "ended"]) }),
+  // timeout (M2, additive): an action card left unanswered for 10 minutes (wall clock). Nobody answers for the user:
+  // the task waits where it is, holding the computer, until a reask (「现在回答」: a new card), a steer or a stop
+  z.object({ kind: z.literal("ask_void"), ask_id: z.string(), why: z.enum(["steer", "stop", "ended", "timeout"]) }),
   // the user's mid-run words reached the task (M0): applied between two steps; from here the judges read them
   z.object({ kind: z.literal("steered"), text: z.string() }),
   // a verdict on a "done" claim (M0): pass ends the task succeeded; unknown with missing_kind "evidence" means only looking

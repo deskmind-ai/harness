@@ -54,6 +54,7 @@ export type SessionControl =
   | ({ type: "steer"; text: string; run_id?: string } & ClientId)
   | { type: "answer"; run_id?: string; line: Record<string, unknown> }
   | { type: "respond"; run_id?: string; line: Record<string, unknown> }
+  | { type: "reask"; run_id?: string }
   | { type: "retry" }
   | { type: "queue_edit"; id: string; text: string }
   | { type: "queue_cancel"; id: string }
@@ -85,6 +86,7 @@ export function parseSessionControl(line: string): SessionControl | null {
     // the executor's own control lines (control v1), forwarded as they came: extra fields (run_id) are ignored there
     case "answer": return { type: "answer", ...runId, line: o };
     case "respond": return { type: "respond", ...runId, line: o };
+    case "reask": return { type: "reask", ...runId };
     case "retry": return { type: "retry" };
     case "queue_edit": return str("id") && str("text") ? { type: "queue_edit", id: o.id as string, text: o.text as string } : null;
     case "queue_cancel": return str("id") ? { type: "queue_cancel", id: o.id as string } : null;
@@ -411,6 +413,7 @@ export class SessionHost {
       case "steer": return this.steer(c.text, c.run_id, c.client_id);
       case "answer": return this.answer(c.line, c.run_id);
       case "respond": return this.respond(c.line, c.run_id);
+      case "reask": return this.reask(c.run_id);
       case "retry": return this.retry();
       case "queue_edit": { const it = this.queue.find((q) => q.id === c.id); if (it && c.text.trim() && c.text.length <= MAX_USER_CHARS) it.text = c.text; return this.emitQueue(); }
       case "queue_cancel": this.queue = this.queue.filter((q) => q.id !== c.id); return this.emitQueue();
@@ -949,6 +952,15 @@ export class SessionHost {
   answer(line: Record<string, unknown>, runId?: string) {
     const t = this.find(runId, "answer");
     if (t) t.handle.write(JSON.stringify(line));
+  }
+
+  /** 「现在回答」 on the running task's expired action card: to its executor, which owns the card and asks it again (or
+   *  refuses, when none expired). A task that ended has no card to ask: refused here. */
+  reask(runId?: string) {
+    const t = this.find(runId, "reask");
+    if (!t) return;
+    if (t.state !== "running" || t.end) return this.refuse("no_task", this.t("这个任务已经结束了", "this task has ended"), "reask");
+    t.handle.write(JSON.stringify({ type: "reask" }));
   }
 
   /** The result card's answer (undo): to the lingering executor, which holds the machine lock as acting again while it
