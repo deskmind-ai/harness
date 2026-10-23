@@ -79,4 +79,5 @@ export interface Driver {
 }
 
 /** What a run's receipts and verification can read back: the executor's own log of what it did. */
-export interface Receipt { seq: number; t: number; request: Omit<ActRequest, "consent"> & { consent?: { scope: string; nonce: string } }; result: ActResult }
+/** `reached`: the action was handed to the driver (whatever the result says, it may have taken effect). */
+export interface Receipt { seq: number; t: number; request: Omit<ActRequest, "consent"> & { consent?: { scope: string; nonce: string } }; result: ActResult; reached?: true }

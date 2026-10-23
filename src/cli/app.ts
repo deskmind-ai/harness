@@ -33,6 +33,7 @@ import { HandsDriver } from "../executor/hands.js";
 import { SkillStore } from "../skills/agentskills.js";
 import { CARD_EXPIRY_MS, type SkillSource } from "../executor/service.js";
 import { WALL_CLOCK, atWallTime, type Clock } from "../executor/clock.js";
+import { T } from "../executor/text.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
@@ -357,8 +358,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     const cause: StopCause | undefined = f ? "last_step_unknown" : stopCause;
     // a task that changed something has its result card here too (M2 H2): the executor's, which names a step still in
     // flight as unknown and offers no undo then
+    // (the process exits right after: nobody can answer an undo, so none is offered — review of #68)
     const rc = rt.resultCard();
-    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", ...(cause ? { cause } : {}), summary: "", result_card: rc ? cardEvent(rc) : null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
+    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", ...(cause ? { cause } : {}), summary: "", result_card: rc ? cardEvent(rc, false, req.lang) : null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
   };
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
   o.signals?.onSignal((sig) => {
@@ -378,14 +380,16 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   });
   const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
   if (!done) closeTrace(r.status, r.reason);
-  const card = r.result_card ? cardEvent(r.result_card) : null;
   // the result card is answered while this process is alive (undo needs the executor's receipts): it waits `--linger`
   // seconds by the wall clock (a Mac asleep meanwhile ends the wait within a second of waking: executor/clock.ts) for
   // `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exits. Not after a signal: the
   // process exits then. The undo's deadline is said on task_done (undo_until, seconds like `t`), from the same clock
   const clock = o.inject?.clock ?? WALL_CLOCK;
   // (stdin closed already: the app went away, nothing can answer — no wait, no deadline said)
-  const lingers = !!card && o.linger > 0 && !signals && !o.input.closed;
+  const lingers = !!r.result_card && o.linger > 0 && !signals && !o.input.closed;
+  // undo is offered only while something waits to carry it out (review of #68): with no wait — no --linger, after a
+  // signal, stdin closed — the card has no undo option, and says why
+  const card = r.result_card ? cardEvent(r.result_card, lingers, req.lang) : null;
   const until = lingers ? clock.now() + o.linger * 1000 : 0;
   const undoUntil = lingers && card!.options.some((x) => x.kind === "undo") ? { undo_until: until / 1000 } : {};
   taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, ...undoUntil, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
@@ -402,6 +406,14 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
         if (deadline.signal.aborted || (!line && (o.input.closed || o.input.stopped))) break;
         const a = parseControl(line);
         if (a?.type !== "respond" || typeof a.option !== "number") continue;
+        // the deadline, asked as the answer arrives: the Mac's timers stop in sleep, and an undo sent in the second after
+        // waking past it would otherwise be carried out (review of #68). Past it, nothing is undone, and that is said
+        if (clock.now() >= until) {
+          const picked = card!.options[a.option]?.kind ?? "other";
+          const why = "the undo window had ended before the answer came";
+          log.emit({ kind: "result_response", picked, effect: why, ...(picked === "undo" ? { undone: 0, total: executor.undoable().steps.length, refused: why } : {}) } as never);
+          break;
+        }
         const u = await rt.respond({ option: a.option });
         log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
         break;
@@ -410,8 +422,12 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   }
 }
 
-/** A result card as the protocol carries it. */
-const cardEvent = (c: Card) => ({ kind: c.kind, text: c.text, options: c.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: c.free_text, blocking: c.blocking });
+/** A result card as the protocol carries it. `offerUndo` false: nothing will wait to carry an undo out, so its option is
+ *  left off and the card says why. */
+const cardEvent = (c: Card, offerUndo = true, lang?: string) => {
+  const drop = !offerUndo && c.options.some((x) => x.kind === "undo");
+  return { kind: c.kind, text: drop ? `${c.text}\n${T(lang).noUndo(T(lang).noWait)}` : c.text, options: c.options.filter((x) => !drop || x.kind !== "undo").map((x) => ({ kind: x.kind, text: x.text })), free_text: c.free_text, blocking: c.blocking };
+};
 
 export function respond(runId: string, runs: string, answer: Record<string, unknown>, out: (ev: AppEvent) => void) {
   const log = new EventLog(path.join(runs, runId, "events.jsonl"), runId, out);

@@ -1258,6 +1258,9 @@ export class Executor {
     // why the epoch moved, when the driver says (hands#53: the snapshot's epoch_reason — an action, the user's input and
     // to which app, a window that appeared, vanished or was renamed), for a stale result's trace; older drivers say nothing
     let epochWhy: unknown;
+    // the action went to the driver (M2 H2): whatever the result says after that — an error, the screen found locked —
+    // it may have taken effect, and the receipt says so (undoable)
+    let reached = false;
     let stepConsented = false, foregroundOk = false;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
@@ -1266,7 +1269,7 @@ export class Executor {
       // fields) is not in it
       const { shot: _s, target_frame: _t, window_frame: _w, ...kept } = r;
       const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, ...c }) => c)(kept.challenge) } : kept;
-      this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain });
+      this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain, ...(reached ? { reached: true as const } : {}) });
       this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
       return r;
     };
@@ -1461,6 +1464,7 @@ export class Executor {
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
+    reached = true;
     // a picture after a step that changes something (not of a look, a wait, or a window it closes): named by the step, in
     // the run's shots/
     const shotFile = this.opts.shots && consequence !== "read" && act.kind !== "wait" && act.kind !== "close_window" ? path.join(this.opts.shots, `${(traceContext().step_id ?? `receipt_${this.receipts.length + 1}`).replace(/[^\w.-]/g, "_")}.png`) : undefined;
@@ -1805,10 +1809,13 @@ export class Executor {
   undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] } {
     const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] = [];
     for (const r of [...this.receipts].reverse()) {
-      if ((r.result.status !== "ok" && r.result.status !== "unverified") || r.result.consequence === "read") continue;
+      // a result decided after the driver had the action (an error from it, a failed read-back, the screen found locked
+      // after it: review of #68) may hide an effect: it counts as one that may have happened
+      const afterDriver = !!r.reached && (r.result.status === "error" || r.result.status === "environment");
+      if ((r.result.status !== "ok" && r.result.status !== "unverified" && !afterDriver) || r.result.consequence === "read") continue;
       const a = r.request.action;
       const t = T(this.opts.lang);
-      if (r.result.status === "unverified") { steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, a.kind === "file" ? this.fileReceipts.get(r.seq)?.cap : undefined, this.opts.lang), can: false, why: t.unsure, unverified: true }); continue; }
+      if (r.result.status !== "ok") { steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, a.kind === "file" ? this.fileReceipts.get(r.seq)?.cap : undefined, this.opts.lang), can: false, why: t.unsure, unverified: true }); continue; }
       if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap, this.opts.lang), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap, this.opts.lang), can: false, why: t.noUndoFor(a.capability) }); continue; }
       if (a.kind === "open_window") {
         // the task's own window is closed; one it brought up for the user's app is left open (it may hold their state):

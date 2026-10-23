@@ -27,6 +27,9 @@ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { configSyntaxProblem, configTable, normalizeConfig, PROVIDERS, providerOf, redactKeys } from "../gateway/index.js";
 import { loopModel } from "../runtime/model.js";
 import { PROTOCOL } from "../protocol/version.js";
+import type { CardEvent as CardEventSchema } from "../protocol/events.js";
+type CardEvent = import("zod").infer<typeof CardEventSchema>;
+import { T } from "../executor/text.js";
 import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
 import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loop.js";
 import { MAX_ASSISTANT_CHARS, MAX_USER_CHARS, SESSION_ID, SessionLog, capChanges, sessionDir, taskView, type ErrorCode, type SessionBody, type SessionEvent } from "./log.js";
@@ -340,7 +343,7 @@ export class SessionHost {
     if (need.end && !this.stored("session.task_end", runId)) {
       const done = [...evs].reverse().find((e) => e.kind === "task_done");
       const steers = evs.filter((e) => e.kind === "steered").map((e) => String(e.text));
-      if (!this.terminal(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, evs))) return;
+      if (!this.terminal(done ? endFrom(runId, done, "none", steers) : interrupted(runId, steers, evs, this.lang))) return;
     }
     if (need.undo && !this.stored("session.task_undo", runId) && !this.terminal(this.undoOfRun(runId))) return;
     if (need.close && !this.stored("session.task_closed", runId)) this.terminal({ kind: "session.task_closed", run_id: runId, why: "session_end" });
@@ -752,7 +755,7 @@ export class SessionHost {
     }
     // a task that does not linger keeps its result card (M2 H2: a task that changed something always shows one): its
     // undo is none in session.task_end, and the deadline it would have had is not said
-    this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { undo_until: undefined } : {}), session_id: this.o.sessionId });
+    this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { undo_until: undefined, result_card: withoutUndo(ev.result_card, this.lang) } : {}), session_id: this.o.sessionId });
     switch (ev.kind) {
       case "ask": task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; break;
       case "resumed": case "ask_void": if (ev.ask_id === task.card) task.card = null; break;
@@ -826,7 +829,7 @@ export class SessionHost {
       reapLater(this.o.dir, task.runId, task.pgid, this.o.exitWaitMs ?? EXIT_WAIT_MS);
       if (!task.end) {
         // no task_done: a step it had begun and not ended may or may not have taken effect
-        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...this.changesOf(task.runId, task.changes), ...(task.steers.length ? { steers: task.steers } : {}) });
+        this.recordEnd(task, { kind: "session.task_end", run_id: task.runId, status: "failed", reason: task.startError ? `the task could not be sent to the executor: ${task.startError}` : `the executor exited (${x.signal ?? `code ${x.code}`}) before the task ended`, ...unknownIf(task.openSteps.size > 0), summary: "", undo: "none", ...this.changesOf(task.runId, task.changes), ...(task.steers.length ? { steers: task.steers } : {}), ...this.cardOfRun(task.runId, "crashed") });
       }
       if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
       // it died while carrying out an undo (asked for, no result_response): how much of it was done is not known — said
@@ -872,6 +875,13 @@ export class SessionHost {
   private changesOf(runId: string, seen?: ReturnType<typeof capChanges>): { changes?: NonNullable<ReturnType<typeof capChanges>> } {
     const c = changesIn(readRunEvents(this.runFile(runId))) ?? seen;
     return c ? { changes: c } : {};
+  }
+
+  /** The session's own result card for an end written without task_done (fallbackCard), from the run's events.jsonl
+   *  (the executor writes it before stdout). */
+  private cardOfRun(runId: string, why: "crashed" | "unconfirmed_stop"): { result_card?: CardEvent } {
+    const card = fallbackCard(readRunEvents(this.runFile(runId)), this.lang, why);
+    return card ? { result_card: card } : {};
   }
 
   /** What a run's undo did, from its events (its last result_response with the counts), or unknown. */
@@ -1136,7 +1146,7 @@ export class SessionHost {
     // with it (its pid is in the lock) until it exits
     t.exitTimer = setTimeout(() => {
       t.exitTimer = null;
-      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", ...unknownIf(t.openSteps.size > 0), summary: "", undo: "none", ...this.changesOf(t.runId, t.changes), ...(t.steers.length ? { steers: t.steers } : {}) });
+      if (!t.end) this.recordEnd(t, { kind: "session.task_end", run_id: t.runId, status: "stopped", reason: "the app went away; the task did not confirm the stop in time", ...unknownIf(t.openSteps.size > 0), summary: "", undo: "none", ...this.changesOf(t.runId, t.changes), ...(t.steers.length ? { steers: t.steers } : {}), ...this.cardOfRun(t.runId, "unconfirmed_stop") });
       this.maybeExit();
     }, this.o.exitWaitMs ?? EXIT_WAIT_MS);
   }
@@ -1193,7 +1203,43 @@ const undoFrom = (runId: string, r: Record<string, unknown>): Extract<SessionBod
 const undoUnknown = (runId: string): Extract<SessionBody, { kind: "session.task_undo" }> => ({ kind: "session.task_undo", run_id: runId, undone: 0, total: 0, refused: "the undo was cut off before it ended; how much of it was done is not known", unknown: true });
 /** A run's changes so far: its last `changes` event's (SessionHost.changesOf: every end written without task_done). */
 const changesIn = (evs: Record<string, unknown>[]) => { const c = [...evs].reverse().find((e) => e.kind === "changes"); return c ? capChanges(c) : undefined; };
-const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[]): TaskEnd => { const changes = changesIn(evs); return { kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}) }; };
+const interrupted = (runId: string, steers: string[], evs: Record<string, unknown>[], lang: Lang = "zh"): TaskEnd => { const changes = changesIn(evs), card = fallbackCard(evs, lang, "crashed"); return { kind: "session.task_end", run_id: runId, status: "interrupted", reason: "the session process went away before the task ended", ...unknownIf(openStepsIn(evs) > 0), summary: "", undo: "none", ...(changes ? { changes } : {}), ...(steers.length ? { steers } : {}), ...(card ? { result_card: card } : {}) }; };
+
+/** A result card whose undo nothing will carry out (its executor does not wait): the undo option left off, the reason
+ *  said — as the executor does when it will not wait (cli/app.ts cardEvent). */
+function withoutUndo(card: unknown, lang: Lang): unknown {
+  const c = card as { text?: unknown; options?: { kind?: unknown }[] } | null | undefined;
+  if (!c || !Array.isArray(c.options) || !c.options.some((x) => x?.kind === "undo")) return card;
+  return { ...c, text: `${String(c.text ?? "")}\n${T(lang).noUndo(T(lang).noWait)}`, options: c.options.filter((x) => x?.kind !== "undo") };
+}
+
+/** A result card for a run that ended with no task_done — its executor crashed or was killed, or did not confirm the app's
+ *  stop in time (review of #68: a task that changed things always ends with a result card, and the app relies on it).
+ *  Written by the session from the run's own events: every step that came back ok or unverified and was not a look,
+ *  every step begun and never ended (it may have taken effect), and the files of the last `changes` — screen edits are
+ *  never in `changes`, so a task that only acted on screen is never shown as having changed nothing. No undo: nothing
+ *  is left to carry it out, and the card says so. Undefined when the run changed nothing. */
+function fallbackCard(evs: Record<string, unknown>[], lang: Lang, why: "crashed" | "unconfirmed_stop"): CardEvent | undefined {
+  const t = T(lang);
+  const steps = new Map<string, { text: string; consequence?: unknown }>(), results = new Map<string, { status: unknown; consequence?: unknown }>();
+  for (const e of evs) {
+    if (e.kind === "step" && typeof e.step_id === "string") steps.set(e.step_id, { text: String(e.human ?? e.text ?? ""), consequence: e.consequence });
+    if (e.kind === "step_result" && typeof e.step_id === "string") results.set(e.step_id, { status: e.status, consequence: e.consequence });
+  }
+  const did: string[] = [], unsure: string[] = [];
+  for (const [id, st] of steps) {
+    const r = results.get(id), consequence = r?.consequence ?? st.consequence;
+    if (consequence === "read") continue;
+    if (!r) unsure.push(st.text);
+    else if (r.status === "ok") did.push(st.text);
+    else if (r.status === "unverified") unsure.push(st.text);
+  }
+  const c = changesIn(evs);
+  const files = c ? [...c.created.map((p) => t.fileMade(p)), ...c.modified.map((p) => t.fileChanged(p)), ...c.deleted.map((p) => t.fileGone(p))] : [];
+  if (!did.length && !unsure.length && !files.length) return undefined;
+  const text = [why === "crashed" ? t.crashed : t.stopUnconfirmed, ...(did.length ? [t.did(did.slice(-6))] : []), ...(unsure.length ? [t.didUnsure(unsure.slice(-6))] : []), ...(files.length ? [t.files(files.slice(0, 12))] : [])].join("\n");
+  return { kind: "result", text, options: [{ kind: "approve", text: t.fine }], free_text: false, blocking: false };
+}
 
 /** session.task_end from the executor's task_done: its cause is the field copied (one of the known values), never read
  *  out of its reason. */

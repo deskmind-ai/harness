@@ -161,7 +161,9 @@ describe("H2: every end path × every kind of change → result card and undo", 
       rows.push(`${row} card=${!!done.result_card} undo=${!!done.result_card?.options.some((x) => x.kind === "undo")}`);
       expect(done.status, row).toBe(end === "app_gone" ? "stopped" : end);
       expect(!!done.result_card, row).toBe(changed);
-      expect(done.result_card?.options.some((x) => x.kind === "undo") ?? false, row).toBe(reversible);
+      // undo is offered only while something waits to carry it out: the app gone (stdin closed), nothing does
+      expect(done.result_card?.options.some((x) => x.kind === "undo") ?? false, row).toBe(reversible && end !== "app_gone");
+      if (reversible && end === "app_gone") expect(done.result_card!.text, row).toContain("这次运行结束后不再等回答，撤回用不了");
       if (change === "gui" || change === "unsure") expect(screen.length, row).toBeGreaterThan(0);
       if (changed && !reversible) expect(done.result_card!.text, row).toMatch(change === "unsure" ? /做没做成没法确认，撤不回/ : /界面上的操作撤不回/);
       if (changed && end !== "succeeded") expect(done.result_card!.text.split("\n")[0], row).toMatch(/^任务.*已经做了的改动：$/);
@@ -381,5 +383,150 @@ describe("H2 through the session: the undo window", () => {
     const end = s.of("session.task_end")[0];
     expect(end).toMatchObject({ status: "failed", undo: "none" });
     expect(end.undo_until).toBeUndefined();
+  });
+});
+
+describe("H2, review of #68: undo only while something can carry it out; every end has its card", () => {
+  it("an undo sent in the second after waking from a sleep past the window, before any tick: nothing is undone, and that is said", async () => {
+    const clock = new FakeClock();
+    const d = desk();
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    const done = appRun({ run_id: "run_wake", raw: "新建 a.txt", config: "ds-flash", scope: d.scope }, {
+      runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out: (e) => events.push(e), input: new LineReader(input), linger: 600,
+      inject: { driver: d.sim, gateway: gateway(), clock, model: { model: MODEL, streamFn: scriptedStream([...changeSteps(d, "file"), { calls: [{ name: "finish", args: { outcome: "done", summary: "写了" } }] }]) } },
+    });
+    await waitFor(() => events.some((e) => e.kind === "task_done"));
+    const td = events.find((e) => e.kind === "task_done") as Extract<AppEvent, { kind: "task_done" }>;
+    expect(td.undo_until).toBe(clock.now() / 1000 + 600);
+    clock.advance(5 * 60_000);
+    clock.sleep(30 * 60_000);                              // past undo_until; no timer moved
+    input.write(JSON.stringify({ type: "respond", option: td.result_card!.options.findIndex((x) => x.kind === "undo") }) + "\n");
+    await done;
+    expect(events.at(-1)).toMatchObject({ kind: "result_response", picked: "undo", undone: 0, total: 1 });
+    expect((events.at(-1) as any).refused).toContain("window had ended");
+    expect(fs.readFileSync(path.join(d.scope, "a.txt"), "utf-8")).toBe("hi");
+  });
+
+  it("a signal ends the run normally (the step's receipt came): the card offers no undo and says why — the process exits, nobody can carry it out", async () => {
+    class Slow extends SimComputer {
+      began!: () => void;
+      performing = new Promise<void>((r) => { this.began = r; });
+      override perform(a: Action) { if (a.kind !== "open_window") return super.perform(a); this.began(); return new Promise<ReturnType<SimComputer["perform"]>>((r) => setTimeout(() => r(super.perform(a)), 300)) as never; }
+    }
+    const scope = fs.mkdtempSync(path.join(os.tmpdir(), "result-card-"));
+    const sim = new Slow(scope);
+    const events: AppEvent[] = [];
+    let signal!: (sig: string) => void;
+    let exited = false;
+    void appRun({ run_id: "run_sig", raw: "新建 a.txt，再开一个编辑器", config: "ds-flash", scope }, {
+      runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out: (e) => events.push(e), input: new LineReader(new PassThrough()), linger: 600,
+      signals: { onSignal: (h) => { signal = h; }, exit: () => { exited = true; }, exitNow: () => { exited = true; }, deadlineMs: 50, waitMs: 3000 },
+      inject: { driver: sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream([
+        { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+        { calls: [{ name: "computer_snapshot", args: {} }] },
+        (m) => ({ calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "编辑器" }, epoch: lastJson(m).epoch, consequence: "create", purpose: "开编辑器" } }] }),
+        { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] },
+      ]) } },
+    });
+    await sim.performing;
+    signal("SIGINT");
+    await waitFor(() => exited, 5000);
+    const done = events.find((e) => e.kind === "task_done") as Extract<AppEvent, { kind: "task_done" }>;
+    expect(done.status).toBe("stopped");
+    expect(done.reason).not.toContain("unknown");            // the runtime's own end, not the forced one
+    expect(done.result_card!.options.map((x) => x.kind)).toEqual(["approve"]);
+    expect(done.result_card!.text).toContain("这次运行结束后不再等回答，撤回用不了");
+    expect(done.undo_until).toBeUndefined();
+  });
+
+  it("an action the driver had, whose result came back as an error or as the screen found locked after it, is a change that may have happened: no undo of the rest", async () => {
+    for (const how of ["error", "locked_after"] as const) {
+      const d = desk();
+      const perform = d.sim.perform.bind(d.sim);
+      d.sim.perform = (a: Action) => {
+        if (a.kind !== "key") return perform(a);
+        perform(a);                                        // it went through on screen
+        if (how === "locked_after") { d.sim.lock(); return { status: "unverified", why: "sent; nothing read back", window: d.w }; }
+        return { status: "error", why: "the driver lost track of it" };
+      };
+      const r = runTask(d, [...changeSteps(d, "unsure")], how === "error" ? "succeeded" : "environment", { undo: true });
+      await r.done;
+      const done = r.taskDone()!;
+      // the key's step came back as the review describes: error (from the driver), or environment (locked after it)
+      expect(r.events.filter((e) => e.kind === "step_result").at(-1), how).toMatchObject(how === "error" ? { status: "error", executor_status: "error" } : { status: "refused", executor_status: "environment" });
+      expect(done.result_card, how).not.toBeNull();
+      expect(done.result_card!.options.map((x) => x.kind), how).toEqual(["approve"]);
+      expect(done.result_card!.text, how).toContain("有一步做没做成没法确认，撤不回");
+      expect(fs.readFileSync(path.join(d.scope, "a.txt"), "utf-8"), how).toBe("hi");    // nothing undone
+    }
+  });
+});
+
+describe("H2, review of #68: the executor ends with no task_done — the session writes the result card", () => {
+  /** An executor that reports a few steps (and their changes) on stdout and in its events.jsonl, then dies. */
+  const crashing = (evs: Record<string, unknown>[]): Launcher => (_req, lo) => {
+    const file = path.join(lo.runs, lo.runId, "events.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    let cb: ((l: string) => void) | null = null;
+    let die!: (x: { code: number | null; signal: string | null }) => void;
+    const exited = new Promise<{ code: number | null; signal: string | null }>((r) => { die = r; });
+    const lines = evs.map((e, i) => JSON.stringify({ seq: i + 1, t: Date.now() / 1000, run_id: lo.runId, ...e }));
+    return {
+      start: () => { setTimeout(() => { fs.writeFileSync(file, lines.join("\n") + "\n"); for (const l of lines) cb?.(l); setTimeout(() => die({ code: 1, signal: null }), 10); }, 5); },
+      write: () => {}, close: () => {}, onLine: (f) => { cb = f; }, exited,
+    };
+  };
+  const ses = (launch: Launcher) => {
+    const evs: any[] = [];
+    const h = new SessionHost({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-ses-")), sessionId: "ses_crash", out: (e) => evs.push(e), coalesceMs: 5,
+      model: { model: MODEL, streamFn: scriptedStream([{ text: "好" }]) }, launch, linger: 600 });
+    hosts.push(h);
+    h.start();
+    return { h, evs };
+  };
+
+  it("screen steps only (nothing in changes): the card lists them, says the process ended unexpectedly, offers no undo", async () => {
+    const s = ses(crashing([
+      { kind: "start", raw: "改一下笔记", lang: "zh", engine: "runtime" },
+      { kind: "step", step_id: "st_1", text: "{}", human: "在 编辑器「笔记.txt」 看一眼", consequence: "read" },
+      { kind: "step_result", step_id: "st_1", status: "ok", consequence: "read" },
+      { kind: "step", step_id: "st_2", text: "{}", human: "在 编辑器「笔记.txt」 把「正文」设为「新的」", consequence: "modify_user" },
+      { kind: "step_result", step_id: "st_2", status: "ok", consequence: "modify_user" },
+      { kind: "step", step_id: "st_3", text: "{}", human: "在 编辑器「笔记.txt」 按 cmd+s", consequence: "modify_user" },
+      { kind: "step_result", step_id: "st_3", status: "unverified", consequence: "modify_user" },
+      { kind: "step", step_id: "st_4", text: "{}", human: "在 编辑器「笔记.txt」 点「关闭」", consequence: "modify_user" },
+      { kind: "changes", created: [], modified: [], deleted: [], external: [], unconfirmed: [] },
+    ]));
+    s.h.handle(JSON.stringify({ type: "cua", text: "改一下笔记" }));
+    await waitFor(() => s.evs.some((e) => e.kind === "session.task_end"));
+    const end = s.evs.find((e) => e.kind === "session.task_end");
+    expect(end).toMatchObject({ status: "failed", undo: "none", cause: "last_step_unknown" });
+    expect(end.result_card).toMatchObject({ kind: "result", blocking: false, options: [{ kind: "approve", text: "好的" }] });
+    const text: string = end.result_card.text;
+    expect(text.split("\n")[0]).toBe("执行进程意外退出，撤不回");
+    expect(text).toContain("做了：在 编辑器「笔记.txt」 把「正文」设为「新的」");
+    expect(text).toContain("做没做成没法确认：在 编辑器「笔记.txt」 按 cmd+s；在 编辑器「笔记.txt」 点「关闭」");
+    expect(text).not.toContain("看一眼");
+  });
+
+  it("files in changes are listed; a run that only looked has no card", async () => {
+    const s = ses(crashing([
+      { kind: "step", step_id: "st_1", text: "fs.create_text {}", human: "新建 a.txt", consequence: "create" },
+      { kind: "step_result", step_id: "st_1", status: "ok", consequence: "create" },
+      { kind: "changes", created: ["a.txt"], modified: ["b.txt"], deleted: [], external: [], unconfirmed: [] },
+    ]));
+    s.h.handle(JSON.stringify({ type: "cua", text: "新建 a.txt" }));
+    await waitFor(() => s.evs.some((e) => e.kind === "session.task_end"));
+    const end = s.evs.find((e) => e.kind === "session.task_end");
+    expect(end.result_card.text).toContain("文件：新建 a.txt；改了 b.txt");
+    expect(end.result_card.options.map((x: any) => x.kind)).toEqual(["approve"]);
+    const s2 = ses(crashing([
+      { kind: "step", step_id: "st_1", text: "{}", human: "看一眼", consequence: "read" },
+      { kind: "step_result", step_id: "st_1", status: "ok", consequence: "read" },
+    ]));
+    s2.h.handle(JSON.stringify({ type: "cua", text: "看一下" }));
+    await waitFor(() => s2.evs.some((e) => e.kind === "session.task_end"));
+    expect(s2.evs.find((e) => e.kind === "session.task_end").result_card).toBeUndefined();
   });
 });

@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { z } from "zod";
+import { CardEvent } from "../protocol/events.js";
 import { STOP_CAUSES } from "../protocol/computer.js";
 
 /** Where sessions live when the command line does not say: the app's own folder. */
@@ -65,7 +66,11 @@ export const SessionBody = z.discriminatedUnion("kind", [
   // `undo_until` (M2 H2, additive): with undo open, when the window ends by itself — the executor's task_done.undo_until,
   // seconds since the epoch. For showing the time left only: the undo can be answered until session.task_closed
   z.object({ kind: z.literal("session.task_end"), run_id: z.string(), status: z.string(), summary: z.string(), undo: z.enum(["open", "none"]), reason: z.string().optional(), cause: z.enum(STOP_CAUSES).optional(),
-    answer: z.string().nullable().optional(), changes: Changes.optional(), steers: z.array(z.string()).optional(), undo_until: z.number().optional() }),
+    answer: z.string().nullable().optional(), changes: Changes.optional(), steers: z.array(z.string()).optional(), undo_until: z.number().optional(),
+    // `result_card` (M2 H2, additive): the session's own result card for an end written with no task_done (its executor
+    // crashed or was killed, or never confirmed a stop) when the run changed something — the steps done or maybe done,
+    // the files; never an undo. With a task_done the card is the executor's (task_done.result_card), not here
+    result_card: CardEvent.optional() }),
   // H2: the session closed the run's executor (its stdin): the result card can no longer be answered. linger: it ended by
   // itself (a respond answered, its deadline, no result card); new_task: a computer task started on this Mac; session_end
   z.object({ kind: z.literal("session.task_closed"), run_id: z.string(), why: z.enum(["linger", "new_task", "session_end"]) }),

@@ -1153,6 +1153,8 @@ rl.on("close",()=>{if(!undoing)process.exit(0)});`;
     // M2 H2: the task changed something, so its result card is shown all the same; its undo is none (task_end above)
     // and no deadline is said for it
     expect(s.evs.find((e) => e.kind === "task_done").result_card).not.toBeNull();
+    // no undo offered: nothing will wait to carry it out (review of #68)
+    expect(s.evs.find((e) => e.kind === "task_done").result_card.options.map((x: any) => x.kind)).not.toContain("undo");
     expect(s.evs.find((e) => e.kind === "task_done").undo_until).toBeUndefined();
     expect((s.stored().find((e: any) => e.kind === "session.task_end") as any).undo_until).toBeUndefined();
     await waitFor(() => !groupUp(ex.pgids[0]!) && lockState(s.dir) === "free");
