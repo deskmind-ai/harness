@@ -99,7 +99,7 @@ MCP（JSON-RPC 2.0，stdio，每行一条）。服务名 `deskmind-executor`，�
 
 - **卡片过期（M2 H1，负责人 10-24，加的取值和控制，不升版本）：** 时间到了不替用户回答。
   - 只有动作卡（单个动作的同意卡，`card.kind` 为 `action`、带 `card.consent`）会过期；计划卡、问题卡、选择卡、中断后对不上的卡一直等。
-  - 动作卡开着 10 分钟没人答（按墙上时钟算：Mac 睡着的时间也算，醒来后一秒内就过期），执行层发 `resumed{ask_id, voided:"timeout"}` 和 `ask_void{ask_id, why:"timeout"}`。什么都没签、什么都没做。
+  - 动作卡开着 10 分钟没人答（按墙上时钟算：Mac 睡着的时间也算，醒来后一秒内就过期），执行层发 `resumed{ask_id, voided:"timeout"}` 和 `ask_void{ask_id, why:"timeout"}`。什么都没签、什么都没做。醒来后还没到那一秒的检查就来了回答或 `reask`：先按墙上时钟看有没有过期，过了就当场过期（回答被拒，`reask` 照常重新问），不会被当成回答。
   - 之后任务停在原地，照旧占着这台 Mac（会话的电脑锁还是 acting），不动手，直到用户：点「现在回答」（控制行 `reask`）、插话（`steer`，那一步不做，按新要求重新决定）、或停止（`stop`，任务以 stopped 结束）。stdin 关闭同停止。
   - `reask`：执行层把这一步在卡片当时的画面上重新交给执行器，不带同意：画面没变，出一张新卡（新的 `ask_id`，重新计 10 分钟）；画面变了，这一步按 stale 回来（`step_result` stale，没做），运行时重新看、重新决定，要动手就再出卡。没有过期的卡时（卡还开着，或者根本没有卡）来了 `reask`，发一条 `refused`（`what` 是 `reask`，`why` 说原因），什么都不做。
   - 过期或作废的卡，之后发来的回答（带它的 `ask_id`）一到就拒：`refused{what:"answer for <ask_id>", why}`，`why` 写明它过期了或作废了；从不当作回答。这条拒绝在 `task_done` 之后也可能出现。

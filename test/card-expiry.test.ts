@@ -93,7 +93,8 @@ function mailSteps(w: string, sendTries = 1): Step[] {
   ];
 }
 
-type Entry = { event: AppEvent } | { control: Record<string, unknown> } | { perform: Action };
+/** `wall`: the fake wall clock when the app sent the line. */
+type Entry = { event: AppEvent } | { control: Record<string, unknown>; wall: number } | { perform: Action };
 
 /** app-run in process: the plan card is approved by the app; everything else is the test's to do (`send`). Every
  *  event, every control line the app sent and every action the driver was asked to perform go on one timeline. */
@@ -104,7 +105,7 @@ function start(o: { clock: FakeClock; sendTries?: number; steps?: (w: string) =>
   sim.perform = (a: Action) => { timeline.push({ perform: a }); return perform(a); };
   const input = new PassThrough();
   const events: AppEvent[] = [];
-  const send = (c: Record<string, unknown>) => { timeline.push({ control: c }); input.write(JSON.stringify(c) + "\n"); };
+  const send = (c: Record<string, unknown>) => { timeline.push({ control: c, wall: o.clock.now() }); input.write(JSON.stringify(c) + "\n"); };
   const out = (e: AppEvent) => {
     events.push(e); timeline.push({ event: e });
     if (e.kind === "ask" && e.card.kind === "plan" && !o.holdPlan) setTimeout(() => send({ type: "answer", ask_id: e.ask_id, option: e.card.options.findIndex((x) => x.kind === "approve") }), 1);
@@ -297,6 +298,41 @@ describe("H1: an expired action card — nobody answers for the user", () => {
     for (const x of [r, r2]) { x.send({ type: "stop" }); await x.done; }
   });
 
+  it("a yes in the second after waking from a sleep past the deadline, before any tick: refused, never used (review of #67)", async () => {
+    const clock = new FakeClock();
+    const r = start({ clock });
+    await waitFor(() => r.actionCards().length === 1);
+    const card = r.actionCards()[0]!;
+    clock.advance(5 * MIN);
+    clock.sleep(60 * MIN);                               // no timer moved: the tick has not run
+    r.send({ type: "answer", ask_id: card.ask_id, option: r.approveOf(card) });
+    await waitFor(() => r.voids("timeout").length === 1);
+    await waitFor(() => r.events.some((e) => e.kind === "refused" && e.what === `answer for ${card.ask_id}`));
+    expect((r.events.find((e) => e.kind === "refused" && e.what === `answer for ${card.ask_id}`) as any).why).toContain("expired");
+    expect(r.events.some((e) => e.kind === "resumed" && e.ask_id === card.ask_id && !e.voided)).toBe(false);
+    await sleep(30);
+    expect(r.sendClicks()).toBe(0);
+    expect(r.finished()).toBe(false);                     // waiting in place
+    r.send({ type: "stop" });
+    await r.done;
+    expect(r.sent()).toBe(0);
+  });
+
+  it("「现在回答」 in the second after waking past the deadline, before any tick: the card expires and is asked again at once", async () => {
+    const clock = new FakeClock();
+    const r = start({ clock });
+    await waitFor(() => r.actionCards().length === 1);
+    clock.sleep(11 * MIN);
+    r.send({ type: "reask" });
+    await waitFor(() => r.actionCards().length === 2);
+    expect(r.voids("timeout").map((v) => v.ask_id)).toEqual([r.actionCards()[0]!.ask_id]);
+    expect(r.events.some((e) => e.kind === "refused" && e.what === "reask")).toBe(false);
+    const second = r.actionCards()[1]!;
+    r.send({ type: "answer", ask_id: second.ask_id, option: r.approveOf(second) });
+    await r.done;
+    expect(r.sent()).toBe(1);
+  });
+
   it("only action cards expire: a question and a plan card wait however long; the send's card in the same task expires", async () => {
     const clock = new FakeClock();
     // the runtime asks a question (a missing-information card), plans (the plan card), then sends (an action card);
@@ -350,22 +386,24 @@ describe("H1: an expired action card — nobody answers for the user", () => {
 describe("H1 property: random interleavings of the user, the clock and the screen", () => {
   /** A small seeded generator (mulberry32): the same seed, the same schedule. */
   const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-  type Move = "wait_9" | "wait_10" | "sleep_60" | "answer_open" | "answer_old" | "reask" | "relayout" | "stop" | "decline_open";
+  type Move = "wait_9" | "wait_10" | "sleep_60" | "sleep_answer" | "sleep_reask" | "answer_open" | "answer_old" | "reask" | "relayout" | "stop" | "decline_open";
 
-  it("never a send without a yes to a live card; nothing performed between an expiry and the user's next word; every late answer refused", async () => {
-    const seeds = Array.from({ length: 32 }, (_, i) => 1000 + i);
+  it("never a send without a yes sent before the card's deadline (by the wall clock); nothing performed between an expiry and the user's next word; every late answer refused", async () => {
+    const seeds = Array.from({ length: 40 }, (_, i) => 1000 + i);
     for (const seed of seeds) {
       const rand = rng(seed);
       const clock = new FakeClock();
       const r = start({ clock, sendTries: 6 });
-      const moves: Move[] = ["wait_9", "wait_10", "sleep_60", "answer_open", "answer_old", "reask", "relayout", "stop", "decline_open"];
+      // sleep_answer / sleep_reask: the Mac sleeps past the deadline and the user answers (or taps 「现在回答」) in the
+      // second after waking, before any tick has run (review of #67)
+      const moves: Move[] = ["wait_9", "wait_10", "sleep_60", "sleep_answer", "sleep_reask", "answer_open", "answer_old", "reask", "relayout", "stop", "decline_open"];
       const done: Move[] = [];
-      /** The app's own view (from the events it got): which cards are open, and which it saw let go. */
+      /** The app's own view (from the events it got): which card is open, to aim its moves. Never the oracle. */
       const openCard = () => { const a = r.actionCards().at(-1); return a && !r.events.some((e) => (e.kind === "ask_void" || e.kind === "resumed") && e.ask_id === a.ask_id) ? a : null; };
-      const yesSentTo: string[] = [];
-      /** When the app first saw each action card (fake wall time: the clock moves only in the moves below), and the
-       *  cards that were open when the wall clock passed their deadline: each must end voided by the timeout */
+      /** The oracle's clock: each action card's deadline is 10 minutes of fake wall time after it was asked (the clock
+       *  moves only in the moves below, so the wall time when the app first sees a card is when it was asked) */
       const seen = new Map<string, number>();
+      const deadlineOf = (id: string) => seen.get(id)! + CARD_EXPIRY_MS;
       const mustExpire: { id: string; at: number }[] = [];
       for (let i = 0; i < 14 && !r.finished(); i++) {
         await waitFor(() => r.finished() || r.actionCards().length > 0, 3000);
@@ -375,13 +413,15 @@ describe("H1 property: random interleavings of the user, the clock and the scree
         done.push(m);
         const open = openCard();
         const old = r.voids().at(-1);
-        const due = () => { if (open && clock.now() >= seen.get(open.ask_id)! + CARD_EXPIRY_MS) mustExpire.push({ id: open.ask_id, at: r.timeline.length }); };
+        const due = () => { if (open && clock.now() >= deadlineOf(open.ask_id)) mustExpire.push({ id: open.ask_id, at: r.timeline.length }); };
         if (m === "wait_9") { clock.advance(9 * MIN); due(); }
         else if (m === "wait_10") { clock.advance(CARD_EXPIRY_MS); due(); }
         else if (m === "sleep_60") { clock.sleep(60 * MIN); clock.advance(1000); due(); }
-        else if (m === "answer_open" && open) { yesSentTo.push(open.ask_id); r.send({ type: "answer", ask_id: open.ask_id, option: r.approveOf(open) }); }
+        else if (m === "sleep_answer") { clock.sleep(11 * MIN); if (open) { r.send({ type: "answer", ask_id: open.ask_id, option: r.approveOf(open) }); due(); } }
+        else if (m === "sleep_reask") { clock.sleep(11 * MIN); r.send({ type: "reask" }); due(); }
+        else if (m === "answer_open" && open) r.send({ type: "answer", ask_id: open.ask_id, option: r.approveOf(open) });
         else if (m === "decline_open" && open) r.send({ type: "answer", ask_id: open.ask_id, option: open.card.options.findIndex((x) => x.kind === "skip_step") });
-        else if (m === "answer_old" && old) { yesSentTo.push(old.ask_id); r.send({ type: "answer", ask_id: old.ask_id, option: 0 }); }
+        else if (m === "answer_old" && old) r.send({ type: "answer", ask_id: old.ask_id, option: 0 });
         else if (m === "reask") r.send({ type: "reask" });
         else if (m === "relayout") r.sim.relayout(r.w);
         else if (m === "stop") r.send({ type: "stop" });
@@ -390,11 +430,17 @@ describe("H1 property: random interleavings of the user, the clock and the scree
       if (!r.finished()) { r.send({ type: "stop" }); }
       await r.done;
       const ctx = `seed ${seed}: ${done.join(",")}`;
-      // 1. the send went out only on a yes the app gave to a card that was not let go before that yes arrived
-      const voidedBefore = (id: string, at: number) => r.timeline.slice(0, at).some((x) => "event" in x && x.event.kind === "ask_void" && x.event.ask_id === id);
-      const liveYes = r.timeline.flatMap((x, i) => ("control" in x && x.control.type === "answer" && x.control.option === 0 && !voidedBefore(String(x.control.ask_id), i) ? [String(x.control.ask_id)] : []));
+      const answers = r.timeline.flatMap((x, i) => ("control" in x && x.control.type === "answer" ? [{ id: String(x.control.ask_id), yes: x.control.option === 0, wall: x.wall, at: i }] : []));
+      // 1. the send went out only on a yes the app sent before that card's deadline, by the fake wall clock
+      const liveYes = answers.filter((a) => a.yes && a.wall < deadlineOf(a.id));
       expect(r.sendClicks(), ctx).toBeLessThanOrEqual(liveYes.length);
       expect(r.sent(), ctx).toBeLessThanOrEqual(r.sendClicks());
+      // 1b. an answer sent at or after its card's deadline is refused by name, and never taken (no resumed for it)
+      for (const a of answers.filter((x) => x.wall >= deadlineOf(x.id))) {
+        expect(r.events.some((e) => e.kind === "refused" && e.what === `answer for ${a.id}`), `${ctx} (late ${a.id})`).toBe(true);
+        expect(r.events.some((e) => e.kind === "resumed" && e.ask_id === a.id && !e.voided), `${ctx} (late ${a.id})`).toBe(false);
+      }
+      const voidedBefore = (id: string, at: number) => r.timeline.slice(0, at).some((x) => "event" in x && x.event.kind === "ask_void" && x.event.ask_id === id);
       // 2. after every expiry, the driver gets nothing until the app's next line (reask, steer, stop, answer)
       r.timeline.forEach((x, i) => { if ("event" in x && x.event.kind === "ask_void" && x.event.why === "timeout") expect(performsAfterUntilControl(r, i), ctx).toEqual([]); });
       // 3. a yes to a card already let go is refused, by name, and no resumed ever answers it
@@ -407,7 +453,7 @@ describe("H1 property: random interleavings of the user, the clock and the scree
       // 4. nobody's silence is an answer, and no card outlives its deadline: one open when the wall clock passed it was
       //    voided by the timeout (unless its answer had already been taken before that move)
       for (const x of mustExpire) {
-        const answered = r.timeline.slice(0, x.at).some((y) => "event" in y && y.event.kind === "resumed" && y.event.ask_id === x.id && !y.event.voided);
+        const answered = answers.some((a) => a.id === x.id && a.at < x.at && a.wall < deadlineOf(x.id));
         if (!answered) expect(r.voids("timeout").map((v) => v.ask_id), ctx).toContain(x.id);
       }
       // 5. a voided card is voided once, and every ask_id is new

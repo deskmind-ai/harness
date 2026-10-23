@@ -153,6 +153,10 @@ export class ExecutorService {
   private reDecide = false;
   /** An action card expired: the task waits in place for the user — 「现在回答」 (reask), a steer, or a stop. */
   private expiredWait: ((how: "reask" | "steer" | null) => void) | null = null;
+  /** The open action card's expiry check (true: it is past its deadline, and is expired by asking), while one is open. */
+  private expireOpen: (() => boolean) | null = null;
+  /** A reask that came for a card past its deadline the tick had not expired yet: taken as soon as it has. */
+  private reaskWaiting = false;
   private readonly t: ReturnType<typeof T>;
 
   /** The options, without the signer and the card asker: those are private fields, out of reach of anything that
@@ -211,6 +215,9 @@ export class ExecutorService {
    *  as it is now — the same screen asks again on a new card, a moved one sends the caller back to look. Nothing to
    *  reask (no card expired, or the task is over): said, nothing else happens. */
   reask() {
+    // the card is past its deadline but the tick has not run (the second after waking): it expires now, and this reask
+    // is the user's answer to that
+    if (!this.expiredWait && this.expireOpen?.()) { this.reaskWaiting = true; this.count("reasks"); this.emit("card.reask", { expired_now: true }); return; }
     if (!this.expiredWait) { this.emit("reask.refused", { why: this.status || this.executorEnded ? "the task already finished" : "no card has expired" }); return; }
     this.count("reasks");
     this.emit("card.reask", {});
@@ -315,11 +322,25 @@ export class ExecutorService {
     // stood still meanwhile). It voids the card like a steer, with the reason "timeout"
     const ms = expires ? this.o.cardExpiryMs : undefined;
     const clock = this.o.clock ?? WALL_CLOCK;
-    const cancel = ms !== undefined && ms >= 0 ? atWallTime(clock, clock.now() + ms, () => open.abort("timeout")) : () => {};
+    const deadline = ms !== undefined && ms >= 0 ? clock.now() + ms : null;
+    const cancel = deadline !== null ? atWallTime(clock, deadline, () => open.abort("timeout")) : () => {};
+    // the tick alone is not enough: the Mac's timers stand still in sleep, and an answer (or a reask) can arrive in the
+    // second after waking, before the tick has run (review of #67). Whatever arrives for the card asks this first: past
+    // the deadline, the card expires now, and what arrived is not its answer
+    // (asked by the asker as an answer arrives, it decides that answer: live, it is taken — not undone by a check a
+    // moment later, after the app was told it was answered)
+    let askerChecked = false;
+    const check = (): boolean => {
+      if (deadline !== null && !open.signal.aborted && clock.now() >= deadline) open.abort("timeout");
+      return open.signal.aborted && open.signal.reason === "timeout";
+    };
+    const expired = (): boolean => { const gone = check(); if (!gone) askerChecked = true; return gone; };
+    this.expireOpen = check;
     try {
       // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16); a steer
-      // voids it (the asker is told through the signal, and lets the app know)
-      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal }));
+      // voids it (the asker is told through the signal, and lets the app know). `expired`: the asker asks it before it
+      // takes an answer
+      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal, ...(deadline !== null ? { expired } : {}) }));
       p.catch(() => undefined);
       const a = await Promise.race([p,
         new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true })),
@@ -330,15 +351,20 @@ export class ExecutorService {
         return why === "timeout" ? "expired" : "voided";
       }
       if (a === null) return null;
+      // an asker that does not ask `expired` itself (not the app's): an answer it hands over past the deadline is not used
+      if (!askerChecked && expired()) { this.emit("card.voided", { kind: card.kind, why: "timeout", late_answer: true }); return "expired"; }
       if ("option" in a) { const o = card.options[a.option]; return o ? { option: o, text: o.text } : null; }
       return { option: null, text: a.text };
-    } finally { cancel(); if (this.openCard === open) this.openCard = null; }
+    } finally { cancel(); if (this.openCard === open) this.openCard = null; if (this.expireOpen === check) this.expireOpen = null; }
   }
 
   /** After an action card expired: the task stays where it is, acting on nothing, until the user taps 「现在回答」
    *  (reask), changes the request (steer) or stops it (null). The computer stays the task's meanwhile. */
   private afterExpiry(): Promise<"reask" | "steer" | null> {
+    const reasked = this.reaskWaiting;
+    this.reaskWaiting = false;
     if (this.pending.length) return Promise.resolve("steer");
+    if (reasked && !this.stopped.signal.aborted) return Promise.resolve("reask");
     if (this.stopped.signal.aborted) return Promise.resolve(null);
     this.emit("card.expired_wait", {});
     return new Promise((res) => { this.expiredWait = (how) => { this.expiredWait = null; res(how); }; });

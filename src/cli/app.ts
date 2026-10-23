@@ -144,12 +144,15 @@ export class StdioUser implements RuntimeUser {
   private refuseLate(ask_id: string, why: string) {
     this.log.emit({ kind: "refused", what: `answer for ${ask_id}`, why: why === "timeout" ? `card ${ask_id} expired before it was answered (nobody answers for the user): reask asks it again` : `card ${ask_id} was voided (${why})`, by: "executor" });
   }
-  async ask(card: Card, o: { signal?: AbortSignal } = {}): Promise<Answer | null> {
+  async ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
     this.log.emit({ kind: "waiting", ask_id });
     for (;;) {
       const line = await this.input.next(o.signal);
+      // an answer in the second after waking, before the deadline's tick has run: the deadline is asked first (review of
+      // #67) — past it, the card expires here and the answer is refused below, never used
+      if (line) o.expired?.();
       // the user changed the request while the card was open (steer), or nobody answered it in time (timeout): the card
       // is let go, and the app is told to close it. A line read at that same moment is not this card's answer any more:
       // an answer in it is refused (never used)
