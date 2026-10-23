@@ -27,7 +27,7 @@ import { NEEDS_CONSENT, higher, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
-import { journalSteps, parseJournal, type JournalLine, type JournalStep } from "./possibly.js";
+import { journalSteps, parseJournal, saysNotPerformed, type JournalLine, type JournalStep } from "./possibly.js";
 import { T, type Lang } from "./text.js";
 import type { KeyObject } from "node:crypto";
 import { span } from "../otel/trace.js";
@@ -1272,9 +1272,13 @@ export class Executor {
     let epochWhy: unknown;
     // the journal as this act begins: whether it could have done something is read off what it wrote (possibly.ts)
     const jmark = this.jlines.length;
+    // a screen action's receipt, written with the act's final status (after the read-back), so the journal says what
+    // the result says: what a card lists as done and what undo takes back are the same (review of #68: E2)
+    let pendingReceipt: Record<string, unknown> | null = null;
     let stepConsented = false, foregroundOk = false;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
+      if (pendingReceipt) { this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...pendingReceipt }); pendingReceipt = null; }
       const { consent, ...rest } = req;
       // the receipt is evidence for the verdict: what the app alone uses (the step's picture, screen frames, a card's
       // fields) is not in it
@@ -1490,8 +1494,9 @@ export class Executor {
     } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     finally { if (land) { this.flight = null; (land as () => void)(); } }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
-    // (seq: the receipt this act is about to write, for undo's recipes; performed: the driver's own "not done")
-    if (consequence !== "read") this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...(r.performed === false ? { performed: false } : {}) });
+    // the receipt goes into the journal with the act's final status (done): what the driver said is kept beside it, and
+    // its "not done" (performed: false, or a reply the protocol defines as a refusal before acting) as performed: false
+    if (consequence !== "read") pendingReceipt = { driver_status: r.status, ...(saysNotPerformed(r) ? { performed: false } : {}) };
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
     // send that went through took it with it
     if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
@@ -1684,7 +1689,7 @@ export class Executor {
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && cap.effect !== "observe") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
-    if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {}, seq: this.receipts.length + 1 });
+    if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {}, seq: this.receipts.length + 1, ...(saysNotPerformed(r) ? { performed: false } : {}) });
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
     if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, writes: fp.writes, versions_before, madeParents, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));
@@ -1812,15 +1817,15 @@ export class Executor {
     };
   }
 
+  /** The task's possibly-done steps in journal order (possibly.ts), earlier processes' included. */
+  possiblySteps(): JournalStep[] { return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly); }
+
   /** The task's possibly-done steps (possibly.ts: from the journal, earlier processes' included), newest first, and
    *  whether each can be taken back: a file action through its capability's undo (create, move, copy, append have one;
    *  a replaced text or a trashed file do not), a window the task opened by closing it — both only when the step's
    *  outcome is known and recorded (its receipt ok). Anything else done on screen, a step whose outcome is not known (no
    *  receipt, or not ok: an error, a capability that threw half way, a lock found after it), a step still out at the
    *  driver, and an earlier process's step cannot be. The whole run is reversible only when every step is. */
-  /** The task's possibly-done steps in journal order (possibly.ts), earlier processes' included. */
-  possiblySteps(): JournalStep[] { return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly); }
-
   undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] } {
     const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] = [];
     const t = T(this.opts.lang);

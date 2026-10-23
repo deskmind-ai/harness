@@ -72,6 +72,7 @@ function tree(root: string): Record<string, string> {
   const out: Record<string, string> = {};
   const walk = (rel: string) => {
     for (const e of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
+      if (!rel && e.name === ".deskmind-tmp") continue;   // the harness's own scratch folder (registry/workspace.ts TMP), never the user's
       const p = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) { out[p + "/"] = "dir"; walk(p); } else out[p] = fs.readFileSync(path.join(root, p), "utf-8");
     }
@@ -306,7 +307,7 @@ function session(o: { scripts: ((d: Desk) => Step[])[]; clock: FakeClock; linger
       if ((e as any).card.kind === "missing" && o.onAsk) o.onAsk(e, send);
       else if ((e as any).card.kind !== "missing") setTimeout(() => send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: (e as any).card.options.findIndex((x: any) => x.kind === "approve") }), 1);
     }
-  }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream([{ text: "好" }, { text: "好" }, { text: "好" }]) }, launch, linger: o.linger ?? 600 });
+  }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream([{ text: "好" }, { text: "好" }, { text: "好" }]) }, launch, linger: o.linger ?? 600, clock: o.clock });
   hosts.push(h);
   h.start();
   const of = (kind: string, runId?: string) => evs.filter((e) => e.kind === kind && (!runId || e.run_id === runId));
@@ -672,12 +673,12 @@ describe("H2 round 2: could this step have done something — one rule, from the
 
   it("the session refuses an undo sent after undo_until itself — never forwarded, never recorded as cut off", async () => {
     const clock = new FakeClock();
-    clock.wall = Date.UTC(2020, 0, 1);                     // the executor's window ended long ago by the wall clock
     const s = session({ clock, scripts: [() => CREATE()] });
     s.send({ type: "cua", text: "新建 b.txt" });
     await waitFor(() => s.of("session.task_end").length === 1);
     const done = s.of("task_done")[0];
     expect(s.of("session.task_end")[0]).toMatchObject({ undo: "open" });
+    clock.sleep(11 * 60_000);                              // past undo_until on the one clock; the executor's tick has not run
     s.send({ type: "respond", run_id: done.run_id, option: 1 });
     await waitFor(() => s.of("session.error").some((e) => e.control === "respond"));
     expect(s.of("session.error").find((e) => e.control === "respond")).toMatchObject({ code: "undo_expired" });
@@ -685,6 +686,79 @@ describe("H2 round 2: could this step have done something — one rule, from the
     expect(s.of("session.task_respond")).toEqual([]);
     expect(s.of("result_response")).toEqual([]);
     expect(fs.existsSync(path.join(s.desks[0]!.scope, "b.txt"))).toBe(true);
+  });
+
+  it("B1: the session compares undo_until with the executors' clock, not its own: a window open by that clock is open", async () => {
+    // the executors' wall clock is years behind this machine's: the undo window is open by it, so the undo is done
+    const clock = new FakeClock();
+    clock.wall = Date.UTC(2020, 0, 1);
+    const s = session({ clock, scripts: [() => CREATE()] });
+    s.send({ type: "cua", text: "新建 b.txt" });
+    await waitFor(() => s.of("session.task_end").length === 1);
+    s.send({ type: "respond", run_id: s.of("task_done")[0].run_id, option: 1 });
+    await waitFor(() => s.of("session.task_undo").length === 1 || s.of("session.error").length > 0);
+    expect(s.of("session.error")).toEqual([]);
+    expect(s.of("session.task_undo")[0]).toMatchObject({ undone: 1, total: 1 });
+  });
+
+  it("B2: a driver reply that by protocol means 'refused before acting' (unsupported, or performed:false) is nothing done: a file-only task keeps its undo", async () => {
+    for (const reply of [{ status: "unsupported", why: "no route" }, { status: "error", why: "stale: observe again", performed: false }]) {
+      const d = desk();
+      const perform = d.sim.perform.bind(d.sim);
+      d.sim.perform = (a: Action) => (a.kind === "key" ? reply as never : perform(a));
+      const r = runTask(d, [{ calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] }, ...changeSteps(d, "gui").slice(0, 2), (m) => ({ calls: [{ name: "computer_act", args: { action: { kind: "key", window: d.w, chord: "cmd+k" }, epoch: lastJson(m).epoch, consequence: "modify_user", purpose: "按一下" } }] })], "succeeded", { undo: true });
+      await r.done;
+      const done = r.taskDone()!;
+      const key = (r.events.filter((e) => e.kind === "step_result") as any[]).at(-1);
+      expect(key, reply.status).toMatchObject({ possibly_done: false });
+      expect(done.result_card!.text, reply.status).not.toContain("cmd+k");
+      expect(done.result_card!.options.map((x) => x.kind), reply.status).toEqual(["approve", "undo"]);
+      expect(tree(d.scope), reply.status).toEqual(d.before);             // undone
+    }
+  });
+
+  it("E1: a capability that fails cleanly (the zip could not be put in place) says it did nothing: no out.zip, the rest keeps its undo", async () => {
+    const { PLACE } = await import("../src/registry/tools.js");
+    const link = PLACE.link;
+    PLACE.link = () => { throw Object.assign(new Error("EACCES: permission denied, link"), { code: "EACCES" }); };
+    const d = desk();
+    let r: ReturnType<typeof runTask>;
+    try {
+      r = runTask(d, [{ calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] }, { calls: [{ name: "fs_zip_files", args: { sources: "a.txt", destination: "out.zip" } }] }], "succeeded", { undo: true });
+      await r.done;
+    } finally { PLACE.link = link; }
+    const done = r!.taskDone()!;
+    expect(fs.existsSync(path.join(d.scope, "out.zip"))).toBe(false);
+    expect((r!.events.filter((e) => e.kind === "step_result") as any[]).map((x) => [x.status, x.possibly_done])).toEqual([["ok", true], ["error", false]]);
+    expect(done.result_card!.options.map((x) => x.kind)).toEqual(["approve", "undo"]);
+    expect(done.result_card!.text).not.toContain("out.zip");
+    expect(tree(d.scope)).toEqual(d.before);
+  });
+
+  it("E2/E3: a window the task opened, whose outcome is not known (the screen locked right after): listed as not known, never as done, and no undo", async () => {
+    const d = desk();
+    const perform = d.sim.perform.bind(d.sim);
+    d.sim.perform = (a: Action) => { const x = perform(a); if (a.kind === "open_window") d.sim.lock(); return x; };
+    const r = runTask(d, [{ calls: [{ name: "computer_snapshot", args: {} }] }, (m) => ({ calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "编辑器" }, epoch: lastJson(m).epoch, consequence: "create", purpose: "开编辑器" } }] })], "succeeded", { undo: true });
+    await r.done;
+    const done = r.taskDone()!;
+    const lines = cardLines(done.result_card!.text);
+    expect(lines.did).toEqual([]);
+    expect(lines.unsure.some((x) => x.includes("编辑器"))).toBe(true);
+    expect(done.result_card!.options.map((x) => x.kind)).toEqual(["approve"]);
+    expect(done.result_card!.text).toContain("有一步做没做成没法确认，撤不回");
+    // the same journal, read by the session for a dead executor, lists it the same way
+    expect(cardLines(fallbackCard([], parseJournal(fs.readFileSync(path.join(r.dir, "journal.jsonl"), "utf-8")), "zh", "crashed")!.text)).toEqual(lines);
+  });
+
+  it("E4: without a journal, a look (consequence read, no possibly_done field) is not listed", () => {
+    const evs = [
+      { kind: "step", step_id: "st_1", text: "{}", human: "滚动", consequence: "read" },
+      { kind: "step_result", step_id: "st_1", status: "ok", consequence: "read" },
+      { kind: "step", step_id: "st_2", text: "{}", human: "再看看" , consequence: "read" },
+    ];
+    expect(fallbackCard(evs, null, "zh", "crashed")).toBeUndefined();
+    expect(fallbackCard([...evs, { kind: "step", step_id: "st_3", text: "{}", human: "按 cmd+s", consequence: "modify_user" }], null, "zh", "crashed")!.text).toContain("做没做成没法确认：按 cmd+s");
   });
 });
 

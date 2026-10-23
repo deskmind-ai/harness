@@ -32,8 +32,20 @@ export interface JournalStep {
   earlier: boolean;
 }
 
+/** Driver replies that, by the protocol (docs/protocol.md 「可能做了」), mean the driver refused before acting: nothing
+ *  was done. `unsupported`: the driver cannot do this kind of action at all (the simulated desktop's unknown app, a
+ *  hands action it has no route for). Any other reply may hide an effect. A reply that says `performed: false` is the
+ *  driver's own word, whatever its status. This is the only place a reply's status is read for the decision. */
+const REFUSED_BEFORE_ACTING: ReadonlySet<string> = new Set(["unsupported"]);
+
+/** Did the driver (or a capability) say it did nothing at all? Its explicit `performed: false`, or a reply the
+ *  protocol defines as a refusal before acting. The executor writes the answer into the receipt as `performed: false`. */
+export function saysNotPerformed(reply: { status?: unknown; performed?: unknown }): boolean {
+  return reply.performed === false || (typeof reply.status === "string" && REFUSED_BEFORE_ACTING.has(reply.status));
+}
+
 /** The one decision: an intent was written (the caller has one), and this receipt — null when there is none — does
- *  not positively say nothing happened. */
+ *  not positively say nothing happened (`performed: false`, or a restart's reconciliation `finding: not_happened`). */
 export function possiblyDone(receipt: Record<string, unknown> | null | undefined): boolean {
   if (!receipt) return true;
   return !(receipt.performed === false || receipt.finding === "not_happened");

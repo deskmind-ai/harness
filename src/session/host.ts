@@ -30,6 +30,7 @@ import { PROTOCOL } from "../protocol/version.js";
 import type { CardEvent as CardEventSchema } from "../protocol/events.js";
 type CardEvent = import("zod").infer<typeof CardEventSchema>;
 import { T } from "../executor/text.js";
+import { WALL_CLOCK, type Clock } from "../executor/clock.js";
 import { journalSteps, parseJournal, stepLines, type JournalLine } from "../executor/possibly.js";
 import { buildContext, WINDOW_SHARE, type Lang } from "./context.js";
 import { COMPUTER_TASK, reply, type ReplyResult, type SessionModel } from "./loop.js";
@@ -125,6 +126,9 @@ export interface HostOptions {
   linger?: number;
   /** How long the app going away waits for a stopped task's task_done (ms, default 12 000). */
   exitWaitMs?: number;
+  /** The wall clock the executors' times are compared with (task_done.undo_until): the same one theirs is (tests: one
+   *  fake clock for both). Default: the wall clock. */
+  clock?: Clock;
 }
 
 const newId = () => `msg_${randomUUID().slice(0, 8)}`;
@@ -991,7 +995,7 @@ export class SessionHost {
     // the undo window is over by the wall clock (the executor's timer may not have run: the Mac slept, or it fired
     // already): refused here, never forwarded — forwarded to an executor that has just exited, it would be recorded as
     // an undo cut off (unknown) though nothing was undone
-    if (t.optionKinds[opt] === "undo" && t.undoUntil !== undefined && Date.now() / 1000 >= t.undoUntil) return this.refuse("undo_expired", this.t("撤回的时间已经过了", "the time to undo this task has passed"), "respond");
+    if (t.optionKinds[opt] === "undo" && t.undoUntil !== undefined && (this.o.clock ?? WALL_CLOCK).now() / 1000 >= t.undoUntil) return this.refuse("undo_expired", this.t("撤回的时间已经过了", "the time to undo this task has passed"), "respond");
     // one respond per card: the executor reads only the first
     if (t.responded) return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
     let u: ReturnType<typeof undo>;
@@ -1237,14 +1241,15 @@ export function fallbackCard(evs: Record<string, unknown>[], journal: JournalLin
     const lines = stepLines(journalSteps(journal));
     did.push(...lines.did); unsure.push(...lines.unsure);
   } else {
-    const steps = new Map<string, string>(), results = new Map<string, Record<string, unknown>>();
+    const steps = new Map<string, string>(), results = new Map<string, Record<string, unknown>>(), consequences = new Map<string, unknown>();
     for (const e of evs) {
-      if (e.kind === "step" && typeof e.step_id === "string") steps.set(e.step_id, String(e.human ?? e.text ?? ""));
+      if (e.kind === "step" && typeof e.step_id === "string") { steps.set(e.step_id, String(e.human ?? e.text ?? "")); consequences.set(e.step_id, e.consequence); }
       if (e.kind === "step_result" && typeof e.step_id === "string") results.set(e.step_id, e);
     }
     for (const [id, text] of steps) {
       const r = results.get(id);
-      if (r?.possibly_done === false) continue;
+      // a look is no step that may have changed anything (a step_result's executor class, else the step's declared one)
+      if (r?.possibly_done === false || (r?.consequence ?? consequences.get(id)) === "read") continue;
       (r?.status === "ok" ? did : unsure).push(text);
     }
   }
