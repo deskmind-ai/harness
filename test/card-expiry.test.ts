@@ -21,7 +21,7 @@ import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import { OUTGOING_QUESTION } from "../src/executor/judge.js";
 import { Gateway } from "../src/gateway/index.js";
 import { scriptedStream, type Step } from "../src/runtime/scripted.js";
-import type { Clock } from "../src/executor/service.js";
+import type { Clock } from "../src/executor/clock.js";
 import type { Action } from "../src/executor/types.js";
 import { SessionHost } from "../src/session/host.js";
 import { readHolder } from "../src/session/computer.js";

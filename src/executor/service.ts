@@ -33,6 +33,7 @@ import { defaultJudge } from "./judge.js";
 import { T, type Lang } from "./text.js";
 import { NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "./types.js";
 import type { StopCause } from "../protocol/computer.js";
+import { WALL_CLOCK, atWallTime, type Clock } from "./clock.js";
 
 /** The tutorials a task may read: candidates by structure (never the request's words), and one read in full. */
 export interface SkillSource { candidates(raw: string): { name: string; description: string }[]; read(name: string): string | null }
@@ -63,16 +64,9 @@ export interface ServiceOptions {
   clock?: Clock;
 }
 
-/** Wall time and a timer. `now` is the wall clock (Date.now): it moves on while the Mac sleeps. The timers do not
- *  (Node's on macOS run on a clock that stops in sleep), so a deadline is checked against `now` at every tick. */
-export interface Clock { now(): number; schedule(ms: number, f: () => void): () => void }
-export const WALL_CLOCK: Clock = { now: () => Date.now(), schedule: (ms, f) => { const h = setTimeout(f, ms); return () => clearTimeout(h); } };
-/** An action card left unanswered this long is voided (owner 10-24, M2 H1): the screen may have moved since it was
- *  shown, and a yes has to be to what is there now. */
+/** An action card left unanswered this long, by the wall clock (executor/clock.ts), is voided (owner 10-24, M2 H1):
+ *  the screen may have moved since it was shown, and a yes has to be to what is there now. */
 export const CARD_EXPIRY_MS = 10 * 60_000;
-/** How often an open action card's deadline is checked against the wall clock: a Mac that wakes after the deadline
- *  expires the card within one tick. */
-export const EXPIRY_TICK_MS = 1000;
 
 const LOOK_ONLY = "the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed";
 const J = (x: unknown) => JSON.stringify(x);
@@ -317,16 +311,11 @@ export class ExecutorService {
     if (stop.aborted) return null;
     const open = new AbortController();
     this.openCard = open;
-    // the deadline, by the wall clock: checked every tick, so a Mac that slept past it expires the card at once on
-    // waking (its timers stood still meanwhile). It voids the card like a steer, with the reason "timeout"
+    // the deadline, by the wall clock: a Mac that slept past it expires the card within a second of waking (its timers
+    // stood still meanwhile). It voids the card like a steer, with the reason "timeout"
     const ms = expires ? this.o.cardExpiryMs : undefined;
     const clock = this.o.clock ?? WALL_CLOCK;
-    let cancel = () => {};
-    if (ms !== undefined && ms >= 0) {
-      const deadline = clock.now() + ms;
-      const tick = () => { const left = deadline - clock.now(); if (left <= 0) open.abort("timeout"); else cancel = clock.schedule(Math.min(EXPIRY_TICK_MS, left), tick); };
-      tick();
-    }
+    const cancel = ms !== undefined && ms >= 0 ? atWallTime(clock, clock.now() + ms, () => open.abort("timeout")) : () => {};
     try {
       // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16); a steer
       // voids it (the asker is told through the signal, and lets the app know)
