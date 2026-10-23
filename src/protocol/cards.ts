@@ -54,6 +54,9 @@ export interface ActionCardFacts {
   consequence: Consequence;
   outgoing: { kind: "field" | "selected" | "typed" | "text"; label: string; value: string }[];
   site: string | null;
+  /** An earlier step of this task on the same object or action whose result is unknown (unverified: it may already
+   *  have gone out or taken effect): the card says so in its text first. */
+  prior_unverified?: { step: string; why: string; model_says?: string };
 }
 
 /** Who answers the executor's cards: the app (stdio: an `ask` event, then the answer line), the evaluation's simulated

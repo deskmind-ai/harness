@@ -34,6 +34,10 @@ const handle = (m, done) => {
   if (m.op === "perform") {
     const mode = process.env.MODE;
     if (mode === "crash") return setTimeout(() => process.exit(3), 100);
+    // acting when it died: its wait said over, written the instant before the exit
+    // (written synchronously, as hands' flushed writes are: Node's own stdout to a pipe is asynchronous on macOS, and an
+    // exit would drop it)
+    if (mode === "actdie") return setTimeout(() => { const put = (x) => { const b = Buffer.from(JSON.stringify(x) + "\\n"); let o = 0; while (o < b.length) { try { o += fs.writeSync(1, b, o); } catch (e) { if (e.code !== "EAGAIN") throw e; } } }; put({ event: "user_wait", req: m.id, reason: "user_active", app: "com.netease.163music", what: "type" }); setTimeout(() => { put({ event: "user_resumed", req: m.id, waited_s: 0.1 }); process.exit(3); }, 100); }, 50);
     if (mode === "slow") return setTimeout(() => { out({ id: m.id, ok: true, result: { status: "ok", why: "entered '安溥 宝贝' into '搜索框' and pressed Return", window: "w" } }); done(); }, Number(process.env.SLOW_MS));
     out({ event: "user_wait", req: m.id, reason: "user_active", app: "com.netease.163music", what: "type" });
     if (mode === "die") return setTimeout(() => process.exit(3), 150);
@@ -44,7 +48,7 @@ const handle = (m, done) => {
 rl.on("line", (l) => { queue.push(JSON.parse(l)); next(); });
 `;
 
-function rig(mode: "slow" | "busy" | "die" | "crash", timeoutMs: number) {
+function rig(mode: "slow" | "busy" | "die" | "crash" | "actdie", timeoutMs: number) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hands-deadline-")), seen = path.join(dir, "seen.jsonl");
   fs.writeFileSync(path.join(dir, "child.cjs"), CHILD);
   const driver = new HandsDriver({ cmd: `MODE=${mode} SLOW_MS=${timeoutMs * 2} SEEN=${seen} ${process.execPath} child.cjs`, dir, timeoutMs });
@@ -127,6 +131,16 @@ describe("hands requests and this side's deadline", () => {
       const r = await fill(ex);
       expect(r.status).toBe("unverified");
       expect(r.why).toMatch(/exited \(3\): the step may have taken effect before that; observe the window before doing it again/);
+    } finally { await driver.end(); }
+  });
+
+  // a guard, not a reproduction: on this Mac node read the last lines before "exit" too, so it passes with "exit" as well
+  it("the lines written just before the process died are read first: a wait it said was over is no wait, the step unverified", async () => {
+    const { driver, ex, events } = rig("actdie", 4_000);
+    try {
+      const r = await fill(ex);
+      expect([r.status, r.why]).toEqual(["unverified", expect.stringMatching(/exited \(3\)/)]);
+      expect(events.filter((e) => e.k === "executor.user_resumed")).toHaveLength(1);
     } finally { await driver.end(); }
   });
 });

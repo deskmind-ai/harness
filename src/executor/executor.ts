@@ -404,10 +404,18 @@ export class Executor {
     return id;
   }
 
-  private issue(action: Action, object: string, consequence: Consequence, text: string, epoch: number, content?: unknown, facts?: ActionCardFacts) {
+  private issue(action: Action, object: string, consequence: Consequence, text0: string, epoch: number, content?: unknown, facts0?: ActionCardFacts, purpose?: string) {
+    // the card first says when an earlier step on the same object or action came back unverified: it may have gone
+    // out already, and a yes here would do it twice (review of harness#66)
+    const prior = this.priorUnverified(action, object);
+    const t = T(this.opts.lang);
+    const said = purpose?.trim() ? cardText(purpose.trim(), 200) : undefined;
+    const text = prior ? `${t.priorUnverified(prior.step, prior.why)}${said ? `\n${t.modelSays(said)}` : ""}\n${text0}` : text0;
+    const base: ActionCardFacts = facts0 ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null };
+    const facts = prior ? { ...base, prior_unverified: { step: prior.step, why: prior.why, ...(said ? { model_says: said } : {}) } } : base;
     const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
       // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
-      facts: facts ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null } };
+      facts };
     this.challenges.set(c.nonce, { action, epoch, object, consequence });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
@@ -415,6 +423,28 @@ export class Executor {
     const site = consequence === "external" ? this.siteRule(action)?.host : undefined;
     return site ? { ...c, site } : c;
   }
+  /** Steps of this task that came back unverified (they may have taken effect) and that no later step of the same action
+   *  has settled with ok: a card for the same object or action says so first. */
+  private unsure: { action: Action; object: string; step: string; why: string }[] = [];
+  private sameStep(a: Action, b: Action): boolean {
+    if (a.kind === "open_window" && b.kind === "open_window" && a.url && b.url) { const h = siteOf(a.url); return !!h && h === siteOf(b.url); }
+    return canon(a) === canon(b);
+  }
+  private priorUnverified(action: Action, object: string) {
+    return [...this.unsure].reverse().find((u) => u.object === object || this.sameStep(u.action, action));
+  }
+  /** Every act's end: an unverified step that changes something is kept as unsure (and a site token for the host an
+   *  unverified open went to no longer covers the next open there: it is asked again, saying why); an ok step of the
+   *  same action settles it. */
+  private noteOutcome(action: Action, r: ActResult) {
+    if (r.consequence === "read") return;
+    if (r.status === "unverified") {
+      this.unsure.push({ action, object: r.object, step: stepText(action, this.lastObs.get("window" in action ? action.window : ""), this.opts.lang), why: cardText(r.why ?? "", 160) });
+      if (this.unsure.length > 50) this.unsure.shift();
+      if (action.kind === "open_window" && action.url) { const h = siteOf(action.url); if (h) this.sites.delete(h); }
+    } else if (r.status === "ok") this.unsure = this.unsure.filter((u) => !this.sameStep(u.action, action));
+  }
+
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
   /** The window each open_window brought up for the user's app (by receipt seq): undo leaves it open. */
@@ -1279,6 +1309,7 @@ export class Executor {
       const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, ...c }) => c)(kept.challenge) } : kept;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain });
       this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
+      this.noteOutcome(req.action, r);
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -1404,7 +1435,7 @@ export class Executor {
             ...(stored && content ? { binding: bindingDiff(stored, content, this.pixelPolicy) } : {}),
           };
         }
-        const challenge = this.issue(req.action, base.object, consequence, text, now.epoch, content, cardFacts);
+        const challenge = this.issue(req.action, base.object, consequence, text, now.epoch, content, cardFacts, req.purpose);
         this.emit("executor.consent_needed", { why, consequence, object: base.object, ...(diag ? { changed: diag } : {}) });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
@@ -1431,7 +1462,7 @@ export class Executor {
       if (consequence === "external") {
         if (!accepted || !again.content || !within(accepted, again.content, this.pixelPolicy)) {
           diag = { binding: accepted && again.content ? bindingDiff(accepted, again.content, this.pixelPolicy) : null, epoch: fresh.epoch };
-          const challenge = this.issue(req.action, base.object, consequence, again.text, fresh.epoch, again.content, again.facts);
+          const challenge = this.issue(req.action, base.object, consequence, again.text, fresh.epoch, again.content, again.facts, req.purpose);
           this.emit("executor.consent_needed", { why: "what goes out changed right before sending", consequence, object: base.object, changed: diag });
           return done({ ...base, status: "needs_consent", why: "what goes out changed right before sending; asked again with what is there now", challenge, epoch: fresh.epoch });
         }
@@ -1452,7 +1483,7 @@ export class Executor {
     if (NEEDS_CONSENT.has(consequence) && req.consent?.scope === "action") {
       if (!this.consent.spend(req.consent)) {
         const card = this.card(req.action, this.lastObs.get(target ?? "") ?? obs, consequence);
-        const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content, card.facts);
+        const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content, card.facts, req.purpose);
         return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
       }
       this.challenges.delete(req.consent.nonce);                 // spent: nothing will be explained against it any more

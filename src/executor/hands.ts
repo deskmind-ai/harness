@@ -69,7 +69,11 @@ export class HandsDriver implements Driver {
       for (const [id, p] of this.pending) p.reject(died && p.op === "perform" && id !== waitingIn ? new EffectUnknown(p.op, `${why}: the step may have taken effect before that`, false) : new Error(why));
       this.pending.clear();
     };
-    this.proc.on("exit", (code) => { fail(`hands executor exited (${code})`, true); this.proc = null; });
+    // on "close", not "exit": close comes after stdout has been read to its end, so the lines the process wrote just
+    // before it died (a user_resumed, then acting) are taken in first — read after "exit", a death mid-action could
+    // pass for a death mid-wait and be recorded an error (review of harness#66). Only this process's own requests
+    const proc = this.proc;
+    proc.on("close", (code) => { if (this.proc !== proc && this.proc !== null) return; fail(`hands executor exited (${code})`, true); this.proc = null; });
     // a wedged or dead child closes its pipes: every waiting call learns at once, and nothing is thrown at the process
     this.proc.on("error", (e) => fail(`hands executor: ${e.message}`));
     this.proc.stdin.on("error", (e) => { fail(`hands executor stdin: ${e.message}`); this.proc?.kill(); this.proc = null; });
