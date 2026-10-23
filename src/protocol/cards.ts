@@ -58,5 +58,7 @@ export interface ActionCardFacts {
 
 /** Who answers the executor's cards: the app (stdio: an `ask` event, then the answer line), the evaluation's simulated
  *  user, a test. `signal`: the card is voided when it fires (the user changed the request — a steer — or the task was
- *  stopped): the asker lets go of it (the app is told) and the answer, if any, is not used. */
-export interface CardAsker { ask(card: Card, o?: { signal?: AbortSignal }): Promise<Answer | null> | Answer | null }
+ *  stopped): the asker lets go of it (the app is told) and the answer, if any, is not used. `expired` (an action card
+ *  with a deadline): asked when an answer arrives, before it is taken — true means the card has just expired (its
+ *  signal fired with "timeout") and the answer is a late one. */
+export interface CardAsker { ask(card: Card, o?: { signal?: AbortSignal; expired?: () => boolean }): Promise<Answer | null> | Answer | null }
