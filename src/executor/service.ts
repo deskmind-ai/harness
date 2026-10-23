@@ -869,19 +869,31 @@ export class ExecutorService {
     return this.result();
   }
 
-  /** The card shown with a result that changed something: what was done, and undo when every step has one (a file
-   *  action through its capability, a window the task opened; a screen action makes the run irreversible, and the
-   *  card then says so instead of offering it). */
+  /** The card shown with a result that changed something — however the task ended (M2 H2, owner 10-24: succeeded,
+   *  failed, stopped, cancelled, unconfirmed, the screen locked; before, only a success had one, and a stopped task's
+   *  changes had no undo at all). "Changed something" is the executor's record, never the caller's: an action that
+   *  reached the driver and did or may have done more than look (undoable's steps), or one still out at the driver
+   *  (a stop that could not wait for it). What was done, and undo when every step has one (a file action through its
+   *  capability, a window the task opened); a screen action, a step whose effect is not known, or one in flight makes
+   *  the run irreversible, and the card then says why instead of offering it. Whether the undo can still be answered
+   *  (the window: the executor lingering, another task, the session) is not the card's: the session's records say. */
   resultCard(): Card | null {
-    if (this.status !== "succeeded" || !this.effects.length) return null;
-    const u = this.o.executor.undoable();
+    const ex = this.o.executor;
+    const u = ex.undoable(), flight = ex.inFlight;
+    if (!u.steps.length && !flight) return null;
+    const reversible = u.reversible && !flight;
     const options: CardOption[] = [{ kind: "approve", text: this.t.fine }];
-    if (u.reversible) options.push({ kind: "undo", text: this.t.undo });
+    if (reversible) options.push({ kind: "undo", text: this.t.undo });
     const consented = this.consents.filter((c) => c.scope !== "action" || c.consequence === "external").map((c) => c.object);
-    const rules = [...this.o.executor.consent.rulesUsed];
-    const text = [this.t.did(this.effects.slice(-6)), ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(u.reversible ? [] : [this.t.noUndo(u.steps.find((x) => !x.can)?.why ?? this.t.undoable)]),
+    const rules = [...ex.consent.rulesUsed];
+    // what may or may not have happened, oldest first: a step done but not read back, the step still out at the driver
+    const unsure = [...u.steps.filter((x) => x.unverified).map((x) => x.text).reverse(), ...(flight ? [flight.text] : [])];
+    const why = flight ? this.t.inFlight : u.steps.find((x) => !x.can)?.why ?? this.t.undoable;
+    const text = [...(this.status && this.status !== "succeeded" ? [this.t.notFinished(this.status)] : []),
+      ...(this.effects.length ? [this.t.did(this.effects.slice(-6))] : []), ...(unsure.length ? [this.t.didUnsure(unsure.slice(-6))] : []),
+      ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(reversible ? [] : [this.t.noUndo(why)]),
       // undo takes the run back but leaves open what a launch brought up of the user's apps: said, not implied
-      ...(u.reversible && u.steps.some((x) => x.left_open) ? [this.t.undoKeepsOpen([...new Set(u.steps.flatMap((x) => (x.left_open ? [x.left_open] : [])))])] : [])].join("\n");
+      ...(reversible && u.steps.some((x) => x.left_open) ? [this.t.undoKeepsOpen([...new Set(u.steps.flatMap((x) => (x.left_open ? [x.left_open] : [])))])] : [])].join("\n");
     return { kind: "result", text, options, free_text: false, blocking: false };
   }
 

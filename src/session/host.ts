@@ -747,8 +747,9 @@ export class SessionHost {
       if (!this.lockLinger(task)) task.noLinger = true;
       this.cardOf(task, ev);
     }
-    // (a task that does not linger offers no result card: none is shown that could not be answered)
-    this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { result_card: null } : {}), session_id: this.o.sessionId });
+    // a task that does not linger keeps its result card (M2 H2: a task that changed something always shows one): its
+    // undo is none in session.task_end, and the deadline it would have had is not said
+    this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { undo_until: undefined } : {}), session_id: this.o.sessionId });
     switch (ev.kind) {
       case "ask": task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; break;
       case "resumed": case "ask_void": if (ev.ask_id === task.card) task.card = null; break;
@@ -789,7 +790,9 @@ export class SessionHost {
     if (task.end) return;
     const card = ev.result_card as { options?: { kind?: string }[] } | null | undefined;
     const undo = this.linger > 0 && !task.noLinger && !!card?.options?.some((x) => x.kind === "undo") ? "open" : "none";
-    this.recordEnd(task, endFrom(task.runId, ev, undo, task.steers));
+    const end = endFrom(task.runId, ev, undo, task.steers);
+    // when the undo window ends by itself, as the executor that holds it said (shown as time left; closing is task_closed)
+    this.recordEnd(task, undo === "open" && typeof ev.undo_until === "number" && Number.isFinite(ev.undo_until) ? { ...end, undo_until: ev.undo_until } : end);
   }
 
   /** The task's end: stored, then the task is over for the session — the model's call returns. An end that cannot be

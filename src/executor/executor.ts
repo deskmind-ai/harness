@@ -1798,13 +1798,17 @@ export class Executor {
 
   /** Which of the task's effects can be taken back, newest first, and why not: a file action through its capability's
    *  undo (create, move, copy, append have one; a replaced text or a trashed file do not), a window the task opened by
-   *  closing it. Anything else done on screen cannot be undone. The whole run is reversible only when every step is. */
-  undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string }[] } {
-    const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string }[] = [];
+   *  closing it. Anything else done on screen cannot be undone. The whole run is reversible only when every step is.
+   *  An effect is every action that reached the driver and did (ok) or may have done (unverified: done, not read back)
+   *  something beyond a look (M2 H2): one that may have, cannot be taken back for certain, so it makes the run
+   *  irreversible — before, it was left out, and a run whose screen step went unverified offered an undo of the rest. */
+  undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] } {
+    const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] = [];
     for (const r of [...this.receipts].reverse()) {
-      if (r.result.status !== "ok" || r.result.consequence === "read") continue;
+      if ((r.result.status !== "ok" && r.result.status !== "unverified") || r.result.consequence === "read") continue;
       const a = r.request.action;
       const t = T(this.opts.lang);
+      if (r.result.status === "unverified") { steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, a.kind === "file" ? this.fileReceipts.get(r.seq)?.cap : undefined, this.opts.lang), can: false, why: t.unsure, unverified: true }); continue; }
       if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap, this.opts.lang), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap, this.opts.lang), can: false, why: t.noUndoFor(a.capability) }); continue; }
       if (a.kind === "open_window") {
         // the task's own window is closed; one it brought up for the user's app is left open (it may hold their state):

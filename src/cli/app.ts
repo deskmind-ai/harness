@@ -32,6 +32,7 @@ import { SimComputer } from "../executor/sim.js";
 import { HandsDriver } from "../executor/hands.js";
 import { SkillStore } from "../skills/agentskills.js";
 import type { SkillSource } from "../executor/service.js";
+import { WALL_CLOCK, atWallTime, type Clock } from "../executor/clock.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
@@ -235,7 +236,7 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
  *  `inject` (tests): a driver, a gateway, a model in place of the config's. */
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number;
   signals?: { onSignal: (h: (sig: string) => void) => void; exit: () => void; exitNow: () => void; deadlineMs?: number; waitMs?: number };
-  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"] } }) {
+  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"]; clock?: Clock } }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
@@ -314,7 +315,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     const f = executor.inFlight, c = executor.changes();
     closeTrace("stopped", f ? STEP_UNKNOWN : stopReason || "stopped");
     const cause: StopCause | undefined = f ? "last_step_unknown" : stopCause;
-    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", ...(cause ? { cause } : {}), summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
+    // a task that changed something has its result card here too (M2 H2): the executor's, which names a step still in
+    // flight as unknown and offers no undo then
+    const rc = rt.resultCard();
+    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", ...(cause ? { cause } : {}), summary: "", result_card: rc ? cardEvent(rc) : null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
   };
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
   o.signals?.onSignal((sig) => {
@@ -334,17 +338,24 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   });
   const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
   if (!done) closeTrace(r.status, r.reason);
-  const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
-  taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
+  const card = r.result_card ? cardEvent(r.result_card) : null;
+  // the result card is answered while this process is alive (undo needs the executor's receipts): it waits `--linger`
+  // seconds by the wall clock (a Mac asleep meanwhile ends the wait within a second of waking: executor/clock.ts) for
+  // `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exits. Not after a signal: the
+  // process exits then. The undo's deadline is said on task_done (undo_until, seconds like `t`), from the same clock
+  const clock = o.inject?.clock ?? WALL_CLOCK;
+  // (stdin closed already: the app went away, nothing can answer — no wait, no deadline said)
+  const lingers = !!card && o.linger > 0 && !signals && !o.input.closed;
+  const until = lingers ? clock.now() + o.linger * 1000 : 0;
+  const undoUntil = lingers && card!.options.some((x) => x.kind === "undo") ? { undo_until: until / 1000 } : {};
+  taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, ...undoUntil, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
   if (signals) return o.signals!.exit();
-  // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
-  // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit. Any other line
-  // in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the wait goes on:
-  // only a respond, the app closing stdin (or stopping), or the deadline ends it (deskmind S0: undo was dead when the
-  // first line after task_done was not the respond)
-  if (card && o.linger > 0) {
+  // Any other line in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the
+  // wait goes on: only a respond, the app closing stdin (or stopping), or the deadline ends it (deskmind S0: undo was
+  // dead when the first line after task_done was not the respond)
+  if (lingers) {
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), o.linger * 1000);
+    const cancel = atWallTime(clock, until, () => deadline.abort());
     try {
       for (;;) {
         const line = await o.input.next(deadline.signal);
@@ -352,12 +363,15 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
         const a = parseControl(line);
         if (a?.type !== "respond" || typeof a.option !== "number") continue;
         const u = await rt.respond({ option: a.option });
-        log.emit({ kind: "result_response", picked: card.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
+        log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
         break;
       }
-    } finally { clearTimeout(timer); }
+    } finally { cancel(); }
   }
 }
+
+/** A result card as the protocol carries it. */
+const cardEvent = (c: Card) => ({ kind: c.kind, text: c.text, options: c.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: c.free_text, blocking: c.blocking });
 
 export function respond(runId: string, runs: string, answer: Record<string, unknown>, out: (ev: AppEvent) => void) {
   const log = new EventLog(path.join(runs, runId, "events.jsonl"), runId, out);

@@ -62,8 +62,10 @@ export const SessionBody = z.discriminatedUnion("kind", [
   // card's undo was open then. `interrupted`: no task_done (the session process went away mid-task)
   // `cause` (additive): task_done's cause as a field, or the session's own when it ends the task with no task_done —
   // last_step_unknown when a step had begun (`step`) and not ended (`step_result`)
+  // `undo_until` (M2 H2, additive): with undo open, when the window ends by itself — the executor's task_done.undo_until,
+  // seconds since the epoch. For showing the time left only: the undo can be answered until session.task_closed
   z.object({ kind: z.literal("session.task_end"), run_id: z.string(), status: z.string(), summary: z.string(), undo: z.enum(["open", "none"]), reason: z.string().optional(), cause: z.enum(STOP_CAUSES).optional(),
-    answer: z.string().nullable().optional(), changes: Changes.optional(), steers: z.array(z.string()).optional() }),
+    answer: z.string().nullable().optional(), changes: Changes.optional(), steers: z.array(z.string()).optional(), undo_until: z.number().optional() }),
   // H2: the session closed the run's executor (its stdin): the result card can no longer be answered. linger: it ended by
   // itself (a respond answered, its deadline, no result card); new_task: a computer task started on this Mac; session_end
   z.object({ kind: z.literal("session.task_closed"), run_id: z.string(), why: z.enum(["linger", "new_task", "session_end"]) }),
