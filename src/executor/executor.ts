@@ -393,7 +393,7 @@ export class Executor {
   private looks = new Map<string, Observation>();
   /** Every challenge this executor issued, as it issued it: what "consent is for another action" is explained against
    *  in the trace (the token's action, epoch, object and class beside the request's). */
-  private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence }>();
+  private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence; uncertain?: number }>();
   /** An object as the user knows it, for a card's fields: a window by its app and title (the last snapshot), a tab by
    *  its title, a file by its path; never a bare window id. */
   private labelOf(object: string): string {
@@ -405,44 +405,51 @@ export class Executor {
   }
 
   private issue(action: Action, object: string, consequence: Consequence, text0: string, epoch: number, content?: unknown, facts0?: ActionCardFacts, purpose?: string) {
-    // the card first says when an earlier step on the same object or action came back unverified: it may have gone
-    // out already, and a yes here would do it twice (review of harness#66)
-    const prior = this.priorUnverified(action, object);
+    // while a step of this run is uncertain, the card names every one of them first, then what the model says (not
+    // checked: it is not shown as fact), then the action — a yes is for this one action, seen against them
     const t = T(this.opts.lang);
-    const said = purpose?.trim() ? cardText(purpose.trim(), 200) : undefined;
-    const text = prior ? `${t.priorUnverified(prior.step, prior.why)}${said ? `\n${t.modelSays(said)}` : ""}\n${text0}` : text0;
+    const uncertain = this.uncertain.length ? [...this.uncertain] : null;
+    const said = uncertain && purpose?.trim() ? cardText(purpose.trim(), 200) : undefined;
+    const text = uncertain ? `${t.uncertainSteps(uncertain.map((u) => u.text))}${said ? `\n${t.modelSaysUnchecked(said)}` : ""}\n${text0}` : text0;
     const base: ActionCardFacts = facts0 ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null };
-    const facts = prior ? { ...base, prior_unverified: { step: prior.step, why: prior.why, ...(said ? { model_says: said } : {}) } } : base;
+    const facts: ActionCardFacts = uncertain ? { ...base, uncertain, ...(said ? { model_says_unchecked: said } : {}) } : base;
     const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
       // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
       facts };
-    this.challenges.set(c.nonce, { action, epoch, object, consequence });
+    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: this.uncertain.length });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
-    // a host asked about after the task read material: the yes approves the host for the rest of the task
-    const site = consequence === "external" ? this.siteRule(action)?.host : undefined;
+    // a host asked about after the task read material: the yes approves the host for the rest of the task — not while a
+    // step is uncertain: then the yes is for this one open (an action token), and the next asks again
+    const site = consequence === "external" && !uncertain ? this.siteRule(action)?.host : undefined;
     return site ? { ...c, site } : c;
   }
-  /** Steps of this task that came back unverified (they may have taken effect) and that no later step of the same action
-   *  has settled with ok: a card for the same object or action says so first. */
-  private unsure: { action: Action; object: string; step: string; why: string }[] = [];
-  private sameStep(a: Action, b: Action): boolean {
-    if (a.kind === "open_window" && b.kind === "open_window" && a.url && b.url) { const h = siteOf(a.url); return !!h && h === siteOf(b.url); }
-    return canon(a) === canon(b);
+  /** The steps of this run that came back unverified while changing the user's things or sending something out
+   *  (modify_user, external): they may have taken effect. A run-level fact (review of harness#66): kept for the rest of
+   *  the run, never matched to a later step by object or action and never cleared by one that went well — a new
+   *  compose window renumbers everything, and a different message sent fine says nothing of the first. While there is
+   *  one, every modify_user or external action asks on a card that names them all (uncertainGate); no standing grant
+   *  covers it — the plan's object consents, a site's, a rule. Read-only actions and those in the task's own windows
+   *  (create) go on as before. */
+  private uncertain: NonNullable<ActionCardFacts["uncertain"]> = [];
+  /** How many steps of this run are uncertain (the service holds no standing grant while there is one). */
+  get uncertainCount(): number { return this.uncertain.length; }
+  /** Why `token` does not let a modify_user or external action go ahead while a step is uncertain, or null: only an
+   *  action token answering a card issued after the last uncertain step (it named them all) does. */
+  private uncertainGate(token: ConsentToken | undefined): string | null {
+    if (!this.uncertain.length) return null;
+    if (token?.scope === "action" && (this.challenges.get(token.nonce)?.uncertain ?? -1) >= this.uncertain.length) return null;
+    return `an earlier step's result is unknown (it may have taken effect): every change or send asks the user again, naming it`;
   }
-  private priorUnverified(action: Action, object: string) {
-    return [...this.unsure].reverse().find((u) => u.object === object || this.sameStep(u.action, action));
-  }
-  /** Every act's end: an unverified step that changes something is kept as unsure (and a site token for the host an
-   *  unverified open went to no longer covers the next open there: it is asked again, saying why); an ok step of the
-   *  same action settles it. */
-  private noteOutcome(action: Action, r: ActResult) {
-    if (r.consequence === "read") return;
-    if (r.status === "unverified") {
-      this.unsure.push({ action, object: r.object, step: stepText(action, this.lastObs.get("window" in action ? action.window : ""), this.opts.lang), why: cardText(r.why ?? "", 160) });
-      if (this.unsure.length > 50) this.unsure.shift();
-      if (action.kind === "open_window" && action.url) { const h = siteOf(action.url); if (h) this.sites.delete(h); }
-    } else if (r.status === "ok") this.unsure = this.unsure.filter((u) => !this.sameStep(u.action, action));
+  /** Every act's end: a modify_user or external step that came back unverified joins the run's uncertain steps, with
+   *  what the user would recognise it by (the step, what went out). */
+  private noteOutcome(r: ActResult, step: { text: string; outgoing: ActionCardFacts["outgoing"] } | undefined, fallback: string) {
+    if (r.status !== "unverified" || !NEEDS_CONSENT.has(r.consequence)) return;
+    const outgoing = step?.outgoing ?? [];
+    const said = outgoing.filter((o) => o.value).map((o) => o.value).join(" / ");
+    const text = cardText(`${step?.text ?? fallback}${said ? `：${said}` : ""}`, 160);
+    this.uncertain.push({ consequence: r.consequence, object: r.object, text, outgoing });
+    this.emit("executor.uncertain", { consequence: r.consequence, object: r.object, text, count: this.uncertain.length });
   }
 
   /** The window each open_window really made (by receipt seq): what its undo closes. */
@@ -1101,7 +1108,7 @@ export class Executor {
     if (a.kind !== "open_window" || !a.url) return null;
     if (!this.readMaterial().length) return null;
     const host = siteOf(a.url);
-    if (host && this.sites.has(host)) return null;
+    if (host && this.sites.has(host) && !this.uncertain.length) return null;     // approved hosts: not while a step is uncertain
     if (host && this.provenance.get(this.provenanceKey(a.url))?.cleared) return null;
     return { host };
   }
@@ -1300,6 +1307,9 @@ export class Executor {
     // to which app, a window that appeared, vanished or was renamed), for a stale result's trace; older drivers say nothing
     let epochWhy: unknown;
     let stepConsented = false, foregroundOk = false;
+    // what this step is, as the user would recognise it (the step, what goes out): kept if it comes back uncertain
+    let uncertainStep: { text: string; outgoing: ActionCardFacts["outgoing"] } | undefined;
+    let cardOutgoing: ActionCardFacts["outgoing"] | undefined;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       const { consent, ...rest } = req;
@@ -1309,7 +1319,7 @@ export class Executor {
       const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, ...c }) => c)(kept.challenge) } : kept;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain });
       this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
-      this.noteOutcome(req.action, r);
+      this.noteOutcome(r, uncertainStep, describeAction(req.action, undefined, r.consequence, undefined, this.opts.lang));
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -1396,6 +1406,7 @@ export class Executor {
       // the card is of what is there now (the latest look, the executor's own included), the target found by what it is;
       // consent is asked and checked for the action as the caller sent it, so a retry of that action is covered
       const { sending, typed, content, text, lost, facts: cardFacts } = this.card(req.action, obs, consequence, (target ? this.looks.get(target) : undefined) ?? obs);
+      cardOutgoing = cardFacts?.outgoing;
       if (lost) return done({ ...base, status: "stale", why: `the target is gone from ${target}, or no longer one of a kind; observe it again and decide anew`, epoch: now.epoch });
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
       const judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
@@ -1419,7 +1430,7 @@ export class Executor {
       // have come): it is checked against the binding it was issued for
       const stored = req.consent?.scope === "action" ? this.consent.contentOf(req.consent.nonce) as SendBinding | undefined : undefined;
       accepted = stored && content && within(stored, content, this.pixelPolicy) ? stored : content;
-      let why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
+      let why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false) ?? this.uncertainGate(req.consent);
       // the token answers a card for this very action: what differs is what goes out, not the action (rc.9: "another
       // action" was said of the same click whose window had changed)
       const same = !!stored && req.consent?.digest === digestOf(req.action, base.object, consequence, stored);
@@ -1499,6 +1510,7 @@ export class Executor {
     let land: (() => void) | null = null;
     if (consequence !== "read") {
       const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence);
+      uncertainStep = { text: stepText(act, (target ? this.looks.get(target) : undefined) ?? obs, this.opts.lang), outgoing: cardOutgoing ?? [] };
       this.journal("intent", { action: act, object: base.object, consequence, text });
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
@@ -1697,7 +1709,7 @@ export class Executor {
       try { still = cap.preconditions(ws, a.args); } catch (e) { still = e instanceof Error ? e.message : String(e); }
       if (still) return { ...base, status: "stale", why: `changed while this step was being checked: ${still}. Look again and decide anew.` };
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
-      const why = this.consent.check(a, object, consequence, this.opts.task, consent);
+      const why = this.consent.check(a, object, consequence, this.opts.task, consent) ?? this.uncertainGate(consent);
       if (why) {
         const challenge = this.issue(a, object, consequence, text, epoch, undefined, { action: "file", action_text: describeAction(a, undefined, "read", cap, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null });
         this.emit("executor.consent_needed", { why, consequence, object });

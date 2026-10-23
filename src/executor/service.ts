@@ -305,7 +305,7 @@ export class ExecutorService {
     if (!got) return null;
     if (got.option?.kind === "approve") {
       // a host asked about after the task read material: the yes is for that site for the rest of the task
-      if (c.site) { const t = this.#signer.forSite(c.object, [c.site], this.o.task, c.consequence); this.siteTokens.push(t); this.consents.push({ scope: "site", object: c.object, consequence: c.consequence }); return t; }
+      if (c.site && !this.o.executor.uncertainCount) { const t = this.#signer.forSite(c.object, [c.site], this.o.task, c.consequence); this.siteTokens.push(t); this.consents.push({ scope: "site", object: c.object, consequence: c.consequence }); return t; }
       const t = this.#signer.forAction(c); this.consents.push({ scope: "action", object: c.object, consequence: c.consequence }); return t;
     }
     if (got.option?.kind === "cancel") return "cancel";
@@ -411,7 +411,19 @@ export class ExecutorService {
    *  cards, the driver — runs with the step's id in the context, so the trace names it. A step asked for while a steer is
    *  pending, or one the schema allows but its kind does not, is no step: it is not tried. */
   /** The executor's act; its result is the step's latest outcome (step.end). */
-  private async exAct(req: Parameters<Executor["act"]>[0]): Promise<ActResult> { const r = await this.o.executor.act(req); const id = current().step_id; if (id) this.results.set(id, r); return r; }
+  private async exAct(req: Parameters<Executor["act"]>[0]): Promise<ActResult> {
+    const r = await this.o.executor.act(req); const id = current().step_id; if (id) this.results.set(id, r);
+    // a change or a send whose result is unknown: the standing grants this side holds (the plan's object consents, the
+    // sites — the plan's and those approved on a card — and a yes kept for a stale retry) are void for the rest of the
+    // run, and are never attached again: every change or send now asks on its own card, which names the uncertain steps
+    // (the executor holds the same line whatever it is handed: Executor.uncertainGate — review of harness#66)
+    if (r.status === "unverified" && NEEDS_CONSENT.has(r.consequence) && (this.tokens.size || this.siteTokens.length || this.retryTokens.size)) {
+      this.emit("grants.void", { why: "uncertain", objects: [...this.tokens.keys()], sites: this.siteTokens.map((t) => t.object) });
+      this.tokens.clear(); this.siteTokens = []; this.retryTokens.clear();
+      this.o.executor.forgetPlanSites();
+    }
+    return r;
+  }
 
   private async step(a: Action, p: { purpose: string; consequence?: Consequence; epoch?: number; plan_step?: number }, body: () => Promise<ToolReply>): Promise<ToolReply> {
     const s = this.steered(); if (s) return s;

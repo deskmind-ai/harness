@@ -60,23 +60,25 @@ export class HandsDriver implements Driver {
     });
     this.proc.stderr.setEncoding("utf-8");
     this.proc.stderr.on("data", (c: string) => { this.log.push(c.trim().slice(0, 500)); });
-    // the process gone with requests out: a perform it was not known to be only waiting for the user in (its user_wait
-    // without a user_resumed) may have acted before it died — its effect is unknown, not failed. A spawn or pipe error:
-    // nothing was taken in
-    const fail = (why: string, died = false) => {
-      const waitingIn = this.waiting?.id;
-      this.endWait(null, "exit"); this.late.clear();
-      for (const [id, p] of this.pending) p.reject(died && p.op === "perform" && id !== waitingIn ? new EffectUnknown(p.op, `${why}: the step may have taken effect before that`, false) : new Error(why));
-      this.pending.clear();
-    };
     // on "close", not "exit": close comes after stdout has been read to its end, so the lines the process wrote just
     // before it died (a user_resumed, then acting) are taken in first — read after "exit", a death mid-action could
-    // pass for a death mid-wait and be recorded an error (review of harness#66). Only this process's own requests
+    // pass for a death mid-wait and be recorded an error (review of harness#66). Only while it is still this driver's
+    // process: one let go of (end, a broken pipe) failed its requests then, and the pending ones now are a new one's
     const proc = this.proc;
-    proc.on("close", (code) => { if (this.proc !== proc && this.proc !== null) return; fail(`hands executor exited (${code})`, true); this.proc = null; });
+    proc.on("close", (code) => { if (this.proc !== proc) return; this.failAll(`hands executor exited (${code})`, true); this.proc = null; });
     // a wedged or dead child closes its pipes: every waiting call learns at once, and nothing is thrown at the process
-    this.proc.on("error", (e) => fail(`hands executor: ${e.message}`));
-    this.proc.stdin.on("error", (e) => { fail(`hands executor stdin: ${e.message}`); this.proc?.kill(); this.proc = null; });
+    proc.on("error", (e) => { if (this.proc === proc) this.failAll(`hands executor: ${e.message}`, false); });
+    proc.stdin.on("error", (e) => { if (this.proc !== proc) return; this.failAll(`hands executor stdin: ${e.message}`, false); proc.kill(); this.proc = null; });
+  }
+
+  /** Every request out fails now (the process is gone, or let go of). `died`: it may have run them — a perform it was
+   *  not known to be only waiting for the user in (its user_wait without a user_resumed) may have acted, so its effect
+   *  is unknown, not failed. A spawn or pipe error: nothing was taken in. */
+  private failAll(why: string, died: boolean) {
+    const waitingIn = this.waiting?.id;
+    this.endWait(null, "exit"); this.late.clear();
+    const out = [...this.pending]; this.pending.clear();
+    for (const [id, p] of out) p.reject(died && p.op === "perform" && id !== waitingIn ? new EffectUnknown(p.op, `${why}: the step may have taken effect before that`, false) : new Error(why));
   }
 
   /** Hear what hands says besides its answers: its waits for the user, and answers that came after their timeout. */
@@ -167,6 +169,9 @@ export class HandsDriver implements Driver {
       await Promise.race([done, new Promise((r) => { timer = setTimeout(r, 5_000); })]);
       clearTimeout(timer);
     }
+    // the requests still out fail now, as the process's death fails them — not left to their timers (120 s each): the
+    // process is let go of, and its close, which comes later, no longer speaks for this driver
+    if (this.pending.size) this.failAll("hands executor exited (ended by the caller)", true);
     this.proc?.kill(); this.proc = null;
   }
 }

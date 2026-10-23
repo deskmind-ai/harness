@@ -34,6 +34,7 @@ const handle = (m, done) => {
   if (m.op === "perform") {
     const mode = process.env.MODE;
     if (mode === "crash") return setTimeout(() => process.exit(3), 100);
+    if (mode === "hang") return;                                   // never answers, and takes nothing else meanwhile
     // acting when it died: its wait said over, written the instant before the exit
     // (written synchronously, as hands' flushed writes are: Node's own stdout to a pipe is asynchronous on macOS, and an
     // exit would drop it)
@@ -48,7 +49,7 @@ const handle = (m, done) => {
 rl.on("line", (l) => { queue.push(JSON.parse(l)); next(); });
 `;
 
-function rig(mode: "slow" | "busy" | "die" | "crash" | "actdie", timeoutMs: number) {
+function rig(mode: "slow" | "busy" | "die" | "crash" | "actdie" | "hang", timeoutMs: number) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hands-deadline-")), seen = path.join(dir, "seen.jsonl");
   fs.writeFileSync(path.join(dir, "child.cjs"), CHILD);
   const driver = new HandsDriver({ cmd: `MODE=${mode} SLOW_MS=${timeoutMs * 2} SEEN=${seen} ${process.execPath} child.cjs`, dir, timeoutMs });
@@ -131,6 +132,20 @@ describe("hands requests and this side's deadline", () => {
       const r = await fill(ex);
       expect(r.status).toBe("unverified");
       expect(r.why).toMatch(/exited \(3\): the step may have taken effect before that; observe the window before doing it again/);
+    } finally { await driver.end(); }
+  });
+
+  it("end() with a request out fails it at once, though a new process starts before the old one's close", async () => {
+    const { driver } = rig("hang", 3_000);
+    try {
+      await driver.snapshot();
+      const t0 = Date.now();
+      const out = driver.perform({ kind: "wait", ms: 1 }).then(() => "answered", (e: Error) => e.message);
+      await new Promise((r) => setTimeout(r, 50));
+      await driver.end();
+      await driver.snapshot();                                       // a new process, before the old one's close
+      expect(await out).toMatch(/ended by the caller/);
+      expect(Date.now() - t0).toBeLessThan(1_500);                   // not left to its 3 s timer
     } finally { await driver.end(); }
   });
 
