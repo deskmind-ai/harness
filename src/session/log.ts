@@ -36,7 +36,7 @@ export const MAX_ASSISTANT_CHARS = 64_000;
 export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model", "cancelled"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 /** Codes that refuse a control line: sent without a seq, never in the history. */
-export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model"];
+export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model", "cancelled"];
 
 /** How a computer task ended, as the session keeps it: the executor's task_done status, or `interrupted` (the process
  *  went away and the run has no task_done). */

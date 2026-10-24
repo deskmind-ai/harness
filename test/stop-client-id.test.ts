@@ -17,6 +17,8 @@ import { scriptedStream, type Step } from "../src/runtime/scripted.js";
 import { SessionHost } from "../src/session/host.js";
 import { SessionLog } from "../src/session/log.js";
 import type { ExecutorHandle, Launcher } from "../src/session/task.js";
+import fsCjs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 
 const MODEL = { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as never;
 const gateway = () => { const g = new Gateway(Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as never); g.script = Array(80).fill((role: string) => (role === "verify" ? { choice: "pass", reason: "ok" } : { choice: "matches" })); return g; };
@@ -40,10 +42,10 @@ const inproc = (scripts: Step[][]): Launcher => { let i = 0; return (req, lo) =>
 const hosts: SessionHost[] = [];
 afterEach(async () => { for (const h of hosts.splice(0)) h.end(); await sleep(50); });
 
-function session(launch: Launcher, o: { dir?: string; exitWaitMs?: number } = {}) {
+function session(launch: Launcher, o: { dir?: string; exitWaitMs?: number; onExit?: (f?: string) => void } = {}) {
   const dir = o.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), "stopcid-ses-"));
   const evs: any[] = [];
-  const h = new SessionHost({ dir, sessionId: "ses_s", out: (e) => evs.push(e), coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(Array(6).fill({ text: "好" })) }, launch, linger: 600, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}) });
+  const h = new SessionHost({ dir, sessionId: "ses_s", out: (e) => evs.push(e), coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(Array(6).fill({ text: "好" })) }, launch, linger: 600, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.onExit ? { onExit: o.onExit } : {}) });
   hosts.push(h);
   h.start();
   const send = (x: Record<string, unknown>) => h.handle(JSON.stringify(x));
@@ -148,5 +150,28 @@ describe("stop{client_id}", () => {
     const s2 = session(inproc([]), { dir: s.dir });
     s2.send({ type: "stop", client_id: "c7" });
     expect(s2.acks("c7")).toEqual([expect.objectContaining({ result: "already_ended", run_id: run, status: "succeeded" })]);
+  });
+
+  it("the cancel cannot be stored: the session halts, and the stop still gets its one ack (none, interrupted) — never a bare error", async () => {
+    let failure: string | undefined;
+    const s = session(inproc([]), { onExit: (f) => { failure = f; } });
+    const orig = fsCjs.writeSync;
+    (fsCjs as any).writeSync = (fd: number, data: unknown, ...rest: unknown[]) => { if (String(data).includes('"kind":"session.cua_cancelled"')) throw Object.assign(new Error("ENOSPC: no space left on device, write"), { code: "ENOSPC" }); return (orig as any)(fd, data, ...rest); };
+    syncBuiltinESMExports();
+    try { s.send({ type: "stop", client_id: "c8" }); }
+    finally { (fsCjs as any).writeSync = orig; syncBuiltinESMExports(); }
+    expect(s.acks("c8")).toEqual([expect.objectContaining({ result: "none", status: "interrupted" })]);
+    expect(s.evs.filter((e) => e.kind === "session.error" && e.control === "stop")).toEqual([]);
+    await waitFor(() => failure !== undefined);
+    expect(failure).toMatch(/session\.cua_cancelled .* could not be stored/);
+  });
+
+  it("a closing session answers a cua nothing, even one a stop cancelled", async () => {
+    const s = session(inproc([]));
+    s.send({ type: "stop", client_id: "c9" });
+    s.h.end();
+    const before = s.evs.length;
+    s.send({ type: "cua", text: "新建 a.txt", client_id: "c9" });
+    expect(s.evs.slice(before).filter((e) => e.kind === "session.error")).toEqual([]);
   });
 });

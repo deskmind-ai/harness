@@ -671,9 +671,10 @@ export class SessionHost {
   /** `/cua <text>`: a computer task with the user's words, no model in between; then the model speaks one turn with
    *  the task's call and result in its context. */
   cua(text: string, scope?: string, cid?: string) {
+    if (this.closing || !text.trim()) return;
     // a stop{client_id} came for this cua before it (it overtook it): refused, nothing starts
     if (cid && this.cancelledCids.has(cid)) return this.refuse("cancelled", this.t("这条 /cua 在开始之前就被停下了", "this /cua was stopped before it started"), "cua", cid);
-    if (this.closing || !text.trim() || this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
+    if (this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
     if (this.current || this.running || this.flows || this.recoverPending) return this.refuseBusy("cua", cid);
     let userId = "";
     const t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
@@ -975,8 +976,10 @@ export class SessionHost {
     if (runId && runId !== task?.run_id) this.stop(runId);
     if (!task) {
       if (!this.cancelledCids.has(cid)) {
+        // not stored: the session halts, as for any record it depends on — and this stop still gets its one ack, as
+        // interrupted (the cancel holds no further than this process: nothing is said to have been recorded)
         try { this.log.emit({ kind: "session.cua_cancelled", client_id: cid }); }
-        catch (e) { return this.refuse("busy", `the stop could not be stored: ${errText(e)}`, "stop", cid); }
+        catch (e) { this.halt(`session.cua_cancelled of ${cid.slice(0, 80)} could not be stored: ${errText(e)}`); return this.ack(cid, { client_id: cid, result: "none", status: "interrupted" }); }
       }
       return this.ack(cid, { client_id: cid, result: "none" });
     }
