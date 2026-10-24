@@ -452,14 +452,19 @@ export class Executor {
   }
   /** An uncertain step as a card shows it: the intent's words, and what went out when the intent recorded it. */
   private uncertainText(x: JournalStep): string {
-    const out = Array.isArray(this.jlines[x.intent]?.outgoing) ? (this.jlines[x.intent]!.outgoing as { value?: string }[]) : [];
-    const said = out.map((o) => cardText(String(o.value ?? ""), 80, this.opts.lang)).filter(Boolean).slice(0, 5).join(" / ");
+    const said = this.uncertainOut(x).map((o) => o.value).filter(Boolean).join(" / ");
     return cardText(`${x.text}${said ? T(this.opts.lang).stepSays(said) : ""}`, 160, this.opts.lang);
+  }
+  /** What the step sent, as the journal recorded it (the last draw before acting when it differed from the card's),
+   *  cut here, once, in the card's language, with the true length. */
+  private uncertainOut(x: JournalStep): ActionCardFacts["outgoing"] {
+    const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
+    const rec = (Array.isArray(l.outgoing_final) ? l.outgoing_final : Array.isArray(l.outgoing) ? l.outgoing : []) as Partial<RecordedOut>[];
+    return rec.slice(0, 5).map((o) => ({ kind: (o.kind ?? "text") as ActionCardFacts["outgoing"][number]["kind"], label: cardText(String(o.label ?? ""), 40, this.opts.lang), value: cardText(String(o.value ?? ""), 80, this.opts.lang, typeof o.chars === "number" ? o.chars : undefined) }));
   }
   private uncertainFact(x: JournalStep): NonNullable<ActionCardFacts["uncertain"]>[number] {
     const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
-    const outgoing = (Array.isArray(l.outgoing) ? l.outgoing as ActionCardFacts["outgoing"] : []).slice(0, 5);
-    return { consequence: x.consequence as Consequence, object: typeof l.object === "string" ? l.object : "", text: x.text, outgoing };
+    return { consequence: x.consequence as Consequence, object: typeof l.object === "string" ? l.object : "", text: x.text, outgoing: this.uncertainOut(x) };
   }
   /** The card's lines for the uncertain steps: the same step (same words) once, with how many times; in the order
    *  of each one's last occurrence; every outbound (external) one and the newest always shown, then the most recent
@@ -1124,11 +1129,13 @@ export class Executor {
   /** The provenance answers, per (URL, material version): asked once each. `cleared`: the judge's「没有」from a tier that
    *  may give it (not a local one) — the open is then not a send. */
   private provenance = new Map<string, { cleared: boolean; why: string; by: string }>();
-  private provenanceKey(url: string) { const h = siteOf(url); return canon({ url, v: this.readMaterial().length, approved: h ? this.planSites.get(h) ?? null : null }); }
+  private provenanceKey(url: string) { const h = siteOf(url); return canon({ url, v: this.readMaterial().length, approved: h && !this.uncertainCount ? this.planSites.get(h) ?? null : null }); }
 
   /** The sites a plan the user accepted declared and what goes to each, from the site token the app signed for this
    *  task (checked here: the runtime cannot add a host or approved content). Returns the hosts taken. */
   acceptPlanSites(t: ConsentToken): string[] {
+    // a step of this run is uncertain: no standing grant, a plan's approved site content included — every open asks
+    if (this.uncertainCount) return [];
     const got = this.consent.planSitesOf(t, this.opts.task);
     for (const h of got.hosts) this.planSites.set(h, [...new Set([...(this.planSites.get(h) ?? []), ...(got.sends[h] ?? [])])]);
     if (got.hosts.length) this.emit("executor.plan_sites", { hosts: got.hosts, sends: got.sends });
@@ -1165,7 +1172,7 @@ export class Executor {
     const material = this.readMaterial();
     const recent = material.slice(-MATERIAL_ITEMS);
     let decoded = url; try { decoded = decodeURIComponent(url); } catch { /* malformed %XX: the raw URL says it */ }
-    const host = siteOf(url), approved = host ? this.planSites.get(host) : undefined;
+    const host = siteOf(url), approved = host && !this.uncertainCount ? this.planSites.get(host) : undefined;
     const ctx: Record<string, unknown> = {
       用户自己的话: { 原话: this.opts.raw ?? "", ...(this.earlierRequests.length ? { 改之前的要求: this.earlierRequests } : {}), ...(this.userWrote.length ? { 用户在卡片上自己写的回答: this.userWrote } : {}) },
       ...(approved ? { "用户同意发到这个网站的内容（计划卡上写明、用户点了同意）": approved.length ? approved : ["计划卡上写了要打开这个网站，没写发过去的内容"] } : {}),
@@ -1329,7 +1336,7 @@ export class Executor {
     const hit = this.classified.get(this.classifyKey(req.action, req.epoch, req.consequence));
     const f = hit ?? this.floor(req.action);
     const consequence = hit ? hit.consequence : higher(f.consequence, req.consequence ?? "read");
-    const needs = NEEDS_CONSENT.has(consequence) && this.consent.check(req.action, f.object, consequence, this.opts.task) !== null;
+    const needs = NEEDS_CONSENT.has(consequence) && (this.uncertainGate(undefined) !== null || this.consent.check(req.action, f.object, consequence, this.opts.task) !== null);
     return { consequence, object: f.object, needs_consent: needs, floor_why: f.why, ...(hit ? { by: hit.by } : {}) };
   }
 
@@ -1352,7 +1359,7 @@ export class Executor {
     let pendingReceipt: Record<string, unknown> | null = null;
     let stepConsented = false, foregroundOk = false;
     // what goes out, as the card showed it: recorded with the intent, so an uncertain step is named by it too
-    let cardOutgoing: ActionCardFacts["outgoing"] | undefined;
+    let cardOutgoing: ActionCardFacts["outgoing"] | undefined, finalOutgoing: ActionCardFacts["outgoing"] | undefined;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       if (pendingReceipt) { this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...pendingReceipt }); pendingReceipt = null; }
@@ -1474,7 +1481,9 @@ export class Executor {
       // have come): it is checked against the binding it was issued for
       const stored = req.consent?.scope === "action" ? this.consent.contentOf(req.consent.nonce) as SendBinding | undefined : undefined;
       accepted = stored && content && within(stored, content, this.pixelPolicy) ? stored : content;
-      let why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false) ?? this.uncertainGate(req.consent);
+      // the uncertain gate first: a stored rule it would refuse is not consulted, so it is not recorded as used (the
+      // result card would say the step went by that rule when the user approved it on the card — review of #66 r6)
+      let why = this.uncertainGate(req.consent) ?? this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
       // the token answers a card for this very action: what differs is what goes out, not the action (rc.9: "another
       // action" was said of the same click whose window had changed)
       const same = !!stored && req.consent?.digest === digestOf(req.action, base.object, consequence, stored);
@@ -1512,6 +1521,8 @@ export class Executor {
       // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
       const again = this.card(req.action, obs, consequence, fresh);
       if (again.lost) return changed("the target is gone or no longer one of a kind");
+      // what goes out now, as drawn right before acting: recorded with the intent when it differs from the card's
+      if (again.facts?.outgoing && canon(again.facts.outgoing) !== canon(cardOutgoing ?? [])) finalOutgoing = again.facts.outgoing;
       act = again.act;
       if (this.mightSend(req.action) && !sameSendFacts(req.action, obs, fresh)) return changed("the focus, or which controls send");
       if (consequence === "external") {
@@ -1554,7 +1565,7 @@ export class Executor {
     let land: (() => void) | null = null;
     if (consequence !== "read") {
       const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence);
-      this.journal("intent", { action: act, object: base.object, consequence, text, ...(cardOutgoing?.length ? { outgoing: cardOutgoing.slice(0, 5).map((o) => ({ kind: o.kind, label: cardText(o.label, 40), value: cardText(o.value, 80) })) } : {}) });
+      this.journal("intent", { action: act, object: base.object, consequence, text, ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
@@ -1759,7 +1770,7 @@ export class Executor {
       try { still = cap.preconditions(ws, a.args); } catch (e) { still = e instanceof Error ? e.message : String(e); }
       if (still) return { ...base, status: "stale", why: `changed while this step was being checked: ${still}. Look again and decide anew.` };
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
-      const why = this.consent.check(a, object, consequence, this.opts.task, consent) ?? this.uncertainGate(consent);
+      const why = this.uncertainGate(consent) ?? this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
         const challenge = this.issue(a, object, consequence, text, epoch, undefined, { action: "file", action_text: describeAction(a, undefined, "read", cap, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null });
         this.emit("executor.consent_needed", { why, consequence, object });
@@ -2103,9 +2114,26 @@ const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u206
  *  after 160 characters with the full length said. The start (scheme and host) always stays. */
 /** Words for a card that came from a model (a plan's `sends`): control, line-break and bidi/format characters escaped
  *  as in shortUrl, so they cannot forge a line or reverse text; cut at `max` characters with the length said. */
-export function cardText(x: string, max = 80, lang?: Lang): string {
+export function cardText(x: string, max = 80, lang?: Lang, total?: number): string {
   const chars = Array.from(x.replace(UNSAFE, (c) => encodeURIComponent(c)));
-  return chars.length > max ? chars.slice(0, max).join("") + T(lang).cut(chars.length) : chars.join("");
+  // `total`: the text's true length when `x` is already a bounded part of it (a journal keeps a byte-bounded copy)
+  const n = Math.max(total ?? 0, chars.length);
+  return n > max ? chars.slice(0, max).join("") + T(lang).cut(n) : chars.join("");
+}
+
+/** `x` cut to at most `bytes` UTF-8 bytes, on a character boundary: what a journal keeps of a long text. */
+function boundBytes(x: string, bytes: number): string {
+  if (Buffer.byteLength(x) <= bytes) return x;
+  let out = "", used = 0;
+  for (const ch of x) { const b = Buffer.byteLength(ch); if (used + b > bytes) break; out += ch; used += b; }
+  return out;
+}
+
+/** What went out, as the journal keeps it: untruncated up to a byte bound, with the true length, no words of any
+ *  language — cut once, at the card, in the card's language (review of harness#66 round 6). */
+type RecordedOut = { kind: string; label: string; value: string; chars: number };
+function recordOut(items: ActionCardFacts["outgoing"]): RecordedOut[] {
+  return items.slice(0, 5).map((o) => ({ kind: o.kind, label: boundBytes(o.label, 512), value: boundBytes(o.value, 4096), chars: Array.from(o.value).length }));
 }
 
 export function shortUrl(u: string, lang?: Lang): string {
