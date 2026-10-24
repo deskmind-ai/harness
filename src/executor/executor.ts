@@ -460,7 +460,10 @@ export class Executor {
   private uncertainOut(x: JournalStep): ActionCardFacts["outgoing"] {
     const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
     const rec = (Array.isArray(l.outgoing_final) ? l.outgoing_final : Array.isArray(l.outgoing) ? l.outgoing : []) as Partial<RecordedOut>[];
-    return rec.slice(0, 5).map((o) => ({ kind: (o.kind ?? "text") as ActionCardFacts["outgoing"][number]["kind"], label: cardText(String(o.label ?? ""), 40, this.opts.lang), value: cardText(String(o.value ?? ""), 80, this.opts.lang, typeof o.chars === "number" ? o.chars : undefined) }));
+    // a record without `chars` was written by an earlier build, already cut (with its own count in its own words):
+    // shown as it is — cut again, it would count the cut text (review of harness#66 round 7)
+    return rec.slice(0, 5).map((o) => ({ kind: (o.kind ?? "text") as ActionCardFacts["outgoing"][number]["kind"], label: cardText(String(o.label ?? ""), 40, this.opts.lang),
+      value: typeof o.chars === "number" ? cardText(String(o.value ?? ""), 80, this.opts.lang, o.chars) : cardText(String(o.value ?? ""), Infinity, this.opts.lang) }));
   }
   private uncertainFact(x: JournalStep): NonNullable<ActionCardFacts["uncertain"]>[number] {
     const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
