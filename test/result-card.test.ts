@@ -779,3 +779,61 @@ async function restart(d: Desk, runDir: string) {
   const lines = stepLines(ex.possiblySteps());
   return { lines, reversible: ex.undoable().reversible };
 }
+
+describe("H2 round 4: a stop while the result card waits closes it and its undo, whatever stopped before", () => {
+  /** A task that writes a.txt and then asks a question; `stopTask`: the app stops it at the question (else it finishes).
+   *  After task_done the app writes `after` (control lines, in one write), then closes stdin a moment later. */
+  async function card(o: { stopTask: boolean; after: Record<string, unknown>[] }) {
+    const d = desk();
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    const write = (c: unknown) => input.write(JSON.stringify(c) + "\n");
+    const steps: Step[] = [
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+      ...(o.stopTask ? [{ calls: [{ name: "ask_user", args: { question: "还要接着做吗？", options: ["接着做"] } }] }] : []),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "写了" } }] },
+    ];
+    const out = (e: AppEvent) => {
+      events.push(e);
+      if (e.kind === "ask") setTimeout(() => write({ type: "stop" }), 1);
+      if (e.kind === "task_done") setTimeout(() => {
+        const undo = e.result_card!.options.findIndex((x) => x.kind === "undo");
+        input.write(o.after.map((c) => JSON.stringify(c.type === "respond" ? { ...c, option: undo } : c) + "\n").join(""));
+        setTimeout(() => input.end(), 100);
+      }, 1);
+    };
+    await appRun({ run_id: "run_stop", raw: "新建 a.txt", config: "ds-flash", scope: d.scope }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out, input: new LineReader(input), linger: 600,
+      inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(steps) } } });
+    const done = events.find((e) => e.kind === "task_done") as Extract<AppEvent, { kind: "task_done" }>;
+    return { d, events, done, file: fs.existsSync(path.join(d.scope, "a.txt")) };
+  }
+
+  it("the task was stopped, its card waits: a second stop closes it — a later undo is not carried out, the file stays", async () => {
+    const r = await card({ stopTask: true, after: [{ type: "stop" }, { type: "respond" }] });
+    expect(r.done).toMatchObject({ status: "stopped" });
+    expect(r.done.result_card!.options.map((x) => x.kind)).toEqual(["approve", "undo"]);
+    expect(r.events.some((e) => e.kind === "result_response")).toBe(false);
+    expect(r.file).toBe(true);
+  });
+
+  it("the task ended normally, its card waits: a stop closes it; a third and fourth stop change nothing", async () => {
+    const r = await card({ stopTask: false, after: [{ type: "stop" }, { type: "stop" }, { type: "stop" }, { type: "respond" }] });
+    expect(r.done).toMatchObject({ status: "succeeded" });
+    expect(r.events.some((e) => e.kind === "result_response")).toBe(false);
+    expect(r.file).toBe(true);
+    expect(r.events.filter((e) => e.kind === "task_done")).toHaveLength(1);
+    expect(r.events.filter((e) => e.kind === "refused" && e.by === "user")).toHaveLength(1);   // one stop recorded, once
+  });
+
+  it("the task was stopped, its card waits: an undo still works (the stop that ended the task does not close the card)", async () => {
+    const r = await card({ stopTask: true, after: [{ type: "respond" }] });
+    expect(r.events.at(-1)).toMatchObject({ kind: "result_response", picked: "undo", undone: 1, total: 1 });
+    expect(r.file).toBe(false);
+  });
+
+  it("a stop that comes after the undo was asked for: the undo is not cut short (it finishes and is recorded)", async () => {
+    const r = await card({ stopTask: true, after: [{ type: "respond" }, { type: "stop" }] });
+    expect(r.events.find((e) => e.kind === "result_response")).toMatchObject({ picked: "undo", undone: 1, total: 1, refused: null });
+    expect(r.file).toBe(false);
+  });
+});

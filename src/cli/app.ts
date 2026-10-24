@@ -60,6 +60,9 @@ export const STEP_UNKNOWN = "a step was in progress; its result is unknown";
  *  and the card answers as the user's words, never this. */
 export interface Request { run_id?: string; raw: string; context?: string; scope?: string; config?: string; engine?: "runtime"; lang?: "zh" | "en"; driver?: "sim" | "hands"; apps?: string[]; skills?: string; rules?: ConsentToken[] }
 
+/** What next() gives for a stop line while `stopsAsLines` is set: no control line ever reads as this. */
+export const STOP_LINE = "\u0000stop";
+
 /** JSON lines in: control lines (protocol/control.ts: answer, stop, respond, steer; v1 also reads the untyped
  *  `{ask_id, option|text}` and `{"stop":true}`); the first line may be the request itself. A stop or a steer is
  *  handled the moment it arrives; answers and responds wait in order for `next()`. */
@@ -74,7 +77,11 @@ export class LineReader {
       // it also lets go of a card waiting for its answer: that card is answered with nothing (review of #16)
       const c = parseControl(l);
       // the session's stop as the app ends or leaves (app_gone) is nobody's request: no cause, as for stdin closing
-      if (c?.type === "stop") { if (c.app_gone) this.stop("the app went away (the session stopped its task)"); else this.stop("stopped by the app", "user_stopped"); return; }
+      if (c?.type === "stop") {
+        // a wait that asked to hear every stop (the result card's): told in order with the lines, latched or not
+        if (this.stopsAsLines) this.deliver(STOP_LINE);
+        if (c.app_gone) this.stop("the app went away (the session stopped its task)"); else this.stop("stopped by the app", "user_stopped"); return;
+      }
       if (c?.type === "steer") { if (this.steerTo) this.steerTo(c.text); else this.earlySteers.push(c.text); return; }
       // 「现在回答」 on an expired card: at once, like a steer (nothing waits in the answer queue while a card is expired)
       if (c?.type === "reask") { this.onReask?.(); return; }
@@ -83,12 +90,17 @@ export class LineReader {
       // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
       // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
       if (!c && isForeignControl(l)) return;
-      const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l);
+      this.deliver(l);
     });
     // the app went away (stdin closed): every open card is answered with nothing (let go: "ended"), then whoever runs
     // the task is told (appRun: a stop)
     rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); this.onClosed?.(); });
   }
+  private deliver(l: string) { const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l); }
+  /** While set (the result card's wait), every stop line — the first, or one after the task's stop has latched — also
+   *  comes through next() as STOP_LINE, in its place among the lines: the wait's own stop, armed per wait (review of
+   *  #68: a task already stopped ignored later stops, and its card's undo stayed open). */
+  stopsAsLines = false;
   closed = false;
   onClosed: (() => void) | null = null;
   stopped = false;
@@ -392,6 +404,8 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const card = r.result_card ? cardEvent(r.result_card, lingers, req.lang) : null;
   const until = lingers ? clock.now() + o.linger * 1000 : 0;
   const undoUntil = lingers && card!.options.some((x) => x.kind === "undo") ? { undo_until: until / 1000 } : {};
+  // the card waits from the moment task_done says so: from here a stop closes it (armed before task_done is written)
+  if (lingers) o.input.stopsAsLines = true;
   taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, ...undoUntil, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
   if (signals) return o.signals!.exit();
   // Any other line in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the
@@ -403,7 +417,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     try {
       for (;;) {
         const line = await o.input.next(deadline.signal);
-        if (deadline.signal.aborted || (!line && (o.input.closed || o.input.stopped))) break;
+        // a stop while the card waits closes it and its undo, whatever stopped before (the task's own stop latched
+        // earlier: that one ended the task, this one ends the wait); one that comes during an undo under way is read
+        // only after it — an undo is never cut short (its result_response is written)
+        if (deadline.signal.aborted || line === STOP_LINE || (!line && (o.input.closed || o.input.stopped))) break;
         const a = parseControl(line);
         if (a?.type !== "respond" || typeof a.option !== "number") continue;
         // the deadline, asked as the answer arrives: the Mac's timers stop in sleep, and an undo sent in the second after
@@ -418,7 +435,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
         log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
         break;
       }
-    } finally { cancel(); }
+    } finally { cancel(); o.input.stopsAsLines = false; }
   }
 }
 
