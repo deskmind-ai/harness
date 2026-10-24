@@ -360,10 +360,14 @@ export class SessionHost {
     for (;;) {
       const evs = readRunEvents(this.runFile(runId));
       const finished = need.undo ? evs.some((e) => e.kind === "result_response") : evs.some((e) => e.kind === "task_done");
+      // one reading of the clock and of the holder per round (harness#69): read twice, the deadline could pass between
+      // the two checks (held() asks ps, which takes milliseconds) — the first said "not yet, keep waiting", the second
+      // "over", and an undo still under way was ended (SIGTERM) and recorded as cut off
+      const over = Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS), up = held(own);
       // an undo still under way at the deadline is never cut short: it is watched on, outside the wait (the model may
       // speak meanwhile: the run reads as not closed), and its records written when it ends (or by the next open)
-      if (need.undo && !finished && held(own) && Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) { void this.watchUndo(runId, own, need); return; }
-      if (finished || !held(own) || Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) {
+      if (need.undo && !finished && up && over) { void this.watchUndo(runId, own, need); return; }
+      if (finished || !up || over) {
         // not ended in time: what is left of its group is ended now (a resumed session's first task must not find it)
         if (!finished) { try { const cur = readHolder(this.o.dir); if (cur?.run_id === runId && held(cur)) endTree(cur); } catch { /* the next task finds it */ } }
         this.recordRecovered(runId, need);
