@@ -201,8 +201,8 @@ export class StdioUser implements RuntimeUser {
     this.open?.expired?.();
     const o = this.open;
     if (o && (a.ask_id === o.id || (a.ask_id === undefined && !this.voided))) {
-      this.log.emit({ kind: "resumed", ask_id: o.id });
       this.closeOpen("answered");
+      this.log.emit({ kind: "resumed", ask_id: o.id });
       if (typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length) return o.settle({ option: a.option });
       if (typeof a.text === "string" && a.text.trim()) return o.settle({ text: a.text });
       return o.settle(null);
@@ -219,8 +219,8 @@ export class StdioUser implements RuntimeUser {
     const o = this.open;
     if (!o) return;
     // any end of the task closes the open card, said so (a task that ends otherwise than by a stop: "ended")
-    this.log.emit({ kind: "ask_void", ask_id: o.id, why: why === "done" ? "ended" : why });
     this.closeOpen(why);
+    this.log.emit({ kind: "ask_void", ask_id: o.id, why: why === "done" ? "ended" : why });
     o.settle(null);
   }
 
@@ -229,28 +229,36 @@ export class StdioUser implements RuntimeUser {
 
   ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
-    this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
-    this.log.emit({ kind: "waiting", ask_id });
-    return new Promise<Answer | null>((resolve) => {
+    // registered (the open record, its settle, its signal; the deadline is the service's, set before this call) BEFORE
+    // anything announces it: the app may answer inside the very `ask` it is handed (an in-process sink, a synchronous
+    // stdin) — review of #67. Closing goes the other way: unregistered first, then said (ask_void / resumed)
+    let settle!: (x: Answer | null) => void;
+    const p = new Promise<Answer | null>((resolve) => {
       let settled = false;
-      const settle = (x: Answer | null) => { if (settled) return; settled = true; o.signal?.removeEventListener("abort", voided); resolve(x); };
-      // the user changed the request (steer), or nobody answered in time (timeout): the card is let go, the app told
-      const voided = () => {
-        if (this.open?.id !== ask_id) return;
-        // the task ended under it (the runtime died, the executor failed): let go as ended, at once
-        if (o.signal!.reason === "ended") { this.log.emit({ kind: "ask_void", ask_id, why: "ended" }); this.closeOpen("ended"); settle(null); return; }
-        const why = o.signal!.reason === "timeout" ? "timeout" : "steer";
-        this.voided = true;
-        this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why });
-        this.closeOpen(why);
-        settle(null);
-      };
-      this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), settle };
-      // stopped or gone before it was shown: let go at once
-      if (this.over === "stop" || this.over === "ended") { this.end(this.over); return; }
-      if (o.signal?.aborted) { voided(); return; }
-      o.signal?.addEventListener("abort", voided, { once: true });
+      settle = (x) => { if (settled) return; settled = true; o.signal?.removeEventListener("abort", voided); resolve(x); };
     });
+    // the user changed the request (steer), nobody answered in time (timeout), or the task ended under it ("ended":
+    // the runtime died, the executor failed): the card is let go, the app told
+    const voided = () => {
+      if (this.open?.id !== ask_id) return;
+      const reason = o.signal!.reason;
+      const why = reason === "ended" ? "ended" : reason === "timeout" ? "timeout" : "steer";
+      this.closeOpen(why);
+      if (why === "ended") this.log.emit({ kind: "ask_void", ask_id, why: "ended" });
+      else { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why }); }
+      settle(null);
+    };
+    this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), settle };
+    o.signal?.addEventListener("abort", voided, { once: true });
+    this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
+    // (answered or let go inside its own announcement: nothing more is said of it)
+    if (this.open?.id !== ask_id) return p;
+    this.log.emit({ kind: "waiting", ask_id });
+    if (this.open?.id !== ask_id) return p;
+    // stopped or gone before it was shown, or already voided: let go at once
+    if (this.over === "stop" || this.over === "ended") this.end(this.over);
+    else if (o.signal?.aborted) voided();
+    return p;
   }
 }
 

@@ -768,12 +768,16 @@ export class SessionHost {
       if (!this.lockLinger(task)) task.noLinger = true;
       this.cardOf(task, ev);
     }
+    // a card is the session's to know of before the app hears of it, and gone before the app hears it went (the app may
+    // answer or type inside the very event it is handed): card_open reads this (review of #67). The result card's state
+    // is set at task_done above (cardOf), before it is forwarded; its closing by deadline is taken here, before too
+    if (ev.kind === "ask") task.card = typeof ev.ask_id === "string" ? ev.ask_id : null;
+    else if ((ev.kind === "resumed" || ev.kind === "ask_void") && ev.ask_id === task.card) task.card = null;
+    else if (ev.kind === "result_card_closed" && task.resultCard.s === "open") task.resultCard = { s: "closed", why: "expired" };
     // a task that does not linger keeps its result card (M2 H2: a task that changed something always shows one): its
     // undo is none in session.task_end, and the deadline it would have had is not said
     this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { undo_until: undefined, result_card: withoutUndo(ev.result_card, this.lang) } : {}), session_id: this.o.sessionId });
     switch (ev.kind) {
-      case "ask": task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; break;
-      case "resumed": case "ask_void": if (ev.ask_id === task.card) task.card = null; break;
       case "steered": if (typeof ev.text === "string") task.steers.push(ev.text); break;
       case "step": if (typeof ev.step_id === "string") task.openSteps.add(ev.step_id); break;
       case "step_result": if (typeof ev.step_id === "string") task.openSteps.delete(ev.step_id); break;
@@ -782,7 +786,6 @@ export class SessionHost {
       // its card's undo window ended by its clock: closed here too (a respond now is refused, never forwarded), and its
       // stdin ended — what it already has, it answers "expired" (one result_response each), then it exits
       case "result_card_closed":
-        if (task.resultCard.s === "open") task.resultCard = { s: "closed", why: "expired" };
         try { task.handle.close(); } catch { /* gone */ }
         break;
       case "result_response":
@@ -812,7 +815,11 @@ export class SessionHost {
     task.options = Array.isArray(card?.options) ? card.options.length : 0;
     task.optionKinds = Array.isArray(card?.options) ? card.options.map((x) => String((x as { kind?: unknown } | null)?.kind ?? "")) : [];
     if (task.state === "running") task.state = card && this.linger > 0 && !task.noLinger ? "lingering" : "ending";
-    if (task.state === "lingering") task.resultCard = { s: "open" };
+    if (task.state === "lingering") {
+      task.resultCard = { s: "open" };
+      // (its deadline too: a respond sent inside the task_done event is checked against it)
+      if (typeof ev.undo_until === "number" && Number.isFinite(ev.undo_until) && card?.options?.some((x) => (x as { kind?: unknown } | null)?.kind === "undo")) task.undoUntil = ev.undo_until;
+    }
   }
 
   private taskDone(task: Task, ev: Record<string, unknown>) {

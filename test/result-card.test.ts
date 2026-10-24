@@ -1031,3 +1031,44 @@ describe("H2 round 6: every respond the session forwards gets one result_respons
     expect(fs.existsSync(path.join(s.desks[0]!.scope, "a.txt"))).toBe(true);
   });
 });
+
+describe("H2 round 8: the result card is registered before task_done announces it", () => {
+  it("app-run: an undo sent inside the task_done event is carried out", async () => {
+    const d = desk();
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    const out = (e: AppEvent) => {
+      events.push(e);
+      if (e.kind === "task_done") { input.write(JSON.stringify({ type: "respond", option: e.result_card!.options.findIndex((x) => x.kind === "undo") }) + "\n"); }
+      if (e.kind === "result_response") input.end();
+    };
+    await Promise.race([appRun({ run_id: "run_sync", raw: "新建 a.txt", config: "ds-flash", scope: d.scope }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out, input: new LineReader(input), linger: 600,
+      inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(CREATE()) } } }), sleep(4000)]);
+    expect(events.find((e) => e.kind === "result_response")).toMatchObject({ picked: "undo", undone: 1, total: 1 });
+    expect(tree(d.scope)).toEqual(d.before);
+  });
+
+  it("through the session: an undo sent inside the task_done event is taken (open), recorded and carried out; a stop sent there closes the card", async () => {
+    for (const how of ["respond", "stop"] as const) {
+      const clock = new FakeClock();
+      let s!: ReturnType<typeof session>;
+      s = session({ clock, scripts: [() => CREATE()] });
+      const evs = s.evs;
+      // answer inside the very event, before anything else runs
+      const orig = evs.push.bind(evs);
+      evs.push = (...xs: any[]) => { const n = orig(...xs); for (const e of xs) if (e.kind === "task_done") s.send(how === "respond" ? { type: "respond", run_id: e.run_id, option: 1 } : { type: "stop", run_id: e.run_id }); return n; };
+      s.send({ type: "cua", text: "新建 b.txt" });
+      if (how === "respond") {
+        await waitFor(() => s.of("session.task_undo").length === 1);
+        expect(s.of("session.task_undo")[0]).toMatchObject({ undone: 1, total: 1, refused: null });
+        expect(s.of("session.error")).toEqual([]);
+        expect(fs.existsSync(path.join(s.desks[0]!.scope, "b.txt"))).toBe(false);
+      } else {
+        await waitFor(() => s.of("session.task_closed").length === 1);
+        s.send({ type: "respond", run_id: s.of("task_done")[0].run_id, option: 1 });
+        expect(s.of("session.task_respond")).toEqual([]);
+        expect(fs.existsSync(path.join(s.desks[0]!.scope, "b.txt"))).toBe(true);
+      }
+    }
+  });
+});
