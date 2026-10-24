@@ -779,13 +779,19 @@ export class SessionHost {
       case "step_result": if (typeof ev.step_id === "string") task.openSteps.delete(ev.step_id); break;
       case "changes": task.changes = capChanges(ev); break;
       case "task_done": this.taskDone(task, ev); if (task.noLinger) { try { task.handle.close(); } catch { /* gone */ } } break;
+      // its card's undo window ended by its clock: closed here too (a respond now is refused, never forwarded), and its
+      // stdin ended — what it already has, it answers "expired" (one result_response each), then it exits
+      case "result_card_closed":
+        if (task.resultCard.s === "open") task.resultCard = { s: "closed", why: "expired" };
+        try { task.handle.close(); } catch { /* gone */ }
+        break;
       case "result_response":
         this.lockLinger(task);                           // the answer carried out: it acts no more (first: whatever the record)
         // what the undo did is the run's record of a change to the user's things: one that cannot be stored halts the
         // session (terminal) — never read as "expired" meanwhile; the next open records it from the run
         if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
         if (!task.undoRecorded && typeof ev.undone === "number" && typeof ev.total === "number") { task.undoRecorded = true; this.terminal(undoFrom(task.runId, ev)); }
-        if (task.resultCard.s === "undoing" || task.resultCard.s === "open") task.resultCard = { s: "closed", why: "answered" };
+        if (task.resultCard.s === "undoing") task.resultCard = { s: "closed", why: "answered" };
         this.maybeExit();                                // a session ending waited for this undo's outcome
         break;
     }

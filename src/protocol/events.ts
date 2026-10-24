@@ -8,7 +8,7 @@
  *
  * Kinds: start, preparing, plan, step, step_result, ask, ask_void, waiting, resumed, consent, refused, steered, verify,
  * changes, model_call, judge, shot_ready, answer_given, task_done,
- * result_response.
+ * result_response, result_card_closed.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -115,6 +115,9 @@ export const EventBody = z.discriminatedUnion("kind", [
   // the user's response to a result card after the run (respond): recorded; what it does is the runtime's to add
   // `undone` / `total` / `refused` (M0): the undo in fields — how many steps were taken back of how many, and why it
   // stopped (null: all of them); absent when nothing was undone
+  // the result card's undo window ended by this process's clock (M2 H2, additive): from here every respond it still
+  // reads is answered "expired" (result_response, nothing undone); the session stops forwarding and ends its stdin
+  z.object({ kind: z.literal("result_card_closed"), why: z.enum(["expired"]) }),
   z.object({ kind: z.literal("result_response"), picked: z.string().nullable(), text: z.string().optional(), effect: z.string(), undone: z.number().int().optional(), total: z.number().int().optional(), refused: z.string().nullable().optional() }),
 ]);
 export type EventBody = z.infer<typeof EventBody>;

@@ -420,8 +420,7 @@ describe("H2, review of #68: undo only while something can carry it out; every e
     clock.sleep(30 * 60_000);                              // past undo_until; no timer moved
     input.write(JSON.stringify({ type: "respond", option: td.result_card!.options.findIndex((x) => x.kind === "undo") }) + "\n");
     await done;
-    expect(events.at(-1)).toMatchObject({ kind: "result_response", picked: "undo", undone: 0, total: 1 });
-    expect((events.at(-1) as any).refused).toContain("window had ended");
+    expect(events.filter((e) => e.kind === "result_response")).toEqual([expect.objectContaining({ picked: "undo", undone: 0, total: 1, refused: "expired" })]);
     expect(fs.readFileSync(path.join(d.scope, "a.txt"), "utf-8")).toBe("hi");
   });
 
@@ -923,5 +922,112 @@ describe("H2 round 5: the result card's state is decided once, in the session; t
     expect(s.of("session.error").find((e) => e.control === "respond")).toMatchObject({ code: "undo_expired" });
     expect(s.of("session.task_respond")).toEqual([]);
     expect(file()).toBe(true);
+  });
+});
+
+describe("H2 round 6: review repros R2, R5", () => {
+  it("R2: the task is stopped with [answer naming no open card, stop] in one chunk at its question card; the result card's undo then does nothing (the respond is read by the question card's leftover wait)", async () => {
+    const d = desk();
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    const steps: Step[] = [
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+      { calls: [{ name: "ask_user", args: { question: "还要接着做吗？", options: ["接着做"] } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "写了" } }] },
+    ];
+    const out = (e: AppEvent) => {
+      events.push(e);
+      if (e.kind === "ask") setTimeout(() => input.write([{ type: "answer", ask_id: "ask_nowhere", option: 0 }, { type: "stop" }].map((c) => JSON.stringify(c) + "\n").join("")), 1);
+      if (e.kind === "task_done") setTimeout(() => {
+        input.write(JSON.stringify({ type: "respond", option: e.result_card!.options.findIndex((x) => x.kind === "undo") }) + "\n");
+        setTimeout(() => input.end(), 300);
+      }, 1);
+    };
+    await appRun({ run_id: "run_r2", raw: "新建 a.txt", config: "ds-flash", scope: d.scope }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out, input: new LineReader(input), linger: 600,
+      inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(steps) } } });
+    expect(events.find((e) => e.kind === "task_done")).toMatchObject({ status: "stopped" });
+    expect(events.find((e) => e.kind === "result_response")).toMatchObject({ picked: "undo", undone: 1, total: 1 });
+    expect(fs.existsSync(path.join(d.scope, "a.txt"))).toBe(false);
+  });
+
+  it("R5: a respond the session forwards just before undo_until, read by the executor just after its own deadline tick: the session records task_undo unknown (an undo cut off) though nothing ran", async () => {
+    const clock = new FakeClock();
+    const s = session({ clock, scripts: [() => CREATE_THEN_ASK()], onAsk: (e, send) => setTimeout(() => send({ type: "stop", run_id: e.run_id }), 1) });
+    s.send({ type: "cua", text: "新建 a.txt" });
+    await waitFor(() => s.of("session.task_end").length === 1);
+    const run = s.of("task_done")[0].run_id as string;
+    const until = s.of("task_done")[0].undo_until as number;
+    clock.sleep(until * 1000 - clock.now() - 1);              // 1 ms before the deadline, by the wall clock
+    s.send({ type: "respond", run_id: run, option: 1 });      // the session: still open → undoing, task_respond stored, forwarded
+    expect(s.of("session.task_respond", run)).toHaveLength(1);
+    clock.advance(1000);                                       // the executor's deadline tick runs before it reads the line
+    await waitFor(() => s.of("session.task_closed", run).length === 1);
+    await sleep(50);
+    expect(fs.existsSync(path.join(s.desks[0]!.scope, "a.txt"))).toBe(true);   // nothing was undone
+    // nothing ran: never recorded as an undo cut off half way
+    expect(s.of("session.task_undo", run).filter((e) => e.unknown)).toEqual([]);
+  });
+});
+
+// gap tests: pass at 711a04d, fail under the surviving mutations M6 (a stop while undoing closes the card) and M2 (a
+// keep is taken as undoing)
+describe("H2 round 6: review gap tests G6, G2", () => {
+  /** An executor that says task_done with an undo card (options: approve, undo), and dies 5 ms after `dieOn` reaches it. */
+  function dying(dieOn: (j: any) => boolean) {
+    let die!: (x: { code: number | null; signal: string | null }) => void;
+    const launch: Launcher = (_req, lo) => {
+      let cb: ((l: string) => void) | null = null;
+      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => { die = r; });
+      return {
+        start: () => setTimeout(() => cb?.(JSON.stringify({ seq: 1, t: Date.now() / 1000, run_id: lo.runId, kind: "task_done", status: "succeeded", summary: "ok", reason: "", result_card: { kind: "result", text: "做了", options: [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }], free_text: false, blocking: false } })), 5),
+        write: (l: string) => { if (dieOn(JSON.parse(l))) setTimeout(() => die({ code: 1, signal: null }), 5); },
+        close: () => {}, onLine: (f: (l: string) => void) => { cb = f; }, exited,
+      } as never;
+    };
+    const evs: any[] = [];
+    const h = new SessionHost({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-ses-")), sessionId: "ses_gap", out: (e) => evs.push(e), coalesceMs: 5,
+      model: { model: MODEL, streamFn: scriptedStream([{ text: "好" }]) }, launch, linger: 600 });
+    hosts.push(h);
+    h.start();
+    h.handle(JSON.stringify({ type: "cua", text: "新建 a.txt" }));
+    return { h, evs };
+  }
+
+  it("G6: undoing + stop, then the executor dies before the undo's outcome: still recorded unknown (the stop does not close an undo under way)", async () => {
+    const { h, evs } = dying((j) => j.type === "stop");
+    await waitFor(() => evs.some((e) => e.kind === "session.task_end"));
+    const run = evs.find((e) => e.kind === "task_done").run_id;
+    h.handle(JSON.stringify({ type: "respond", run_id: run, option: 1 }));
+    h.handle(JSON.stringify({ type: "stop", run_id: run }));
+    await waitFor(() => evs.some((e) => e.kind === "session.task_closed"));
+    expect(evs.find((e) => e.kind === "session.task_undo")).toMatchObject({ unknown: true });
+  });
+
+  it("G2: a respond that is not undo (approve), then the executor dies before its result_response: no undo is recorded at all", async () => {
+    const { h, evs } = dying((j) => j.type === "respond");
+    await waitFor(() => evs.some((e) => e.kind === "session.task_end"));
+    const run = evs.find((e) => e.kind === "task_done").run_id;
+    h.handle(JSON.stringify({ type: "respond", run_id: run, option: 0 }));
+    await waitFor(() => evs.some((e) => e.kind === "session.task_closed"));
+    expect(evs.filter((e) => e.kind === "session.task_undo")).toEqual([]);
+  });
+});
+
+describe("H2 round 6: every respond the session forwards gets one result_response", () => {
+  it("a respond forwarded just before undo_until and read after the executor's deadline: answered 'expired', recorded as such (not cut off); the session stops forwarding", async () => {
+    const clock = new FakeClock();
+    const s = session({ clock, scripts: [() => CREATE_THEN_ASK()], onAsk: (e, send) => setTimeout(() => send({ type: "stop", run_id: e.run_id }), 1) });
+    s.send({ type: "cua", text: "新建 a.txt" });
+    await waitFor(() => s.of("session.task_end").length === 1);
+    const run = s.of("task_done")[0].run_id as string;
+    clock.sleep((s.of("task_done")[0].undo_until as number) * 1000 - clock.now() - 1);
+    s.send({ type: "respond", run_id: run, option: 1 });
+    clock.advance(1000);
+    await waitFor(() => s.of("session.task_closed", run).length === 1);
+    expect(s.of("result_response", run)).toEqual([expect.objectContaining({ picked: "undo", undone: 0, refused: "expired" })]);
+    expect(s.of("session.task_undo", run)).toEqual([expect.objectContaining({ undone: 0, refused: "expired" })]);
+    expect(s.of("session.task_undo", run)[0]).not.toHaveProperty("unknown");
+    expect(s.of("result_card_closed", run)).toHaveLength(1);
+    expect(fs.existsSync(path.join(s.desks[0]!.scope, "a.txt"))).toBe(true);
   });
 });

@@ -464,7 +464,8 @@ describe("M0 slice F: the remaining events the new app needs", () => {
     t0 = Date.now();
     const r3 = await run(new SimComputer(scope3), "在任务目录里新建 a.txt，写 hi", steps(), { scope: scope3, linger: 0.3, afterDone: ["not json"] });
     expect(Date.now() - t0).toBeLessThan(10_000);
-    expect(r3.events.at(-1)!.kind).toBe("task_done");
+    // (M2 H2: the deadline closes the card, said after task_done; no respond came, so no result_response)
+    expect(r3.events.slice(-2).map((e) => e.kind)).toEqual(["task_done", "result_card_closed"]);
     expect(fs.existsSync(path.join(scope3, "a.txt"))).toBe(true);
   });
 

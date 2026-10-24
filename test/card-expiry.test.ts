@@ -359,20 +359,18 @@ describe("H1: an expired action card — nobody answers for the user", () => {
     await r.done;
   });
 
-  it("an answer read at the very moment the card expires is refused, never used", async () => {
+  it("an answer that arrives at the very moment the card's deadline passes is refused, never used (the router asks the deadline first)", async () => {
     const input = new PassThrough();
     const sent: AppEvent[] = [];
     const reader = new LineReader(input);
     const u = new StdioUser(new EventLog(path.join(fs.mkdtempSync(path.join(os.tmpdir(), "expiry-")), "e.jsonl"), "r1", (e) => sent.push(e)), reader);
     const card: Card = { kind: "action", text: "点「发送」", free_text: false, blocking: true, options: [{ kind: "approve", text: "可以" }, { kind: "cancel", text: "先别做了" }] };
     const ctl = new AbortController();
-    const p = u.ask(card, { signal: ctl.signal });
-    await sleep(5);
+    let past = false;
+    const p = u.ask(card, { signal: ctl.signal, expired: () => { if (past && !ctl.signal.aborted) ctl.abort("timeout"); return ctl.signal.aborted; } });
     const ask = sent.find((e) => e.kind === "ask") as Extract<AppEvent, { kind: "ask" }>;
-    // the reader hands the line to the waiting card, and the deadline fires before the card has read it
-    const waiting = (reader as unknown as { waiting: ((l: string) => void)[] }).waiting;
-    waiting[0]!(JSON.stringify({ type: "answer", ask_id: ask.ask_id, option: 0 }));
-    ctl.abort("timeout");
+    past = true;                                           // the deadline passed; no tick has run
+    input.write(JSON.stringify({ type: "answer", ask_id: ask.ask_id, option: 0 }) + "\n");
     expect(await p).toBeNull();
     expect(sent.some((e) => e.kind === "resumed" && e.ask_id === ask.ask_id && !e.voided)).toBe(false);
     expect(sent.filter((e) => e.kind === "ask_void")).toEqual([expect.objectContaining({ ask_id: ask.ask_id, why: "timeout" })]);
@@ -643,5 +641,96 @@ describe("H1, review of #67 (Codex): every reply addressed to a card gets exactl
     expect(r.sent()).toBe(1);
     expect((r.events.find((e) => e.kind === "refused" && e.what === `answer for ${x.ask_id}`) as any).why).toContain("expired");
     oneOutcomeEach(r);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// review repros (#67 @32d237b): every reply addressed to a card gets exactly one outcome
+describe("H1 round 4: replies are routed once, on arrival (review repros R1, R3, R3b)", () => {
+  const outcomes = (r: Run, id: string) => r.events.filter((e: any) => (e.kind === "resumed" && e.ask_id === id && !e.voided) || (e.kind === "refused" && e.what === `answer for ${id}`)).length;
+
+  it("R1: [answer naming no open card, stop] in one chunk while card X is open: X is closed (ask_void stop), and a later answer to X is refused, not taken", async () => {
+    const r = start({ clock: new FakeClock() });
+    await waitFor(() => r.actionCards().length === 1);
+    const x = r.actionCards()[0]!;
+    r.sendBatch([{ type: "answer", ask_id: "ask_nowhere", option: 0 }, { type: "stop" }]);
+    await r.done;
+    // (R1a, checked last) the card was let go by the stop: the app is told so
+    const voided = r.voids().map((e) => e.ask_id);
+    // the user's late tap on X (the app still showed it): refused, never "resumed"
+    r.send({ type: "answer", ask_id: x.ask_id, option: r.approveOf(x) });
+    await sleep(50);
+    expect(r.events.filter((e: any) => e.kind === "resumed" && e.ask_id === x.ask_id && !e.voided)).toEqual([]);
+    expect(outcomes(r, x.ask_id)).toBe(1);
+    expect(r.sent()).toBe(0);
+    expect(voided).toContain(x.ask_id);
+  });
+
+  it("R3: during the expired wait, [stop, answer without ask_id, answer for an unknown card] in one chunk: both answers refused (the reverse order of the PR's own test)", async () => {
+    const clock = new FakeClock();
+    const r = start({ clock });
+    await waitFor(() => r.actionCards().length === 1);
+    clock.advance(10 * MIN);
+    await waitFor(() => r.voids("timeout").length === 1);
+    r.sendBatch([{ type: "stop" }, { type: "answer", option: 0 }, { type: "answer", ask_id: "ask_nowhere", option: 0 }]);
+    await r.done;
+    await sleep(50);
+    expect(r.events.filter((e: any) => e.kind === "refused" && (e.what === "an answer without ask_id" || e.what === "answer for ask_nowhere"))).toHaveLength(2);
+  });
+
+  it("R3b: the same two answers sent after the stop, in their own chunk: refused too", async () => {
+    const clock = new FakeClock();
+    const r = start({ clock });
+    await waitFor(() => r.actionCards().length === 1);
+    clock.advance(10 * MIN);
+    await waitFor(() => r.voids("timeout").length === 1);
+    r.send({ type: "stop" });
+    await r.done;
+    r.sendBatch([{ type: "answer", option: 0 }, { type: "answer", ask_id: "ask_nowhere", option: 0 }]);
+    await sleep(50);
+    expect(r.events.filter((e: any) => e.kind === "refused" && (e.what === "an answer without ask_id" || e.what === "answer for ask_nowhere"))).toHaveLength(2);
+  });
+});
+
+describe("H1 round 4: the router — more rows", () => {
+  const refusedFor = (r: Run, what: string) => r.events.filter((e: any) => e.kind === "refused" && e.what === what);
+
+  it("an answer naming an unknown card while a card is open: refused at once; the open card stays open and takes its own yes", async () => {
+    const r = start({ clock: new FakeClock() });
+    await waitFor(() => r.actionCards().length === 1);
+    const x = r.actionCards()[0]!;
+    r.sendBatch([{ type: "answer", ask_id: "ask_nowhere", option: 0 }, { type: "answer", ask_id: x.ask_id, option: r.approveOf(x) }]);
+    await r.done;
+    expect(refusedFor(r, "answer for ask_nowhere")).toHaveLength(1);
+    expect(r.sent()).toBe(1);
+  });
+
+  it("after the task ended normally: replies with no id, an unknown id or a closed card's id are refused (the task is over), never dropped", async () => {
+    const r = start({ clock: new FakeClock() });
+    await waitFor(() => r.actionCards().length === 1);
+    const x = r.actionCards()[0]!;
+    r.send({ type: "answer", ask_id: x.ask_id, option: r.approveOf(x) });
+    await r.done;
+    r.sendBatch([{ type: "answer", option: 0 }, { type: "answer", ask_id: "ask_nowhere", option: 0 }, { type: "answer", ask_id: x.ask_id, option: 0 }]);
+    await sleep(50);
+    expect(refusedFor(r, "an answer without ask_id").map((e: any) => e.why)).toEqual([expect.stringContaining("the task is over")]);
+    expect(refusedFor(r, "answer for ask_nowhere").map((e: any) => e.why)).toEqual([expect.stringContaining("the task is over")]);
+    expect(refusedFor(r, `answer for ${x.ask_id}`).map((e: any) => e.why)).toEqual([`card ${x.ask_id} was answered already`]);
+    expect(r.sent()).toBe(1);
+  });
+
+  it("after a void, an answer naming no card is refused (it may be the voided card's); one naming the new card is taken", async () => {
+    const clock = new FakeClock();
+    const r = start({ clock });
+    await waitFor(() => r.actionCards().length === 1);
+    clock.advance(10 * MIN);
+    await waitFor(() => r.voids("timeout").length === 1);
+    r.sendBatch([{ type: "reask" }]);
+    await waitFor(() => r.actionCards().length === 2);
+    const y = r.actionCards()[1]!;
+    r.sendBatch([{ type: "answer", option: r.approveOf(y) }, { type: "answer", ask_id: y.ask_id, option: r.approveOf(y) }]);
+    await r.done;
+    expect(refusedFor(r, "an answer without ask_id")).toHaveLength(1);
+    expect(r.sent()).toBe(1);
   });
 });
