@@ -85,8 +85,9 @@ export class LineReader {
       if (c?.type === "steer") { if (this.steerTo) this.steerTo(c.text); else this.earlySteers.push(c.text); return; }
       // 「现在回答」 on an expired card: at once, like a steer (nothing waits in the answer queue while a card is expired)
       if (c?.type === "reask") { this.onReask?.(); return; }
-      // an answer to a card that was let go (expired, voided): refused the moment it comes, never queued for a later card
-      if (c?.type === "answer" && this.onLateAnswer?.(c)) return;
+      // a card's answer, once a card router is there (StdioUser): routed once, as it arrives — to the open card, or
+      // refused with the reason. It never waits in the queue. (Before that, the queue holds the request line itself.)
+      if (c?.type === "answer" && this.onAnswer) { this.onAnswer(c); return; }
       // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
       // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
       if (!c && isForeignControl(l)) return;
@@ -94,7 +95,7 @@ export class LineReader {
     });
     // the app went away (stdin closed): every open card is answered with nothing (let go: "ended"), then whoever runs
     // the task is told (appRun: a stop)
-    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); this.onClosed?.(); });
+    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); this.onClosed?.(); this.onEnd?.("ended"); });
   }
   private deliver(l: string) { const w = this.waiting.shift(); if (w) w(l); else this.queued.push(l); }
   /** While set (the result card's wait), every stop line — the first, or one after the task's stop has latched — also
@@ -106,8 +107,11 @@ export class LineReader {
   stopped = false;
   onStop: ((why: string, cause?: StopCause) => void) | null = null;
   onReask: (() => void) | null = null;
-  /** An answer line, before it is queued: true when it was handled (an answer to a card already let go, refused). */
-  onLateAnswer: ((a: Extract<Control, { type: "answer" }>) => boolean) | null = null;
+  /** Every answer line, as it arrives (StdioUser's router): it decides each one's outcome there and then. */
+  onAnswer: ((a: Extract<Control, { type: "answer" }>) => void) | null = null;
+  /** The task stopped ("stop") or the app went away ("ended"): told after the stop's own handlers, and again when stdin
+   *  closes (the router keeps the first). */
+  onEnd: ((why: "stop" | "ended") => void) | null = null;
   /** Steer lines go to this handler; one read before it is set (the request and a steer in the same stdin batch) waits
    *  and is handed over when it is set, never dropped. */
   get onSteer(): ((text: string) => void) | null { return this.steerTo; }
@@ -120,16 +124,7 @@ export class LineReader {
    *  which is a stop nobody asked for. */
   stopCause: StopCause | undefined;
   stopWhy = "";
-  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopWhy = why; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); this.onStopped?.(); }
-  /** After a stop, once the waiting readers were let go: whoever owns queued lines settles them (StdioUser refuses
-   *  the answers: none is left without an outcome). */
-  onStopped: (() => void) | null = null;
-  /** Take the queued lines `pick` claims out of the queue, in order (StdioUser: answers no open card can take). */
-  takeQueued(pick: (line: string) => boolean): string[] {
-    const out: string[] = [];
-    this.queued = this.queued.filter((l) => (pick(l) ? (out.push(l), false) : true));
-    return out;
-  }
+  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopWhy = why; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); this.onEnd?.(this.closed ? "ended" : "stop"); }
   /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
    *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
   next(signal?: AbortSignal): Promise<string> {
@@ -146,27 +141,30 @@ export class LineReader {
   }
 }
 
-/** Every card is an `ask` event; the run waits (`waiting`) for the matching answer line, then goes on (`resumed`).
- *  An answer for another ask_id is not an answer to this card: it is dropped with a `refused` event. A card let go
- *  without an answer (its signal: a steer, or "timeout" — an action card nobody answered in time) is closed for the app
- *  (`resumed{voided}`, `ask_void{why}`); an answer naming it later is refused the moment it comes, with the reason. */
+/** Every card is an `ask` event; the run waits (`waiting`) for its answer, then goes on (`resumed`).
+ *
+ *  Replies are routed once, as each line arrives, by one function (`route`) against one registry of cards (review of
+ *  #67: the 2nd bug of "every reply gets exactly one outcome", redesigned). A reply goes to the card that is open now
+ *  — taken there and then, so a second one for it finds it answered — or is refused at once with the reason from the
+ *  registry: that card closed (expired, voided by a steer, stopped, the app gone, answered), no such card is open, it
+ *  names no card after a void, the task stopped or ended. Replies never wait in a queue, and no wait reads stdin: an
+ *  open card is closed by its signal (steer, timeout), the task's stop or stdin's end, and the router stays on after
+ *  the task — late replies are refused, never dropped. */
 export class StdioUser implements RuntimeUser {
   constructor(private readonly log: EventLog, private readonly input: LineReader) {
-    // every reply addressed to a card gets exactly one outcome — delivered to the live card, or refused with the
-    // reason — however the lines are batched (review of #67): one naming a card no longer open is refused as it
-    // arrives; one already queued when a card closes (answered, voided, expired) or the task stops is refused then
-    input.onLateAnswer = (a) => {
-      const why = a.ask_id !== undefined ? this.closed.get(a.ask_id) : undefined;
-      if (why === undefined) return false;
-      this.refuse(a, why);
-      return true;
-    };
-    input.onStopped = () => this.settleQueued("stop");
+    input.onAnswer = (a) => this.route(a);
+    input.onEnd = (why) => this.end(why);
+    if (input.stopped || input.closed) this.end(input.closed ? "ended" : "stop");
   }
   /** A card of this run was voided (steer, timeout): from then on an answer must name its card (ask_id). */
   private voided = false;
   /** The cards no longer open, and how they closed: timeout, steer, stop, ended, answered. */
   private readonly closed = new Map<string, string>();
+  /** The card open now: its id, what checks its deadline, and how it is answered or let go. */
+  private open: { id: string; card: Card; expired?: () => boolean; settle: (a: Answer | null) => void } | null = null;
+  /** The task stopped ("stop"), the app went away ("ended"), or the task is over ("done"): every reply is refused. */
+  private over: "stop" | "ended" | "done" | null = null;
+
   private refuse(a: { ask_id?: string }, why: string) {
     const what = a.ask_id !== undefined ? `answer for ${a.ask_id}` : "an answer without ask_id";
     const card = a.ask_id ?? "a card";
@@ -174,56 +172,67 @@ export class StdioUser implements RuntimeUser {
       : why === "answered" ? `card ${card} was answered already`
       : why === "stop" ? `the task was stopped; card ${card} is closed`
       : why === "ended" ? `the app went away; card ${card} is closed`
-      : why === "none" ? (a.ask_id !== undefined ? `no card ${card} is open` : "it names no card, and none was open for it")
+      : why === "done" ? `the task is over; card ${card} is closed`
+      : why === "unnamed" ? `a card was voided: an answer must name its card${this.open ? `; the open card is ${this.open.id}` : ""}`
+      : why === "none" ? (a.ask_id !== undefined ? `no card ${card} is open${this.open ? `; the open card is ${this.open.id}` : ""}` : "it names no card, and none is open")
       : `card ${card} was voided (${why})`;
     this.log.emit({ kind: "refused", what, why: text, by: "executor" });
   }
-  /** A card closed (or the task stopped): every answer still queued is refused now, with its own reason — the card it
-   *  names closed (how), or none open; an answer that names no card, after a void (it may be that card's late one). No
-   *  card can take it later: ask ids are new each time. */
-  private settleQueued(fallback: string) {
-    for (const l of this.input.takeQueued((x) => parseControl(x)?.type === "answer")) {
-      const a = parseControl(l) as Extract<Control, { type: "answer" }>;
-      this.refuse(a, a.ask_id !== undefined ? this.closed.get(a.ask_id) ?? (fallback === "stop" ? "stop" : "none") : fallback);
+
+  /** One reply's one outcome, decided now. */
+  private route(a: Extract<Control, { type: "answer" }>) {
+    // a card past its deadline expires first (the tick may not have run: the second after waking — review of #67);
+    // its signal's handler closes it here and now
+    this.open?.expired?.();
+    const o = this.open;
+    if (o && (a.ask_id === o.id || (a.ask_id === undefined && !this.voided))) {
+      this.log.emit({ kind: "resumed", ask_id: o.id });
+      this.closeOpen("answered");
+      if (typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length) return o.settle({ option: a.option });
+      if (typeof a.text === "string" && a.text.trim()) return o.settle({ text: a.text });
+      return o.settle(null);
     }
+    const why = a.ask_id !== undefined ? this.closed.get(a.ask_id) ?? this.over ?? "none" : this.over ?? (this.voided ? "unnamed" : "none");
+    this.refuse(a, why);
   }
-  private close(ask_id: string, why: string) { this.closed.set(ask_id, why); this.settleQueued(why === "answered" ? "none" : why); }
-  async ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
+
+  private closeOpen(why: string) { if (this.open) { this.closed.set(this.open.id, why); this.open = null; } }
+
+  /** The task stopped or the app went away: the open card is let go (said so); from now on every reply is refused. */
+  private end(why: "stop" | "ended" | "done") {
+    if (!this.over) this.over = why;
+    const o = this.open;
+    if (!o || why === "done") return;
+    this.log.emit({ kind: "ask_void", ask_id: o.id, why });
+    this.closeOpen(why);
+    o.settle(null);
+  }
+
+  /** The task is over (task_done): replies after it are refused as such. */
+  taskOver() { this.end("done"); }
+
+  ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
     this.log.emit({ kind: "waiting", ask_id });
-    for (;;) {
-      const line = await this.input.next(o.signal);
-      // an answer in the second after waking, before the deadline's tick has run: the deadline is asked first (review of
-      // #67) — past it, the card expires here and the answer is refused below, never used
-      if (line) o.expired?.();
-      // the user changed the request while the card was open (steer), or nobody answered it in time (timeout): the card
-      // is let go, and the app is told to close it. A line read at that same moment is not this card's answer any more:
-      // an answer in it is refused (never used)
-      if (o.signal?.aborted) {
-        const why = o.signal.reason === "timeout" ? "timeout" : "steer";
+    return new Promise<Answer | null>((resolve) => {
+      let settled = false;
+      const settle = (x: Answer | null) => { if (settled) return; settled = true; o.signal?.removeEventListener("abort", voided); resolve(x); };
+      // the user changed the request (steer), or nobody answered in time (timeout): the card is let go, the app told
+      const voided = () => {
+        if (this.open?.id !== ask_id) return;
+        const why = o.signal!.reason === "timeout" ? "timeout" : "steer";
         this.voided = true;
         this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why });
-        const late = line ? parseControl(line) : null;
-        // (the line read at that moment: this card's late answer, or one naming another card — refused for its own)
-        if (late?.type === "answer") this.refuse(late, late.ask_id === undefined || late.ask_id === ask_id ? why : this.closed.get(late.ask_id) ?? "none");
-        this.close(ask_id, why);
-        return null;
-      }
-      // the app is gone or stopped the task: no answer, the run ends honestly; the card is let go, said so
-      // (stdin closing also stops the run now, right after: the card went because the app went — "ended")
-      if (!line && (this.input.closed || this.input.stopped)) { const why = this.input.closed ? "ended" : "stop"; this.log.emit({ kind: "ask_void", ask_id, why }); this.close(ask_id, why); return null; }
-      const a = parseControl(line);
-      if (a?.type !== "answer") continue;
-      if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: this.closed.has(a.ask_id) ? `card ${a.ask_id} is closed (${this.closed.get(a.ask_id)}); the open card is ${ask_id}` : `the open card is ${ask_id}`, by: "executor" }); continue; }
-      // once a card was voided, an answer that names no card may be the late answer to that one: it answers nothing
-      if (a.ask_id === undefined && this.voided) { this.log.emit({ kind: "refused", what: "an answer without ask_id", why: `a card was voided; the open card is ${ask_id}`, by: "executor" }); continue; }
-      this.log.emit({ kind: "resumed", ask_id });
-      this.close(ask_id, "answered");
-      if (typeof a.option === "number" && a.option >= 0 && a.option < card.options.length) return { option: a.option };
-      if (typeof a.text === "string" && a.text.trim()) return { text: a.text };
-      return null;
-    }
+        this.closeOpen(why);
+        settle(null);
+      };
+      this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), settle };
+      // stopped or gone before it was shown: let go at once
+      if (this.over === "stop" || this.over === "ended") { this.end(this.over); return; }
+      if (o.signal?.aborted) { voided(); return; }
+      o.signal?.addEventListener("abort", voided, { once: true });
+    });
   }
 }
 
@@ -358,8 +367,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // provenance judge, anchored on raw — a run never starts with nothing read when the request was written by a model
   if (typeof req.context === "string" && req.context.trim()) executor.noteTakenIn("the chat model's restatement (request.context)", req.context);
   log.emit({ kind: "preparing" });
+  // the cards' replies: routed as they arrive, from here until the process exits (before and after task_done)
+  const user = new StdioUser(log, o.input);
   const rt = new FrontierRuntime({
-    task: runId, raw: req.raw, ...(typeof req.context === "string" && req.context.trim() ? { context: req.context } : {}), executor, signer, user: new StdioUser(log, o.input), gateway: gw,
+    task: runId, raw: req.raw, ...(typeof req.context === "string" && req.context.trim() ? { context: req.context } : {}), executor, signer, user, gateway: gw,
     // the agent loop: its own process (P2), its own files beside the run's; a model handed in (tests) runs in this one
     ...(o.inject?.model ? { model: o.inject.model } : {}),
     agent: { model: o.inject?.agent ?? table.goal.model, log: path.join(o.runs, runId, "runtime.jsonl"), stderr: path.join(o.runs, runId, "runtime.log") },
@@ -394,7 +405,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // one task_done per run: a signal's deadline may write it before the runtime returns
   let signals = 0, ended = () => {};
   const whenDone = new Promise<void>((res) => { ended = res; });
-  const taskDone = (body: EventBody) => { if (done) return; done = true; log.emit(body); ended(); };
+  const taskDone = (body: EventBody) => { if (done) return; done = true; user.taskOver(); log.emit(body); ended(); };
   // the run did not end by itself in time: an action still out at the driver may land after this, so the stop is not
   // called clean — the action is listed as unconfirmed and the reason says its result is unknown
   const forceDone = () => {
