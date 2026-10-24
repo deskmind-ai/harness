@@ -71,14 +71,14 @@ export class HandsDriver implements Driver {
     proc.stdin.on("error", (e) => { if (this.proc !== proc) return; this.failAll(`hands executor stdin: ${e.message}`, false); proc.kill(); this.proc = null; });
   }
 
-  /** Every request out fails now (the process is gone, or let go of). `died`: it may have run them — a perform it was
-   *  not known to be only waiting for the user in (its user_wait without a user_resumed) may have acted, so its effect
-   *  is unknown, not failed. A spawn or pipe error: nothing was taken in. */
+  /** Every request out fails now (the process is gone, or let go of). `died`: it may have run them — a perform's
+   *  effect is unknown, not failed, whatever it said before (a user_wait proves nothing: hands may wait for the user
+   *  after it has typed — review of harness#66, Codex P2). Only an answer that says performed: false says nothing went,
+   *  and a request that died has none. A spawn or pipe error: nothing was taken in. */
   private failAll(why: string, died: boolean) {
-    const waitingIn = this.waiting?.id;
     this.endWait(null, "exit"); this.late.clear();
     const out = [...this.pending]; this.pending.clear();
-    for (const [id, p] of out) p.reject(died && p.op === "perform" && id !== waitingIn ? new EffectUnknown(p.op, `${why}: the step may have taken effect before that`, false) : new Error(why));
+    for (const [, p] of out) p.reject(died && p.op === "perform" ? new EffectUnknown(p.op, `${why}: the step may have taken effect before that`, false) : new Error(why));
   }
 
   /** Hear what hands says besides its answers: its waits for the user, and answers that came after their timeout. */

@@ -1376,12 +1376,20 @@ export class Executor {
     // a screen action's receipt, written with the act's final status (after the read-back), so the journal says what
     // the result says: what a card lists as done and what undo takes back are the same (review of #68: E2)
     let pendingReceipt: Record<string, unknown> | null = null;
+    // the window whose typed text this act's send takes with it — cleared only in done(), on the act's FINAL status
+    // ok (the one the receipt records, after the read-back), never on the driver's own word (review of harness#66,
+    // Codex P1: cleared on a raw ok that the after-snapshot, a lock or the read-back then made unverified, the
+    // retried send key was classed create and pressed again with no card)
+    let sendTakesTyped: string | null = null;
     let stepConsented = false, foregroundOk = false;
     // what goes out, as the card showed it: recorded with the intent, so an uncertain step is named by it too
     let cardOutgoing: ActionCardFacts["outgoing"] | undefined, finalOutgoing: ActionCardFacts["outgoing"] | undefined;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       if (pendingReceipt) { this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...pendingReceipt }); pendingReceipt = null; }
+      // the one place typed text is taken away: a send whose final status is ok
+      if (sendTakesTyped !== null && r.status === "ok") this.typed.delete(sendTakesTyped);
+      sendTakesTyped = null;
       const { consent, ...rest } = req;
       // the receipt is evidence for the verdict: what the app alone uses (the step's picture, screen frames, a card's
       // fields) is not in it
@@ -1615,12 +1623,11 @@ export class Executor {
     // the receipt goes into the journal with the act's final status (done): what the driver said is kept beside it, and
     // its "not done" (performed: false, or a reply the protocol defines as a refusal before acting) as performed: false
     if (consequence !== "read") pendingReceipt = { driver_status: r.status, ...(saysNotPerformed(r) ? { performed: false } : {}) };
-    // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
-    // send that went through (ok) took it with it. One that came back unverified may not have: the text stays, so a
-    // send key tried again there is still asked about as a send (review of harness#66: cleared on unverified, the
-    // retried cmd+shift+d was classed create in the task's own window and went with no card)
+    // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows. A
+    // send takes it with it only if the act ends ok (done(): the final status, after the read-back); one that may not
+    // have gone keeps it, so a send key tried again there is still asked about as a send
     if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
-      if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) { if (r.status === "ok") this.typed.delete(req.action.window); }
+      if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) sendTakesTyped = req.action.window;
       else if (req.action.kind === "type" || req.action.kind === "set_value") this.typed.set(req.action.window, this.typedIn(req.action));
     }
     // a window is the task's (and closing it takes the opening back) only on the driver's proof that the action made

@@ -40,6 +40,9 @@ const handle = (m, done) => {
     // exit would drop it)
     if (mode === "actdie") return setTimeout(() => { const put = (x) => { const b = Buffer.from(JSON.stringify(x) + "\\n"); let o = 0; while (o < b.length) { try { o += fs.writeSync(1, b, o); } catch (e) { if (e.code !== "EAGAIN") throw e; } } }; put({ event: "user_wait", req: m.id, reason: "user_active", app: "com.netease.163music", what: "type" }); setTimeout(() => { put({ event: "user_resumed", req: m.id, waited_s: 0.1 }); process.exit(3); }, 100); }, 50);
     if (mode === "slow") return setTimeout(() => { out({ id: m.id, ok: true, result: { status: "ok", why: "entered '安溥 宝贝' into '搜索框' and pressed Return", window: "w" } }); done(); }, Number(process.env.SLOW_MS));
+    // die: it typed into the field (an effect), then waits for the user -- hands may, reading a pop-up after typing --
+    // and the process exits
+    if (mode === "die") fs.appendFileSync(process.env.SEEN + ".effect", "typed");
     out({ event: "user_wait", req: m.id, reason: "user_active", app: "com.netease.163music", what: "type" });
     if (mode === "die") return setTimeout(() => process.exit(3), 150);
     return setTimeout(() => { out({ event: "user_resumed", req: m.id, waited_s: 0.1 }); out({ id: m.id, ok: true, result: { status: "user_busy", performed: false, why: "the user is active; the step was not carried out before the caller's deadline -- nothing was done; wait", window: "w" } }); done(); }, 100);
@@ -56,8 +59,8 @@ function rig(mode: "slow" | "busy" | "die" | "crash" | "actdie" | "hang", timeou
   const events: { k: string; [x: string]: unknown }[] = [];
   const app = ConsentSigner.fresh();
   const ex = new Executor(driver, { task: "t", publicKey: app.publicKey, onEvent: (k, b) => events.push({ k, ...b }) });
-  const sent = () => fs.readFileSync(seen, "utf-8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
-  return { driver, ex, events, sent };
+  const sent = Object.assign(() => fs.readFileSync(seen, "utf-8").trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>), { file: seen });
+  return { driver, ex, events, sent, app };
 }
 
 /** begin, the start gate, the search box in a window the task owns (no consent card in the way), and the step. */
@@ -66,6 +69,13 @@ async function fill(ex: Executor) {
   ex.ledger.created("window:w");
   const o = await ex.observe("w");
   return ex.act({ action: { kind: "set_value", window: "w", target: "f", value: "安溥 宝贝" }, epoch: o.epoch });
+}
+
+/** The same step in a window of the user's (not the task's: a change there needs consent), under the plan's consent. */
+async function fillUsers(ex: Executor, app: ConsentSigner) {
+  await ex.begin(); await ex.plan({ steps: [] });
+  const o = await ex.observe("w");
+  return ex.act({ action: { kind: "set_value", window: "w", target: "f", value: "安溥 宝贝" }, epoch: o.epoch, consequence: "modify_user", consent: app.forObject("window:w", "modify_user", "t") });
 }
 
 const until = async (f: () => boolean, ms = 3000) => { for (let i = 0; i < ms / 20 && !f(); i++) await new Promise((r) => setTimeout(r, 20)); };
@@ -114,12 +124,14 @@ describe("hands requests and this side's deadline", () => {
     } finally { await driver.end(); }
   });
 
-  it("the helper dying mid-wait still ends the pause, and the step is an error: it was only waiting, nothing was done", async () => {
-    const { driver, ex, events } = rig("die", 4_000);
+  it("the helper dying during a wait for the user, after it acted, leaves the step unverified and uncertain: a user_wait proves nothing", async () => {
+    const { driver, ex, events, sent, app } = rig("die", 4_000);
     try {
-      const r = await fill(ex);
-      expect(r.status).toBe("error");
+      const r = await fillUsers(ex, app);
+      expect(fs.existsSync(String(sent.file) + ".effect")).toBe(true);        // it did act before it died
+      expect(r.status).toBe("unverified");
       expect(r.why).toMatch(/exited/);
+      expect(ex.uncertainCount).toBe(1);
       const ks = events.map((e) => e.k);
       expect(ks.filter((k) => k === "executor.user_wait").length).toBe(1);
       expect(ks.filter((k) => k === "executor.user_resumed").length).toBe(1);
