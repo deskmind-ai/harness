@@ -31,7 +31,9 @@ import { Executor } from "../executor/executor.js";
 import { SimComputer } from "../executor/sim.js";
 import { HandsDriver } from "../executor/hands.js";
 import { SkillStore } from "../skills/agentskills.js";
-import type { SkillSource } from "../executor/service.js";
+import { CARD_EXPIRY_MS, type SkillSource } from "../executor/service.js";
+import { WALL_CLOCK, atWallTime, type Clock } from "../executor/clock.js";
+import { T } from "../executor/text.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
@@ -42,7 +44,7 @@ import type { AgentSpec } from "../host/agent.js";
 import { runtimeMain } from "./runtime.js";
 import { sessionMain } from "./session.js";
 import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
-import { isForeignControl, parseControl } from "../protocol/control.js";
+import { isForeignControl, parseControl, type Control } from "../protocol/control.js";
 import { PROTOCOL } from "../protocol/version.js";
 import { current as traceContext, within, type ModelCallRecord } from "../otel/context.js";
 import { Tracer, exportTrace } from "../otel/trace.js";
@@ -74,6 +76,10 @@ export class LineReader {
       // the session's stop as the app ends or leaves (app_gone) is nobody's request: no cause, as for stdin closing
       if (c?.type === "stop") { if (c.app_gone) this.stop("the app went away (the session stopped its task)"); else this.stop("stopped by the app", "user_stopped"); return; }
       if (c?.type === "steer") { if (this.steerTo) this.steerTo(c.text); else this.earlySteers.push(c.text); return; }
+      // 「现在回答」 on an expired card: at once, like a steer (nothing waits in the answer queue while a card is expired)
+      if (c?.type === "reask") { this.onReask?.(); return; }
+      // an answer to a card that was let go (expired, voided): refused the moment it comes, never queued for a later card
+      if (c?.type === "answer" && this.onLateAnswer?.(c)) return;
       // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
       // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
       if (!c && isForeignControl(l)) return;
@@ -87,6 +93,9 @@ export class LineReader {
   onClosed: (() => void) | null = null;
   stopped = false;
   onStop: ((why: string, cause?: StopCause) => void) | null = null;
+  onReask: (() => void) | null = null;
+  /** An answer line, before it is queued: true when it was handled (an answer to a card already let go, refused). */
+  onLateAnswer: ((a: Extract<Control, { type: "answer" }>) => boolean) | null = null;
   /** Steer lines go to this handler; one read before it is set (the request and a steer in the same stdin batch) waits
    *  and is handed over when it is set, never dropped. */
   get onSteer(): ((text: string) => void) | null { return this.steerTo; }
@@ -117,19 +126,45 @@ export class LineReader {
 }
 
 /** Every card is an `ask` event; the run waits (`waiting`) for the matching answer line, then goes on (`resumed`).
- *  An answer for another ask_id is not an answer to this card: it is dropped with a `refused` event. */
+ *  An answer for another ask_id is not an answer to this card: it is dropped with a `refused` event. A card let go
+ *  without an answer (its signal: a steer, or "timeout" — an action card nobody answered in time) is closed for the app
+ *  (`resumed{voided}`, `ask_void{why}`); an answer naming it later is refused the moment it comes, with the reason. */
 export class StdioUser implements RuntimeUser {
-  constructor(private readonly log: EventLog, private readonly input: LineReader) {}
-  /** A card of this run was voided (steer): from then on an answer must name its card (ask_id). */
+  constructor(private readonly log: EventLog, private readonly input: LineReader) {
+    input.onLateAnswer = (a) => {
+      const why = a.ask_id !== undefined ? this.gone.get(a.ask_id) : undefined;
+      if (why === undefined) return false;
+      this.refuseLate(a.ask_id!, why);
+      return true;
+    };
+  }
+  /** A card of this run was voided (steer, timeout): from then on an answer must name its card (ask_id). */
   private voided = false;
-  async ask(card: Card, o: { signal?: AbortSignal } = {}): Promise<Answer | null> {
+  /** The cards let go without an answer, and why (steer, timeout): an answer naming one is refused. */
+  private readonly gone = new Map<string, string>();
+  private refuseLate(ask_id: string, why: string) {
+    this.log.emit({ kind: "refused", what: `answer for ${ask_id}`, why: why === "timeout" ? `card ${ask_id} expired before it was answered (nobody answers for the user): reask asks it again` : `card ${ask_id} was voided (${why})`, by: "executor" });
+  }
+  async ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
     this.log.emit({ kind: "waiting", ask_id });
     for (;;) {
       const line = await this.input.next(o.signal);
-      // the user changed the request while the card was open (steer): the card is let go, and the app is told to close it
-      if (o.signal?.aborted) { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); this.log.emit({ kind: "ask_void", ask_id, why: "steer" }); return null; }
+      // an answer in the second after waking, before the deadline's tick has run: the deadline is asked first (review of
+      // #67) — past it, the card expires here and the answer is refused below, never used
+      if (line) o.expired?.();
+      // the user changed the request while the card was open (steer), or nobody answered it in time (timeout): the card
+      // is let go, and the app is told to close it. A line read at that same moment is not this card's answer any more:
+      // an answer in it is refused (never used)
+      if (o.signal?.aborted) {
+        const why = o.signal.reason === "timeout" ? "timeout" : "steer";
+        this.voided = true; this.gone.set(ask_id, why);
+        this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why });
+        const late = line ? parseControl(line) : null;
+        if (late?.type === "answer") this.refuseLate(late.ask_id ?? ask_id, why);
+        return null;
+      }
       // the app is gone or stopped the task: no answer, the run ends honestly; the card is let go, said so
       // (stdin closing also stops the run now, right after: the card went because the app went — "ended")
       if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.closed ? "ended" : "stop" }); return null; }
@@ -156,7 +191,7 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
     case "step.start": { const a = body.action as { kind?: string; capability?: unknown; args?: unknown };
       return { kind: "step", text: a?.kind === "file" ? `${s(a.capability)} ${s(a.args)}` : s(a), purpose: s(body.purpose ?? ""), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(body.object ? { object: s(body.object) } : {}),
         step_id: s(body.step_id), ...(body.human ? { human: s(body.human) } : {}), ...(body.target ? { target: body.target as never } : {}), ...(typeof body.plan_step === "number" ? { plan_step: body.plan_step } : {}) }; }
-    case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}),
+    case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(typeof body.possibly_done === "boolean" ? { possibly_done: body.possibly_done } : {}),
       ...(body.shot ? { shot: s(body.shot), ...(body.shot_pending ? { shot_pending: true } : {}) } : {}), ...(body.target_frame ? { target_frame: body.target_frame as never } : {}), ...(body.window_frame ? { window_frame: body.window_frame as never } : {}) };
     case "shot.ready": return { kind: "shot_ready", step_id: s(body.step_id), shot: s(body.shot) };
     case "executor.user_wait": return { kind: "waiting" };            // the user is at the keyboard: the app says "paused while you use your Mac"
@@ -177,6 +212,8 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
         tiers: (body.tiers as never) ?? [], ...(body.shadow ? { shadow: body.shadow as never } : {}), ...(body.step_id ? { step_id: s(body.step_id) } : {}), ...(typeof body.ms === "number" ? { ms: body.ms } : {}) }; }
     // the user's words came after the task was over: said, not dropped
     case "steer.refused": return { kind: "refused", what: `steer: ${s(body.raw)}`, why: s(body.why), by: "executor" };
+    // 「现在回答」 with no card expired (or after the task): said, nothing happens
+    case "reask.refused": return { kind: "refused", what: "reask", why: s(body.why), by: "executor" };
     default: return null;
   }
 }
@@ -235,7 +272,7 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
  *  `inject` (tests): a driver, a gateway, a model in place of the config's. */
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number;
   signals?: { onSignal: (h: (sig: string) => void) => void; exit: () => void; exitNow: () => void; deadlineMs?: number; waitMs?: number };
-  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"] } }) {
+  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"]; cardExpiryMs?: number; clock?: Clock } }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
@@ -286,6 +323,8 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     // and the old engine used ~20 actions on the music sample; the evaluation keeps the default budget
     budget: req.driver === "hands" ? { tool_calls: 90, turns: 60 } : {},
     onEvent: send,
+    // an action card nobody answers is voided after 10 minutes by the wall clock; the task then waits for the user
+    cardExpiryMs: o.inject?.cardExpiryMs ?? CARD_EXPIRY_MS, ...(o.inject?.clock ? { clock: o.inject.clock } : {}),
   });
   // one stop for the run, whoever asks (a stop line, a signal): one refused event, the first asker's reason
   let stopReason = "";
@@ -303,6 +342,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // it was and every change), voids an open card, and asks for a new plan card when the new words go beyond the plan
   // (after the task is over — a verdict passed, a stop, the result card's linger — the executor refuses them: a refused event)
   o.input.onSteer = (text) => { trace("control.steer", { text }); if (text.trim()) rt.steer(text); };
+  // 「现在回答」 on an expired action card: the executor asks it again on the screen as it is now (after the task is
+  // over it is refused, in the trace only: nothing but a late steer's refusal follows task_done)
+  o.input.onReask = () => { trace("control.reask", {}); rt.reask(); };
   // one task_done per run: a signal's deadline may write it before the runtime returns
   let signals = 0, ended = () => {};
   const whenDone = new Promise<void>((res) => { ended = res; });
@@ -314,7 +356,11 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     const f = executor.inFlight, c = executor.changes();
     closeTrace("stopped", f ? STEP_UNKNOWN : stopReason || "stopped");
     const cause: StopCause | undefined = f ? "last_step_unknown" : stopCause;
-    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", ...(cause ? { cause } : {}), summary: "", result_card: null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
+    // a task that changed something has its result card here too (M2 H2): the executor's, which names a step still in
+    // flight as unknown and offers no undo then
+    // (the process exits right after: nobody can answer an undo, so none is offered — review of #68)
+    const rc = rt.resultCard();
+    taskDone({ kind: "task_done", status: "stopped", reason: f ? STEP_UNKNOWN : stopReason || "stopped", ...(cause ? { cause } : {}), summary: "", result_card: rc ? cardEvent(rc, false, req.lang) : null, changes: f ? { ...c, unconfirmed: [...c.unconfirmed, f.object] } : c, usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as EventBody);
   };
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
   o.signals?.onSignal((sig) => {
@@ -334,30 +380,54 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   });
   const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
   if (!done) closeTrace(r.status, r.reason);
-  const card = r.result_card ? { kind: r.result_card.kind, text: r.result_card.text, options: r.result_card.options.map((x) => ({ kind: x.kind, text: x.text })), free_text: r.result_card.free_text, blocking: r.result_card.blocking } : null;
-  taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
+  // the result card is answered while this process is alive (undo needs the executor's receipts): it waits `--linger`
+  // seconds by the wall clock (a Mac asleep meanwhile ends the wait within a second of waking: executor/clock.ts) for
+  // `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exits. Not after a signal: the
+  // process exits then. The undo's deadline is said on task_done (undo_until, seconds like `t`), from the same clock
+  const clock = o.inject?.clock ?? WALL_CLOCK;
+  // (stdin closed already: the app went away, nothing can answer — no wait, no deadline said)
+  const lingers = !!r.result_card && o.linger > 0 && !signals && !o.input.closed;
+  // undo is offered only while something waits to carry it out (review of #68): with no wait — no --linger, after a
+  // signal, stdin closed — the card has no undo option, and says why
+  const card = r.result_card ? cardEvent(r.result_card, lingers, req.lang) : null;
+  const until = lingers ? clock.now() + o.linger * 1000 : 0;
+  const undoUntil = lingers && card!.options.some((x) => x.kind === "undo") ? { undo_until: until / 1000 } : {};
+  taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, ...undoUntil, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
   if (signals) return o.signals!.exit();
-  // the result card is answered while this process is alive (undo needs the executor's receipts): wait `--linger`
-  // seconds for `{"type":"respond","option":<index>}` (v0: `{"respond":<index>}`) on stdin, then exit. Any other line
-  // in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the wait goes on:
-  // only a respond, the app closing stdin (or stopping), or the deadline ends it (deskmind S0: undo was dead when the
-  // first line after task_done was not the respond)
-  if (card && o.linger > 0) {
+  // Any other line in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the
+  // wait goes on: only a respond, the app closing stdin (or stopping), or the deadline ends it (deskmind S0: undo was
+  // dead when the first line after task_done was not the respond)
+  if (lingers) {
     const deadline = new AbortController();
-    const timer = setTimeout(() => deadline.abort(), o.linger * 1000);
+    const cancel = atWallTime(clock, until, () => deadline.abort());
     try {
       for (;;) {
         const line = await o.input.next(deadline.signal);
         if (deadline.signal.aborted || (!line && (o.input.closed || o.input.stopped))) break;
         const a = parseControl(line);
         if (a?.type !== "respond" || typeof a.option !== "number") continue;
+        // the deadline, asked as the answer arrives: the Mac's timers stop in sleep, and an undo sent in the second after
+        // waking past it would otherwise be carried out (review of #68). Past it, nothing is undone, and that is said
+        if (clock.now() >= until) {
+          const picked = card!.options[a.option]?.kind ?? "other";
+          const why = "the undo window had ended before the answer came";
+          log.emit({ kind: "result_response", picked, effect: why, ...(picked === "undo" ? { undone: 0, total: executor.undoable().steps.length, refused: why } : {}) } as never);
+          break;
+        }
         const u = await rt.respond({ option: a.option });
-        log.emit({ kind: "result_response", picked: card.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
+        log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
         break;
       }
-    } finally { clearTimeout(timer); }
+    } finally { cancel(); }
   }
 }
+
+/** A result card as the protocol carries it. `offerUndo` false: nothing will wait to carry an undo out, so its option is
+ *  left off and the card says why. */
+const cardEvent = (c: Card, offerUndo = true, lang?: string) => {
+  const drop = !offerUndo && c.options.some((x) => x.kind === "undo");
+  return { kind: c.kind, text: drop ? `${c.text}\n${T(lang).noUndo(T(lang).noWait)}` : c.text, options: c.options.filter((x) => !drop || x.kind !== "undo").map((x) => ({ kind: x.kind, text: x.text })), free_text: c.free_text, blocking: c.blocking };
+};
 
 export function respond(runId: string, runs: string, answer: Record<string, unknown>, out: (ev: AppEvent) => void) {
   const log = new EventLog(path.join(runs, runId, "events.jsonl"), runId, out);

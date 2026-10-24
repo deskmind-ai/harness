@@ -27,6 +27,7 @@ import { NEEDS_CONSENT, higher, isEffectUnknown, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
+import { journalSteps, parseJournal, saysNotPerformed, type JournalLine, type JournalStep } from "./possibly.js";
 import { T, type Lang } from "./text.js";
 import type { KeyObject } from "node:crypto";
 import { span } from "../otel/trace.js";
@@ -395,7 +396,7 @@ export class Executor {
   private looks = new Map<string, Observation>();
   /** Every challenge this executor issued, as it issued it: what "consent is for another action" is explained against
    *  in the trace (the token's action, epoch, object and class beside the request's). */
-  private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence; uncertain?: number }>();
+  private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence; uncertain?: ReadonlySet<number> }>();
   /** An object as the user knows it, for a card's fields: a window by its app and title (the last snapshot), a tab by
    *  its title, a file by its path; never a bare window id. */
   private labelOf(object: string): string {
@@ -407,28 +408,20 @@ export class Executor {
   }
 
   private issue(action: Action, object: string, consequence: Consequence, text0: string, epoch: number, content?: unknown, facts0?: ActionCardFacts, purpose?: string) {
-    // while a step of this run is uncertain, the card names every one of them first, then what the model says (not
-    // checked: it is not shown as fact), then the action — a yes is for this one action, seen against them
+    // while a step of this run is uncertain, the card names them first (uncertainLines: every outbound one and the
+    // newest always, the rest as room allows, counted), then what the model says (not checked: never shown as fact),
+    // then the action — a yes is for this one action, seen against them
     const t = T(this.opts.lang);
-    const uncertain = this.uncertainTotal ? [...this.uncertain] : null;
+    const steps = this.uncertainSteps();
+    const uncertain = steps.length ? steps : null;
     const said = uncertain && purpose?.trim() ? cardText(purpose.trim(), 200, this.opts.lang) : undefined;
-    let head = "";
-    if (uncertain) {
-      // the same step uncertain more than once is one line (with how many times); at most UNCERTAIN_SHOWN lines, the
-      // rest counted — the card stays readable, the fields keep up to UNCERTAIN_KEPT of them
-      const lines = new Map<string, number>();
-      for (const u of uncertain) lines.set(u.text, (lines.get(u.text) ?? 0) + 1);
-      const merged = [...lines].map(([x, n]) => (n > 1 ? `${x}${t.times(n)}` : x));
-      const hidden = Math.max(0, merged.length - UNCERTAIN_SHOWN) + (this.uncertainTotal - uncertain.length);
-      head = t.uncertainSteps(merged.slice(-UNCERTAIN_SHOWN), hidden);
-    }
-    const text = uncertain ? `${head}${said ? `\n${t.modelSaysUnchecked(said)}` : ""}\n${text0}` : text0;
+    const text = uncertain ? `${this.uncertainLines(steps)}${said ? `\n${t.modelSaysUnchecked(said)}` : ""}\n${text0}` : text0;
     const base: ActionCardFacts = facts0 ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null };
-    const facts: ActionCardFacts = uncertain ? { ...base, uncertain, uncertain_total: this.uncertainTotal, ...(said ? { model_says_unchecked: said } : {}) } : base;
+    const facts: ActionCardFacts = uncertain ? { ...base, uncertain: steps.slice(-UNCERTAIN_KEPT).map((x) => this.uncertainFact(x)), uncertain_total: steps.length, ...(said ? { model_says_unchecked: said } : {}) } : base;
     const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
       // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
       facts };
-    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: this.uncertainTotal });
+    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: new Set(steps.map((x) => x.intent)) });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
     // a host asked about after the task read material: the yes approves the host for the rest of the task — not while a
@@ -436,41 +429,55 @@ export class Executor {
     const site = consequence === "external" && !uncertain ? this.siteRule(action)?.host : undefined;
     return site ? { ...c, site } : c;
   }
-  /** The steps of this run that came back unverified while changing the user's things or sending something out
-   *  (modify_user, external): they may have taken effect. A run-level fact (review of harness#66): kept for the rest of
-   *  the run, never matched to a later step by object or action and never cleared by one that went well — a new
-   *  compose window renumbers everything, and a different message sent fine says nothing of the first. While there is
-   *  one, every modify_user or external action asks on a card that names them all (uncertainGate); no standing grant
-   *  covers it — the plan's object consents, a site's, a rule. Read-only actions and those in the task's own windows
-   *  (create) go on as before. */
-  private uncertain: NonNullable<ActionCardFacts["uncertain"]> = [];
-  /** Every uncertain step of the run, counted (the list keeps the last UNCERTAIN_KEPT). */
-  private uncertainTotal = 0;
+  /** The run's uncertain steps — one rule, possibly.ts' (review of harness#66 round 5: the list kept its own rule and
+   *  lost steps #68's did not): a step of any process of this task that needed consent (modify_user, external), is
+   *  possibly done (an intent with no receipt that says nothing happened), and is not known done (its receipt not ok).
+   *  That is the result card's "unsure" set (stepLines) restricted to consent steps, from the same journal records,
+   *  live and after any number of restarts. Never matched to a later step, never cleared. While there is one, every
+   *  modify_user or external action asks on a card that names them (uncertainGate); no standing grant covers it — the
+   *  plan's object consents, a site's, a rule. Read-only actions and the task's own windows (create) go on as before. */
+  uncertainSteps(): JournalStep[] {
+    return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly && x.receipt?.status !== "ok" && NEEDS_CONSENT.has(x.consequence as Consequence));
+  }
   /** How many steps of this run are uncertain (the service holds no standing grant while there is one). */
-  get uncertainCount(): number { return this.uncertainTotal; }
+  get uncertainCount(): number { return this.uncertainSteps().length; }
   /** Why `token` does not let a modify_user or external action go ahead while a step is uncertain, or null: only an
-   *  action token answering a card issued after the last uncertain step (it named them all) does. */
+   *  action token answering a card that named every step uncertain now does. */
   private uncertainGate(token: ConsentToken | undefined): string | null {
-    if (!this.uncertainTotal) return null;
-    if (token?.scope === "action" && (this.challenges.get(token.nonce)?.uncertain ?? -1) >= this.uncertainTotal) return null;
+    const now = this.uncertainSteps();
+    if (!now.length) return null;
+    const named = token?.scope === "action" ? this.challenges.get(token.nonce)?.uncertain : undefined;
+    if (named && now.every((x) => named.has(x.intent))) return null;
     return `an earlier step's result is unknown (it may have taken effect): every change or send asks the user again, naming it`;
   }
-  /** Every act's end: a modify_user or external step that came back unverified joins the run's uncertain steps, with
-   *  what the user would recognise it by (the step, what went out). */
-  private noteOutcome(r: ActResult, step: { text: string; outgoing: ActionCardFacts["outgoing"] } | undefined, fallback: string) {
-    if (r.status !== "unverified" || !NEEDS_CONSENT.has(r.consequence)) return;
-    this.noteUncertain(r.consequence, r.object, step?.text ?? fallback, step?.outgoing ?? [], false);
+  /** An uncertain step as a card shows it: the intent's words, and what went out when the intent recorded it. */
+  private uncertainText(x: JournalStep): string {
+    const out = Array.isArray(this.jlines[x.intent]?.outgoing) ? (this.jlines[x.intent]!.outgoing as { value?: string }[]) : [];
+    const said = out.map((o) => cardText(String(o.value ?? ""), 80, this.opts.lang)).filter(Boolean).slice(0, 5).join(" / ");
+    return cardText(`${x.text}${said ? T(this.opts.lang).stepSays(said) : ""}`, 160, this.opts.lang);
   }
-  /** One more uncertain step (`recovered`: found by a restart in the journal). The list is bounded: past
-   *  UNCERTAIN_KEPT entries the oldest give way, and `uncertainTotal` still counts every one (the gate keys on it). */
-  private noteUncertain(consequence: Consequence, object: string, step: string, outgoing0: ActionCardFacts["outgoing"], recovered: boolean) {
-    const outgoing = outgoing0.slice(0, 5).map((o) => ({ ...o, label: cardText(o.label, 40, this.opts.lang), value: cardText(o.value, 80, this.opts.lang) }));
-    const said = outgoing.filter((o) => o.value).map((o) => o.value).join(" / ");
-    const text = cardText(`${step}${said ? T(this.opts.lang).stepSays(said) : ""}`, 160, this.opts.lang);
-    this.uncertain.push({ consequence, object, text, outgoing });
-    if (this.uncertain.length > UNCERTAIN_KEPT) this.uncertain.shift();
-    this.uncertainTotal += 1;
-    this.emit("executor.uncertain", { consequence, object, text, count: this.uncertainTotal, ...(recovered ? { recovered: true } : {}) });
+  private uncertainFact(x: JournalStep): NonNullable<ActionCardFacts["uncertain"]>[number] {
+    const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
+    const outgoing = (Array.isArray(l.outgoing) ? l.outgoing as ActionCardFacts["outgoing"] : []).slice(0, 5);
+    return { consequence: x.consequence as Consequence, object: typeof l.object === "string" ? l.object : "", text: x.text, outgoing };
+  }
+  /** The card's lines for the uncertain steps: the same step (same words) once, with how many times; in the order
+   *  of each one's last occurrence; every outbound (external) one and the newest always shown, then the most recent
+   *  others up to UNCERTAIN_SHOWN; 「另有 N 条」 counts the distinct steps not shown. */
+  private uncertainLines(steps: readonly JournalStep[]): string {
+    const t = T(this.opts.lang);
+    const groups = new Map<string, { n: number; last: number; external: boolean }>();
+    steps.forEach((x, i) => {
+      const k = this.uncertainText(x), g = groups.get(k) ?? { n: 0, last: i, external: false };
+      g.n += 1; g.last = i; g.external ||= x.consequence === "external";
+      groups.set(k, g);
+    });
+    const order = [...groups].sort((p, q) => p[1].last - q[1].last);
+    const newest = order.at(-1)![0];
+    const shown = new Set(order.filter(([k, g]) => g.external || k === newest).map(([k]) => k));
+    for (const [k] of [...order].reverse()) { if (shown.size >= UNCERTAIN_SHOWN) break; shown.add(k); }
+    const lines = order.filter(([k]) => shown.has(k)).map(([k, g]) => (g.n > 1 ? `${k}${t.times(g.n)}` : k));
+    return t.uncertainSteps(lines, order.length - lines.length);
   }
 
   /** The window each open_window really made (by receipt seq): what its undo closes. */
@@ -513,10 +520,18 @@ export class Executor {
     else if (ev.kind === "late_reply") this.emit("executor.late_reply", { op: ev.op, id: ev.id, late_ms: ev.late_ms, ok: ev.ok, ...(ev.status ? { status: ev.status } : {}), ...(ev.why ? { why: ev.why } : {}) });
   }
 
+  /** The journal's records, earlier processes' (read at recover) and this one's, whether or not a file is kept: what
+   *  "could this step have done something" is read from (possibly.ts). `ownFrom`: the first of this process's. */
+  private jlines: JournalLine[] = [];
+  private ownFrom = 0;
+
   private journal(kind: "begin" | "intent" | "receipt" | "reconcile_pending" | "reconciled", body: Record<string, unknown>) {
-    if (!this.opts.journal) return;
-    const fd = fs.openSync(this.opts.journal, "a");
-    try { fs.writeSync(fd, JSON.stringify({ t: this.opts.now?.() ?? Date.now(), kind, ...body }) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    const line = { t: this.opts.now?.() ?? Date.now(), kind, ...body };
+    if (this.opts.journal) {
+      const fd = fs.openSync(this.opts.journal, "a");
+      try { fs.writeSync(fd, JSON.stringify(line) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    }
+    this.jlines.push(line);
   }
 
   /** On begin: the last intent of an earlier process with no receipt. A file action is reconciled from the versions
@@ -531,6 +546,9 @@ export class Executor {
     const raw = fs.readFileSync(p, "utf-8");
     if (raw && !raw.endsWith("\n")) { fs.appendFileSync(p, "\n"); this.emit("executor.journal_torn_tail", { bytes: Buffer.byteLength(raw) - Buffer.byteLength(raw.slice(0, raw.lastIndexOf("\n") + 1)) }); }
     const lines = raw.split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
+    // the earlier processes' records come first: their steps are this task's too (possibly.ts: earlier)
+    const whole = parseJournal(raw);
+    this.jlines = [...whole, ...this.jlines]; this.ownFrom = whole.length;
     const writesOf = (l: Record<string, unknown>): string[] => (Array.isArray(l.writes) ? (l.writes as string[]) : Object.keys((l.expect_after as Record<string, string> | undefined) ?? {}));
     const first = lines.find((l) => l.kind === "begin" && l.versions);
     if (first) this.firstBegin = { versions: { ...(first.versions as Record<string, string>) }, contents: { ...((first.contents as Record<string, string> | undefined) ?? {}) } };
@@ -540,16 +558,6 @@ export class Executor {
     let pending: Record<string, unknown> | null = null;
     for (const l of lines) { if (l.kind === "reconcile_pending") pending = l; else if (l.kind === "reconciled") pending = null; }
     if (pending && this.opts.files) this.restorePending(pending);
-    // the run's uncertain steps, from every process of it: a change or a send whose receipt said unverified, or that a
-    // restart found with no receipt and could not tell happened (review of harness#66: told only to the model, a send
-    // that may have gone out before the crash was not named on the next send's card). The step being recovered now
-    // is added below, once its finding is known
-    const uncertainOf = (l: Record<string, unknown>) => { const c = l.consequence as Consequence; if (NEEDS_CONSENT.has(c)) this.noteUncertain(c, typeof l.object === "string" ? l.object : "", String(l.text ?? ""), [], true); };
-    for (let i = 0; i + 1 < lines.length; i += 1) {
-      const l = lines[i]!, next = lines[i + 1]!;
-      if (l.kind !== "intent" || next.kind !== "receipt") continue;
-      if (next.status === "unverified" || (next.recovered === true && next.finding === "unknown")) uncertainOf(l);
-    }
     const last = lines.at(-1);
     if (!last || last.kind !== "intent") { if (this.reconciliation) this.emit("executor.reconcile_needed", { object: this.reconciliation.object, paths: this.reconciliation.files.map((f) => f.path), still: true }); return; }
     const action = last.action as Action;
@@ -609,7 +617,6 @@ export class Executor {
       this.emit("executor.reconcile_needed", { object: rc.object, paths: rc.files.map((f) => f.path) });
     }
     this.journal("receipt", { recovered: true, finding, external });
-    if (finding === "unknown") uncertainOf(last);
     this.emit("executor.recovered", { action, finding, external });
   }
 
@@ -1140,7 +1147,7 @@ export class Executor {
     if (a.kind !== "open_window" || !a.url) return null;
     if (!this.readMaterial().length) return null;
     const host = siteOf(a.url);
-    if (host && this.sites.has(host) && !this.uncertainTotal) return null;     // approved hosts: not while a step is uncertain
+    if (host && this.sites.has(host) && !this.uncertainCount) return null;     // approved hosts: not while a step is uncertain
     if (host && this.provenance.get(this.provenanceKey(a.url))?.cleared) return null;
     return { host };
   }
@@ -1338,20 +1345,25 @@ export class Executor {
     // why the epoch moved, when the driver says (hands#53: the snapshot's epoch_reason — an action, the user's input and
     // to which app, a window that appeared, vanished or was renamed), for a stale result's trace; older drivers say nothing
     let epochWhy: unknown;
+    // the journal as this act begins: whether it could have done something is read off what it wrote (possibly.ts)
+    const jmark = this.jlines.length;
+    // a screen action's receipt, written with the act's final status (after the read-back), so the journal says what
+    // the result says: what a card lists as done and what undo takes back are the same (review of #68: E2)
+    let pendingReceipt: Record<string, unknown> | null = null;
     let stepConsented = false, foregroundOk = false;
-    // what this step is, as the user would recognise it (the step, what goes out): kept if it comes back uncertain
-    let uncertainStep: { text: string; outgoing: ActionCardFacts["outgoing"] } | undefined;
+    // what goes out, as the card showed it: recorded with the intent, so an uncertain step is named by it too
     let cardOutgoing: ActionCardFacts["outgoing"] | undefined;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
+      if (pendingReceipt) { this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...pendingReceipt }); pendingReceipt = null; }
       const { consent, ...rest } = req;
       // the receipt is evidence for the verdict: what the app alone uses (the step's picture, screen frames, a card's
       // fields) is not in it
       const { shot: _s, target_frame: _t, window_frame: _w, ...kept } = r;
       const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, ...c }) => c)(kept.challenge) } : kept;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain });
+      r.possibly_done = journalSteps(this.jlines.slice(jmark)).some((x) => x.possibly);
       this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
-      this.noteOutcome(r, uncertainStep, describeAction(req.action, undefined, r.consequence, undefined, this.opts.lang));
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -1542,8 +1554,7 @@ export class Executor {
     let land: (() => void) | null = null;
     if (consequence !== "read") {
       const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence);
-      uncertainStep = { text: stepText(act, (target ? this.looks.get(target) : undefined) ?? obs, this.opts.lang), outgoing: cardOutgoing ?? [] };
-      this.journal("intent", { action: act, object: base.object, consequence, text });
+      this.journal("intent", { action: act, object: base.object, consequence, text, ...(cardOutgoing?.length ? { outgoing: cardOutgoing.slice(0, 5).map((o) => ({ kind: o.kind, label: cardText(o.label, 40), value: cardText(o.value, 80) })) } : {}) });
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
@@ -1571,7 +1582,9 @@ export class Executor {
     }
     finally { if (land) { this.flight = null; (land as () => void)(); } }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
-    if (consequence !== "read") this.journal("receipt", { status: r.status });
+    // the receipt goes into the journal with the act's final status (done): what the driver said is kept beside it, and
+    // its "not done" (performed: false, or a reply the protocol defines as a refusal before acting) as performed: false
+    if (consequence !== "read") pendingReceipt = { driver_status: r.status, ...(saysNotPerformed(r) ? { performed: false } : {}) };
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
     // send that went through (ok) took it with it. One that came back unverified may not have: the text stays, so a
     // send key tried again there is still asked about as a send (review of harness#66: cleared on unverified, the
@@ -1771,7 +1784,7 @@ export class Executor {
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && cap.effect !== "observe") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
-    if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {} });
+    if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {}, seq: this.receipts.length + 1, ...(saysNotPerformed(r) ? { performed: false } : {}) });
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
     if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, writes: fp.writes, versions_before, madeParents, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));
@@ -1899,23 +1912,32 @@ export class Executor {
     };
   }
 
-  /** Which of the task's effects can be taken back, newest first, and why not: a file action through its capability's
-   *  undo (create, move, copy, append have one; a replaced text or a trashed file do not), a window the task opened by
-   *  closing it. Anything else done on screen cannot be undone. The whole run is reversible only when every step is. */
-  undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string }[] } {
-    const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string }[] = [];
-    for (const r of [...this.receipts].reverse()) {
-      if (r.result.status !== "ok" || r.result.consequence === "read") continue;
+  /** The task's possibly-done steps in journal order (possibly.ts), earlier processes' included. */
+  possiblySteps(): JournalStep[] { return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly); }
+
+  /** The task's possibly-done steps (possibly.ts: from the journal, earlier processes' included), newest first, and
+   *  whether each can be taken back: a file action through its capability's undo (create, move, copy, append have one;
+   *  a replaced text or a trashed file do not), a window the task opened by closing it — both only when the step's
+   *  outcome is known and recorded (its receipt ok). Anything else done on screen, a step whose outcome is not known (no
+   *  receipt, or not ok: an error, a capability that threw half way, a lock found after it), a step still out at the
+   *  driver, and an earlier process's step cannot be. The whole run is reversible only when every step is. */
+  undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] } {
+    const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] = [];
+    const t = T(this.opts.lang);
+    for (const s of this.possiblySteps().reverse()) {
+      const seq = typeof s.receipt?.seq === "number" ? s.receipt.seq : 0;
+      const r = seq && !s.earlier ? this.receipts.find((x) => x.seq === seq) : undefined;
+      if (s.earlier) { steps.push({ seq: 0, text: s.text, can: false, why: t.earlier, unverified: true }); continue; }
+      if (!r || r.result.status !== "ok") { steps.push({ seq, text: s.text, can: false, why: !s.receipt && this.flight ? t.inFlight : t.unsure, unverified: true }); continue; }
       const a = r.request.action;
-      const t = T(this.opts.lang);
-      if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap, this.opts.lang), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap, this.opts.lang), can: false, why: t.noUndoFor(a.capability) }); continue; }
+      if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: s.text, can: true } : { seq: r.seq, text: s.text, can: false, why: t.noUndoFor(a.capability) }); continue; }
       if (a.kind === "open_window") {
         // the task's own window is closed; one it brought up for the user's app is left open (it may hold their state):
         // nothing to take back there
-        steps.push(this.openedWindows.has(r.seq) ? { seq: r.seq, text: t.openWindow(a.app), can: true } : this.openedForUser.has(r.seq) ? { seq: r.seq, text: t.leftOpen(this.openedForUser.get(r.seq)!.app), can: true, left_open: this.openedForUser.get(r.seq)!.app } : { seq: r.seq, text: t.openWindow(a.app), can: false, why: t.openedInYours });
+        steps.push(this.openedWindows.has(r.seq) ? { seq: r.seq, text: s.text, can: true } : this.openedForUser.has(r.seq) ? { seq: r.seq, text: t.leftOpen(this.openedForUser.get(r.seq)!.app), can: true, left_open: this.openedForUser.get(r.seq)!.app } : { seq: r.seq, text: s.text, can: false, why: t.openedInYours });
         continue;
       }
-      steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, undefined, this.opts.lang), can: false, why: t.undoable });
+      steps.push({ seq: r.seq, text: s.text, can: false, why: t.undoable });
     }
     return { reversible: steps.every((s) => s.can), steps };
   }

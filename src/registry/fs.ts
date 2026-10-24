@@ -51,7 +51,7 @@ export const fsMove = make({
     // rename replaces what is there: a destination that exists under another case or Unicode form (another file on a
     // case-insensitive volume) is refused, not replaced. The source itself under another spelling is a rename of its
     // name (readme.md → README.md), which the volume does in place
-    if (fs.existsSync(ws.abs(dst)) && !sameFile(ws.abs(src), ws.abs(dst))) return { status: "error", why: `${dst} already exists`, output: {}, versions_after: {} };
+    if (fs.existsSync(ws.abs(dst)) && !sameFile(ws.abs(src), ws.abs(dst))) return { status: "error", why: `${dst} already exists`, output: {}, versions_after: {}, performed: false };
     fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]);
   },
   check: (ws, a) => (folderOk(ws, parentOf(norm(a.source!))) ? null : `folder ${parentOf(norm(a.source!))} is gone`),

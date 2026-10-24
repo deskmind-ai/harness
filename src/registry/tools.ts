@@ -20,7 +20,10 @@ import { readZip, writeZip } from "./zip.js";
 
 const pathsOf = (list: string) => list.split("\n").map(norm).filter(Boolean);
 const badPath = (q: string) => q.split("/").includes("..");
-const failed = (why: string): ExecResult => ({ status: "failed", why, output: {}, versions_after: {} });
+/** A tool that failed cleanly: every failure here comes before anything reached the task folder, or from `wrote`, which
+ *  builds the output in a temporary file and puts it in place in one atomic step — so nothing was left behind, and
+ *  the receipt says so (performed: false: executor/possibly.ts). */
+const failed = (why: string): ExecResult => ({ status: "failed", why, output: {}, versions_after: {}, performed: false });
 
 /** The destination is new, in an existing folder, with the extension the tool writes (when it writes one). */
 function newFile(ws: Workspace, dst: string, ext?: string): string | null {

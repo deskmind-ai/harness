@@ -82,7 +82,8 @@ describe("after a step of this run came back unverified", () => {
     expect(b.done.status).toBe("ok");                                 // B went out fine
     const w3 = await compose("回复C");
     const c = await send(w3);
-    expect(c.card.facts?.uncertain?.map((u) => u.text).join()).toContain("回复A");    // still named: not cleared by B
+    expect(c.card.text).toMatch(/^之前「.*回复A.*」结果不确定/);                        // still named: not cleared by B
+    expect(c.card.facts?.uncertain?.flatMap((u) => u.outgoing.map((o) => o.value)).join()).toContain("回复A");
   });
 
   it("a plan-approved change asks again (its object consent no longer covers it); looks and the task's own windows do not", async () => {

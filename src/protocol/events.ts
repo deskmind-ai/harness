@@ -55,7 +55,10 @@ export const EventBody = z.discriminatedUnion("kind", [
     // the window after the step as a small PNG (relative to the run folder; only steps that changed something), and
     // where the window and the element were on screen before acting (hands' receipt)
     // shot_pending: the picture is still being written there (a shot_ready follows when it is)
-    shot: z.string().optional(), shot_pending: z.boolean().optional(), target_frame: FrameEv.optional(), window_frame: FrameEv.optional() }),
+    shot: z.string().optional(), shot_pending: z.boolean().optional(), target_frame: FrameEv.optional(), window_frame: FrameEv.optional(),
+    // (M2 H2, additive) could this step have done something — the executor's one answer (executor/possibly.ts: an
+    // intent in its journal and no receipt that says nothing happened), whatever `status` says. Absent: count it as yes
+    possibly_done: z.boolean().optional() }),
   // a step's picture is on disk now (M0): it is taken after the step's result was sent, so it may come after later events
   // — even after task_done, while the process lives; if none comes, the file at step_result.shot is the answer
   z.object({ kind: z.literal("shot_ready"), step_id: z.string(), shot: z.string() }),
@@ -68,7 +71,9 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional(), why: z.enum(["", "stopped", "timed_out"]).optional() }),
   // an open card let go without an answer (M0): the user changed the request (steer), stopped the task (stop), or the app
   // went away (ended). An answer sent for it later is refused
-  z.object({ kind: z.literal("ask_void"), ask_id: z.string(), why: z.enum(["steer", "stop", "ended"]) }),
+  // timeout (M2, additive): an action card left unanswered for 10 minutes (wall clock). Nobody answers for the user:
+  // the task waits where it is, holding the computer, until a reask (「现在回答」: a new card), a steer or a stop
+  z.object({ kind: z.literal("ask_void"), ask_id: z.string(), why: z.enum(["steer", "stop", "ended", "timeout"]) }),
   // the user's mid-run words reached the task (M0): applied between two steps; from here the judges read them
   z.object({ kind: z.literal("steered"), text: z.string() }),
   // a verdict on a "done" claim (M0): pass ends the task succeeded; unknown with missing_kind "evidence" means only looking
@@ -91,6 +96,8 @@ export const EventBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("judge"), judge_id: z.string(), question: z.string(), answer: z.string().nullable(), by: z.string().nullable(), confidence: z.number().optional(),
     tiers: z.array(z.object({ tier: z.string(), outcome: z.string(), choice: z.string().nullable(), confidence: z.number().optional(), settled: z.boolean() })),
     shadow: z.object({ tier: z.string(), top: z.string().nullable(), agree: z.boolean().nullable() }).optional(), step_id: z.string().optional(), ms: z.number().optional() }),
+  // the result card (M2 H2): there whenever the task changed something, however it ended — its undo option only when
+  // every change can be taken back (the text says why not otherwise)
   // `reason` is display text, never matched; `cause` (additive, events v1) says in structure why the task stopped, set
   // only where the code knew it (protocol/computer.ts STOP_CAUSES): screen_locked, last_step_unknown, user_stopped.
   // Absent: a plain error or a normal end
@@ -101,7 +108,10 @@ export const EventBody = z.discriminatedUnion("kind", [
     usage: z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), by_role: z.record(z.object({ calls: z.number(), tokens_in: z.number(), tokens_out: z.number(), cost_usd: z.number(), latency_ms: z.number() })) }).optional(),
     /** Some of the runtime's model-call reports were dropped (its notifications came faster than the executor takes
      *  them): `usage` is lower than what was spent (executor split P2). */
-    usage_incomplete: z.boolean().optional() }),
+    usage_incomplete: z.boolean().optional(),
+    /** (M2 H2, additive) The result card offers undo and the process waits for its answer until then: seconds since
+     *  the epoch, like `t`, by the wall clock. Absent: no undo offered, or no wait (no --linger, or a signal). */
+    undo_until: z.number().optional() }),
   // the user's response to a result card after the run (respond): recorded; what it does is the runtime's to add
   // `undone` / `total` / `refused` (M0): the undo in fields — how many steps were taken back of how many, and why it
   // stopped (null: all of them); absent when nothing was undone

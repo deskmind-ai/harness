@@ -34,9 +34,10 @@ export interface ActRequest {
 
 export interface PerformResult {
   /** `user_busy` (hands): the step waited for the user to pause and they did not, before the deadline it was sent
-   *  with; nothing was done (`performed: false`). */
+   *  with; nothing was done only with `performed: false` (the executor takes one without it as unverified). */
   status: "ok" | "error" | "unsupported" | "unverified" | "blocked" | "user_busy"; why?: string; window?: string; new_window?: WindowInfo;
-  /** false: the driver says nothing was sent (hands: a wait for the user ran out, or the deadline came first). */
+  /** The driver's own word that it did not perform the action at all (e.g. the user was busy): the one driver answer
+   *  that says nothing happened (executor/possibly.ts). Absent: it may have. */
   performed?: boolean;
   /** A window that appeared when the task launched an app, without proof the task made it (hands#54): the user's. */
   opened_window?: WindowInfo;

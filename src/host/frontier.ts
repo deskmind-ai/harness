@@ -24,6 +24,7 @@ import type { Registry } from "../registry/capability.js";
 import type { Workspace } from "../registry/workspace.js";
 import type { Executor } from "../executor/executor.js";
 import { ExecutorService, type SkillSource } from "../executor/service.js";
+import type { Clock } from "../executor/clock.js";
 import type { Lang } from "../executor/text.js";
 import type { AgentLoop, LoopOptions } from "../runtime/loop.js";
 import { serve, McpExecutorServer } from "../cli/mcp.js";
@@ -60,6 +61,9 @@ export interface RuntimeOptions {
   lang?: Lang;
   /** The user's standing rules (rule-tier consent tokens the app signed), handed to the executor at begin. */
   rules?: ConsentToken[];
+  /** An action card's expiry (ms, by `clock`; the app's run: CARD_EXPIRY_MS). Absent: cards wait however long. */
+  cardExpiryMs?: number;
+  clock?: Clock;
 }
 
 const sum = (a: Record<string, number>, b: Record<string, number>) => { const out = { ...a }; for (const [k, v] of Object.entries(b)) out[k] = (out[k] ?? 0) + v; return out; };
@@ -83,7 +87,7 @@ export class FrontierRuntime {
   constructor(readonly o: RuntimeOptions) {
     const { tool_calls, turns, asks, verify_retries } = o.budget ?? {};
     const def = <K extends string, V>(x: Record<K, V | undefined>) => Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined)) as Partial<Record<K, V>>;
-    this.service = new ExecutorService({ task: o.task, raw: o.raw, executor: o.executor, signer: o.signer, user: o.user, gateway: o.gateway, workspace: o.workspace, registry: o.registry, skills: o.skills, budget: def({ asks, verify_retries }), onEvent: o.onEvent, lang: o.lang, rules: o.rules });
+    this.service = new ExecutorService({ task: o.task, raw: o.raw, executor: o.executor, signer: o.signer, user: o.user, gateway: o.gateway, workspace: o.workspace, registry: o.registry, skills: o.skills, budget: def({ asks, verify_retries }), onEvent: o.onEvent, lang: o.lang, rules: o.rules, ...(o.cardExpiryMs !== undefined ? { cardExpiryMs: o.cardExpiryMs } : {}), ...(o.clock ? { clock: o.clock } : {}) });
     this.port = tracedPort(this.service.port, (k, b) => o.onEvent?.(k, b), (p) => { this.ended = p; this.onEnded(); });
     if (!o.agent && !o.model) throw new Error("FrontierRuntime needs a model (in process) or an agent spec");
     if (o.mode === "inproc" || (o.mode !== "process" && (o.model || inProcess()))) this.loop = loopFromSpec(this.spec(), this.port, o.model);
@@ -111,6 +115,9 @@ export class FrontierRuntime {
   /** A steer came before the runtime's process was started (read with the request): it is told once it is there, so its
    *  first turn hears the words, as the loop in process does (its first poll) — review of P2. */
   private steeredEarly = false;
+
+  /** 「现在回答」 on an expired action card (the protocol's reask): to the executor, which tries the step again. */
+  reask() { this.service.reask(); }
 
   /** The app's stop: the executor refuses every later action and lets go of an open card; the loop stops. `cause`: the
    *  stop's structured cause when the caller knows it (task_done.cause). */
