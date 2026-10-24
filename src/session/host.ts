@@ -164,10 +164,14 @@ interface Task {
   pgid: number;
   /** The machine lock as this task last wrote it: every change of it is made from exactly this (compare-and-set). */
   holder: Holder | null;
-  /** An answer to its result card was sent (the executor reads only the first). */
-  responded: boolean;
-  /** That answer was the card's undo (stored: session.task_respond). */
-  undoAsked?: boolean;
+  /** Its result card, decided here and only here (review of #68: the stop-vs-card family, redesigned): `none` no card
+   *  waits (running, or none offered); `open` it can be answered; `undoing` its undo was accepted (stored:
+   *  session.task_respond) and sent; `closed` it can no longer be answered — stopped (the user's stop), expired (its
+   *  undo_until passed), answered (a respond that was not undo, or the undo's outcome came), gone (its executor was
+   *  closed: a new task, the session's end, its own exit). The executor follows: it gets only what this state lets
+   *  through — a stop on an open card is forwarded after the card is closed here, a respond only while open — and
+   *  the order of its stdin is the order of these transitions. */
+  resultCard: { s: "none" } | { s: "open" } | { s: "undoing" } | { s: "closed"; why: "stopped" | "expired" | "answered" | "gone" };
   /** Its undo's session.task_undo was written (or tried: a failure halts), from its result_response — on stdout or
    *  in its run's events.jsonl, which the executor writes first — or as unknown. Never twice. */
   undoRecorded?: boolean;
@@ -370,10 +374,14 @@ export class SessionHost {
     for (;;) {
       const evs = readRunEvents(this.runFile(runId));
       const finished = need.undo ? evs.some((e) => e.kind === "result_response") : evs.some((e) => e.kind === "task_done");
+      // one reading of the clock and of the holder per round (harness#69): read twice, the deadline could pass between
+      // the two checks (held() asks ps, which takes milliseconds) — the first said "not yet, keep waiting", the second
+      // "over", and an undo still under way was ended (SIGTERM) and recorded as cut off
+      const over = Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS), up = held(own);
       // an undo still under way at the deadline is never cut short: it is watched on, outside the wait (the model may
       // speak meanwhile: the run reads as not closed), and its records written when it ends (or by the next open)
-      if (need.undo && !finished && held(own) && Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) { void this.watchUndo(runId, own, need); return; }
-      if (finished || !held(own) || Date.now() - t0 > (this.o.exitWaitMs ?? EXIT_WAIT_MS)) {
+      if (need.undo && !finished && up && over) { void this.watchUndo(runId, own, need); return; }
+      if (finished || !up || over) {
         // not ended in time: what is left of its group is ended now (a resumed session's first task must not find it)
         if (!finished) { try { const cur = readHolder(this.o.dir); if (cur?.run_id === runId && held(cur)) endTree(cur); } catch { /* the next task finds it */ } }
         this.recordRecovered(runId, need);
@@ -723,7 +731,7 @@ export class SessionHost {
     }
     let resolve!: (e: TaskEnd) => void;
     const ended = new Promise<TaskEnd>((res) => { resolve = res; });
-    const task: Task = { runId, handle: h, pgid, holder, responded: false, sawDone: false, options: 0, optionKinds: [], state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set() };
+    const task: Task = { runId, handle: h, pgid, holder, resultCard: { s: "none" }, sawDone: false, options: 0, optionKinds: [], state: "running", card: null, steers: [], end: null, ended, resolve, exitTimer: null, openSteps: new Set() };
     this.current = task;
     this.tasks.set(runId, task);
     void h.exited.then((x) => this.onExecutorExit(task, x));
@@ -777,6 +785,7 @@ export class SessionHost {
         // session (terminal) — never read as "expired" meanwhile; the next open records it from the run
         if (task.undoTimer) { clearTimeout(task.undoTimer); task.undoTimer = undefined; }
         if (!task.undoRecorded && typeof ev.undone === "number" && typeof ev.total === "number") { task.undoRecorded = true; this.terminal(undoFrom(task.runId, ev)); }
+        if (task.resultCard.s === "undoing" || task.resultCard.s === "open") task.resultCard = { s: "closed", why: "answered" };
         this.maybeExit();                                // a session ending waited for this undo's outcome
         break;
     }
@@ -797,6 +806,7 @@ export class SessionHost {
     task.options = Array.isArray(card?.options) ? card.options.length : 0;
     task.optionKinds = Array.isArray(card?.options) ? card.options.map((x) => String((x as { kind?: unknown } | null)?.kind ?? "")) : [];
     if (task.state === "running") task.state = card && this.linger > 0 && !task.noLinger ? "lingering" : "ending";
+    if (task.state === "lingering") task.resultCard = { s: "open" };
   }
 
   private taskDone(task: Task, ev: Record<string, unknown>) {
@@ -843,6 +853,7 @@ export class SessionHost {
       // it died while carrying out an undo (asked for, no result_response): how much of it was done is not known — said
       // so before its closure, never left to read as "expired"
       if (!this.settleUndo(task)) return;
+      if (task.resultCard.s === "open") task.resultCard = { s: "closed", why: "gone" };
       if (task.state !== "closed") {
         // a lingering executor ended by a new task elsewhere on this Mac (the lock names another run now): undo expired
         const other = task.state === "lingering" && readHolder(this.o.dir)?.run_id !== undefined && readHolder(this.o.dir)?.run_id !== task.runId;
@@ -860,6 +871,7 @@ export class SessionHost {
   private closeTask(task: Task, why: "new_task" | "session_end") {
     if (task.state === "closed") return;
     task.state = "closed";
+    if (task.resultCard.s === "open") task.resultCard = { s: "closed", why: "gone" };
     try { task.handle.close(); } catch { /* gone */ }
     if (!this.settleUndo(task)) return;
     this.terminal({ kind: "session.task_closed", run_id: task.runId, why });
@@ -868,7 +880,7 @@ export class SessionHost {
   /** An undo this session asked for whose outcome is not recorded (no result_response, no unknown). A run's closure is
    *  never written while one is open: the session's exit waits for it (maybeExit), and a closure that comes first all
    *  the same (its executor died before its exit was seen: a new task found the Mac free) records it unknown first. */
-  private undoOpen(t: Task): boolean { return !!t.undoAsked && !t.undoRecorded; }
+  private undoOpen(t: Task): boolean { return t.resultCard.s === "undoing" && !t.undoRecorded; }
   /** Before a run's closure: an undo with no outcome recorded gets it — from its run's events.jsonl when its
    *  result_response is there (the executor writes it before stdout: its exit can be seen before the line), else
    *  unknown. False: it could not be stored (halted). */
@@ -995,9 +1007,15 @@ export class SessionHost {
     // the undo window is over by the wall clock (the executor's timer may not have run: the Mac slept, or it fired
     // already): refused here, never forwarded — forwarded to an executor that has just exited, it would be recorded as
     // an undo cut off (unknown) though nothing was undone
-    if (t.optionKinds[opt] === "undo" && t.undoUntil !== undefined && (this.o.clock ?? WALL_CLOCK).now() / 1000 >= t.undoUntil) return this.refuse("undo_expired", this.t("撤回的时间已经过了", "the time to undo this task has passed"), "respond");
-    // one respond per card: the executor reads only the first
-    if (t.responded) return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
+    if (t.resultCard.s === "open" && t.optionKinds[opt] === "undo" && t.undoUntil !== undefined && (this.o.clock ?? WALL_CLOCK).now() / 1000 >= t.undoUntil) t.resultCard = { s: "closed", why: "expired" };
+    // only an open card takes an answer (one per card: the executor reads only the first); a closed one says why
+    const rc = t.resultCard;
+    if (rc.s !== "open") {
+      if (rc.s === "undoing" || (rc.s === "closed" && rc.why === "answered")) return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
+      if (rc.s === "closed" && rc.why === "expired") return this.refuse("undo_expired", this.t("撤回的时间已经过了", "the time to undo this task has passed"), "respond");
+      if (rc.s === "closed" && rc.why === "stopped") return this.refuse("undo_expired", this.t("这张结果卡已经停下关掉了，不能再撤回", "this result card was closed by a stop; it can no longer be undone"), "respond");
+      return this.refuse("no_task", "no result card of this session is waiting", "respond");
+    }
     let u: ReturnType<typeof undo>;
     // (a change that landed is taken as made, also when only closing the lock's guard failed after it: an acting lock
     // nobody accounts for would hold the Mac)
@@ -1021,8 +1039,7 @@ export class SessionHost {
       catch (x) { this.halt(`the machine lock of ${t.runId} could not be set back to lingering after its answer was not stored: ${errText(x)}`); }
       return;
     }
-    t.responded = true;
-    t.undoAsked = t.optionKinds[opt] === "undo";
+    t.resultCard = t.optionKinds[opt] === "undo" ? { s: "undoing" } : { s: "closed", why: "answered" };
     t.handle.write(JSON.stringify(line));
   }
 
@@ -1101,7 +1118,16 @@ export class SessionHost {
   /** `stop{run_id}`: that task (running, or lingering: its result card is let go). Without: the running task, else
    *  the reply (what came so far is stored with `stopped: true`). */
   stop(runId?: string) {
-    if (runId) { const t = this.find(runId, "stop"); if (t) t.handle.write(JSON.stringify({ type: "stop" })); return; }
+    if (runId) {
+      const t = this.find(runId, "stop");
+      if (!t) return;
+      // a stop on its open result card closes the card here first: a respond after it is refused, never sent (the
+      // executor's wait ends on the stop it then reads). On an undo under way it changes nothing here: the undo is
+      // never cut half way (the executor finishes it and writes its result_response)
+      if (t.resultCard.s === "open") t.resultCard = { s: "closed", why: "stopped" };
+      t.handle.write(JSON.stringify({ type: "stop" }));
+      return;
+    }
     if (this.current) return this.current.handle.write(JSON.stringify({ type: "stop" }));
     this.running?.abort.abort();
   }
