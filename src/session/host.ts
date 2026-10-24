@@ -912,8 +912,13 @@ export class SessionHost {
 
   /** What a run's undo did, from its events (its last result_response with the counts), or unknown. */
   private undoOfRun(runId: string) {
-    const r = [...readRunEvents(this.runFile(runId))].reverse().find((e) => e.kind === "result_response" && typeof e.undone === "number" && typeof e.total === "number");
-    return r ? undoFrom(runId, r) : undoUnknown(runId);
+    const evs = readRunEvents(this.runFile(runId));
+    const r = [...evs].reverse().find((e) => e.kind === "result_response" && typeof e.undone === "number" && typeof e.total === "number");
+    if (r) return undoFrom(runId, r);
+    // its card closed by its deadline (result_card_closed) and no result_response: proof nothing was undone — an undo
+    // only starts while the card is open — so an expiry, never "cut off"
+    if (evs.some((e) => e.kind === "result_card_closed")) return { kind: "session.task_undo" as const, run_id: runId, undone: 0, total: 0, refused: "expired" };
+    return undoUnknown(runId);
   }
 
   /** A run's terminal record — session.task_end, session.task_closed, or session.task_undo (what an undo did, or that

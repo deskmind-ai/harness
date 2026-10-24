@@ -124,7 +124,20 @@ export class LineReader {
    *  which is a stop nobody asked for. */
   stopCause: StopCause | undefined;
   stopWhy = "";
-  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopWhy = why; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); this.onEnd?.(this.closed ? "ended" : "stop"); }
+  stop(why = "stopped by the app", cause?: StopCause) {
+    if (this.stopped) return;
+    this.stopped = true; this.stopWhy = why; this.stopCause = cause;
+    // the open card first, with the stop's own reason (stop / ended), then whoever runs the task
+    this.onEnd?.(this.closed ? "ended" : "stop");
+    this.onStop?.(why, cause);
+    for (const w of this.waiting.splice(0)) w("");
+  }
+  /** The answer lines that came before a router was there (in the request's stdin chunk): taken out, in order. */
+  takeAnswers(): Extract<Control, { type: "answer" }>[] {
+    const out: Extract<Control, { type: "answer" }>[] = [];
+    this.queued = this.queued.filter((l) => { const c = parseControl(l); if (c?.type === "answer") { out.push(c); return false; } return true; });
+    return out;
+  }
   /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
    *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
   next(signal?: AbortSignal): Promise<string> {
@@ -154,6 +167,8 @@ export class StdioUser implements RuntimeUser {
   constructor(private readonly log: EventLog, private readonly input: LineReader) {
     input.onAnswer = (a) => this.route(a);
     input.onEnd = (why) => this.end(why);
+    // answers read before this router existed (with the request, in one chunk): routed now — no card is open yet
+    for (const a of input.takeAnswers()) this.route(a);
     if (input.stopped || input.closed) this.end(input.closed ? "ended" : "stop");
   }
   /** A card of this run was voided (steer, timeout): from then on an answer must name its card (ask_id). */
@@ -202,8 +217,9 @@ export class StdioUser implements RuntimeUser {
   private end(why: "stop" | "ended" | "done") {
     if (!this.over) this.over = why;
     const o = this.open;
-    if (!o || why === "done") return;
-    this.log.emit({ kind: "ask_void", ask_id: o.id, why });
+    if (!o) return;
+    // any end of the task closes the open card, said so (a task that ends otherwise than by a stop: "ended")
+    this.log.emit({ kind: "ask_void", ask_id: o.id, why: why === "done" ? "ended" : why });
     this.closeOpen(why);
     o.settle(null);
   }
@@ -221,6 +237,8 @@ export class StdioUser implements RuntimeUser {
       // the user changed the request (steer), or nobody answered in time (timeout): the card is let go, the app told
       const voided = () => {
         if (this.open?.id !== ask_id) return;
+        // the task ended under it (the runtime died, the executor failed): let go as ended, at once
+        if (o.signal!.reason === "ended") { this.log.emit({ kind: "ask_void", ask_id, why: "ended" }); this.closeOpen("ended"); settle(null); return; }
         const why = o.signal!.reason === "timeout" ? "timeout" : "steer";
         this.voided = true;
         this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why });
