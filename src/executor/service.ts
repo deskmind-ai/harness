@@ -345,7 +345,9 @@ export class ExecutorService {
       const a = await Promise.race([p,
         new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true })),
         new Promise<"voided">((r) => { if (open.signal.aborted) r("voided"); else open.signal.addEventListener("abort", () => r("voided"), { once: true }); })]);
-      if (a === "voided") {
+      // (the asker may let go of the card in the same moment as the signal fires, and hand back "nothing" first: the
+      // signal decides — a voided card is voided, whichever promise settled first)
+      if (a === "voided" || (a === null && open.signal.aborted && !stop.aborted)) {
         const why = open.signal.reason === "timeout" ? "timeout" : "steer";
         this.emit("card.voided", { kind: card.kind, why });
         return why === "timeout" ? "expired" : "voided";
