@@ -96,6 +96,10 @@ const SMALL_TEXT = 1000;
 const BEGIN_TEXT_FILES = 200, BEGIN_TEXT_CHARS = 200_000;
 /** An uncertain-step list keeps the last this many (the card's fields), and a card shows at most this many lines. */
 const UNCERTAIN_KEPT = 20, UNCERTAIN_SHOWN = 5;
+/** An earlier build's outgoing value (no `chars`) is shown as written, up to this many characters. */
+const OLD_SHAPE_MAX = 200;
+/** An uncertain step's line on a card (its words and what went out, each value already cut) is bounded here. */
+const UNCERTAIN_LINE_MAX = 600;
 /** A file's text when it is a small text file, else undefined (absent, a folder, not text, too long, unreadable). */
 function smallText(ws: Workspace, p: string): string | undefined {
   try { if (ws.exists(p) && !ws.isDir(p) && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= SMALL_TEXT) return t; } } catch { /* the version says it */ }
@@ -453,17 +457,29 @@ export class Executor {
   /** An uncertain step as a card shows it: the intent's words, and what went out when the intent recorded it. */
   private uncertainText(x: JournalStep): string {
     const said = this.uncertainOut(x).map((o) => o.value).filter(Boolean).join(" / ");
-    return cardText(`${x.text}${said ? T(this.opts.lang).stepSays(said) : ""}`, 160, this.opts.lang);
+    // each value is cut (with its true count) on its own; the line as a whole only bounded, with a bare ellipsis: a
+    // count there would be the composed line's length, read as the message's
+    const line = Array.from(cardText(`${x.text}${said ? T(this.opts.lang).stepSays(said) : ""}`, Infinity, this.opts.lang));
+    return line.length > UNCERTAIN_LINE_MAX ? line.slice(0, UNCERTAIN_LINE_MAX).join("") + "…" : line.join("");
   }
   /** What the step sent, as the journal recorded it (the last draw before acting when it differed from the card's),
    *  cut here, once, in the card's language, with the true length. */
   private uncertainOut(x: JournalStep): ActionCardFacts["outgoing"] {
     const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
-    const rec = (Array.isArray(l.outgoing_final) ? l.outgoing_final : Array.isArray(l.outgoing) ? l.outgoing : []) as Partial<RecordedOut>[];
+    const raw: unknown[] = Array.isArray(l.outgoing_final) ? l.outgoing_final : Array.isArray(l.outgoing) ? l.outgoing : [];
+    // a journal is read as found (an earlier build's, a torn or hand-edited one): an entry that is not a record is a
+    // bare value, null is nothing (review of harness#66 round 8: a null threw)
+    const rec: Partial<RecordedOut>[] = raw.flatMap((o) => (o && typeof o === "object" ? [o as Partial<RecordedOut>] : typeof o === "string" || typeof o === "number" ? [{ value: String(o) }] : []));
     // a record without `chars` was written by an earlier build, already cut (with its own count in its own words):
-    // shown as it is — cut again, it would count the cut text (review of harness#66 round 7)
-    return rec.slice(0, 5).map((o) => ({ kind: (o.kind ?? "text") as ActionCardFacts["outgoing"][number]["kind"], label: cardText(String(o.label ?? ""), 40, this.opts.lang),
-      value: typeof o.chars === "number" ? cardText(String(o.value ?? ""), 80, this.opts.lang, o.chars) : cardText(String(o.value ?? ""), Infinity, this.opts.lang) }));
+    // shown as it is, no count — cut again, it would count the cut text (round 7). Those were at most ~90
+    // characters; a longer one is bounded at OLD_SHAPE_MAX with a bare ellipsis, never a count
+    return rec.slice(0, 5).map((o) => {
+      const value = String(o.value ?? ""), label = String(o.label ?? "");
+      const kind = (["field", "selected", "typed", "text"].includes(String(o.kind)) ? o.kind : "text") as ActionCardFacts["outgoing"][number]["kind"];
+      if (typeof o.chars === "number" && Number.isFinite(o.chars)) return { kind, label: cardText(label, 40, this.opts.lang), value: cardText(value, 80, this.opts.lang, o.chars) };
+      const shown = cardText(value, Infinity, this.opts.lang), cut = Array.from(shown);
+      return { kind, label: cardText(label, 40, this.opts.lang), value: cut.length > OLD_SHAPE_MAX ? cut.slice(0, OLD_SHAPE_MAX).join("") + "…" : shown };
+    });
   }
   private uncertainFact(x: JournalStep): NonNullable<ActionCardFacts["uncertain"]>[number] {
     const l: Record<string, unknown> = this.jlines[x.intent] ?? {};

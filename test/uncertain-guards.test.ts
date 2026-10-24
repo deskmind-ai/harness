@@ -137,3 +137,26 @@ for (const lang of ["zh", "en"] as const) it(`E1: an earlier build's outgoing (a
   expect(r.challenge!.facts!.uncertain![0]!.outgoing[0]!.value).toBe(oldValue);
   expect(r.challenge!.text).not.toMatch(/共 (?!300)\d+ 字|\d+ characters in all/);
 });
+
+/** rv11 e1-shapes: odd journal shapes of `outgoing` (an earlier build's, a hand-edited one) are read, never thrown on. */
+const shapes: [string, unknown, (v: string) => void][] = [
+  ["chars as a string (treated as none)", [{ kind: "field", label: "M", value: "x".repeat(200), chars: "200" }], (v) => expect(v).toBe("x".repeat(200))],
+  ["value a number, no label", [{ value: 12345 }], (v) => expect(v).toBe("12345")],
+  ["a long value with no chars", [{ kind: "field", label: "M", value: "长".repeat(1500) }], (v) => expect(v).toBe("长".repeat(200) + "…")],
+  ["a null entry", [null], () => undefined],
+  ["a string entry", ["hello"], (v) => expect(v).toBe("hello")],
+];
+for (const [name, outgoing, check] of shapes) it(`E1 shape: ${name}`, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rv11-e1-")), journal = path.join(dir, "j.jsonl");
+  fs.writeFileSync(journal, JSON.stringify({ t: 1, kind: "intent", action: { kind: "click", window: "w", target: "send" }, object: "window:w", consequence: "external", text: "点 发送", outgoing }) + "\n");
+  const app = ConsentSigner.fresh();
+  const ex = new Executor(new Flagger(), { task: "t1", publicKey: app.publicKey, journal, lang: "zh" });
+  await ex.begin(); await ex.plan({ steps: [] });
+  const o = await ex.observe("w");
+  const r = await ex.act({ action: { kind: "click", window: "w", target: "flag" } as Action, epoch: o.epoch, consequence: "modify_user" });
+  expect(r.status).toBe("needs_consent");
+  const out = r.challenge!.facts!.uncertain![0]!.outgoing;
+  if (outgoing && (outgoing as unknown[])[0] === null) expect(out).toEqual([]);
+  else check(out[0]!.value);
+  expect(r.challenge!.text).not.toMatch(/共 \d+ 字/);
+});
