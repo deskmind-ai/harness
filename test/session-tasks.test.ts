@@ -996,18 +996,21 @@ describe("a task start that fails part-way lets go of what it took (the disk is 
 
   /** A real executor, the leader of its own process group with a child in it (`sleep`, killed when the leader exits
    *  by itself): takes its request, says task_done with an undo card, then lingers until its stdin ends (or for
-   *  `lingerMs`, then exits by itself, as at the end of its linger). A respond is an undo that takes `undoMs`; as the
+   *  `lingerMs`, then exits by itself, as at the end of its linger). A respond is an undo that takes `undoMs` — or, with
+   *  `undoGate`, that ends only once the test creates that file (harness#69: a fixed time raced the sessions' own waits
+   *  under load); as the
    *  real executor, its stdin's end does not cut it (it exits once the undo is done) but a signal does (after task_done
    *  it exits at once on one). Its result_response goes to the run's events.jsonl too, as the real one's. */
   const SCRIPT = `const c=require("child_process").spawn("sleep",["30"],{stdio:"ignore"});process.on("exit",()=>{try{c.kill("SIGKILL")}catch{}});
 const rl=require("readline").createInterface({input:process.stdin});let first=true,undoing=false;
+const later=(f)=>{const g=process.env.DM_UNDO_GATE;if(!g)return setTimeout(f,Number(process.env.DM_UNDO_MS||0));const t=setInterval(()=>{if(require("fs").existsSync(g)){clearInterval(t);f()}},20)};
 const rec=(o)=>{const f=process.env.DM_EVENTS;if(f){require("fs").mkdirSync(require("path").dirname(f),{recursive:true});require("fs").appendFileSync(f,JSON.stringify(o)+"\\n")}};
-rl.on("line",(l)=>{if(!first){const j=JSON.parse(l);if(j.type==="respond"&&!undoing){undoing=true;setTimeout(()=>{const r={seq:2,t:2,run_id:"",kind:"result_response",option:j.option,undone:1,total:1,refused:null};rec(r);console.log(JSON.stringify(r));setTimeout(()=>process.exit(0),50)},Number(process.env.DM_UNDO_MS||0))}return}first=false;const r=JSON.parse(l);console.log(JSON.stringify({seq:1,t:1,run_id:r.run_id,kind:"task_done",status:"succeeded",summary:"ok",result_card:{options:[{kind:"undo",label:"撤回"},{kind:"keep",label:"保留"}]}}));if(process.env.DM_LINGER_MS)setTimeout(()=>process.exit(0),Number(process.env.DM_LINGER_MS))});
+rl.on("line",(l)=>{if(!first){const j=JSON.parse(l);if(j.type==="respond"&&!undoing){undoing=true;later(()=>{const r={seq:2,t:2,run_id:"",kind:"result_response",option:j.option,undone:1,total:1,refused:null};rec(r);console.log(JSON.stringify(r));setTimeout(()=>process.exit(0),50)})}return}first=false;const r=JSON.parse(l);console.log(JSON.stringify({seq:1,t:1,run_id:r.run_id,kind:"task_done",status:"succeeded",summary:"ok",result_card:{options:[{kind:"undo",label:"撤回"},{kind:"keep",label:"保留"}]}}));if(process.env.DM_LINGER_MS)setTimeout(()=>process.exit(0),Number(process.env.DM_LINGER_MS))});
 rl.on("close",()=>{if(!undoing)process.exit(0)});`;
-  const realExec = (o: { lingerMs?: number; undoMs?: number } = {}) => {
+  const realExec = (o: { lingerMs?: number; undoMs?: number; undoGate?: string } = {}) => {
     const pgids: number[] = [];
     const launch: Launcher = (req, lo) => {
-      const env = { ...process.env, DM_EVENTS: path.join(lo.runs, lo.runId, "events.jsonl"), ...(o.lingerMs ? { DM_LINGER_MS: String(o.lingerMs) } : {}), ...(o.undoMs ? { DM_UNDO_MS: String(o.undoMs) } : {}) };
+      const env = { ...process.env, DM_EVENTS: path.join(lo.runs, lo.runId, "events.jsonl"), ...(o.lingerMs ? { DM_LINGER_MS: String(o.lingerMs) } : {}), ...(o.undoMs ? { DM_UNDO_MS: String(o.undoMs) } : {}), ...(o.undoGate ? { DM_UNDO_GATE: o.undoGate } : {}) };
       const p = spawn(process.execPath, ["-e", SCRIPT], { stdio: ["pipe", "pipe", "ignore"], detached: true, env });
       pgids.push(p.pid!); groups.push(p.pid!);
       p.stdin!.on("error", () => {});
@@ -1690,8 +1693,11 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
 
     /** A session that ended during an undo past the budget (the run left open), reopened while the undo still runs:
      *  recover's wait is over and it watches the undo. */
+    /** The undo ends only when the test says (`finishUndo`): nothing here depends on how long the sessions take. */
+    const gate = () => { const f = path.join(tmp(), "undo-go"); return { file: f, finishUndo: () => fs.writeFileSync(f, "") }; };
     const reopenedDuringUndo = async () => {
-      const ex = realExec({ undoMs: 3000 });
+      const g = gate();
+      const ex = realExec({ undoGate: g.file });
       const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
       s.send({ type: "cua", text: "第一件" });
       await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
@@ -1703,15 +1709,16 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       await Promise.all(s2.h.recovering);
       expect(groupUp(ex.pgids[0]!)).toBe(true);
       expect(recsOf(s2, runA, "session.task_undo", "session.task_closed")).toEqual([]);
-      return { ex, s2, runA };
+      return { ex, s2, runA, finishUndo: g.finishUndo };
     };
 
     it("while recover watches an old executor's undo, the session is not idle: end_if_idle is refused (recovering) and it does not exit", async () => {
-      const { ex, s2, runA } = await reopenedDuringUndo();
+      const { ex, s2, runA, finishUndo } = await reopenedDuringUndo();
       s2.send({ type: "end_if_idle", client_id: "i1" });
       expect(s2.kinds("session.error").at(-1)).toMatchObject({ code: "not_idle", control: "end_if_idle", why: ["recovering"], client_id: "i1" });
       await new Promise((r) => setTimeout(r, 300));
       expect(s2.exited()).toBe(false);
+      finishUndo();
       await waitFor(() => recsOf(s2, runA, "session.task_closed").length === 1, 10_000);
       await waitFor(() => !groupUp(ex.pgids[0]!));
       s2.send({ type: "end_if_idle", client_id: "i2" });
@@ -1719,15 +1726,17 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
     }, 20_000);
 
     it("while an undo asked for has no outcome recorded, the model reads it as undoing (not open: never offered again, no result promised)", async () => {
-      const { s2, runA } = await reopenedDuringUndo();
+      const { s2, runA, finishUndo } = await reopenedDuringUndo();
       const view = () => JSON.parse(s2.h.log.messages().find((m) => m.msg_id === `end_${runA}`)!.text).undo;
       expect(view()).toBe("undoing");
+      finishUndo();
       await waitFor(() => recsOf(s2, runA, "session.task_undo").length === 1, 10_000);
       expect(view()).toBe("undone 1/1");
     }, 20_000);
 
     it("reopened while an undo left open still runs: recover waits, then watches it without cutting it (the model may speak meanwhile), and records its real result before the closure, once", async () => {
-      const ex = realExec({ undoMs: 3000 });
+      const g = gate();
+      const ex = realExec({ undoGate: g.file });
       const s = session({ model: [{ text: "好" }], launch: ex.launch, exitWaitMs: 300 });
       s.send({ type: "cua", text: "第一件" });
       await waitFor(() => doneRuns(s.evs).length === 1 && !s.h.busy);
@@ -1742,6 +1751,8 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       expect(groupUp(ex.pgids[0]!)).toBe(true);
       s2.send({ type: "say", text: "在吗" });                                          // recover's wait is over: the model speaks
       await waitFor(() => s2.stored().some((e: any) => e.kind === "session.message" && e.role === "assistant"));
+      expect(recsOf(s2, runA, "session.task_undo", "session.task_closed")).toEqual([]);   // still under way, still watched
+      g.finishUndo();
       await waitFor(() => recsOf(s2, runA, "session.task_closed").length === 1, 10_000);
       const recs = recsOf(s2, runA, "session.task_undo", "session.task_closed");
       expect(recs.map((e: any) => e.kind)).toEqual(["session.task_undo", "session.task_closed"]);
