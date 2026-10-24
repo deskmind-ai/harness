@@ -210,7 +210,7 @@ export class ExecutorService {
   /** The app's stop: the executor refuses every later action, an open card is left unanswered, the task ends stopped.
    *  `as`: the status when the stop is not the user's (the runtime process died: "failed"); `cause`: the stop's cause when
    *  the caller knows it (the app's stop: user_stopped). */
-  stop(why = "stopped", as: TaskStatus = "stopped", cause?: StopCause) { this.o.executor.stop(); if (!this.status) { this.status = as; this.reason = why; this.cause = cause; } this.stopped.abort(); this.expiredWait?.(null); }
+  stop(why = "stopped", as: TaskStatus = "stopped", cause?: StopCause) { this.o.executor.stop(); if (!this.status) { this.status = as; this.reason = why; this.cause = cause; } this.stopped.abort(); this.openCard?.abort("ended"); this.expiredWait?.(null); }
 
   /** 「现在回答」 on an expired action card (the protocol's reask): the step it belonged to is tried again on the screen
    *  as it is now — the same screen asks again on a new card, a moved one sends the caller back to look. Nothing to
