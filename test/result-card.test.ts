@@ -837,3 +837,91 @@ describe("H2 round 4: a stop while the result card waits closes it and its undo,
     expect(r.file).toBe(false);
   });
 });
+
+describe("H2 round 5: the result card's state is decided once, in the session; the executor follows", () => {
+  /** A stopped task that wrote a.txt: its result card (with undo) open in the session. */
+  async function openCard() {
+    const clock = new FakeClock();
+    const s = session({ clock, scripts: [() => CREATE_THEN_ASK()], onAsk: (e, send) => setTimeout(() => send({ type: "stop", run_id: e.run_id }), 1) });
+    s.send({ type: "cua", text: "新建 a.txt" });
+    await waitFor(() => s.of("session.task_end").length === 1);
+    const run = s.of("task_done")[0].run_id as string;
+    expect(s.of("session.task_end")[0]).toMatchObject({ status: "stopped", undo: "open" });
+    return { s, run, file: () => fs.existsSync(path.join(s.desks[0]!.scope, "a.txt")), clock };
+  }
+  const UNDO = 1;
+
+  it("open + stop → closed(stopped): nothing recorded as a respond; the executor's wait ends and it exits", async () => {
+    const { s, run, file } = await openCard();
+    s.send({ type: "stop", run_id: run });
+    await waitFor(() => s.of("session.task_closed", run).length === 1);
+    expect(s.of("session.task_respond")).toEqual([]);
+    expect(s.of("session.task_undo")).toEqual([]);
+    expect(file()).toBe(true);
+  });
+
+  it("open + respond(undo) → undoing: task_respond recorded, the undo runs and is recorded", async () => {
+    const { s, run, file } = await openCard();
+    s.send({ type: "respond", run_id: run, option: UNDO });
+    await waitFor(() => s.of("session.task_undo", run).length === 1);
+    expect(s.of("session.task_respond", run)).toHaveLength(1);
+    expect(s.of("session.task_undo", run)[0]).toMatchObject({ undone: 1, total: 1, refused: null });
+    expect(s.of("session.task_undo", run)[0]).not.toHaveProperty("unknown");
+    expect(file()).toBe(false);
+  });
+
+  it("closed(stopped) + respond at once (the same moment as the stop): refused; no task_respond, no undo record, no undo", async () => {
+    const { s, run, file } = await openCard();
+    s.send({ type: "stop", run_id: run });
+    s.send({ type: "respond", run_id: run, option: UNDO });
+    expect(s.of("session.error").find((e) => e.control === "respond")).toMatchObject({ code: "undo_expired" });
+    await waitFor(() => s.of("session.task_closed", run).length === 1);
+    await sleep(50);
+    expect(s.of("session.task_respond")).toEqual([]);
+    expect(s.of("session.task_undo")).toEqual([]);
+    expect(file()).toBe(true);
+  });
+
+  it("undoing + stop: the undo is not cut half way — it finishes and is recorded", async () => {
+    const { s, run, file } = await openCard();
+    s.send({ type: "respond", run_id: run, option: UNDO });
+    s.send({ type: "stop", run_id: run });
+    await waitFor(() => s.of("session.task_undo", run).length === 1);
+    expect(s.of("session.task_undo", run)[0]).toMatchObject({ undone: 1, total: 1, refused: null });
+    expect(file()).toBe(false);
+  });
+
+  it("undoing, and the executor dies before the undo's outcome: recorded unknown (the one case it is)", async () => {
+    // an executor that says task_done with an undo card, takes the respond, and dies without result_response
+    let die!: (x: { code: number | null; signal: string | null }) => void;
+    const launch: Launcher = (_req, lo) => {
+      let cb: ((l: string) => void) | null = null;
+      const exited = new Promise<{ code: number | null; signal: string | null }>((r) => { die = r; });
+      return {
+        start: () => setTimeout(() => cb?.(JSON.stringify({ seq: 1, t: Date.now() / 1000, run_id: lo.runId, kind: "task_done", status: "succeeded", summary: "ok", reason: "", result_card: { kind: "result", text: "做了", options: [{ kind: "approve", text: "好的" }, { kind: "undo", text: "撤回" }], free_text: false, blocking: false } })), 5),
+        write: (l) => { if (JSON.parse(l).type === "respond") setTimeout(() => die({ code: 1, signal: null }), 5); },
+        close: () => {}, onLine: (f) => { cb = f; }, exited,
+      };
+    };
+    const evs: any[] = [];
+    const h = new SessionHost({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-ses-")), sessionId: "ses_die", out: (e) => evs.push(e), coalesceMs: 5,
+      model: { model: MODEL, streamFn: scriptedStream([{ text: "好" }]) }, launch, linger: 600 });
+    hosts.push(h);
+    h.start();
+    h.handle(JSON.stringify({ type: "cua", text: "新建 a.txt" }));
+    await waitFor(() => evs.some((e) => e.kind === "session.task_end"));
+    const run = evs.find((e) => e.kind === "task_done").run_id;
+    h.handle(JSON.stringify({ type: "respond", run_id: run, option: 1 }));
+    await waitFor(() => evs.some((e) => e.kind === "session.task_undo"));
+    expect(evs.find((e) => e.kind === "session.task_undo")).toMatchObject({ unknown: true });
+  });
+
+  it("closed(expired) + respond → refused undo_expired, nothing recorded", async () => {
+    const { s, run, clock, file } = await openCard();
+    clock.sleep(11 * 60_000);
+    s.send({ type: "respond", run_id: run, option: UNDO });
+    expect(s.of("session.error").find((e) => e.control === "respond")).toMatchObject({ code: "undo_expired" });
+    expect(s.of("session.task_respond")).toEqual([]);
+    expect(file()).toBe(true);
+  });
+});
