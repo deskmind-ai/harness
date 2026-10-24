@@ -33,6 +33,7 @@ import { defaultJudge } from "./judge.js";
 import { T, type Lang } from "./text.js";
 import { NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "./types.js";
 import type { StopCause } from "../protocol/computer.js";
+import { WALL_CLOCK, atWallTime, type Clock } from "./clock.js";
 
 /** The tutorials a task may read: candidates by structure (never the request's words), and one read in full. */
 export interface SkillSource { candidates(raw: string): { name: string; description: string }[]; read(name: string): string | null }
@@ -56,7 +57,16 @@ export interface ServiceOptions {
   lang?: Lang;
   /** The user's standing rules (rule-tier consent tokens the app signed), handed to the executor at begin. */
   rules?: ConsentToken[];
+  /** How long a card asking consent for one action stays open, by the wall clock (ms; the app's run: CARD_EXPIRY_MS).
+   *  Absent: it waits for its answer however long (the evaluation's simulated user, tests). */
+  cardExpiryMs?: number;
+  /** The clock the expiry reads (tests: a fake one). Default: the wall clock and the process's timers. */
+  clock?: Clock;
 }
+
+/** An action card left unanswered this long, by the wall clock (executor/clock.ts), is voided (owner 10-24, M2 H1):
+ *  the screen may have moved since it was shown, and a yes has to be to what is there now. */
+export const CARD_EXPIRY_MS = 10 * 60_000;
 
 const LOOK_ONLY = "the task is done as far as actions go; only look for evidence (computer_snapshot, computer_observe, reading files), or finish unconfirmed";
 const J = (x: unknown) => JSON.stringify(x);
@@ -95,8 +105,9 @@ export function placeOf(rect: [number, number, number, number] | undefined, fram
 }
 
 /** A card's outcome: the option picked (or the user's own words), nothing (no answer: stopped, the app went away), or
- *  voided (the user changed the request while it was open). */
+ *  voided (the user changed the request while it was open). An action card can also have expired (`Expiring`). */
 type Got = { option: CardOption | null; text: string } | null | "voided";
+type Expiring = Got | "expired";
 
 export class ExecutorService {
   readonly counters: Record<string, number> = {};
@@ -140,6 +151,12 @@ export class ExecutorService {
   /** A reply carried a steer: every further step the caller decided before hearing it (the rest of the model's turn)
    *  comes back undone too, until the caller asks for steers again (`steers`, between turns). */
   private reDecide = false;
+  /** An action card expired: the task waits in place for the user — 「现在回答」 (reask), a steer, or a stop. */
+  private expiredWait: ((how: "reask" | "steer" | null) => void) | null = null;
+  /** The open action card's expiry check (true: it is past its deadline, and is expired by asking), while one is open. */
+  private expireOpen: (() => boolean) | null = null;
+  /** A reask that came for a card past its deadline the tick had not expired yet: taken as soon as it has. */
+  private reaskWaiting = false;
   private readonly t: ReturnType<typeof T>;
 
   /** The options, without the signer and the card asker: those are private fields, out of reach of anything that
@@ -192,7 +209,20 @@ export class ExecutorService {
   /** The app's stop: the executor refuses every later action, an open card is left unanswered, the task ends stopped.
    *  `as`: the status when the stop is not the user's (the runtime process died: "failed"); `cause`: the stop's cause when
    *  the caller knows it (the app's stop: user_stopped). */
-  stop(why = "stopped", as: TaskStatus = "stopped", cause?: StopCause) { this.o.executor.stop(); if (!this.status) { this.status = as; this.reason = why; this.cause = cause; } this.stopped.abort(); }
+  stop(why = "stopped", as: TaskStatus = "stopped", cause?: StopCause) { this.o.executor.stop(); if (!this.status) { this.status = as; this.reason = why; this.cause = cause; } this.stopped.abort(); this.openCard?.abort("ended"); this.expiredWait?.(null); }
+
+  /** 「现在回答」 on an expired action card (the protocol's reask): the step it belonged to is tried again on the screen
+   *  as it is now — the same screen asks again on a new card, a moved one sends the caller back to look. Nothing to
+   *  reask (no card expired, or the task is over): said, nothing else happens. */
+  reask() {
+    // the card is past its deadline but the tick has not run (the second after waking): it expires now, and this reask
+    // is the user's answer to that
+    if (!this.expiredWait && this.expireOpen?.()) { this.reaskWaiting = true; this.count("reasks"); this.emit("card.reask", { expired_now: true }); return; }
+    if (!this.expiredWait) { this.emit("reask.refused", { why: this.status || this.executorEnded ? "the task already finished" : "no card has expired" }); return; }
+    this.count("reasks");
+    this.emit("card.reask", {});
+    this.expiredWait("reask");
+  }
 
   /** The user changed what they want mid-run (the protocol's steer). Nothing changes mid-step: the words wait until the
    *  step in progress is over (`applySteers`). A card open now is voided at once — its answer was for the old words —
@@ -204,6 +234,7 @@ export class ExecutorService {
     this.count("steers");
     this.emit("steer", { raw });
     this.openCard?.abort();
+    this.expiredWait?.("steer");
   }
 
   /** Between steps: the pending steers become the request (the judges then read the new words beside the earlier ones);
@@ -264,15 +295,21 @@ export class ExecutorService {
 
   // --- cards -----------------------------------------------------------------------------------------------------------
   /** A card, waiting for the user (its span: the wait in the call chain, and how it was answered). */
-  private askCard(card: Card): Promise<Got> {
+  private askCard(card: Card): Promise<Got> { return this.askCardSpan(card, false) as Promise<Got>; }
+
+  /** A card that may expire: one asking consent for one action (owner 10-24: only those; a plan, a question, a choice
+   *  and the reconciliation card wait however long). */
+  private askExpiring(card: Card): Promise<Expiring> { return this.askCardSpan(card, true); }
+
+  private askCardSpan(card: Card, expires: boolean): Promise<Expiring> {
     return span("deskmind.ask_user", { "deskmind.card.kind": card.kind, "deskmind.card.blocking": card.blocking }, async (s) => {
-      const got = await this.askCardNow(card);
-      s?.set({ "deskmind.card.answer": got === "voided" ? "voided" : !got ? "none" : got.option?.kind ?? "text" });
+      const got = await this.askCardNow(card, expires);
+      s?.set({ "deskmind.card.answer": got === "voided" || got === "expired" ? got : !got ? "none" : got.option?.kind ?? "text" });
       return got;
     });
   }
 
-  private async askCardNow(card: Card): Promise<Got> {
+  private async askCardNow(card: Card, expires: boolean): Promise<Expiring> {
     // a steer that came before the card was shown: its answer would be to the old words
     if (this.pending.length) return "voided";
     this.count("cards"); this.count(`cards:${card.kind}`);
@@ -281,25 +318,66 @@ export class ExecutorService {
     if (stop.aborted) return null;
     const open = new AbortController();
     this.openCard = open;
+    // the deadline, by the wall clock: a Mac that slept past it expires the card within a second of waking (its timers
+    // stood still meanwhile). It voids the card like a steer, with the reason "timeout"
+    const ms = expires ? this.o.cardExpiryMs : undefined;
+    const clock = this.o.clock ?? WALL_CLOCK;
+    const deadline = ms !== undefined && ms >= 0 ? clock.now() + ms : null;
+    const cancel = deadline !== null ? atWallTime(clock, deadline, () => open.abort("timeout")) : () => {};
+    // the tick alone is not enough: the Mac's timers stand still in sleep, and an answer (or a reask) can arrive in the
+    // second after waking, before the tick has run (review of #67). Whatever arrives for the card asks this first: past
+    // the deadline, the card expires now, and what arrived is not its answer
+    // (asked by the asker as an answer arrives, it decides that answer: live, it is taken — not undone by a check a
+    // moment later, after the app was told it was answered)
+    let askerChecked = false;
+    const check = (): boolean => {
+      if (deadline !== null && !open.signal.aborted && clock.now() >= deadline) open.abort("timeout");
+      return open.signal.aborted && open.signal.reason === "timeout";
+    };
+    const expired = (): boolean => { const gone = check(); if (!gone) askerChecked = true; return gone; };
+    this.expireOpen = check;
     try {
       // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16); a steer
-      // voids it (the asker is told through the signal, and lets the app know)
-      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal }));
+      // voids it (the asker is told through the signal, and lets the app know). `expired`: the asker asks it before it
+      // takes an answer
+      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal, ...(deadline !== null ? { expired } : {}) }));
       p.catch(() => undefined);
       const a = await Promise.race([p,
         new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true })),
-        new Promise<"voided">((r) => open.signal.addEventListener("abort", () => r("voided"), { once: true }))]);
-      if (a === "voided") { this.emit("card.voided", { kind: card.kind, why: "steer" }); return "voided"; }
+        new Promise<"voided">((r) => { if (open.signal.aborted) r("voided"); else open.signal.addEventListener("abort", () => r("voided"), { once: true }); })]);
+      // (the asker may let go of the card in the same moment as the signal fires, and hand back "nothing" first: the
+      // signal decides — a voided card is voided, whichever promise settled first)
+      if (a === "voided" || (a === null && open.signal.aborted && !stop.aborted)) {
+        const why = open.signal.reason === "timeout" ? "timeout" : "steer";
+        this.emit("card.voided", { kind: card.kind, why });
+        return why === "timeout" ? "expired" : "voided";
+      }
       if (a === null) return null;
+      // an asker that does not ask `expired` itself (not the app's): an answer it hands over past the deadline is not used
+      if (!askerChecked && expired()) { this.emit("card.voided", { kind: card.kind, why: "timeout", late_answer: true }); return "expired"; }
       if ("option" in a) { const o = card.options[a.option]; return o ? { option: o, text: o.text } : null; }
       return { option: null, text: a.text };
-    } finally { if (this.openCard === open) this.openCard = null; }
+    } finally { cancel(); if (this.openCard === open) this.openCard = null; if (this.expireOpen === check) this.expireOpen = null; }
+  }
+
+  /** After an action card expired: the task stays where it is, acting on nothing, until the user taps 「现在回答」
+   *  (reask), changes the request (steer) or stops it (null). The computer stays the task's meanwhile. */
+  private afterExpiry(): Promise<"reask" | "steer" | null> {
+    const reasked = this.reaskWaiting;
+    this.reaskWaiting = false;
+    if (this.pending.length) return Promise.resolve("steer");
+    if (reasked && !this.stopped.signal.aborted) return Promise.resolve("reask");
+    if (this.stopped.signal.aborted) return Promise.resolve(null);
+    this.emit("card.expired_wait", {});
+    return new Promise((res) => { this.expiredWait = (how) => { this.expiredWait = null; res(how); }; });
   }
 
   /** The user is asked for this one action; a yes becomes a signed, single-use token. */
-  private async consentFor(c: Challenge): Promise<ConsentToken | "declined" | "cancel" | "voided" | null> {
+  private async consentFor(c: Challenge): Promise<ConsentToken | "declined" | "cancel" | "voided" | "expired" | null> {
     const card: Card = { kind: "action", text: c.text, free_text: false, blocking: true, options: [{ kind: "approve", text: this.t.ok }, { kind: "skip_step", text: this.t.skipStep }, { kind: "cancel", text: this.t.cancel }], ...(c.facts ? { consent: c.facts } : {}) };
-    const got = await this.askCard(card);
+    const got = await this.askExpiring(card);
+    // expired: nothing was answered, nothing is signed; the caller waits for the user
+    if (got === "expired") return "expired";
     if (got === "voided") return "voided";
     this.emit("consent.asked", { object: c.object, consequence: c.consequence, picked: got?.option?.kind ?? null });
     if (!got) return null;
@@ -526,7 +604,7 @@ export class ExecutorService {
       try { r = await this.exAct({ action: a, epoch: ex.currentEpoch, consequence: p.consequence, purpose: p.purpose, consent }); }
       catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
     }
-    if (r.status === "needs_consent" && r.challenge) {
+    while (r.status === "needs_consent" && r.challenge) {
       // the user changed the request since accepting the plan, and this step is on something the plan did not name (no
       // token of it covers the object or the site): the new request goes on a new plan card, not on a card per step
       const covered = host ? !!(opening ?? this.retryTokens.get(canon(a))) : !!consent;
@@ -535,7 +613,20 @@ export class ExecutorService {
         this.emit("plan.beyond", { object: r.challenge.object, consequence: r.challenge.consequence });
         return err(`用户中途改了要求，这一步要碰的东西不在用户同意过的计划里（${r.challenge.text}）：先按新要求交一份新计划（plan），写上它。`);
       }
-      const t = await this.consentFor(r.challenge);
+      let t = await this.consentFor(r.challenge);
+      if (t === "expired") {
+        // nobody answers for the user (owner 10-24): the step waits, acting on nothing, until they come back
+        const how = await this.afterExpiry();
+        if (how === "reask") {
+          // 「现在回答」: the same action, decided on the screen the card showed, goes to the executor again without a yes.
+          // It reads the computer now: the same screen asks again (a new card, a new deadline); a screen that moved
+          // since makes it stale, and the caller is sent back to look (below) — never a yes to what the user did not see
+          try { r = await this.exAct({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent }); }
+          catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
+          continue;
+        }
+        t = how === "steer" ? "voided" : null;
+      }
       // the step's outcome is the user's answer, not the reason consent was asked
       const sid = current().step_id;
       if (sid && (t === "voided" || t === null || t === "cancel" || t === "declined")) this.answered.set(sid, t === "voided" ? "the card was voided: the user changed the request" : t === null ? "no answer from the user" : t === "cancel" ? "the user stopped the task" : "the user declined this step");
@@ -546,6 +637,7 @@ export class ExecutorService {
       try { r = await this.exAct({ action: a, epoch: r.epoch, consequence: p.consequence, purpose: p.purpose, consent: t }); }
       catch (e) { if (e instanceof Crash) { this.crash = e; this.stopped.abort(); return { text: "crash", done: true }; } throw e; }
       if (r.status === "stale") this.retryTokens.set(canon(a), t);
+      break;                                              // one card per try, as before: only an expiry asks again
     }
     if (r.status !== "stale" && r.status !== "needs_consent") this.retryTokens.delete(canon(a));
     // a stale action did nothing: the window moved on after the caller looked. It is looked at again here, so the caller

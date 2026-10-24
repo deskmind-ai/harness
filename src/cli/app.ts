@@ -31,7 +31,8 @@ import { Executor } from "../executor/executor.js";
 import { SimComputer } from "../executor/sim.js";
 import { HandsDriver } from "../executor/hands.js";
 import { SkillStore } from "../skills/agentskills.js";
-import type { SkillSource } from "../executor/service.js";
+import { CARD_EXPIRY_MS, type SkillSource } from "../executor/service.js";
+import type { Clock } from "../executor/clock.js";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ConsentToken, Driver, Snapshot } from "../executor/types.js";
@@ -42,7 +43,7 @@ import type { AgentSpec } from "../host/agent.js";
 import { runtimeMain } from "./runtime.js";
 import { sessionMain } from "./session.js";
 import { EventLog, type AppEvent, type EventBody } from "../protocol/events.js";
-import { isForeignControl, parseControl } from "../protocol/control.js";
+import { isForeignControl, parseControl, type Control } from "../protocol/control.js";
 import { PROTOCOL } from "../protocol/version.js";
 import { current as traceContext, within, type ModelCallRecord } from "../otel/context.js";
 import { Tracer, exportTrace } from "../otel/trace.js";
@@ -74,6 +75,11 @@ export class LineReader {
       // the session's stop as the app ends or leaves (app_gone) is nobody's request: no cause, as for stdin closing
       if (c?.type === "stop") { if (c.app_gone) this.stop("the app went away (the session stopped its task)"); else this.stop("stopped by the app", "user_stopped"); return; }
       if (c?.type === "steer") { if (this.steerTo) this.steerTo(c.text); else this.earlySteers.push(c.text); return; }
+      // 「现在回答」 on an expired card: at once, like a steer (nothing waits in the answer queue while a card is expired)
+      if (c?.type === "reask") { this.onReask?.(); return; }
+      // a card's answer, once a card router is there (StdioUser): routed once, as it arrives — to the open card, or
+      // refused with the reason. It never waits in the queue. (Before that, the queue holds the request line itself.)
+      if (c?.type === "answer" && this.onAnswer) { this.onAnswer(c); return; }
       // a type this version does not know (additions keep the version): not for us. Anything else waits for next():
       // the request line, an answer, or a line that is not JSON (the reader of next() says what it makes of it)
       if (!c && isForeignControl(l)) return;
@@ -81,12 +87,18 @@ export class LineReader {
     });
     // the app went away (stdin closed): every open card is answered with nothing (let go: "ended"), then whoever runs
     // the task is told (appRun: a stop)
-    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); this.onClosed?.(); });
+    rl.on("close", () => { this.closed = true; for (const w of this.waiting.splice(0)) w(""); this.onClosed?.(); this.onEnd?.("ended"); });
   }
   closed = false;
   onClosed: (() => void) | null = null;
   stopped = false;
   onStop: ((why: string, cause?: StopCause) => void) | null = null;
+  onReask: (() => void) | null = null;
+  /** Every answer line, as it arrives (StdioUser's router): it decides each one's outcome there and then. */
+  onAnswer: ((a: Extract<Control, { type: "answer" }>) => void) | null = null;
+  /** The task stopped ("stop") or the app went away ("ended"): told after the stop's own handlers, and again when stdin
+   *  closes (the router keeps the first). */
+  onEnd: ((why: "stop" | "ended") => void) | null = null;
   /** Steer lines go to this handler; one read before it is set (the request and a steer in the same stdin batch) waits
    *  and is handed over when it is set, never dropped. */
   get onSteer(): ((text: string) => void) | null { return this.steerTo; }
@@ -99,7 +111,20 @@ export class LineReader {
    *  which is a stop nobody asked for. */
   stopCause: StopCause | undefined;
   stopWhy = "";
-  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopWhy = why; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); }
+  stop(why = "stopped by the app", cause?: StopCause) {
+    if (this.stopped) return;
+    this.stopped = true; this.stopWhy = why; this.stopCause = cause;
+    // the open card first, with the stop's own reason (stop / ended), then whoever runs the task
+    this.onEnd?.(this.closed ? "ended" : "stop");
+    this.onStop?.(why, cause);
+    for (const w of this.waiting.splice(0)) w("");
+  }
+  /** The answer lines that came before a router was there (in the request's stdin chunk): taken out, in order. */
+  takeAnswers(): Extract<Control, { type: "answer" }>[] {
+    const out: Extract<Control, { type: "answer" }>[] = [];
+    this.queued = this.queued.filter((l) => { const c = parseControl(l); if (c?.type === "answer") { out.push(c); return false; } return true; });
+    return out;
+  }
   /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
    *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
   next(signal?: AbortSignal): Promise<string> {
@@ -116,33 +141,111 @@ export class LineReader {
   }
 }
 
-/** Every card is an `ask` event; the run waits (`waiting`) for the matching answer line, then goes on (`resumed`).
- *  An answer for another ask_id is not an answer to this card: it is dropped with a `refused` event. */
+/** Every card is an `ask` event; the run waits (`waiting`) for its answer, then goes on (`resumed`).
+ *
+ *  Replies are routed once, as each line arrives, by one function (`route`) against one registry of cards (review of
+ *  #67: the 2nd bug of "every reply gets exactly one outcome", redesigned). A reply goes to the card that is open now
+ *  — taken there and then, so a second one for it finds it answered — or is refused at once with the reason from the
+ *  registry: that card closed (expired, voided by a steer, stopped, the app gone, answered), no such card is open, it
+ *  names no card after a void, the task stopped or ended. Replies never wait in a queue, and no wait reads stdin: an
+ *  open card is closed by its signal (steer, timeout), the task's stop or stdin's end, and the router stays on after
+ *  the task — late replies are refused, never dropped. */
 export class StdioUser implements RuntimeUser {
-  constructor(private readonly log: EventLog, private readonly input: LineReader) {}
-  /** A card of this run was voided (steer): from then on an answer must name its card (ask_id). */
+  constructor(private readonly log: EventLog, private readonly input: LineReader) {
+    input.onAnswer = (a) => this.route(a);
+    input.onEnd = (why) => this.end(why);
+    // answers read before this router existed (with the request, in one chunk): routed now — no card is open yet
+    for (const a of input.takeAnswers()) this.route(a);
+    if (input.stopped || input.closed) this.end(input.closed ? "ended" : "stop");
+  }
+  /** A card of this run was voided (steer, timeout): from then on an answer must name its card (ask_id). */
   private voided = false;
-  async ask(card: Card, o: { signal?: AbortSignal } = {}): Promise<Answer | null> {
-    const ask_id = `ask_${randomUUID().slice(0, 8)}`;
-    this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
-    this.log.emit({ kind: "waiting", ask_id });
-    for (;;) {
-      const line = await this.input.next(o.signal);
-      // the user changed the request while the card was open (steer): the card is let go, and the app is told to close it
-      if (o.signal?.aborted) { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: "steer" }); this.log.emit({ kind: "ask_void", ask_id, why: "steer" }); return null; }
-      // the app is gone or stopped the task: no answer, the run ends honestly; the card is let go, said so
-      // (stdin closing also stops the run now, right after: the card went because the app went — "ended")
-      if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.closed ? "ended" : "stop" }); return null; }
-      const a = parseControl(line);
-      if (a?.type !== "answer") continue;
-      if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
-      // once a card was voided, an answer that names no card may be the late answer to that one: it answers nothing
-      if (a.ask_id === undefined && this.voided) { this.log.emit({ kind: "refused", what: "an answer without ask_id", why: `a card was voided; the open card is ${ask_id}`, by: "executor" }); continue; }
-      this.log.emit({ kind: "resumed", ask_id });
-      if (typeof a.option === "number" && a.option >= 0 && a.option < card.options.length) return { option: a.option };
-      if (typeof a.text === "string" && a.text.trim()) return { text: a.text };
-      return null;
+  /** The cards no longer open, and how they closed: timeout, steer, stop, ended, answered. */
+  private readonly closed = new Map<string, string>();
+  /** The card open now: its id, what checks its deadline, and how it is answered or let go. */
+  private open: { id: string; card: Card; expired?: () => boolean; settle: (a: Answer | null) => void } | null = null;
+  /** The task stopped ("stop"), the app went away ("ended"), or the task is over ("done"): every reply is refused. */
+  private over: "stop" | "ended" | "done" | null = null;
+
+  private refuse(a: { ask_id?: string }, why: string) {
+    const what = a.ask_id !== undefined ? `answer for ${a.ask_id}` : "an answer without ask_id";
+    const card = a.ask_id ?? "a card";
+    const text = why === "timeout" ? `card ${card} expired before it was answered (nobody answers for the user): reask asks it again`
+      : why === "answered" ? `card ${card} was answered already`
+      : why === "stop" ? `the task was stopped; card ${card} is closed`
+      : why === "ended" ? `the app went away; card ${card} is closed`
+      : why === "done" ? `the task is over; card ${card} is closed`
+      : why === "unnamed" ? `a card was voided: an answer must name its card${this.open ? `; the open card is ${this.open.id}` : ""}`
+      : why === "none" ? (a.ask_id !== undefined ? `no card ${card} is open${this.open ? `; the open card is ${this.open.id}` : ""}` : "it names no card, and none is open")
+      : `card ${card} was voided (${why})`;
+    this.log.emit({ kind: "refused", what, why: text, by: "executor" });
+  }
+
+  /** One reply's one outcome, decided now. */
+  private route(a: Extract<Control, { type: "answer" }>) {
+    // a card past its deadline expires first (the tick may not have run: the second after waking — review of #67);
+    // its signal's handler closes it here and now
+    this.open?.expired?.();
+    const o = this.open;
+    if (o && (a.ask_id === o.id || (a.ask_id === undefined && !this.voided))) {
+      this.closeOpen("answered");
+      this.log.emit({ kind: "resumed", ask_id: o.id });
+      if (typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length) return o.settle({ option: a.option });
+      if (typeof a.text === "string" && a.text.trim()) return o.settle({ text: a.text });
+      return o.settle(null);
     }
+    const why = a.ask_id !== undefined ? this.closed.get(a.ask_id) ?? this.over ?? "none" : this.over ?? (this.voided ? "unnamed" : "none");
+    this.refuse(a, why);
+  }
+
+  private closeOpen(why: string) { if (this.open) { this.closed.set(this.open.id, why); this.open = null; } }
+
+  /** The task stopped or the app went away: the open card is let go (said so); from now on every reply is refused. */
+  private end(why: "stop" | "ended" | "done") {
+    if (!this.over) this.over = why;
+    const o = this.open;
+    if (!o) return;
+    // any end of the task closes the open card, said so (a task that ends otherwise than by a stop: "ended")
+    this.closeOpen(why);
+    this.log.emit({ kind: "ask_void", ask_id: o.id, why: why === "done" ? "ended" : why });
+    o.settle(null);
+  }
+
+  /** The task is over (task_done): replies after it are refused as such. */
+  taskOver() { this.end("done"); }
+
+  ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
+    const ask_id = `ask_${randomUUID().slice(0, 8)}`;
+    // registered (the open record, its settle, its signal; the deadline is the service's, set before this call) BEFORE
+    // anything announces it: the app may answer inside the very `ask` it is handed (an in-process sink, a synchronous
+    // stdin) — review of #67. Closing goes the other way: unregistered first, then said (ask_void / resumed)
+    let settle!: (x: Answer | null) => void;
+    const p = new Promise<Answer | null>((resolve) => {
+      let settled = false;
+      settle = (x) => { if (settled) return; settled = true; o.signal?.removeEventListener("abort", voided); resolve(x); };
+    });
+    // the user changed the request (steer), nobody answered in time (timeout), or the task ended under it ("ended":
+    // the runtime died, the executor failed): the card is let go, the app told
+    const voided = () => {
+      if (this.open?.id !== ask_id) return;
+      const reason = o.signal!.reason;
+      const why = reason === "ended" ? "ended" : reason === "timeout" ? "timeout" : "steer";
+      this.closeOpen(why);
+      if (why === "ended") this.log.emit({ kind: "ask_void", ask_id, why: "ended" });
+      else { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why }); }
+      settle(null);
+    };
+    this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), settle };
+    o.signal?.addEventListener("abort", voided, { once: true });
+    this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
+    // (answered or let go inside its own announcement: nothing more is said of it)
+    if (this.open?.id !== ask_id) return p;
+    this.log.emit({ kind: "waiting", ask_id });
+    if (this.open?.id !== ask_id) return p;
+    // stopped or gone before it was shown, or already voided: let go at once
+    if (this.over === "stop" || this.over === "ended") this.end(this.over);
+    else if (o.signal?.aborted) voided();
+    return p;
   }
 }
 
@@ -177,6 +280,8 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
         tiers: (body.tiers as never) ?? [], ...(body.shadow ? { shadow: body.shadow as never } : {}), ...(body.step_id ? { step_id: s(body.step_id) } : {}), ...(typeof body.ms === "number" ? { ms: body.ms } : {}) }; }
     // the user's words came after the task was over: said, not dropped
     case "steer.refused": return { kind: "refused", what: `steer: ${s(body.raw)}`, why: s(body.why), by: "executor" };
+    // 「现在回答」 with no card expired (or after the task): said, nothing happens
+    case "reask.refused": return { kind: "refused", what: "reask", why: s(body.why), by: "executor" };
     default: return null;
   }
 }
@@ -235,7 +340,7 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
  *  `inject` (tests): a driver, a gateway, a model in place of the config's. */
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number;
   signals?: { onSignal: (h: (sig: string) => void) => void; exit: () => void; exitNow: () => void; deadlineMs?: number; waitMs?: number };
-  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"] } }) {
+  inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"]; cardExpiryMs?: number; clock?: Clock } }) {
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
@@ -275,8 +380,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // provenance judge, anchored on raw — a run never starts with nothing read when the request was written by a model
   if (typeof req.context === "string" && req.context.trim()) executor.noteTakenIn("the chat model's restatement (request.context)", req.context);
   log.emit({ kind: "preparing" });
+  // the cards' replies: routed as they arrive, from here until the process exits (before and after task_done)
+  const user = new StdioUser(log, o.input);
   const rt = new FrontierRuntime({
-    task: runId, raw: req.raw, ...(typeof req.context === "string" && req.context.trim() ? { context: req.context } : {}), executor, signer, user: new StdioUser(log, o.input), gateway: gw,
+    task: runId, raw: req.raw, ...(typeof req.context === "string" && req.context.trim() ? { context: req.context } : {}), executor, signer, user, gateway: gw,
     // the agent loop: its own process (P2), its own files beside the run's; a model handed in (tests) runs in this one
     ...(o.inject?.model ? { model: o.inject.model } : {}),
     agent: { model: o.inject?.agent ?? table.goal.model, log: path.join(o.runs, runId, "runtime.jsonl"), stderr: path.join(o.runs, runId, "runtime.log") },
@@ -286,6 +393,8 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     // and the old engine used ~20 actions on the music sample; the evaluation keeps the default budget
     budget: req.driver === "hands" ? { tool_calls: 90, turns: 60 } : {},
     onEvent: send,
+    // an action card nobody answers is voided after 10 minutes by the wall clock; the task then waits for the user
+    cardExpiryMs: o.inject?.cardExpiryMs ?? CARD_EXPIRY_MS, ...(o.inject?.clock ? { clock: o.inject.clock } : {}),
   });
   // one stop for the run, whoever asks (a stop line, a signal): one refused event, the first asker's reason
   let stopReason = "";
@@ -303,10 +412,13 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // it was and every change), voids an open card, and asks for a new plan card when the new words go beyond the plan
   // (after the task is over — a verdict passed, a stop, the result card's linger — the executor refuses them: a refused event)
   o.input.onSteer = (text) => { trace("control.steer", { text }); if (text.trim()) rt.steer(text); };
+  // 「现在回答」 on an expired action card: the executor asks it again on the screen as it is now (after the task is
+  // over it is refused, in the trace only: nothing but a late steer's refusal follows task_done)
+  o.input.onReask = () => { trace("control.reask", {}); rt.reask(); };
   // one task_done per run: a signal's deadline may write it before the runtime returns
   let signals = 0, ended = () => {};
   const whenDone = new Promise<void>((res) => { ended = res; });
-  const taskDone = (body: EventBody) => { if (done) return; done = true; log.emit(body); ended(); };
+  const taskDone = (body: EventBody) => { if (done) return; done = true; user.taskOver(); log.emit(body); ended(); };
   // the run did not end by itself in time: an action still out at the driver may land after this, so the stop is not
   // called clean — the action is listed as unconfirmed and the reason says its result is unknown
   const forceDone = () => {
