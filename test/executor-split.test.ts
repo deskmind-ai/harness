@@ -96,7 +96,9 @@ describe("the runtime as a child process", () => {
     await inproc.done;
     const done = child.events.find((e) => e.kind === "task_done") as any;
     expect(done).toMatchObject({ status: "succeeded" });
-    expect(done.result_card?.options.map((x: any) => x.kind)).toContain("undo");
+    // (--linger 0: nothing waits to carry an undo out, so the card offers none and says why — M2 H2, review of #68)
+    expect(done.result_card?.options.map((x: any) => x.kind)).toEqual(["approve"]);
+    expect(done.result_card?.text).toContain("这次运行结束后不再等回答，撤回用不了");
     // additive only: the stream the app reads is the in-process one
     expect(shape(child.events)).toEqual(shape(inproc.events));
     expect(child.events.filter((e) => e.kind === "step")).toHaveLength(1);

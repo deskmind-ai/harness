@@ -30,6 +30,7 @@ import { Executor, appName, cardText, describeAction, elementName, stepText, win
 import { current, within } from "../otel/context.js";
 import { span } from "../otel/trace.js";
 import { defaultJudge } from "./judge.js";
+import { stepLines } from "./possibly.js";
 import { T, type Lang } from "./text.js";
 import { NEEDS_CONSENT, higher, rank, type Action, type ActResult, type Challenge, type Consequence, type ConsentToken, type Reading, type Snapshot } from "./types.js";
 import type { StopCause } from "../protocol/computer.js";
@@ -489,7 +490,12 @@ export class ExecutorService {
    *  cards, the driver — runs with the step's id in the context, so the trace names it. A step asked for while a steer is
    *  pending, or one the schema allows but its kind does not, is no step: it is not tried. */
   /** The executor's act; its result is the step's latest outcome (step.end). */
-  private async exAct(req: Parameters<Executor["act"]>[0]): Promise<ActResult> { const r = await this.o.executor.act(req); const id = current().step_id; if (id) this.results.set(id, r); return r; }
+  private async exAct(req: Parameters<Executor["act"]>[0]): Promise<ActResult> {
+    const r = await this.o.executor.act(req); const id = current().step_id;
+    // a step that tries more than once (a consent card, a reask, a reconciliation): possibly done if any try was
+    if (id) { const prev = this.results.get(id); this.results.set(id, prev?.possibly_done !== false && prev && r.possibly_done === false ? { ...r, possibly_done: true } : r); }
+    return r;
+  }
 
   private async step(a: Action, p: { purpose: string; consequence?: Consequence; epoch?: number; plan_step?: number }, body: () => Promise<ToolReply>): Promise<ToolReply> {
     const s = this.steered(); if (s) return s;
@@ -515,7 +521,8 @@ export class ExecutorService {
       this.results.delete(step_id); this.answered.delete(step_id);
       const status = !r ? (reply.isError ? "refused" : "ok") : r.status === "ok" || r.status === "unverified" || r.status === "stale" || r.status === "error" ? r.status : "refused";
       const why = user ?? r?.why ?? (reply.isError ? reply.text.slice(0, 300) : "");
-      this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}),
+      // possibly_done (executor/possibly.ts): read off the journal by the executor; a step that never reached it did nothing
+      this.emit("step.end", { step_id, status, ...(why ? { why } : {}), ...(r ? { executor_status: r.status, consequence: r.consequence } : {}), possibly_done: r ? r.possibly_done !== false : false,
         ...(r?.shot ? { shot: r.shot, ...(r.shot_pending ? { shot_pending: true } : {}) } : {}), ...(r?.target_frame ? { target_frame: r.target_frame } : {}), ...(r?.window_frame ? { window_frame: r.window_frame } : {}) });
       if (r?.shot && r.shot_pending) this.whenShot(step_id, r.shot);
       // what the task has changed so far, after a step that changed something (the app's 改动和产出 while it runs)
@@ -665,7 +672,7 @@ export class ExecutorService {
     if (r.status === "environment") return this.endWith("environment", r.why ?? "environment", r.cause);      // the executor's cause, copied as a field
     if (r.status === "stopped") return this.endWith("stopped", r.why ?? "stopped");
     // the step's picture and where things were on screen are the app's, not the caller's
-    const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, shot_pending: _p, ...rest } = r;
+    const { after, challenge: _c, shot: _s, target_frame: _t, window_frame: _w, shot_pending: _p, possibly_done: _pd, ...rest } = r;
     if (a.kind === "file") return r.status === "ok" ? text(J({ status: "ok", output: r.output ?? {}, consequence: r.consequence })) : err(J({ status: r.status, why: r.why, consequence: r.consequence }));
     const view = { ...rest, ...(after ? { after: { epoch: after.epoch, window: withoutFrame(after.window), modal: after.modal, elements: after.elements, text: after.text } } : {}) };
     // the step check: a state change with nothing visibly changed is said so, in the result the caller reads
@@ -961,19 +968,32 @@ export class ExecutorService {
     return this.result();
   }
 
-  /** The card shown with a result that changed something: what was done, and undo when every step has one (a file
-   *  action through its capability, a window the task opened; a screen action makes the run irreversible, and the
-   *  card then says so instead of offering it). */
+  /** The card shown with a result that changed something — however the task ended (M2 H2, owner 10-24: succeeded,
+   *  failed, stopped, cancelled, unconfirmed, the screen locked; before, only a success had one, and a stopped task's
+   *  changes had no undo at all). "Changed something" has one rule (executor/possibly.ts): a step with an intent in the
+   *  journal and no receipt that says nothing happened — the executor's record, never the caller's. What was done, and undo when every step has one (a file action through its
+   *  capability, a window the task opened); a screen action, a step whose effect is not known, or one in flight makes
+   *  the run irreversible, and the card then says why instead of offering it. Whether the undo can still be answered
+   *  (the window: the executor lingering, another task, the session) is not the card's: the session's records say. */
   resultCard(): Card | null {
-    if (this.status !== "succeeded" || !this.effects.length) return null;
-    const u = this.o.executor.undoable();
+    const ex = this.o.executor;
+    // the possibly-done steps, from the journal (executor/possibly.ts): one still out at the driver among them
+    const u = ex.undoable();
+    if (!u.steps.length) return null;
+    const reversible = u.reversible;
     const options: CardOption[] = [{ kind: "approve", text: this.t.fine }];
-    if (u.reversible) options.push({ kind: "undo", text: this.t.undo });
+    if (reversible) options.push({ kind: "undo", text: this.t.undo });
     const consented = this.consents.filter((c) => c.scope !== "action" || c.consequence === "external").map((c) => c.object);
-    const rules = [...this.o.executor.consent.rulesUsed];
-    const text = [this.t.did(this.effects.slice(-6)), ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(u.reversible ? [] : [this.t.noUndo(u.steps.find((x) => !x.can)?.why ?? this.t.undoable)]),
+    const rules = [...ex.consent.rulesUsed];
+    // the steps as every card lists them (executor/possibly.ts stepLines): done, or not known — the same lines a card
+    // the session writes for this journal would have
+    const { did, unsure } = stepLines(ex.possiblySteps());
+    const why = u.steps.find((x) => !x.can)?.why ?? this.t.undoable;
+    const text = [...(this.status && this.status !== "succeeded" ? [this.t.notFinished(this.status)] : []),
+      ...(did.length ? [this.t.did(did.slice(-6))] : []), ...(unsure.length ? [this.t.didUnsure(unsure.slice(-6))] : []),
+      ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(reversible ? [] : [this.t.noUndo(why)]),
       // undo takes the run back but leaves open what a launch brought up of the user's apps: said, not implied
-      ...(u.reversible && u.steps.some((x) => x.left_open) ? [this.t.undoKeepsOpen([...new Set(u.steps.flatMap((x) => (x.left_open ? [x.left_open] : [])))])] : [])].join("\n");
+      ...(reversible && u.steps.some((x) => x.left_open) ? [this.t.undoKeepsOpen([...new Set(u.steps.flatMap((x) => (x.left_open ? [x.left_open] : [])))])] : [])].join("\n");
     return { kind: "result", text, options, free_text: false, blocking: false };
   }
 

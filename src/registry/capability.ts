@@ -27,7 +27,9 @@ export interface Footprint {
 }
 
 /** `undo` holds what the capability needs to take the action back (kept in the receipt, never shown to models). */
-export interface ExecResult { status: string; output: Record<string, unknown>; versions_after: Record<string, string>; why?: string; undo?: Record<string, unknown> }
+/** `performed: false`: the capability failed cleanly and guarantees it left nothing behind (an atomic step that did not
+ *  take place, a check that did not pass). Absent on a failure: it may have changed something. */
+export interface ExecResult { status: string; output: Record<string, unknown>; versions_after: Record<string, string>; why?: string; undo?: Record<string, unknown>; performed?: boolean }
 
 export interface Capability {
   readonly id: string;

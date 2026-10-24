@@ -27,6 +27,7 @@ import { NEEDS_CONSENT, higher, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
+import { journalSteps, parseJournal, saysNotPerformed, type JournalLine, type JournalStep } from "./possibly.js";
 import { T, type Lang } from "./text.js";
 import type { KeyObject } from "node:crypto";
 import { span } from "../otel/trace.js";
@@ -444,10 +445,18 @@ export class Executor {
     this.pixelPolicy = opts.pixelSendBinding ?? pixelSendBindingFrom(process.env.DESKMIND_PIXEL_SEND_BINDING);
   }
 
+  /** The journal's records, earlier processes' (read at recover) and this one's, whether or not a file is kept: what
+   *  "could this step have done something" is read from (possibly.ts). `ownFrom`: the first of this process's. */
+  private jlines: JournalLine[] = [];
+  private ownFrom = 0;
+
   private journal(kind: "begin" | "intent" | "receipt" | "reconcile_pending" | "reconciled", body: Record<string, unknown>) {
-    if (!this.opts.journal) return;
-    const fd = fs.openSync(this.opts.journal, "a");
-    try { fs.writeSync(fd, JSON.stringify({ t: this.opts.now?.() ?? Date.now(), kind, ...body }) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    const line = { t: this.opts.now?.() ?? Date.now(), kind, ...body };
+    if (this.opts.journal) {
+      const fd = fs.openSync(this.opts.journal, "a");
+      try { fs.writeSync(fd, JSON.stringify(line) + "\n"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    }
+    this.jlines.push(line);
   }
 
   /** On begin: the last intent of an earlier process with no receipt. A file action is reconciled from the versions
@@ -462,6 +471,9 @@ export class Executor {
     const raw = fs.readFileSync(p, "utf-8");
     if (raw && !raw.endsWith("\n")) { fs.appendFileSync(p, "\n"); this.emit("executor.journal_torn_tail", { bytes: Buffer.byteLength(raw) - Buffer.byteLength(raw.slice(0, raw.lastIndexOf("\n") + 1)) }); }
     const lines = raw.split("\n").filter(Boolean).flatMap((l) => { try { return [JSON.parse(l) as Record<string, unknown>]; } catch { return []; } });
+    // the earlier processes' records come first: their steps are this task's too (possibly.ts: earlier)
+    const whole = parseJournal(raw);
+    this.jlines = [...whole, ...this.jlines]; this.ownFrom = whole.length;
     const writesOf = (l: Record<string, unknown>): string[] => (Array.isArray(l.writes) ? (l.writes as string[]) : Object.keys((l.expect_after as Record<string, string> | undefined) ?? {}));
     const first = lines.find((l) => l.kind === "begin" && l.versions);
     if (first) this.firstBegin = { versions: { ...(first.versions as Record<string, string>) }, contents: { ...((first.contents as Record<string, string> | undefined) ?? {}) } };
@@ -1258,15 +1270,22 @@ export class Executor {
     // why the epoch moved, when the driver says (hands#53: the snapshot's epoch_reason — an action, the user's input and
     // to which app, a window that appeared, vanished or was renamed), for a stale result's trace; older drivers say nothing
     let epochWhy: unknown;
+    // the journal as this act begins: whether it could have done something is read off what it wrote (possibly.ts)
+    const jmark = this.jlines.length;
+    // a screen action's receipt, written with the act's final status (after the read-back), so the journal says what
+    // the result says: what a card lists as done and what undo takes back are the same (review of #68: E2)
+    let pendingReceipt: Record<string, unknown> | null = null;
     let stepConsented = false, foregroundOk = false;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
+      if (pendingReceipt) { this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...pendingReceipt }); pendingReceipt = null; }
       const { consent, ...rest } = req;
       // the receipt is evidence for the verdict: what the app alone uses (the step's picture, screen frames, a card's
       // fields) is not in it
       const { shot: _s, target_frame: _t, window_frame: _w, ...kept } = r;
       const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, ...c }) => c)(kept.challenge) } : kept;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain });
+      r.possibly_done = journalSteps(this.jlines.slice(jmark)).some((x) => x.possibly);
       this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
       return r;
     };
@@ -1475,7 +1494,9 @@ export class Executor {
     } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
     finally { if (land) { this.flight = null; (land as () => void)(); } }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
-    if (consequence !== "read") this.journal("receipt", { status: r.status });
+    // the receipt goes into the journal with the act's final status (done): what the driver said is kept beside it, and
+    // its "not done" (performed: false, or a reply the protocol defines as a refusal before acting) as performed: false
+    if (consequence !== "read") pendingReceipt = { driver_status: r.status, ...(saysNotPerformed(r) ? { performed: false } : {}) };
     // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
     // send that went through took it with it
     if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
@@ -1668,7 +1689,7 @@ export class Executor {
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && cap.effect !== "observe") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
-    if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {} });
+    if (cap.effect !== "observe") this.journal("receipt", { status: r.status, versions_after: r.versions_after ?? {}, seq: this.receipts.length + 1, ...(saysNotPerformed(r) ? { performed: false } : {}) });
     if (r.status !== "ok") return { ...base, status: "error", why: r.why ?? r.status };
     if (cap.effect !== "observe") this.fileReceipts.set(this.receipts.length + 1, { cap, args: a.args, writes: fp.writes, versions_before, madeParents, exec: { status: r.status, versions_after: r.versions_after, undo: r.undo }, ...(undo_prep ? { undo_prep } : {}) });
     const gone = existed.filter((p) => !ws.exists(p));
@@ -1796,23 +1817,32 @@ export class Executor {
     };
   }
 
-  /** Which of the task's effects can be taken back, newest first, and why not: a file action through its capability's
-   *  undo (create, move, copy, append have one; a replaced text or a trashed file do not), a window the task opened by
-   *  closing it. Anything else done on screen cannot be undone. The whole run is reversible only when every step is. */
-  undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string }[] } {
-    const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string }[] = [];
-    for (const r of [...this.receipts].reverse()) {
-      if (r.result.status !== "ok" || r.result.consequence === "read") continue;
+  /** The task's possibly-done steps in journal order (possibly.ts), earlier processes' included. */
+  possiblySteps(): JournalStep[] { return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly); }
+
+  /** The task's possibly-done steps (possibly.ts: from the journal, earlier processes' included), newest first, and
+   *  whether each can be taken back: a file action through its capability's undo (create, move, copy, append have one;
+   *  a replaced text or a trashed file do not), a window the task opened by closing it — both only when the step's
+   *  outcome is known and recorded (its receipt ok). Anything else done on screen, a step whose outcome is not known (no
+   *  receipt, or not ok: an error, a capability that threw half way, a lock found after it), a step still out at the
+   *  driver, and an earlier process's step cannot be. The whole run is reversible only when every step is. */
+  undoable(): { reversible: boolean; steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] } {
+    const steps: { seq: number; text: string; can: boolean; why?: string; left_open?: string; unverified?: true }[] = [];
+    const t = T(this.opts.lang);
+    for (const s of this.possiblySteps().reverse()) {
+      const seq = typeof s.receipt?.seq === "number" ? s.receipt.seq : 0;
+      const r = seq && !s.earlier ? this.receipts.find((x) => x.seq === seq) : undefined;
+      if (s.earlier) { steps.push({ seq: 0, text: s.text, can: false, why: t.earlier, unverified: true }); continue; }
+      if (!r || r.result.status !== "ok") { steps.push({ seq, text: s.text, can: false, why: !s.receipt && this.flight ? t.inFlight : t.unsure, unverified: true }); continue; }
       const a = r.request.action;
-      const t = T(this.opts.lang);
-      if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f.cap, this.opts.lang), can: true } : { seq: r.seq, text: describeAction(a, undefined, r.result.consequence, f?.cap, this.opts.lang), can: false, why: t.noUndoFor(a.capability) }); continue; }
+      if (a.kind === "file") { const f = this.fileReceipts.get(r.seq); steps.push(f?.cap.undo ? { seq: r.seq, text: s.text, can: true } : { seq: r.seq, text: s.text, can: false, why: t.noUndoFor(a.capability) }); continue; }
       if (a.kind === "open_window") {
         // the task's own window is closed; one it brought up for the user's app is left open (it may hold their state):
         // nothing to take back there
-        steps.push(this.openedWindows.has(r.seq) ? { seq: r.seq, text: t.openWindow(a.app), can: true } : this.openedForUser.has(r.seq) ? { seq: r.seq, text: t.leftOpen(this.openedForUser.get(r.seq)!.app), can: true, left_open: this.openedForUser.get(r.seq)!.app } : { seq: r.seq, text: t.openWindow(a.app), can: false, why: t.openedInYours });
+        steps.push(this.openedWindows.has(r.seq) ? { seq: r.seq, text: s.text, can: true } : this.openedForUser.has(r.seq) ? { seq: r.seq, text: t.leftOpen(this.openedForUser.get(r.seq)!.app), can: true, left_open: this.openedForUser.get(r.seq)!.app } : { seq: r.seq, text: s.text, can: false, why: t.openedInYours });
         continue;
       }
-      steps.push({ seq: r.seq, text: describeAction(a, undefined, r.result.consequence, undefined, this.opts.lang), can: false, why: t.undoable });
+      steps.push({ seq: r.seq, text: s.text, can: false, why: t.undoable });
     }
     return { reversible: steps.every((s) => s.can), steps };
   }
