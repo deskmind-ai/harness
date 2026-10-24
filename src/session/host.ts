@@ -55,7 +55,7 @@ export type ReqId = { req_id?: string };
 
 export type SessionControl =
   | ({ type: "say"; text: string } & ClientId)
-  | { type: "stop"; run_id?: string }
+  | ({ type: "stop"; run_id?: string } & ClientId)
   | { type: "attach"; after_seq: number; run_id?: string }
   | { type: "end" }
   | ({ type: "end_if_idle" } & ClientId)
@@ -87,7 +87,7 @@ export function parseSessionControl(line: string): SessionControl | null {
   const reqId = typeof o.req_id === "string" && o.req_id && o.req_id.length <= MAX_CLIENT_ID ? { req_id: o.req_id } : {};
   switch (o.type) {
     case "say": return str("text") ? { type: "say", text: o.text as string, ...cid } : null;
-    case "stop": return { type: "stop", ...runId };
+    case "stop": return { type: "stop", ...runId, ...cid };
     case "attach": return { type: "attach", after_seq: typeof o.after_seq === "number" && Number.isFinite(o.after_seq) && o.after_seq > 0 ? Math.floor(o.after_seq) : 0, ...runId };
     case "end": return { type: "end" };
     case "end_if_idle": return { type: "end_if_idle", ...cid };
@@ -267,9 +267,16 @@ export class SessionHost {
    *  read back from session.jsonl on start, kept as new ones are stored. A say / cua / steer naming one of them is a
    *  repeat (the app sent again words whose answer it missed): it is not acted on again (sendsDuplicate). */
   private readonly taken = new Map<string, number>();
+  /** cua client_ids a stop{client_id} cancelled before any task came from them (session.cua_cancelled). */
+  private readonly cancelledCids = new Set<string>();
+  /** stop{client_id}: the answer each client_id was given (repeated stops get the same), and the stops waiting for their
+   *  task's end, by run. */
+  private readonly stopAcks = new Map<string, Record<string, unknown>>();
+  private readonly pendingStopAcks = new Map<string, string[]>();     // (one entry per stop: each gets its ack)
   private noteTaken(ev: SessionEvent) {
     const cid = (ev as { client_id?: unknown }).client_id;
     if (typeof cid !== "string" || !cid) return;
+    if (ev.kind === "session.cua_cancelled") { this.cancelledCids.add(cid); return; }
     if ((ev.kind === "session.message" && ev.role === "user") || ev.kind === "session.steer") this.taken.set(cid, ev.seq);
   }
 
@@ -430,7 +437,7 @@ export class SessionHost {
     if (!c || this.refusedNoModel(c)) return;
     switch (c.type) {
       case "say": return this.say(c.text, c.client_id);
-      case "stop": return this.stop(c.run_id);
+      case "stop": return c.client_id ? this.stopByClient(c.client_id, c.run_id) : this.stop(c.run_id);
       case "attach": return c.run_id ? this.attachRun(c.run_id, c.after_seq) : this.attach(c.after_seq);
       case "end": return this.end();
       case "end_if_idle": return this.endIfIdle(c.client_id);
@@ -664,6 +671,8 @@ export class SessionHost {
   /** `/cua <text>`: a computer task with the user's words, no model in between; then the model speaks one turn with
    *  the task's call and result in its context. */
   cua(text: string, scope?: string, cid?: string) {
+    // a stop{client_id} came for this cua before it (it overtook it): refused, nothing starts
+    if (cid && this.cancelledCids.has(cid)) return this.refuse("cancelled", this.t("这条 /cua 在开始之前就被停下了", "this /cua was stopped before it started"), "cua", cid);
     if (this.closing || !text.trim() || this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
     if (this.current || this.running || this.flows || this.recoverPending) return this.refuseBusy("cua", cid);
     let userId = "";
@@ -943,8 +952,56 @@ export class SessionHost {
    *  exiting, so a session whose history lacks one does not carry on. */
   private terminal(body: TaskEnd | TaskClosed | TaskUndo): boolean {
     if (this.halted) return false;
-    try { this.log.emit(body); return true; }
+    try { this.log.emit(body); }
     catch (e) { this.halt(`${body.kind} of ${body.run_id} could not be stored: ${errText(e)}`); return false; }
+    // every path that stores a task's end — its task_done, its executor's exit without one, the app going away and the
+    // stop not confirmed in time, recover's interrupted — goes through here: the stops waiting for it are answered
+    if (body.kind === "session.task_end") this.releaseStopAcks(body.run_id, body.status);
+    return true;
+  }
+
+  /** stop{client_id}: one confirmation per stop, `session.stop_ack{client_id, result, run_id?, status?}` (not stored).
+   *  The client_id is the cua's: its stored user message (session.message with that client_id), the task that answers
+   *  it (session.task reply_to that message). No such task (the cua not received yet, or refused): nothing is stopped,
+   *  and session.cua_cancelled is stored, so a cua with that client_id after it is refused — "none". A task still
+   *  running: stopped as by stop{run_id}, and answered once its task_end is stored (status says how it ended) —
+   *  "stopped". A task already ended: its result card, if open, closed as by stop{run_id} — "already_ended". A repeated
+   *  stop gets the same answer. `runId` too: a stop{run_id} of its own when it is another task. */
+  stopByClient(cid: string, runId?: string) {
+    const known = this.stopAcks.get(cid);
+    if (known) return this.send({ kind: "session.stop_ack", ...known });
+    const msg = this.log.events.find((e): e is Extract<SessionEvent, { kind: "session.message" }> => e.kind === "session.message" && e.role === "user" && e.client_id === cid);
+    const task = msg ? [...this.log.events].reverse().find((e) => e.kind === "session.task" && e.reply_to === msg.msg_id) as Extract<SessionEvent, { kind: "session.task" }> | undefined : undefined;
+    if (runId && runId !== task?.run_id) this.stop(runId);
+    if (!task) {
+      if (!this.cancelledCids.has(cid)) {
+        try { this.log.emit({ kind: "session.cua_cancelled", client_id: cid }); }
+        catch (e) { return this.refuse("busy", `the stop could not be stored: ${errText(e)}`, "stop", cid); }
+      }
+      return this.ack(cid, { client_id: cid, result: "none" });
+    }
+    const end = [...this.log.events].reverse().find((e) => e.kind === "session.task_end" && e.run_id === task.run_id) as TaskEnd | undefined;
+    const live = this.tasks.get(task.run_id);
+    if (end) {
+      if (live && live.state === "lingering") this.stop(task.run_id);     // its result card closes, as stop{run_id}
+      return this.ack(cid, { client_id: cid, result: "already_ended", run_id: task.run_id, status: end.status });
+    }
+    // running (or being recovered): stopped once; answered when its end is stored
+    const waiting = this.pendingStopAcks.get(task.run_id) ?? [];
+    const first = waiting.length === 0;
+    waiting.push(cid);
+    this.pendingStopAcks.set(task.run_id, waiting);
+    if (first && live && live.state !== "closed") this.stop(task.run_id);
+  }
+
+  private ack(cid: string, body: Record<string, unknown>) { this.stopAcks.set(cid, body); this.send({ kind: "session.stop_ack", ...body }); }
+
+  /** A task's end is stored (or, halting, given): every stop{client_id} waiting for it is answered. */
+  private releaseStopAcks(runId: string, status: string) {
+    const waiting = this.pendingStopAcks.get(runId);
+    if (!waiting) return;
+    this.pendingStopAcks.delete(runId);
+    for (const cid of waiting) this.ack(cid, { client_id: cid, result: "stopped", run_id: runId, status });
   }
 
   /** Fail-stop: this process stores nothing more, passes on no executor event and handles no later control line (the
@@ -971,6 +1028,8 @@ export class SessionHost {
     }
     this.running?.abort.abort();
     for (const t of open) if (!t.end) { t.end = { kind: "session.task_end", run_id: t.runId, status: "interrupted", reason: "the session stopped: its history could not be written", summary: "", undo: "none" }; t.resolve(t.end); }
+    // (an end given, not stored: the stops waiting for it are answered all the same, as interrupted)
+    for (const [runId] of [...this.pendingStopAcks]) this.releaseStopAcks(runId, "interrupted");
     void (async () => {
       await Promise.all(open.map((t) => this.letGo(t)));
       await Promise.allSettled(this.recovering);

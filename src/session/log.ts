@@ -33,7 +33,7 @@ export const MAX_ASSISTANT_CHARS = 64_000;
  *  (a control line without what it needs: a respond with no valid option index). not_idle: end_if_idle while the
  *  session is not idle (the refusal's `why` says what holds). no_model: a control that needs the model (say, cua,
  *  retry, steer, a queued entry sent now) while the session has no model (set_config null). */
-export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model"] as const;
+export const ERROR_CODES = ["no_key", "key_invalid", "network", "quota", "bad_config", "not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model", "cancelled"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 /** Codes that refuse a control line: sent without a seq, never in the history. */
 export const REFUSALS: readonly ErrorCode[] = ["not_yet", "busy", "too_long", "computer_busy", "card_open", "no_task", "undo_expired", "bad_control", "not_idle", "no_model"];
@@ -79,6 +79,9 @@ export const SessionBody = z.discriminatedUnion("kind", [
   // H2: the result card was answered (stored before the answer goes to the executor; additive). `undo`: the option is
   // the card's undo — from here until session.task_undo an undo may be under way
   // `req_id` (additive): the app's id for the respond this answers (ReqId), echoed
+  // a stop{client_id} found no task from that cua (not received yet, or refused): a cua with that client_id from here on
+  // is refused (cancelled) — stored, so it holds across a reopen and is ordered before any later cua line
+  z.object({ kind: z.literal("session.cua_cancelled"), client_id: z.string() }),
   z.object({ kind: z.literal("session.task_respond"), run_id: z.string(), option: z.number().int(), undo: z.boolean(), req_id: z.string().optional() }),
   // H2: the result card's undo was done (the executor's result_response, in fields). `unknown` (additive): recorded on
   // reopen for an undo that began and was cut off with no result_response — how much of it was done is not known
