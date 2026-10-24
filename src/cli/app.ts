@@ -459,23 +459,40 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   if (lingers) {
     const deadline = new AbortController();
     const cancel = atWallTime(clock, until, () => deadline.abort());
+    // every respond that reaches this process gets exactly one result_response (review of #68: the session and this
+    // process each read their own clock, so a respond the session forwarded a moment before undo_until can arrive
+    // after this deadline). At the deadline the card closes — said (result_card_closed{why:"expired"}), so the session
+    // stops forwarding and ends this stdin — and every respond still read is answered "expired", nothing undone,
+    // until stdin ends (at most EXPIRED_GRACE_MS, for a reader that never ends it)
+    const expired = (picked: string) => log.emit({ kind: "result_response", picked, effect: "expired: nothing was undone", ...(picked === "undo" ? { undone: 0, total: executor.undoable().steps.length, refused: "expired" } : {}) } as never);
     try {
       for (;;) {
         const line = await o.input.next(deadline.signal);
         // a stop while the card waits closes it and its undo, whatever stopped before (the task's own stop latched
         // earlier: that one ended the task, this one ends the wait); one that comes during an undo under way is read
         // only after it — an undo is never cut short (its result_response is written)
-        if (deadline.signal.aborted || line === STOP_LINE || (!line && (o.input.closed || o.input.stopped))) break;
+        if (line === STOP_LINE || (!deadline.signal.aborted && !line && (o.input.closed || o.input.stopped))) break;
+        if (deadline.signal.aborted) {
+          log.emit({ kind: "result_card_closed", why: "expired" } as never);
+          const grace = new AbortController();
+          const t = setTimeout(() => grace.abort(), EXPIRED_GRACE_MS);
+          try {
+            // (the line read as the deadline fired, then every one until stdin ends)
+            let l: string = line;
+            for (;;) {
+              const a = l ? parseControl(l) : null;
+              if (a?.type === "respond" && typeof a.option === "number") expired(card!.options[a.option]?.kind ?? "other");
+              l = await o.input.next(grace.signal);
+              if (grace.signal.aborted || l === STOP_LINE || (!l && (o.input.closed || o.input.stopped))) break;
+            }
+          } finally { clearTimeout(t); }
+          break;
+        }
         const a = parseControl(line);
         if (a?.type !== "respond" || typeof a.option !== "number") continue;
         // the deadline, asked as the answer arrives: the Mac's timers stop in sleep, and an undo sent in the second after
         // waking past it would otherwise be carried out (review of #68). Past it, nothing is undone, and that is said
-        if (clock.now() >= until) {
-          const picked = card!.options[a.option]?.kind ?? "other";
-          const why = "the undo window had ended before the answer came";
-          log.emit({ kind: "result_response", picked, effect: why, ...(picked === "undo" ? { undone: 0, total: executor.undoable().steps.length, refused: why } : {}) } as never);
-          break;
-        }
+        if (clock.now() >= until) { deadline.abort(); expired(card!.options[a.option]?.kind ?? "other"); continue; }
         const u = await rt.respond({ option: a.option });
         log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
         break;
@@ -483,6 +500,10 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
     } finally { cancel(); o.input.stopsAsLines = false; }
   }
 }
+
+/** After the result card's deadline, how long the process still reads stdin to answer responds already on their way
+ *  ("expired") before it exits, when nothing ends stdin (the session ends it as soon as it hears the card closed). */
+export const EXPIRED_GRACE_MS = 2000;
 
 /** A result card as the protocol carries it. `offerUndo` false: nothing will wait to carry an undo out, so its option is
  *  left off and the card says why. */
