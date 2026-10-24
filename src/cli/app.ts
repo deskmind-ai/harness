@@ -107,7 +107,16 @@ export class LineReader {
    *  which is a stop nobody asked for. */
   stopCause: StopCause | undefined;
   stopWhy = "";
-  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopWhy = why; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); }
+  stop(why = "stopped by the app", cause?: StopCause) { if (this.stopped) return; this.stopped = true; this.stopWhy = why; this.stopCause = cause; this.onStop?.(why, cause); for (const w of this.waiting.splice(0)) w(""); this.onStopped?.(); }
+  /** After a stop, once the waiting readers were let go: whoever owns queued lines settles them (StdioUser refuses
+   *  the answers: none is left without an outcome). */
+  onStopped: (() => void) | null = null;
+  /** Take the queued lines `pick` claims out of the queue, in order (StdioUser: answers no open card can take). */
+  takeQueued(pick: (line: string) => boolean): string[] {
+    const out: string[] = [];
+    this.queued = this.queued.filter((l) => (pick(l) ? (out.push(l), false) : true));
+    return out;
+  }
   /** The next line that waits in order (the request, an answer, a respond). `signal`: stop waiting when it fires (a
    *  card voided by a steer) — the waiter is taken out of the queue, so the next line goes to whoever waits next. */
   next(signal?: AbortSignal): Promise<string> {
@@ -130,20 +139,42 @@ export class LineReader {
  *  (`resumed{voided}`, `ask_void{why}`); an answer naming it later is refused the moment it comes, with the reason. */
 export class StdioUser implements RuntimeUser {
   constructor(private readonly log: EventLog, private readonly input: LineReader) {
+    // every reply addressed to a card gets exactly one outcome — delivered to the live card, or refused with the
+    // reason — however the lines are batched (review of #67): one naming a card no longer open is refused as it
+    // arrives; one already queued when a card closes (answered, voided, expired) or the task stops is refused then
     input.onLateAnswer = (a) => {
-      const why = a.ask_id !== undefined ? this.gone.get(a.ask_id) : undefined;
+      const why = a.ask_id !== undefined ? this.closed.get(a.ask_id) : undefined;
       if (why === undefined) return false;
-      this.refuseLate(a.ask_id!, why);
+      this.refuse(a, why);
       return true;
     };
+    input.onStopped = () => this.settleQueued("stop");
   }
   /** A card of this run was voided (steer, timeout): from then on an answer must name its card (ask_id). */
   private voided = false;
-  /** The cards let go without an answer, and why (steer, timeout): an answer naming one is refused. */
-  private readonly gone = new Map<string, string>();
-  private refuseLate(ask_id: string, why: string) {
-    this.log.emit({ kind: "refused", what: `answer for ${ask_id}`, why: why === "timeout" ? `card ${ask_id} expired before it was answered (nobody answers for the user): reask asks it again` : `card ${ask_id} was voided (${why})`, by: "executor" });
+  /** The cards no longer open, and how they closed: timeout, steer, stop, ended, answered. */
+  private readonly closed = new Map<string, string>();
+  private refuse(a: { ask_id?: string }, why: string) {
+    const what = a.ask_id !== undefined ? `answer for ${a.ask_id}` : "an answer without ask_id";
+    const card = a.ask_id ?? "a card";
+    const text = why === "timeout" ? `card ${card} expired before it was answered (nobody answers for the user): reask asks it again`
+      : why === "answered" ? `card ${card} was answered already`
+      : why === "stop" ? `the task was stopped; card ${card} is closed`
+      : why === "ended" ? `the app went away; card ${card} is closed`
+      : why === "none" ? (a.ask_id !== undefined ? `no card ${card} is open` : "it names no card, and none was open for it")
+      : `card ${card} was voided (${why})`;
+    this.log.emit({ kind: "refused", what, why: text, by: "executor" });
   }
+  /** A card closed (or the task stopped): every answer still queued is refused now, with its own reason — the card it
+   *  names closed (how), or none open; an answer that names no card, after a void (it may be that card's late one). No
+   *  card can take it later: ask ids are new each time. */
+  private settleQueued(fallback: string) {
+    for (const l of this.input.takeQueued((x) => parseControl(x)?.type === "answer")) {
+      const a = parseControl(l) as Extract<Control, { type: "answer" }>;
+      this.refuse(a, a.ask_id !== undefined ? this.closed.get(a.ask_id) ?? (fallback === "stop" ? "stop" : "none") : fallback);
+    }
+  }
+  private close(ask_id: string, why: string) { this.closed.set(ask_id, why); this.settleQueued(why === "answered" ? "none" : why); }
   async ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
@@ -158,21 +189,24 @@ export class StdioUser implements RuntimeUser {
       // an answer in it is refused (never used)
       if (o.signal?.aborted) {
         const why = o.signal.reason === "timeout" ? "timeout" : "steer";
-        this.voided = true; this.gone.set(ask_id, why);
+        this.voided = true;
         this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why });
         const late = line ? parseControl(line) : null;
-        if (late?.type === "answer") this.refuseLate(late.ask_id ?? ask_id, why);
+        // (the line read at that moment: this card's late answer, or one naming another card — refused for its own)
+        if (late?.type === "answer") this.refuse(late, late.ask_id === undefined || late.ask_id === ask_id ? why : this.closed.get(late.ask_id) ?? "none");
+        this.close(ask_id, why);
         return null;
       }
       // the app is gone or stopped the task: no answer, the run ends honestly; the card is let go, said so
       // (stdin closing also stops the run now, right after: the card went because the app went — "ended")
-      if (!line && (this.input.closed || this.input.stopped)) { this.log.emit({ kind: "ask_void", ask_id, why: this.input.closed ? "ended" : "stop" }); return null; }
+      if (!line && (this.input.closed || this.input.stopped)) { const why = this.input.closed ? "ended" : "stop"; this.log.emit({ kind: "ask_void", ask_id, why }); this.close(ask_id, why); return null; }
       const a = parseControl(line);
       if (a?.type !== "answer") continue;
-      if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: `the open card is ${ask_id}`, by: "executor" }); continue; }
+      if (a.ask_id !== undefined && a.ask_id !== ask_id) { this.log.emit({ kind: "refused", what: `answer for ${a.ask_id}`, why: this.closed.has(a.ask_id) ? `card ${a.ask_id} is closed (${this.closed.get(a.ask_id)}); the open card is ${ask_id}` : `the open card is ${ask_id}`, by: "executor" }); continue; }
       // once a card was voided, an answer that names no card may be the late answer to that one: it answers nothing
       if (a.ask_id === undefined && this.voided) { this.log.emit({ kind: "refused", what: "an answer without ask_id", why: `a card was voided; the open card is ${ask_id}`, by: "executor" }); continue; }
       this.log.emit({ kind: "resumed", ask_id });
+      this.close(ask_id, "answered");
       if (typeof a.option === "number" && a.option >= 0 && a.option < card.options.length) return { option: a.option };
       if (typeof a.text === "string" && a.text.trim()) return { text: a.text };
       return null;
