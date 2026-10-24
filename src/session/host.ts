@@ -968,7 +968,7 @@ export class SessionHost {
    *  it (session.task reply_to that message). No such task (the cua not received yet, or refused): nothing is stopped,
    *  and session.cua_cancelled is stored, so a cua with that client_id after it is refused — "none". A task still
    *  running: stopped as by stop{run_id}, and answered once its task_end is stored (status says how it ended) —
-   *  "stopped". A task already ended: its result card, if open, closed as by stop{run_id} — "already_ended". A repeated
+   *  "stopped". A task already ended: nothing is done to it or its result card (undo stays) — "already_ended". A repeated
    *  stop gets the same answer. `runId` too: a stop{run_id} of its own when it is another task. */
   stopByClient(cid: string, runId?: string) {
     // an explicit run_id first, exactly as a plain stop{run_id} (a cached answer for the client_id never skips it)
@@ -990,7 +990,9 @@ export class SessionHost {
     const end = [...this.log.events].reverse().find((e) => e.kind === "session.task_end" && e.run_id === task.run_id) as TaskEnd | undefined;
     const live = this.tasks.get(task.run_id);
     if (end) {
-      if (live && live.state === "lingering" && runId !== task.run_id) this.stop(task.run_id);     // its result card closes, as stop{run_id}
+      // the task is done: nothing to stop. Its result card stays as it is — a stop{client_id} after the end (the app's
+      // cleanup after a local bound, a Stop pressed just after it finished) never takes the undo away. (A run_id given
+      // with it was handled above, as stop{run_id}.)
       return this.ack(cid, { client_id: cid, result: "already_ended", run_id: task.run_id, status: end.status });
     }
     // running (or being recovered): stopped once; answered when its end is stored

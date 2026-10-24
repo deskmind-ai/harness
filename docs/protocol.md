@@ -243,7 +243,7 @@ app 往 `app-run` 的 stdin 写，每行一个 JSON。第一行是任务本身�
 - **stop{client_id}（加的可选字段，不升版本）：** `stop` 可以带一条 `cua` 自己的 `client_id`（代替 `run_id`）：app 还没看到 `session.task`、不知道 `run_id` 时，也能停下那条 /cua 开的任务，而且由会话确认，不靠 app 本地超时。会话按记录找：那条 /cua 开任务时，`session.task` 上记着它的 `client_id`（加的可选字段），只按这个字段找；重试或模型后来为同一条消息开的任务不带它，不会被停。每一行 `stop{client_id}` 都有且只有一条 `session.stop_ack{client_id, result, run_id?, status?}`（不入库）：
   - 没有从这条 /cua 开出的任务（/cua 还没到——stop 超车了——或者被拒了）：什么都不停，入库一条 `session.cua_cancelled{client_id}`，之后带这个 `client_id` 的 `cua` 一律拒（`cancelled`），重新打开后也一样；`result: "none"`。
   - 任务还在跑：和 `stop{run_id}` 一样停下它；等它的 `session.task_end` 入库后才回 `result: "stopped"`，带 `run_id` 和 `status`（它实际怎么结束的；停之前已经做完的照实说）。不管 `task_end` 是哪条路记的（执行层的 `task_done`、执行层没写 `task_done` 就退出、app 走了而任务没在时限内确认停下、重新打开时补记的 `interrupted`）都会回；会话因为写不进历史而停下时，按 `interrupted` 回。
-  - 任务已经结束：结果卡还开着的，像 `stop{run_id}` 一样关掉；`result: "already_ended"`，带 `run_id`、`status`。
+  - 任务已经结束：没有可停的，任务和它的结果卡都不动（结果卡还开着的照样能撤回——app 收尾时发的、或者任务刚做完时按的停止，不会把撤回弄没）；`result: "already_ended"`，带 `run_id`、`status`。`stop{run_id}` 不变：仍然会关掉还开着的结果卡；同时带 `run_id` 时，`run_id` 那部分照旧这样处理。
   - 同一个 `client_id` 再停一次：同样的回答；重新打开会话之后，按历史回 `already_ended`，带同样的 `run_id` 和 `status`（第一次回的若是 `stopped`，也是这样，不另存）。
   - `session.cua_cancelled` 写不进去：会话按「任务的结局写不进去」停下，这一行照样回一条 `stop_ack{result:"none", status:"interrupted"}`（取消没有记下来）。
   - `client_id` 只认一条 `cua` 的 id；给别的 id（比如一条 `say` 的）找不到任务，回 `none`，什么都不停。

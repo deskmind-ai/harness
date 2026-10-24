@@ -93,18 +93,33 @@ describe("stop{client_id}", () => {
     expect(s.acks("c3")[0]).toMatchObject({ result: "stopped", status: "stopped" });
   });
 
-  it("task ended: already_ended with its status, and its result card is closed (a later undo refused)", async () => {
+  it("task ended, its result card open: stop{client_id} leaves the task and its card alone (already_ended) — a later undo still works", async () => {
     const s = session(inproc([CREATE]));
     s.send({ type: "cua", text: "新建 a.txt", client_id: "c4" });
     await waitFor(() => s.evs.some((e) => e.kind === "session.task_end") && !s.h.busy);
     const run = s.evs.find((e) => e.kind === "session.task").run_id;
     s.send({ type: "stop", client_id: "c4" });
-    expect(s.acks("c4")).toEqual([expect.objectContaining({ result: "already_ended", run_id: run, status: "succeeded" })]);
-    s.send({ type: "respond", run_id: run, option: 1 });
-    expect(s.evs.filter((e) => e.kind === "session.error" && e.control === "respond").at(-1)).toMatchObject({ code: "undo_expired" });
     s.send({ type: "stop", client_id: "c4" });
-    expect(s.acks("c4")).toHaveLength(2);
-    expect(s.acks("c4")[1]).toMatchObject({ result: "already_ended", run_id: run, status: "succeeded" });
+    expect(s.acks("c4")).toEqual([expect.objectContaining({ result: "already_ended", run_id: run, status: "succeeded" }), expect.objectContaining({ result: "already_ended", run_id: run, status: "succeeded" })]);
+    await sleep(50);
+    expect(s.evs.some((e) => e.kind === "session.task_closed" && e.run_id === run)).toBe(false);   // still lingering
+    s.send({ type: "respond", run_id: run, option: 1 });
+    await waitFor(() => s.evs.some((e) => e.kind === "session.task_undo"));
+    expect(s.evs.filter((e) => e.kind === "session.error" && e.control === "respond")).toEqual([]);
+    expect(s.evs.find((e) => e.kind === "session.task_undo")).toMatchObject({ undone: 1, total: 1, refused: null });
+  });
+
+  it("stop{run_id} on the same ended task still closes its result card (a later undo refused); with both, the run_id part does", async () => {
+    for (const both of [false, true]) {
+      const s = session(inproc([CREATE]));
+      s.send({ type: "cua", text: "新建 a.txt", client_id: "c4b" });
+      await waitFor(() => s.evs.some((e) => e.kind === "session.task_end") && !s.h.busy);
+      const run = s.evs.find((e) => e.kind === "session.task").run_id;
+      s.send(both ? { type: "stop", run_id: run, client_id: "c4b" } : { type: "stop", run_id: run });
+      s.send({ type: "respond", run_id: run, option: 1 });
+      expect(s.evs.filter((e) => e.kind === "session.error" && e.control === "respond").at(-1), String(both)).toMatchObject({ code: "undo_expired" });
+      if (both) expect(s.acks("c4b")).toEqual([expect.objectContaining({ result: "already_ended", run_id: run })]);
+    }
   });
 
   it("the cua was refused: none, nothing else is stopped, and a retry of that cua is refused", async () => {
