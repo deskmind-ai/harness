@@ -48,6 +48,10 @@ export interface SessionHeader { session_id?: string; config?: string; lang?: La
  *  it back on whatever becomes of them — the stored user message (or session.steer), the queue entry they wait in, and
  *  a refusal of the line — so the app knows its words' fate from the session, never from the helper's ack. */
 export type ClientId = { client_id?: string };
+/** `req_id` (additive, optional, on answer / respond): the app's own id for this one request. Every refusal the session
+ *  gives it (session.error) carries it back with `control` and the `run_id` it targeted, and so does its stored
+ *  session.task_respond: the app matches its in-flight requests by id, never by order. At most MAX_CLIENT_ID chars. */
+export type ReqId = { req_id?: string };
 
 export type SessionControl =
   | ({ type: "say"; text: string } & ClientId)
@@ -57,8 +61,8 @@ export type SessionControl =
   | ({ type: "end_if_idle" } & ClientId)
   | ({ type: "cua"; text: string; scope?: string } & ClientId)
   | ({ type: "steer"; text: string; run_id?: string } & ClientId)
-  | { type: "answer"; run_id?: string; line: Record<string, unknown> }
-  | { type: "respond"; run_id?: string; line: Record<string, unknown> }
+  | ({ type: "answer"; run_id?: string; line: Record<string, unknown> } & ReqId)
+  | ({ type: "respond"; run_id?: string; line: Record<string, unknown> } & ReqId)
   | { type: "reask"; run_id?: string }
   | { type: "retry" }
   | { type: "queue_edit"; id: string; text: string }
@@ -80,6 +84,7 @@ export function parseSessionControl(line: string): SessionControl | null {
   const runId = typeof o.run_id === "string" ? { run_id: o.run_id } : {};
   const str = (k: string) => typeof o[k] === "string";
   const cid = typeof o.client_id === "string" && o.client_id && o.client_id.length <= MAX_CLIENT_ID ? { client_id: o.client_id } : {};
+  const reqId = typeof o.req_id === "string" && o.req_id && o.req_id.length <= MAX_CLIENT_ID ? { req_id: o.req_id } : {};
   switch (o.type) {
     case "say": return str("text") ? { type: "say", text: o.text as string, ...cid } : null;
     case "stop": return { type: "stop", ...runId };
@@ -89,8 +94,8 @@ export function parseSessionControl(line: string): SessionControl | null {
     case "cua": return str("text") ? { type: "cua", text: o.text as string, ...(str("scope") ? { scope: o.scope as string } : {}), ...cid } : null;
     case "steer": return str("text") ? { type: "steer", text: o.text as string, ...runId, ...cid } : null;
     // the executor's own control lines (control v1), forwarded as they came: extra fields (run_id) are ignored there
-    case "answer": return { type: "answer", ...runId, line: o };
-    case "respond": return { type: "respond", ...runId, line: o };
+    case "answer": return { type: "answer", ...runId, line: o, ...reqId };
+    case "respond": return { type: "respond", ...runId, line: o, ...reqId };
     case "reask": return { type: "reask", ...runId };
     case "retry": return { type: "retry" };
     case "queue_edit": return str("id") && str("text") ? { type: "queue_edit", id: o.id as string, text: o.text as string } : null;
@@ -287,8 +292,10 @@ export class SessionHost {
   private send(body: Record<string, unknown>) { this.o.out({ t: Date.now() / 1000, session_id: this.o.sessionId, ...body }); }
 
   /** Every error's text, stored or not, passes here: no key value from the environment ever reaches the app or the file. */
-  private refuse(code: ErrorCode, text: string, control?: string, cid?: string) {
-    this.send({ kind: "session.error", code, text: redactKeys(text), ...(control ? { control } : {}), ...(cid ? { client_id: cid } : {}) });
+  private refuse(code: ErrorCode, text: string, control?: string, cid?: string, ids: { run_id?: string; req_id?: string } = {}) {
+    // (run_id and req_id only for a request that carried a req_id: a refusal to an old client is as it was)
+    const echo = ids.req_id ? { ...(ids.run_id ? { run_id: ids.run_id } : {}), req_id: ids.req_id } : {};
+    this.send({ kind: "session.error", code, text: redactKeys(text), ...(control ? { control } : {}), ...(cid ? { client_id: cid } : {}), ...echo });
   }
   private fail(code: ErrorCode, text: string, ids: { msg_id?: string; reply_to: string }) { this.log.emit({ kind: "session.error", code, text: redactKeys(text).slice(0, 300), ...ids }); }
 
@@ -429,8 +436,8 @@ export class SessionHost {
       case "end_if_idle": return this.endIfIdle(c.client_id);
       case "cua": return this.cua(c.text, c.scope, c.client_id);
       case "steer": return this.steer(c.text, c.run_id, c.client_id);
-      case "answer": return this.answer(c.line, c.run_id);
-      case "respond": return this.respond(c.line, c.run_id);
+      case "answer": return this.answer(c.line, c.run_id, c.req_id);
+      case "respond": return this.respond(c.line, c.run_id, c.req_id);
       case "reask": return this.reask(c.run_id);
       case "retry": return this.retry();
       case "queue_edit": { const it = this.queue.find((q) => q.id === c.id); if (it && c.text.trim() && c.text.length <= MAX_USER_CHARS) it.text = c.text; return this.emitQueue(); }
@@ -993,15 +1000,15 @@ export class SessionHost {
   }
 
   /** The executor's control lines, to the task they name (or the running one). */
-  private find(runId: string | undefined, control: string): Task | null {
+  private find(runId: string | undefined, control: string, reqId?: string): Task | null {
     const t = runId ? this.tasks.get(runId) : this.current;
     if (t && t.state !== "closed") return t;
-    this.refuse("no_task", runId ? `no task ${runId.slice(0, 80)} of this session can take ${control}` : `no task is running`, control);
+    this.refuse("no_task", runId ? `no task ${runId.slice(0, 80)} of this session can take ${control}` : `no task is running`, control, undefined, { ...(runId ? { run_id: runId } : {}), ...(reqId ? { req_id: reqId } : {}) });
     return null;
   }
 
-  answer(line: Record<string, unknown>, runId?: string) {
-    const t = this.find(runId, "answer");
+  answer(line: Record<string, unknown>, runId?: string, reqId?: string) {
+    const t = this.find(runId, "answer", reqId);
     if (t) t.handle.write(JSON.stringify(line));
   }
 
@@ -1016,12 +1023,14 @@ export class SessionHost {
 
   /** The result card's answer (undo): to the lingering executor, which holds the machine lock as acting again while it
    *  runs (computer.ts undo) — unless another task started on this Mac since (undo expired). */
-  respond(line: Record<string, unknown>, runId?: string) {
+  respond(line: Record<string, unknown>, runId?: string, reqId?: string) {
     const t = runId ? this.tasks.get(runId) : [...this.tasks.values()].reverse().find((x) => x.state === "lingering");
-    if (!t || t.state !== "lingering") return this.refuse("no_task", "no result card of this session is waiting", "respond");
+    // every refusal of this respond names it: the control, the task it targeted, the app's req_id
+    const no = (code: ErrorCode, text: string) => this.refuse(code, text, "respond", undefined, { ...((t?.runId ?? runId) ? { run_id: t?.runId ?? runId } : {}), ...(reqId ? { req_id: reqId } : {}) });
+    if (!t || t.state !== "lingering") return no("no_task", "no result card of this session is waiting");
     // checked before anything is held: only an option index of its card is a respond the executor acts on
     const opt = line.option;
-    if (typeof opt !== "number" || !Number.isInteger(opt) || opt < 0 || opt >= t.options) return this.refuse("bad_control", `a respond needs option: the index of one of the result card's ${t.options} options`, "respond");
+    if (typeof opt !== "number" || !Number.isInteger(opt) || opt < 0 || opt >= t.options) return no("bad_control", `a respond needs option: the index of one of the result card's ${t.options} options`);
     // the undo window is over by the wall clock (the executor's timer may not have run: the Mac slept, or it fired
     // already): refused here, never forwarded — forwarded to an executor that has just exited, it would be recorded as
     // an undo cut off (unknown) though nothing was undone
@@ -1029,18 +1038,18 @@ export class SessionHost {
     // only an open card takes an answer (one per card: the executor reads only the first); a closed one says why
     const rc = t.resultCard;
     if (rc.s !== "open") {
-      if (rc.s === "undoing" || (rc.s === "closed" && rc.why === "answered")) return this.refuse("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"), "respond");
-      if (rc.s === "closed" && rc.why === "expired") return this.refuse("undo_expired", this.t("撤回的时间已经过了", "the time to undo this task has passed"), "respond");
-      if (rc.s === "closed" && rc.why === "stopped") return this.refuse("undo_expired", this.t("这张结果卡已经停下关掉了，不能再撤回", "this result card was closed by a stop; it can no longer be undone"), "respond");
-      return this.refuse("no_task", "no result card of this session is waiting", "respond");
+      if (rc.s === "undoing" || (rc.s === "closed" && rc.why === "answered")) return no("busy", this.t("这张结果卡已经回答过了", "this result card was answered already"));
+      if (rc.s === "closed" && rc.why === "expired") return no("undo_expired", this.t("撤回的时间已经过了", "the time to undo this task has passed"));
+      if (rc.s === "closed" && rc.why === "stopped") return no("undo_expired", this.t("这张结果卡已经停下关掉了，不能再撤回", "this result card was closed by a stop; it can no longer be undone"));
+      return no("no_task", "no result card of this session is waiting");
     }
     let u: ReturnType<typeof undo>;
     // (a change that landed is taken as made, also when only closing the lock's guard failed after it: an acting lock
     // nobody accounts for would hold the Mac)
     try { const h = t.holder; u = h ? landed(() => undo(this.o.dir, h)) : "expired"; }
-    catch (e) { return this.refuse("busy", `the machine lock: ${e instanceof Error ? e.message : String(e)}`, "respond"); }
-    if (u === "expired") { this.closeTask(t, "new_task"); return this.refuse("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired"), "respond"); }
-    if (u === "busy") return this.refuse("busy", this.t("这个任务的撤回正在进行", "an answer to this task's card is being carried out"), "respond");
+    catch (e) { return no("busy", `the machine lock: ${e instanceof Error ? e.message : String(e)}`); }
+    if (u === "expired") { this.closeTask(t, "new_task"); return no("undo_expired", this.t("另一个电脑任务开始了，这个任务的撤回已经过期", "another computer task started on this Mac; this task's undo has expired")); }
+    if (u === "busy") return no("busy", this.t("这个任务的撤回正在进行", "an answer to this task's card is being carried out"));
     // the lock is now the acting holder this answer wrote: every later change of it is made from that (compare-and-set)
     t.holder = u.ok;
     // stored before the executor has it: a session that stops while an undo is under way leaves this in its history,
@@ -1050,9 +1059,9 @@ export class SessionHost {
     // back (no result_response comes) and the Mac would stay busy until the linger ends: the session halts (as for a
     // terminal record), which ends that executor and removes the lock by compare-and-set; the history has no answer,
     // so the next open records no undo
-    try { this.log.emit({ kind: "session.task_respond", run_id: t.runId, option: opt, undo: t.optionKinds[opt] === "undo" }); }
+    try { this.log.emit({ kind: "session.task_respond", run_id: t.runId, option: opt, undo: t.optionKinds[opt] === "undo", ...(reqId ? { req_id: reqId } : {}) }); }
     catch (e) {
-      this.refuse("busy", `the answer could not be stored: ${errText(e)}`, "respond");
+      no("busy", `the answer could not be stored: ${errText(e)}`);
       try { const n = landed(() => linger(this.o.dir, u.ok)); if (n) t.holder = n; }
       catch (x) { this.halt(`the machine lock of ${t.runId} could not be set back to lingering after its answer was not stored: ${errText(x)}`); }
       return;
