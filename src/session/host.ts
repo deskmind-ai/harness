@@ -677,7 +677,7 @@ export class SessionHost {
     if (this.sendsDuplicate(cid, "cua") || this.tooLong(text, "cua", cid)) return;
     if (this.current || this.running || this.flows || this.recoverPending) return this.refuseBusy("cua", cid);
     let userId = "";
-    const t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), before: () => {
+    const t = this.startTask({ raw: cutRaw([text]), by: "slash", ...(scope ? { scope } : {}), ...(cid ? { clientId: cid } : {}), before: () => {
       userId = (this.log.emit({ kind: "session.message", msg_id: newId(), role: "user", text, via: "cua", ...(cid ? { client_id: cid } : {}) }) as Extract<SessionEvent, { kind: "session.message" }>).msg_id;
       return userId;
     } });
@@ -699,7 +699,7 @@ export class SessionHost {
    *  closed or the task is recorded (a disk that is full), this attempt lets go of what it took — its executor (which
    *  never got its task) is ended and the lock it wrote removed, compare-and-set on that holder (computer.ts release) —
    *  and the caller is told `failed` with the reason; nothing says the task began. */
-  private startTask(o: { raw: string; goal?: string; by: "slash" | "model"; replyTo?: string; scope?: string; before?: () => string }): Task | { busy: true } | { failed: string } {
+  private startTask(o: { raw: string; goal?: string; by: "slash" | "model"; replyTo?: string; scope?: string; before?: () => string; clientId?: string }): Task | { busy: true } | { failed: string } {
     if (this.config === null) return { failed: "no model is set" };      // (refused before: cua, computer_task)
     const runId = `run_${randomUUID().slice(0, 8)}`;
     const scope = o.scope ?? this.o.scope;
@@ -740,7 +740,9 @@ export class SessionHost {
       for (const t of [...this.tasks.values()]) if (t.state !== "running") this.closeTask(t, "new_task");
       if (this.halted) throw new Error(this.halted);
       const replyTo = o.before?.() ?? o.replyTo;
-      this.log.emit({ kind: "session.task", msg_id: newId(), run_id: runId, raw: o.raw, ...(o.goal ? { goal: o.goal } : {}), by: o.by, ...(replyTo ? { reply_to: replyTo } : {}) });
+      // a /cua's own client_id is bound to the task it starts, here, as the task is recorded: stop{client_id} resolves
+      // through this field only (a retry's or the model's later task answers the same message, never carries it)
+      this.log.emit({ kind: "session.task", msg_id: newId(), run_id: runId, raw: o.raw, ...(o.goal ? { goal: o.goal } : {}), by: o.by, ...(replyTo ? { reply_to: replyTo } : {}), ...(o.clientId ? { client_id: o.clientId } : {}) });
     } catch (e) {
       // not recorded: the executor never gets its task; it is ended and the lock it took let go now
       this.abandon(runId, h, holder);
@@ -969,11 +971,13 @@ export class SessionHost {
    *  "stopped". A task already ended: its result card, if open, closed as by stop{run_id} — "already_ended". A repeated
    *  stop gets the same answer. `runId` too: a stop{run_id} of its own when it is another task. */
   stopByClient(cid: string, runId?: string) {
+    // an explicit run_id first, exactly as a plain stop{run_id} (a cached answer for the client_id never skips it)
+    if (runId) this.stop(runId);
     const known = this.stopAcks.get(cid);
     if (known) return this.send({ kind: "session.stop_ack", ...known });
-    const msg = this.log.events.find((e): e is Extract<SessionEvent, { kind: "session.message" }> => e.kind === "session.message" && e.role === "user" && e.client_id === cid);
-    const task = msg ? [...this.log.events].reverse().find((e) => e.kind === "session.task" && e.reply_to === msg.msg_id) as Extract<SessionEvent, { kind: "session.task" }> | undefined : undefined;
-    if (runId && runId !== task?.run_id) this.stop(runId);
+    // the task this cua started: the one recorded with its client_id (never found by reply_to: a retry's task answers
+    // the same message)
+    const task = this.log.events.find((e): e is Extract<SessionEvent, { kind: "session.task" }> => e.kind === "session.task" && e.client_id === cid);
     if (!task) {
       if (!this.cancelledCids.has(cid)) {
         // not stored: the session halts, as for any record it depends on — and this stop still gets its one ack, as
@@ -986,7 +990,7 @@ export class SessionHost {
     const end = [...this.log.events].reverse().find((e) => e.kind === "session.task_end" && e.run_id === task.run_id) as TaskEnd | undefined;
     const live = this.tasks.get(task.run_id);
     if (end) {
-      if (live && live.state === "lingering") this.stop(task.run_id);     // its result card closes, as stop{run_id}
+      if (live && live.state === "lingering" && runId !== task.run_id) this.stop(task.run_id);     // its result card closes, as stop{run_id}
       return this.ack(cid, { client_id: cid, result: "already_ended", run_id: task.run_id, status: end.status });
     }
     // running (or being recovered): stopped once; answered when its end is stored
@@ -994,7 +998,7 @@ export class SessionHost {
     const first = waiting.length === 0;
     waiting.push(cid);
     this.pendingStopAcks.set(task.run_id, waiting);
-    if (first && live && live.state !== "closed") this.stop(task.run_id);
+    if (first && live && live.state !== "closed" && runId !== task.run_id) this.stop(task.run_id);
   }
 
   private ack(cid: string, body: Record<string, unknown>) { this.stopAcks.set(cid, body); this.send({ kind: "session.stop_ack", ...body }); }

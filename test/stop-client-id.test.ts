@@ -42,10 +42,10 @@ const inproc = (scripts: Step[][]): Launcher => { let i = 0; return (req, lo) =>
 const hosts: SessionHost[] = [];
 afterEach(async () => { for (const h of hosts.splice(0)) h.end(); await sleep(50); });
 
-function session(launch: Launcher, o: { dir?: string; exitWaitMs?: number; onExit?: (f?: string) => void } = {}) {
+function session(launch: Launcher, o: { dir?: string; exitWaitMs?: number; onExit?: (f?: string) => void; model?: Step[] } = {}) {
   const dir = o.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), "stopcid-ses-"));
   const evs: any[] = [];
-  const h = new SessionHost({ dir, sessionId: "ses_s", out: (e) => evs.push(e), coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(Array(6).fill({ text: "好" })) }, launch, linger: 600, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.onExit ? { onExit: o.onExit } : {}) });
+  const h = new SessionHost({ dir, sessionId: "ses_s", out: (e) => evs.push(e), coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream(o.model ?? Array(6).fill({ text: "好" })) }, launch, linger: 600, ...(o.exitWaitMs ? { exitWaitMs: o.exitWaitMs } : {}), ...(o.onExit ? { onExit: o.onExit } : {}) });
   hosts.push(h);
   h.start();
   const send = (x: Record<string, unknown>) => h.handle(JSON.stringify(x));
@@ -173,5 +173,48 @@ describe("stop{client_id}", () => {
     const before = s.evs.length;
     s.send({ type: "cua", text: "新建 a.txt", client_id: "c9" });
     expect(s.evs.slice(before).filter((e) => e.kind === "session.error")).toEqual([]);
+  });
+
+  /** A /cua (c10) that ends, then a retry whose model reply starts another task (it waits on a card): the second task
+   *  answers the same user message, but it is not the cua's. */
+  async function cuaThenRetry(dir?: string) {
+    const s = session(inproc([CREATE, WAITS]), { ...(dir ? { dir } : {}), model: [{ text: "好" }, { calls: [{ name: "computer_task", args: { goal: "再做一次" } }] }, { text: "做完了" }] });
+    s.send({ type: "cua", text: "新建 a.txt", client_id: "c10" });
+    await waitFor(() => s.evs.some((e) => e.kind === "session.task_end") && !s.h.busy);
+    const first = s.evs.find((e) => e.kind === "session.task").run_id;
+    s.send({ type: "retry" });
+    await waitFor(() => s.evs.filter((e) => e.kind === "session.task").length === 2 && s.evs.some((e) => e.kind === "ask"));
+    const second = s.evs.filter((e) => e.kind === "session.task")[1].run_id;
+    return { s, first, second };
+  }
+
+  it("a retry's task after a cua is never the cua's: a delayed stop{client_id} answers already_ended for the cua's own task and stops nothing new", async () => {
+    const { s, first, second } = await cuaThenRetry();
+    expect(s.stored().find((e: any) => e.kind === "session.task" && e.run_id === first)).toMatchObject({ client_id: "c10" });
+    expect(s.stored().find((e: any) => e.kind === "session.task" && e.run_id === second)).not.toHaveProperty("client_id");
+    s.send({ type: "stop", client_id: "c10" });
+    expect(s.acks("c10")).toEqual([expect.objectContaining({ result: "already_ended", run_id: first, status: "succeeded" })]);
+    await sleep(100);
+    expect(s.evs.some((e) => e.kind === "session.task_end" && e.run_id === second)).toBe(false);     // the retry's task runs on
+    s.send({ type: "stop", run_id: second });
+  });
+
+  it("the same after a reopen: the cua's client_id resolves to its own run, not the newer one", async () => {
+    const { s, first, second } = await cuaThenRetry();
+    s.send({ type: "stop", run_id: second });
+    await waitFor(() => s.evs.some((e) => e.kind === "session.task_end" && e.run_id === second));
+    s.h.end(); await sleep(100);
+    const s2 = session(inproc([]), { dir: s.dir });
+    s2.send({ type: "stop", client_id: "c10" });
+    expect(s2.acks("c10")).toEqual([expect.objectContaining({ result: "already_ended", run_id: first })]);
+  });
+
+  it("a cached answer for the client_id never skips an explicit run_id: that run is stopped as by stop{run_id} (Codex's repro)", async () => {
+    const { s, first, second } = await cuaThenRetry();
+    s.send({ type: "stop", client_id: "c10" });                                           // answered, cached
+    s.send({ type: "stop", client_id: "c10", run_id: second });
+    await waitFor(() => s.evs.some((e) => e.kind === "session.task_end" && e.run_id === second));
+    expect(s.evs.find((e) => e.kind === "session.task_end" && e.run_id === second)).toMatchObject({ status: "stopped" });
+    expect(s.acks("c10")).toEqual([expect.objectContaining({ result: "already_ended", run_id: first }), expect.objectContaining({ result: "already_ended", run_id: first })]);
   });
 });

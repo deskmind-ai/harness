@@ -60,7 +60,9 @@ export const SessionBody = z.discriminatedUnion("kind", [
     run_id: z.string().optional(), req_id: z.string().optional() }),
   // H2: a computer task began. `raw`: the user's own words it carries (the executor's request.raw); `goal`: the model's
   // restatement (request.context), when the model started it; `by`: slash (the user's /cua) or model (computer_task)
-  z.object({ kind: z.literal("session.task"), msg_id: z.string(), run_id: z.string(), raw: z.string(), goal: z.string().optional(), by: z.enum(["slash", "model"]), reply_to: z.string().optional() }),
+  z.object({ kind: z.literal("session.task"), msg_id: z.string(), run_id: z.string(), raw: z.string(), goal: z.string().optional(), by: z.enum(["slash", "model"]), reply_to: z.string().optional(),
+    // (additive) a /cua's own client_id, on the task it started: what stop{client_id} resolves by
+    client_id: z.string().optional() }),
   // H2: how it ended — what the model was told (status, reason, summary, answer, changes, steers) and whether the result
   // card's undo was open then. `interrupted`: no task_done (the session process went away mid-task)
   // `cause` (additive): task_done's cause as a field, or the session's own when it ends the task with no task_done —
