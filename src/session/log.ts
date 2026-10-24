@@ -55,7 +55,9 @@ export const SessionBody = z.discriminatedUnion("kind", [
   // the model could not answer (no key, a key the service refused, the network, the account's quota, a config that
   // names no service), or a control line was refused. `msg_id`: the reply that failed (its deltas, if any, are void);
   // `control`: the refused line's type
-  z.object({ kind: z.literal("session.error"), code: z.enum(ERROR_CODES), text: z.string(), msg_id: z.string().optional(), reply_to: z.string().optional(), control: z.string().optional() }),
+  z.object({ kind: z.literal("session.error"), code: z.enum(ERROR_CODES), text: z.string(), msg_id: z.string().optional(), reply_to: z.string().optional(), control: z.string().optional(),
+    // (additive) a refused answer / respond that carried a req_id: that req_id and the run it targeted
+    run_id: z.string().optional(), req_id: z.string().optional() }),
   // H2: a computer task began. `raw`: the user's own words it carries (the executor's request.raw); `goal`: the model's
   // restatement (request.context), when the model started it; `by`: slash (the user's /cua) or model (computer_task)
   z.object({ kind: z.literal("session.task"), msg_id: z.string(), run_id: z.string(), raw: z.string(), goal: z.string().optional(), by: z.enum(["slash", "model"]), reply_to: z.string().optional() }),
@@ -76,7 +78,8 @@ export const SessionBody = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("session.task_closed"), run_id: z.string(), why: z.enum(["linger", "new_task", "session_end"]) }),
   // H2: the result card was answered (stored before the answer goes to the executor; additive). `undo`: the option is
   // the card's undo — from here until session.task_undo an undo may be under way
-  z.object({ kind: z.literal("session.task_respond"), run_id: z.string(), option: z.number().int(), undo: z.boolean() }),
+  // `req_id` (additive): the app's id for the respond this answers (ReqId), echoed
+  z.object({ kind: z.literal("session.task_respond"), run_id: z.string(), option: z.number().int(), undo: z.boolean(), req_id: z.string().optional() }),
   // H2: the result card's undo was done (the executor's result_response, in fields). `unknown` (additive): recorded on
   // reopen for an undo that began and was cut off with no result_response — how much of it was done is not known
   // (undone and total are 0 then, `refused` says why)
