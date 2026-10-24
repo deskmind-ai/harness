@@ -754,11 +754,13 @@ export class SessionHost {
       if (!this.lockLinger(task)) task.noLinger = true;
       this.cardOf(task, ev);
     }
+    // a card is the session's to know of before the app hears of it, and gone before the app hears it went (the app may
+    // answer or type inside the very event it is handed): card_open reads this (review of #67)
+    if (ev.kind === "ask") task.card = typeof ev.ask_id === "string" ? ev.ask_id : null;
+    else if ((ev.kind === "resumed" || ev.kind === "ask_void") && ev.ask_id === task.card) task.card = null;
     // (a task that does not linger offers no result card: none is shown that could not be answered)
     this.o.out({ ...ev, ...(ev.kind === "task_done" && task.noLinger ? { result_card: null } : {}), session_id: this.o.sessionId });
     switch (ev.kind) {
-      case "ask": task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; break;
-      case "resumed": case "ask_void": if (ev.ask_id === task.card) task.card = null; break;
       case "steered": if (typeof ev.text === "string") task.steers.push(ev.text); break;
       case "step": if (typeof ev.step_id === "string") task.openSteps.add(ev.step_id); break;
       case "step_result": if (typeof ev.step_id === "string") task.openSteps.delete(ev.step_id); break;

@@ -734,3 +734,67 @@ describe("H1 round 4: the router — more rows", () => {
     expect(r.sent()).toBe(1);
   });
 });
+
+describe("H1 round 6: a card is registered before anything announces it (an app that answers inside the event)", () => {
+  /** app-run whose app answers synchronously inside `out`: every card the moment its ask is written, by `pick`. */
+  function syncApp(o: { clock: FakeClock; pick: (e: Extract<AppEvent, { kind: "ask" }>) => Record<string, unknown> | null; onEvent?: (e: AppEvent, write: (c: unknown) => void) => void }) {
+    const { sim, w } = mailSim();
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    const write = (c: unknown) => input.write(JSON.stringify(c) + "\n");
+    const out = (e: AppEvent) => {
+      events.push(e);
+      if (e.kind === "ask") { const c = o.pick(e); if (c) write(c); }
+      o.onEvent?.(e, write);
+    };
+    const done = appRun({ run_id: "run_sync", raw: "回复林晓：收到，谢谢", config: "ds-flash" }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "expiry-")), out, input: new LineReader(input), linger: 0,
+      inject: { driver: sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(mailSteps(w)) }, clock: o.clock } });
+    return { sim, w, events, done, input };
+  }
+  const approve = (e: Extract<AppEvent, { kind: "ask" }>) => ({ type: "answer", ask_id: e.ask_id, option: e.card.options.findIndex((x) => x.kind === "approve") });
+
+  it("the plan card and the action card answered inside their own ask events: both taken, the reply sent", async () => {
+    const r = syncApp({ clock: new FakeClock(), pick: approve });
+    await Promise.race([r.done, sleep(4000)]);
+    expect(r.events.find((e) => e.kind === "task_done")).toMatchObject({ status: "succeeded" });
+    expect(r.events.filter((e) => e.kind === "refused" && e.what.startsWith("answer for"))).toEqual([]);
+    expect(r.sim.mailState(r.w).replies).toHaveLength(1);
+  });
+
+  it("a reask's new card answered inside its ask event: taken", async () => {
+    const clock = new FakeClock();
+    let actionCards = 0;
+    const r = syncApp({ clock, pick: (e) => (e.card.kind === "action" && ++actionCards === 1 ? null : approve(e)), onEvent: (e, write) => {
+      if (e.kind === "ask" && e.card.kind === "action" && actionCards === 1) setTimeout(() => clock.advance(10 * MIN), 1);
+      if (e.kind === "ask_void" && e.why === "timeout") write({ type: "reask" });
+    } });
+    await Promise.race([r.done, sleep(4000)]);
+    expect(r.events.find((e) => e.kind === "task_done")).toMatchObject({ status: "succeeded" });
+    expect(r.sim.mailState(r.w).replies).toHaveLength(1);
+  });
+
+  it("through the session: a steer typed inside the ask event is refused card_open (the session knew the card first)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "expiry-ses-"));
+    const launch: Launcher = (req, o) => {
+      const m = mailSim();
+      const input = new PassThrough();
+      let ended = false, cb: ((l: string) => void) | null = null;
+      const early: string[] = [];
+      const out = (e: unknown) => { const l = JSON.stringify(e); if (cb) cb(l); else early.push(l); };
+      const exited = appRun(req as never, { runs: o.runs, out, input: new LineReader(input), linger: o.linger,
+        inject: { driver: m.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream(mailSteps(m.w)) }, clock: new FakeClock() } }).then(() => ({ code: 0, signal: null }));
+      return { write: (l) => { if (!ended) input.write(l + "\n"); }, close: () => { if (!ended) { ended = true; input.end(); } }, onLine: (f) => { cb = f; for (const l of early.splice(0)) f(l); }, exited };
+    };
+    const evs: any[] = [];
+    const h: SessionHost = new SessionHost({ dir, sessionId: "ses_sync", out: (e) => {
+      evs.push(e);
+      if (e.kind === "ask") { h.handle(JSON.stringify({ type: "steer", text: "等一下" })); h.handle(JSON.stringify({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: (e as any).card.options.findIndex((x: any) => x.kind === "approve") })); }
+    }, coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream([{ text: "好" }]) }, launch, linger: 0 });
+    hosts.push(h);
+    h.start();
+    h.handle(JSON.stringify({ type: "cua", text: "回复林晓：收到，谢谢" }));
+    await waitFor(() => evs.some((e) => e.kind === "session.task_end"), 4000);
+    expect(evs.filter((e) => e.kind === "session.error" && e.control === "steer").map((e) => e.code)).toEqual(["card_open", "card_open"]);
+    expect(evs.find((e) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+  });
+});
