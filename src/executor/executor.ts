@@ -385,10 +385,27 @@ export class Executor {
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; madeParents: string[]; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
   /** Paths the task has seen listed in a folder (fs.list): known to be there, though not read. */
   private listed = new Set<string>();
-  /** What the task typed into each window (type / set_value that went through), in order: evidence for the outgoing
-   *  question, and on a window read from the screen what the card shows goes out (text recognition may not read an
-   *  input box back). Cleared when a send in that window went through: that text is gone. */
-  private typed = new Map<string, string[]>();
+  /** The text possibly waiting in window `w`, derived from the journal (possibly.ts' rule, the uncertain list's): the
+   *  text of every type / set_value step on `w` whose receipt says it may have happened, after the last certain send
+   *  on `w` (its intent says takes_typed) whose FINAL status was ok — that one took the text with it. Live and after a restart
+   *  alike; no state of its own to forget (review of harness#66, Codex P1, the 3rd bug of the "typed text" family:
+   *  a typed newline that ended unverified was never recorded, and the send key after it was classed create). Evidence
+   *  for the outgoing question, and what a card shows goes out where the screen may not show an input box. */
+  private typedIn(a: Action): string[] {
+    if (!("window" in a)) return [];
+    return [...this.typedOn(a.window), ...(a.kind === "type" ? [a.text] : a.kind === "set_value" ? [a.value] : [])];
+  }
+  private typedOn(w: string): string[] {
+    let out: string[] = [];
+    const lines = this.jlines;
+    for (const s of journalSteps(lines)) {
+      const act = s.action as Action | undefined;
+      if (!act || !("window" in act) || act.window !== w) continue;
+      if ((lines[s.intent] as { takes_typed?: unknown } | undefined)?.takes_typed === true && s.receipt?.status === "ok") out = [];
+      else if ((act.kind === "type" || act.kind === "set_value") && s.possibly) out.push(act.kind === "type" ? act.text : act.value);
+    }
+    return out;
+  }
   /** classify's answers, per (action, epoch, the model's class): the judge is asked once per action per screen. */
   private classified = new Map<string, Classification>();
   /** How many times each window has been observed: two observations can share an epoch (another app changes a window
@@ -1105,7 +1122,7 @@ export class Executor {
     if (a.kind === "click" || a.kind === "double_click") return true;
     if (a.kind === "type") return a.text.includes("\n");
     if (a.kind === "key" && RETURN.test(a.chord)) return true;
-    if (a.kind === "key" || a.kind === "select") return !!this.lastObs.get(a.window)?.elements.some((e) => e.sends) || !!this.typed.get(a.window)?.length;
+    if (a.kind === "key" || a.kind === "select") return !!this.lastObs.get(a.window)?.elements.some((e) => e.sends) || this.typedOn(a.window).length > 0;
     return false;
   }
 
@@ -1213,10 +1230,6 @@ export class Executor {
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
-  private typedIn(a: Action): string[] {
-    if (!("window" in a)) return [];
-    return [...(this.typed.get(a.window) ?? []), ...(a.kind === "type" ? [a.text] : a.kind === "set_value" ? [a.value] : [])];
-  }
 
   /** An action's class and who settled it (docs/outgoing-check-2026-10-20.md §4), from structured facts only — never
    *  the user's words: structure first (ownership; a capability that declares it sends), then the model's own class,
@@ -1376,20 +1389,12 @@ export class Executor {
     // a screen action's receipt, written with the act's final status (after the read-back), so the journal says what
     // the result says: what a card lists as done and what undo takes back are the same (review of #68: E2)
     let pendingReceipt: Record<string, unknown> | null = null;
-    // the window whose typed text this act's send takes with it — cleared only in done(), on the act's FINAL status
-    // ok (the one the receipt records, after the read-back), never on the driver's own word (review of harness#66,
-    // Codex P1: cleared on a raw ok that the after-snapshot, a lock or the read-back then made unverified, the
-    // retried send key was classed create and pressed again with no card)
-    let sendTakesTyped: string | null = null;
     let stepConsented = false, foregroundOk = false;
     // what goes out, as the card showed it: recorded with the intent, so an uncertain step is named by it too
     let cardOutgoing: ActionCardFacts["outgoing"] | undefined, finalOutgoing: ActionCardFacts["outgoing"] | undefined;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       if (pendingReceipt) { this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...pendingReceipt }); pendingReceipt = null; }
-      // the one place typed text is taken away: a send whose final status is ok
-      if (sendTakesTyped !== null && r.status === "ok") this.typed.delete(sendTakesTyped);
-      sendTakesTyped = null;
       const { consent, ...rest } = req;
       // the receipt is evidence for the verdict: what the app alone uses (the step's picture, screen frames, a card's
       // fields) is not in it
@@ -1592,7 +1597,10 @@ export class Executor {
     let land: (() => void) | null = null;
     if (consequence !== "read") {
       const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence);
-      this.journal("intent", { action: act, object: base.object, consequence, text, ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
+      // a certain send (the judge's 会, or a control marked as sending) takes the window's typed text with it once it
+      // ends ok (typedOn); a 拿不准 one does not
+      const takesTyped = consequence === "external" && "window" in req.action && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends));
+      this.journal("intent", { action: act, object: base.object, consequence, text, ...(takesTyped ? { takes_typed: true } : {}), ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
@@ -1623,13 +1631,8 @@ export class Executor {
     // the receipt goes into the journal with the act's final status (done): what the driver said is kept beside it, and
     // its "not done" (performed: false, or a reply the protocol defines as a refusal before acting) as performed: false
     if (consequence !== "read") pendingReceipt = { driver_status: r.status, ...(saysNotPerformed(r) ? { performed: false } : {}) };
-    // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows. A
-    // send takes it with it only if the act ends ok (done(): the final status, after the read-back); one that may not
-    // have gone keeps it, so a send key tried again there is still asked about as a send
-    if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
-      if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) sendTakesTyped = req.action.window;
-      else if (req.action.kind === "type" || req.action.kind === "set_value") this.typed.set(req.action.window, this.typedIn(req.action));
-    }
+    // what the task typed into a window is read off the journal (typedOn): this act's intent and receipt are what
+    // later steps see, nothing is kept here
     // a window is the task's (and closing it takes the opening back) only on the driver's proof that the action made
     // it (`new_window`) and when it was not on screen before. The window an action merely lands in is not proof: a URL
     // put into the user's browser window returns that window (review of #16), and an app launched by open_window comes
