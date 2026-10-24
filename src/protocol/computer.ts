@@ -69,6 +69,9 @@ export interface Element {
 export interface Observation {
   epoch: number; window: WindowInfo; modal: { title: string } | null; elements: Element[];
   text?: string; screenshot_png?: string;     // base64
+  /** What this look could not read in the time it was given (hands: a pop-up's choices, left unread while the user
+   *  kept using the Mac until the look's deadline). */
+  notes?: string[];
 }
 
 export type Action =

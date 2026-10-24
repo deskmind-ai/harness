@@ -54,6 +54,13 @@ export interface ActionCardFacts {
   consequence: Consequence;
   outgoing: { kind: "field" | "selected" | "typed" | "text"; label: string; value: string }[];
   site: string | null;
+  /** The steps of this run whose result is unknown (unverified while changing the user's things or sending: they may
+   *  already have taken effect), every one, as the card's text names them first; while there is one, every change or
+   *  send asks. `model_says_unchecked`: what the model says of the situation now — its words, not checked. */
+  uncertain?: { consequence: Consequence; object: string; text: string; outgoing: ActionCardFacts["outgoing"] }[];
+  /** How many there are in all (the list keeps the last 20; the text shows at most 5 lines and counts the rest). */
+  uncertain_total?: number;
+  model_says_unchecked?: string;
 }
 
 /** Who answers the executor's cards: the app (stdio: an `ask` event, then the answer line), the evaluation's simulated

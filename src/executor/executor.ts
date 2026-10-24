@@ -13,7 +13,7 @@
  *   end       collect the receipts
  */
 import type { ActionCardFacts } from "../protocol/cards.js";
-import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
@@ -23,7 +23,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import type { Workspace } from "../registry/workspace.js";
-import { NEEDS_CONSENT, higher, rank } from "./types.js";
+import { NEEDS_CONSENT, higher, isEffectUnknown, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
@@ -94,6 +94,12 @@ const SMALL_TEXT = 1000;
 /** What the journal's begin record keeps of the folder's text: at most this many files and characters in all (the
  *  rest by version only), so a big folder does not make every task's journal big. */
 const BEGIN_TEXT_FILES = 200, BEGIN_TEXT_CHARS = 200_000;
+/** An uncertain-step list keeps the last this many (the card's fields), and a card shows at most this many lines. */
+const UNCERTAIN_KEPT = 20, UNCERTAIN_SHOWN = 5;
+/** An earlier build's outgoing value (no `chars`) is shown as written, up to this many characters. */
+const OLD_SHAPE_MAX = 200;
+/** An uncertain step's line on a card (its words and what went out, each value already cut) is bounded here. */
+const UNCERTAIN_LINE_MAX = 600;
 /** A file's text when it is a small text file, else undefined (absent, a folder, not text, too long, unreadable). */
 function smallText(ws: Workspace, p: string): string | undefined {
   try { if (ws.exists(p) && !ws.isDir(p) && ws.isTextFile(p)) { const t = ws.read(p); if (t.length <= SMALL_TEXT) return t; } } catch { /* the version says it */ }
@@ -379,10 +385,27 @@ export class Executor {
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; madeParents: string[]; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
   /** Paths the task has seen listed in a folder (fs.list): known to be there, though not read. */
   private listed = new Set<string>();
-  /** What the task typed into each window (type / set_value that went through), in order: evidence for the outgoing
-   *  question, and on a window read from the screen what the card shows goes out (text recognition may not read an
-   *  input box back). Cleared when a send in that window went through: that text is gone. */
-  private typed = new Map<string, string[]>();
+  /** The text possibly waiting in window `w`, derived from the journal (possibly.ts' rule, the uncertain list's): the
+   *  text of every type / set_value step on `w` whose receipt says it may have happened, after the last certain send
+   *  on `w` (its intent says takes_typed) whose FINAL status was ok — that one took the text with it. Live and after a restart
+   *  alike; no state of its own to forget (review of harness#66, Codex P1, the 3rd bug of the "typed text" family:
+   *  a typed newline that ended unverified was never recorded, and the send key after it was classed create). Evidence
+   *  for the outgoing question, and what a card shows goes out where the screen may not show an input box. */
+  private typedIn(a: Action): string[] {
+    if (!("window" in a)) return [];
+    return [...this.typedOn(a.window), ...(a.kind === "type" ? [a.text] : a.kind === "set_value" ? [a.value] : [])];
+  }
+  private typedOn(w: string): string[] {
+    let out: string[] = [];
+    const lines = this.jlines;
+    for (const s of journalSteps(lines)) {
+      const act = s.action as Action | undefined;
+      if (!act || !("window" in act) || act.window !== w) continue;
+      if ((lines[s.intent] as { takes_typed?: unknown } | undefined)?.takes_typed === true && s.receipt?.status === "ok") out = [];
+      else if ((act.kind === "type" || act.kind === "set_value") && s.possibly) out.push(act.kind === "type" ? act.text : act.value);
+    }
+    return out;
+  }
   /** classify's answers, per (action, epoch, the model's class): the judge is asked once per action per screen. */
   private classified = new Map<string, Classification>();
   /** How many times each window has been observed: two observations can share an epoch (another app changes a window
@@ -394,7 +417,7 @@ export class Executor {
   private looks = new Map<string, Observation>();
   /** Every challenge this executor issued, as it issued it: what "consent is for another action" is explained against
    *  in the trace (the token's action, epoch, object and class beside the request's). */
-  private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence }>();
+  private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence; uncertain?: ReadonlySet<number> }>();
   /** An object as the user knows it, for a card's fields: a window by its app and title (the last snapshot), a tab by
    *  its title, a file by its path; never a bare window id. */
   private labelOf(object: string): string {
@@ -405,17 +428,99 @@ export class Executor {
     return id;
   }
 
-  private issue(action: Action, object: string, consequence: Consequence, text: string, epoch: number, content?: unknown, facts?: ActionCardFacts) {
+  private issue(action: Action, object: string, consequence: Consequence, text0: string, epoch: number, content?: unknown, facts0?: ActionCardFacts, purpose?: string) {
+    // while a step of this run is uncertain, the card names them first (uncertainLines: every outbound one and the
+    // newest always, the rest as room allows, counted), then what the model says (not checked: never shown as fact),
+    // then the action — a yes is for this one action, seen against them
+    const t = T(this.opts.lang);
+    const steps = this.uncertainSteps();
+    const uncertain = steps.length ? steps : null;
+    const said = uncertain && purpose?.trim() ? cardText(purpose.trim(), 200, this.opts.lang) : undefined;
+    const text = uncertain ? `${this.uncertainLines(steps)}${said ? `\n${t.modelSaysUnchecked(said)}` : ""}\n${text0}` : text0;
+    const base: ActionCardFacts = facts0 ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null };
+    const facts: ActionCardFacts = uncertain ? { ...base, uncertain: steps.slice(-UNCERTAIN_KEPT).map((x) => this.uncertainFact(x)), uncertain_total: steps.length, ...(said ? { model_says_unchecked: said } : {}) } : base;
     const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
       // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
-      facts: facts ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null } };
-    this.challenges.set(c.nonce, { action, epoch, object, consequence });
+      facts };
+    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: new Set(steps.map((x) => x.intent)) });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
-    // a host asked about after the task read material: the yes approves the host for the rest of the task
-    const site = consequence === "external" ? this.siteRule(action)?.host : undefined;
+    // a host asked about after the task read material: the yes approves the host for the rest of the task — not while a
+    // step is uncertain: then the yes is for this one open (an action token), and the next asks again
+    const site = consequence === "external" && !uncertain ? this.siteRule(action)?.host : undefined;
     return site ? { ...c, site } : c;
   }
+  /** The run's uncertain steps — one rule, possibly.ts' (review of harness#66 round 5: the list kept its own rule and
+   *  lost steps #68's did not): a step of any process of this task that needed consent (modify_user, external), is
+   *  possibly done (an intent with no receipt that says nothing happened), and is not known done (its receipt not ok).
+   *  That is the result card's "unsure" set (stepLines) restricted to consent steps, from the same journal records,
+   *  live and after any number of restarts. Never matched to a later step, never cleared. While there is one, every
+   *  modify_user or external action asks on a card that names them (uncertainGate); no standing grant covers it — the
+   *  plan's object consents, a site's, a rule. Read-only actions and the task's own windows (create) go on as before. */
+  uncertainSteps(): JournalStep[] {
+    return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly && x.receipt?.status !== "ok" && NEEDS_CONSENT.has(x.consequence as Consequence));
+  }
+  /** How many steps of this run are uncertain (the service holds no standing grant while there is one). */
+  get uncertainCount(): number { return this.uncertainSteps().length; }
+  /** Why `token` does not let a modify_user or external action go ahead while a step is uncertain, or null: only an
+   *  action token answering a card that named every step uncertain now does. */
+  private uncertainGate(token: ConsentToken | undefined): string | null {
+    const now = this.uncertainSteps();
+    if (!now.length) return null;
+    const named = token?.scope === "action" ? this.challenges.get(token.nonce)?.uncertain : undefined;
+    if (named && now.every((x) => named.has(x.intent))) return null;
+    return `an earlier step's result is unknown (it may have taken effect): every change or send asks the user again, naming it`;
+  }
+  /** An uncertain step as a card shows it: the intent's words, and what went out when the intent recorded it. */
+  private uncertainText(x: JournalStep): string {
+    const said = this.uncertainOut(x).map((o) => o.value).filter(Boolean).join(" / ");
+    // each value is cut (with its true count) on its own; the line as a whole only bounded, with a bare ellipsis: a
+    // count there would be the composed line's length, read as the message's
+    const line = Array.from(cardText(`${x.text}${said ? T(this.opts.lang).stepSays(said) : ""}`, Infinity, this.opts.lang));
+    return line.length > UNCERTAIN_LINE_MAX ? line.slice(0, UNCERTAIN_LINE_MAX).join("") + "…" : line.join("");
+  }
+  /** What the step sent, as the journal recorded it (the last draw before acting when it differed from the card's),
+   *  cut here, once, in the card's language, with the true length. */
+  private uncertainOut(x: JournalStep): ActionCardFacts["outgoing"] {
+    const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
+    const raw: unknown[] = Array.isArray(l.outgoing_final) ? l.outgoing_final : Array.isArray(l.outgoing) ? l.outgoing : [];
+    // a journal is read as found (an earlier build's, a torn or hand-edited one): an entry that is not a record is a
+    // bare value, null is nothing (review of harness#66 round 8: a null threw)
+    const rec: Partial<RecordedOut>[] = raw.flatMap((o) => (o && typeof o === "object" ? [o as Partial<RecordedOut>] : typeof o === "string" || typeof o === "number" ? [{ value: String(o) }] : []));
+    // a record without `chars` was written by an earlier build, already cut (with its own count in its own words):
+    // shown as it is, no count — cut again, it would count the cut text (round 7). Those were at most ~90
+    // characters; a longer one is bounded at OLD_SHAPE_MAX with a bare ellipsis, never a count
+    return rec.slice(0, 5).map((o) => {
+      const value = String(o.value ?? ""), label = String(o.label ?? "");
+      const kind = (["field", "selected", "typed", "text"].includes(String(o.kind)) ? o.kind : "text") as ActionCardFacts["outgoing"][number]["kind"];
+      if (typeof o.chars === "number" && Number.isFinite(o.chars)) return { kind, label: cardText(label, 40, this.opts.lang), value: cardText(value, 80, this.opts.lang, o.chars) };
+      const shown = cardText(value, Infinity, this.opts.lang), cut = Array.from(shown);
+      return { kind, label: cardText(label, 40, this.opts.lang), value: cut.length > OLD_SHAPE_MAX ? cut.slice(0, OLD_SHAPE_MAX).join("") + "…" : shown };
+    });
+  }
+  private uncertainFact(x: JournalStep): NonNullable<ActionCardFacts["uncertain"]>[number] {
+    const l: Record<string, unknown> = this.jlines[x.intent] ?? {};
+    return { consequence: x.consequence as Consequence, object: typeof l.object === "string" ? l.object : "", text: x.text, outgoing: this.uncertainOut(x) };
+  }
+  /** The card's lines for the uncertain steps: the same step (same words) once, with how many times; in the order
+   *  of each one's last occurrence; every outbound (external) one and the newest always shown, then the most recent
+   *  others up to UNCERTAIN_SHOWN; 「另有 N 条」 counts the distinct steps not shown. */
+  private uncertainLines(steps: readonly JournalStep[]): string {
+    const t = T(this.opts.lang);
+    const groups = new Map<string, { n: number; last: number; external: boolean }>();
+    steps.forEach((x, i) => {
+      const k = this.uncertainText(x), g = groups.get(k) ?? { n: 0, last: i, external: false };
+      g.n += 1; g.last = i; g.external ||= x.consequence === "external";
+      groups.set(k, g);
+    });
+    const order = [...groups].sort((p, q) => p[1].last - q[1].last);
+    const newest = order.at(-1)![0];
+    const shown = new Set(order.filter(([k, g]) => g.external || k === newest).map(([k]) => k));
+    for (const [k] of [...order].reverse()) { if (shown.size >= UNCERTAIN_SHOWN) break; shown.add(k); }
+    const lines = order.filter(([k]) => shown.has(k)).map(([k, g]) => (g.n > 1 ? `${k}${t.times(g.n)}` : k));
+    return t.uncertainSteps(lines, order.length - lines.length);
+  }
+
   /** The window each open_window really made (by receipt seq): what its undo closes. */
   private openedWindows = new Map<number, string>();
   /** The window each open_window brought up for the user's app (by receipt seq): undo leaves it open. */
@@ -443,6 +548,17 @@ export class Executor {
   constructor(readonly driver: Driver, readonly opts: ExecutorOptions) {
     this.consent = new ConsentVerifier(opts.publicKey, opts.now);
     this.pixelPolicy = opts.pixelSendBinding ?? pixelSendBindingFrom(process.env.DESKMIND_PIXEL_SEND_BINDING);
+    driver.listen?.((ev) => this.fromDriver(ev));
+  }
+
+  /** The driver's own events. Its wait for the user (hands waits for a still Mac before a step that needs the app in
+   *  front) is the same "paused" the app shows for this side's own wait (waitForUser): user_wait, then always one
+   *  user_resumed. An answer that came after its timeout goes to the trace (executor.late_reply): the step was
+   *  recorded unverified, and this is what became of it. */
+  private fromDriver(ev: DriverEvent) {
+    if (ev.kind === "user_wait") this.emit("executor.user_wait", { object: this.flight?.object ?? "", by: "driver", ...(ev.app ? { app: ev.app } : {}), ...(ev.what ? { what: ev.what } : {}) });
+    else if (ev.kind === "user_resumed") this.emit("executor.user_resumed", { by: "driver", ...(ev.ended === "timeout" ? { timed_out: true } : {}), ...(ev.waited_s !== undefined ? { waited_s: ev.waited_s } : {}) });
+    else if (ev.kind === "late_reply") this.emit("executor.late_reply", { op: ev.op, id: ev.id, late_ms: ev.late_ms, ok: ev.ok, ...(ev.status ? { status: ev.status } : {}), ...(ev.why ? { why: ev.why } : {}) });
   }
 
   /** The journal's records, earlier processes' (read at recover) and this one's, whether or not a file is kept: what
@@ -1006,7 +1122,7 @@ export class Executor {
     if (a.kind === "click" || a.kind === "double_click") return true;
     if (a.kind === "type") return a.text.includes("\n");
     if (a.kind === "key" && RETURN.test(a.chord)) return true;
-    if (a.kind === "key" || a.kind === "select") return !!this.lastObs.get(a.window)?.elements.some((e) => e.sends) || !!this.typed.get(a.window)?.length;
+    if (a.kind === "key" || a.kind === "select") return !!this.lastObs.get(a.window)?.elements.some((e) => e.sends) || this.typedOn(a.window).length > 0;
     return false;
   }
 
@@ -1049,11 +1165,13 @@ export class Executor {
   /** The provenance answers, per (URL, material version): asked once each. `cleared`: the judge's「没有」from a tier that
    *  may give it (not a local one) — the open is then not a send. */
   private provenance = new Map<string, { cleared: boolean; why: string; by: string }>();
-  private provenanceKey(url: string) { const h = siteOf(url); return canon({ url, v: this.readMaterial().length, approved: h ? this.planSites.get(h) ?? null : null }); }
+  private provenanceKey(url: string) { const h = siteOf(url); return canon({ url, v: this.readMaterial().length, approved: h && !this.uncertainCount ? this.planSites.get(h) ?? null : null }); }
 
   /** The sites a plan the user accepted declared and what goes to each, from the site token the app signed for this
    *  task (checked here: the runtime cannot add a host or approved content). Returns the hosts taken. */
   acceptPlanSites(t: ConsentToken): string[] {
+    // a step of this run is uncertain: no standing grant, a plan's approved site content included — every open asks
+    if (this.uncertainCount) return [];
     const got = this.consent.planSitesOf(t, this.opts.task);
     for (const h of got.hosts) this.planSites.set(h, [...new Set([...(this.planSites.get(h) ?? []), ...(got.sends[h] ?? [])])]);
     if (got.hosts.length) this.emit("executor.plan_sites", { hosts: got.hosts, sends: got.sends });
@@ -1072,7 +1190,7 @@ export class Executor {
     if (a.kind !== "open_window" || !a.url) return null;
     if (!this.readMaterial().length) return null;
     const host = siteOf(a.url);
-    if (host && this.sites.has(host)) return null;
+    if (host && this.sites.has(host) && !this.uncertainCount) return null;     // approved hosts: not while a step is uncertain
     if (host && this.provenance.get(this.provenanceKey(a.url))?.cleared) return null;
     return { host };
   }
@@ -1090,7 +1208,7 @@ export class Executor {
     const material = this.readMaterial();
     const recent = material.slice(-MATERIAL_ITEMS);
     let decoded = url; try { decoded = decodeURIComponent(url); } catch { /* malformed %XX: the raw URL says it */ }
-    const host = siteOf(url), approved = host ? this.planSites.get(host) : undefined;
+    const host = siteOf(url), approved = host && !this.uncertainCount ? this.planSites.get(host) : undefined;
     const ctx: Record<string, unknown> = {
       用户自己的话: { 原话: this.opts.raw ?? "", ...(this.earlierRequests.length ? { 改之前的要求: this.earlierRequests } : {}), ...(this.userWrote.length ? { 用户在卡片上自己写的回答: this.userWrote } : {}) },
       ...(approved ? { "用户同意发到这个网站的内容（计划卡上写明、用户点了同意）": approved.length ? approved : ["计划卡上写了要打开这个网站，没写发过去的内容"] } : {}),
@@ -1112,10 +1230,6 @@ export class Executor {
   }
 
   /** The text the task typed into the action's window so far, and what this action types. */
-  private typedIn(a: Action): string[] {
-    if (!("window" in a)) return [];
-    return [...(this.typed.get(a.window) ?? []), ...(a.kind === "type" ? [a.text] : a.kind === "set_value" ? [a.value] : [])];
-  }
 
   /** An action's class and who settled it (docs/outgoing-check-2026-10-20.md §4), from structured facts only — never
    *  the user's words: structure first (ownership; a capability that declares it sends), then the model's own class,
@@ -1234,7 +1348,7 @@ export class Executor {
     const facts = (text: string, outgoingItems: ActionCardFacts["outgoing"], host: string | null): ActionCardFacts => ({
       action: a.kind, action_text: stepText(act, look, this.opts.lang), target: elementName(el ?? undefined), object,
       object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host });
-    if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!)) : t.openLink(a.app, shortUrl(a.url!)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
+    if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!, this.opts.lang)) : t.openLink(a.app, shortUrl(a.url!, this.opts.lang)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el, facts: facts(text, sending ? outgoingItems(look, typedLines) : [], null) };
   }
@@ -1254,7 +1368,7 @@ export class Executor {
     const hit = this.classified.get(this.classifyKey(req.action, req.epoch, req.consequence));
     const f = hit ?? this.floor(req.action);
     const consequence = hit ? hit.consequence : higher(f.consequence, req.consequence ?? "read");
-    const needs = NEEDS_CONSENT.has(consequence) && this.consent.check(req.action, f.object, consequence, this.opts.task) !== null;
+    const needs = NEEDS_CONSENT.has(consequence) && (this.uncertainGate(undefined) !== null || this.consent.check(req.action, f.object, consequence, this.opts.task) !== null);
     return { consequence, object: f.object, needs_consent: needs, floor_why: f.why, ...(hit ? { by: hit.by } : {}) };
   }
 
@@ -1276,6 +1390,8 @@ export class Executor {
     // the result says: what a card lists as done and what undo takes back are the same (review of #68: E2)
     let pendingReceipt: Record<string, unknown> | null = null;
     let stepConsented = false, foregroundOk = false;
+    // what goes out, as the card showed it: recorded with the intent, so an uncertain step is named by it too
+    let cardOutgoing: ActionCardFacts["outgoing"] | undefined, finalOutgoing: ActionCardFacts["outgoing"] | undefined;
     const staleOn = (s: Snapshot, r: ActResult): ActResult => { epochWhy = s.epoch_reason; return done(r); };
     const done = (r: ActResult): ActResult => {
       if (pendingReceipt) { this.journal("receipt", { status: r.status, seq: this.receipts.length + 1, ...pendingReceipt }); pendingReceipt = null; }
@@ -1373,6 +1489,7 @@ export class Executor {
       // the card is of what is there now (the latest look, the executor's own included), the target found by what it is;
       // consent is asked and checked for the action as the caller sent it, so a retry of that action is covered
       const { sending, typed, content, text, lost, facts: cardFacts } = this.card(req.action, obs, consequence, (target ? this.looks.get(target) : undefined) ?? obs);
+      cardOutgoing = cardFacts?.outgoing;
       if (lost) return done({ ...base, status: "stale", why: `the target is gone from ${target}, or no longer one of a kind; observe it again and decide anew`, epoch: now.epoch });
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
       const judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
@@ -1396,7 +1513,9 @@ export class Executor {
       // have come): it is checked against the binding it was issued for
       const stored = req.consent?.scope === "action" ? this.consent.contentOf(req.consent.nonce) as SendBinding | undefined : undefined;
       accepted = stored && content && within(stored, content, this.pixelPolicy) ? stored : content;
-      let why = this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
+      // the uncertain gate first: a stored rule it would refuse is not consulted, so it is not recorded as used (the
+      // result card would say the step went by that rule when the user approved it on the card — review of #66 r6)
+      let why = this.uncertainGate(req.consent) ?? this.consent.check(req.action, base.object, consequence, this.opts.task, req.consent, accepted, false);
       // the token answers a card for this very action: what differs is what goes out, not the action (rc.9: "another
       // action" was said of the same click whose window had changed)
       const same = !!stored && req.consent?.digest === digestOf(req.action, base.object, consequence, stored);
@@ -1412,7 +1531,7 @@ export class Executor {
             ...(stored && content ? { binding: bindingDiff(stored, content, this.pixelPolicy) } : {}),
           };
         }
-        const challenge = this.issue(req.action, base.object, consequence, text, now.epoch, content, cardFacts);
+        const challenge = this.issue(req.action, base.object, consequence, text, now.epoch, content, cardFacts, req.purpose);
         this.emit("executor.consent_needed", { why, consequence, object: base.object, ...(diag ? { changed: diag } : {}) });
         return done({ ...base, status: "needs_consent", why, challenge, epoch: now.epoch });
       }
@@ -1434,12 +1553,14 @@ export class Executor {
       // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
       const again = this.card(req.action, obs, consequence, fresh);
       if (again.lost) return changed("the target is gone or no longer one of a kind");
+      // what goes out now, as drawn right before acting: recorded with the intent when it differs from the card's
+      if (again.facts?.outgoing && canon(again.facts.outgoing) !== canon(cardOutgoing ?? [])) finalOutgoing = again.facts.outgoing;
       act = again.act;
       if (this.mightSend(req.action) && !sameSendFacts(req.action, obs, fresh)) return changed("the focus, or which controls send");
       if (consequence === "external") {
         if (!accepted || !again.content || !within(accepted, again.content, this.pixelPolicy)) {
           diag = { binding: accepted && again.content ? bindingDiff(accepted, again.content, this.pixelPolicy) : null, epoch: fresh.epoch };
-          const challenge = this.issue(req.action, base.object, consequence, again.text, fresh.epoch, again.content, again.facts);
+          const challenge = this.issue(req.action, base.object, consequence, again.text, fresh.epoch, again.content, again.facts, req.purpose);
           this.emit("executor.consent_needed", { why: "what goes out changed right before sending", consequence, object: base.object, changed: diag });
           return done({ ...base, status: "needs_consent", why: "what goes out changed right before sending; asked again with what is there now", challenge, epoch: fresh.epoch });
         }
@@ -1460,7 +1581,7 @@ export class Executor {
     if (NEEDS_CONSENT.has(consequence) && req.consent?.scope === "action") {
       if (!this.consent.spend(req.consent)) {
         const card = this.card(req.action, this.lastObs.get(target ?? "") ?? obs, consequence);
-        const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content, card.facts);
+        const challenge = this.issue(req.action, base.object, consequence, card.text, this.epoch, card.content, card.facts, req.purpose);
         return done({ ...base, status: "needs_consent", why: "consent already used", challenge, epoch: this.epoch });
       }
       this.challenges.delete(req.consent.nonce);                 // spent: nothing will be explained against it any more
@@ -1476,7 +1597,10 @@ export class Executor {
     let land: (() => void) | null = null;
     if (consequence !== "read") {
       const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence);
-      this.journal("intent", { action: act, object: base.object, consequence, text });
+      // a certain send (the judge's 会, or a control marked as sending) takes the window's typed text with it once it
+      // ends ok (typedOn); a 拿不准 one does not
+      const takesTyped = consequence === "external" && "window" in req.action && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends));
+      this.journal("intent", { action: act, object: base.object, consequence, text, ...(takesTyped ? { takes_typed: true } : {}), ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
@@ -1491,18 +1615,24 @@ export class Executor {
         if (x.status === "error" || x.status === "unsupported") s?.fail(x.why ?? x.status);
         return x;
       });
-    } catch (e) { r = { status: "error", why: e instanceof Error ? e.message : String(e) }; }
+      // user_busy without the driver's word that nothing was sent (performed: false) is no "nothing done": hands says
+      // it only where no input went; anything else may have gone, so it is unverified (review of hands#64)
+      if (r.status === "user_busy" && r.performed !== false) r = { ...r, status: "unverified", why: `${r.why ?? "the user was busy"}; the step may have been partly carried out; observe the window before doing it again` };
+    } catch (e) {
+      // no answer in time is not a failure: the driver may still be acting (it answers one request at a time, and an
+      // old hands did not stop at the deadline it was sent), so the effect may land after this — unverified, never
+      // error, and a late answer is traced (executor.late_reply). The same for a driver that died mid-action. Any
+      // other throw: nothing went out
+      r = isEffectUnknown(e) ? { status: "unverified", why: `${e.message}${e.timedOut ? ": the step may have taken effect after that" : ""}; observe the window before doing it again` }
+        : { status: "error", why: e instanceof Error ? e.message : String(e) };
+    }
     finally { if (land) { this.flight = null; (land as () => void)(); } }
     if (this.opts.crashAfterFirstEffect && !this.crashed && r.status === "ok" && consequence !== "read") { this.crashed = true; throw new Crash("crash after the effect, before the receipt"); }
     // the receipt goes into the journal with the act's final status (done): what the driver said is kept beside it, and
     // its "not done" (performed: false, or a reply the protocol defines as a refusal before acting) as performed: false
     if (consequence !== "read") pendingReceipt = { driver_status: r.status, ...(saysNotPerformed(r) ? { performed: false } : {}) };
-    // what the task typed into a window: evidence for later outgoing questions and what a later send's card shows; a
-    // send that went through took it with it
-    if ((r.status === "ok" || r.status === "unverified") && "window" in req.action) {
-      if (consequence === "external" && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends))) this.typed.delete(req.action.window);
-      else if (req.action.kind === "type" || req.action.kind === "set_value") this.typed.set(req.action.window, this.typedIn(req.action));
-    }
+    // what the task typed into a window is read off the journal (typedOn): this act's intent and receipt are what
+    // later steps see, nothing is kept here
     // a window is the task's (and closing it takes the opening back) only on the driver's proof that the action made
     // it (`new_window`) and when it was not on screen before. The window an action merely lands in is not proof: a URL
     // put into the user's browser window returns that window (review of #16), and an app launched by open_window comes
@@ -1538,11 +1668,16 @@ export class Executor {
     // another program" (rc.1 end-to-end: hello.txt, 10-18)
     const wrote = r.status === "ok" && consequence !== "read" ? this.creditFiles(this.fileChanges(filesBefore), r.files) : [];
     let after: Snapshot;
-    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: r.status === "ok" ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
+    // went out, or may have (ok, unverified): whatever comes next, never reported as an error
+    const sent = r.status === "ok" || r.status === "unverified";
+    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: sent ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
     this.epoch = after.epoch;
-    if (after.locked) return done({ ...base, status: r.status === "ok" ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), cause: "screen_locked", epoch: after.epoch, ...madeField });
-    const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
-    const out: ActResult = { ...base, status, why: r.why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}), ...madeField };
+    if (after.locked) return done({ ...base, status: sent ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), cause: "screen_locked", epoch: after.epoch, ...madeField });
+    // user_busy (hands): the step waited for the user to pause until the deadline it was sent with, and nothing was
+    // done — the same end as this side's own wait for the user (waitForUser): blocked, try again later
+    const status = r.status === "ok" ? "ok" : r.status === "unverified" ? "unverified" : r.status === "blocked" || r.status === "user_busy" ? "blocked" : r.status === "unsupported" ? "refused" : "error";
+    const why = r.status === "user_busy" ? `the user kept using the computer while the step waited for a pause; nothing was done; try again later${r.why ? ` (${r.why})` : ""}` : r.why;
+    const out: ActResult = { ...base, status, why, epoch: after.epoch, ...(wrote.length ? { files: wrote } : {}), ...madeField };
     const win = r.window ?? ("window" in req.action ? req.action.window : r.new_window?.id ?? r.opened_window?.id);
     if (win && after.windows.some((w) => w.id === win)) {
       try {
@@ -1664,7 +1799,7 @@ export class Executor {
       try { still = cap.preconditions(ws, a.args); } catch (e) { still = e instanceof Error ? e.message : String(e); }
       if (still) return { ...base, status: "stale", why: `changed while this step was being checked: ${still}. Look again and decide anew.` };
       if (judged.verdict === "mismatch") return { ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}` };
-      const why = this.consent.check(a, object, consequence, this.opts.task, consent);
+      const why = this.uncertainGate(consent) ?? this.consent.check(a, object, consequence, this.opts.task, consent);
       if (why) {
         const challenge = this.issue(a, object, consequence, text, epoch, undefined, { action: "file", action_text: describeAction(a, undefined, "read", cap, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null });
         this.emit("executor.consent_needed", { why, consequence, object });
@@ -2008,16 +2143,33 @@ const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u206
  *  after 160 characters with the full length said. The start (scheme and host) always stays. */
 /** Words for a card that came from a model (a plan's `sends`): control, line-break and bidi/format characters escaped
  *  as in shortUrl, so they cannot forge a line or reverse text; cut at `max` characters with the length said. */
-export function cardText(x: string, max = 80): string {
+export function cardText(x: string, max = 80, lang?: Lang, total?: number): string {
   const chars = Array.from(x.replace(UNSAFE, (c) => encodeURIComponent(c)));
-  return chars.length > max ? chars.slice(0, max).join("") + `…（共 ${chars.length} 字）` : chars.join("");
+  // `total`: the text's true length when `x` is already a bounded part of it (a journal keeps a byte-bounded copy)
+  const n = Math.max(total ?? 0, chars.length);
+  return n > max ? chars.slice(0, max).join("") + T(lang).cut(n) : chars.join("");
 }
 
-export function shortUrl(u: string): string {
+/** `x` cut to at most `bytes` UTF-8 bytes, on a character boundary: what a journal keeps of a long text. */
+function boundBytes(x: string, bytes: number): string {
+  if (Buffer.byteLength(x) <= bytes) return x;
+  let out = "", used = 0;
+  for (const ch of x) { const b = Buffer.byteLength(ch); if (used + b > bytes) break; out += ch; used += b; }
+  return out;
+}
+
+/** What went out, as the journal keeps it: untruncated up to a byte bound, with the true length, no words of any
+ *  language — cut once, at the card, in the card's language (review of harness#66 round 6). */
+type RecordedOut = { kind: string; label: string; value: string; chars: number };
+function recordOut(items: ActionCardFacts["outgoing"]): RecordedOut[] {
+  return items.slice(0, 5).map((o) => ({ kind: o.kind, label: boundBytes(o.label, 512), value: boundBytes(o.value, 4096), chars: Array.from(o.value).length }));
+}
+
+export function shortUrl(u: string, lang?: Lang): string {
   let s = u;
   try { s = decodeURI(u); } catch { /* as it is */ }
   const chars = Array.from(s.replace(UNSAFE, (c) => encodeURIComponent(c)));
-  return chars.length > 160 ? chars.slice(0, 160).join("") + `…（共 ${chars.length} 字）` : chars.join("");
+  return chars.length > 160 ? chars.slice(0, 160).join("") + T(lang).cut(chars.length) : chars.join("");
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
@@ -2053,10 +2205,10 @@ export function elementName(el: Element | undefined): string | null {
  *  only; an element id or the action's JSON never shows. Values the task types are cut short. */
 export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, cap?: Capability): string {
   const t = T(lang);
-  if (a.kind === "file") return `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}${Object.keys(a.args).length ? "：" + Object.values(a.args).map((v) => `「${cardText(v, 40)}」`).join("，") : ""}`;
+  if (a.kind === "file") return `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}${Object.keys(a.args).length ? "：" + Object.values(a.args).map((v) => `「${cardText(v, 40, lang)}」`).join("，") : ""}`;
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
   const name = elementName(el) ?? t.anElement;
-  const short = (x: string) => cardText(x, 40);
+  const short = (x: string) => cardText(x, 40, lang);
   const where = obs ? windowLabel(obs.window, lang) : "";
   const what = a.kind === "click" ? t.click(name) : a.kind === "double_click" ? t.doubleClick(name)
     : a.kind === "set_value" ? t.set(name, short(a.value))
@@ -2064,7 +2216,7 @@ export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, c
     : a.kind === "select" ? t.select(name, short(a.option))
     : a.kind === "key" ? t.key(a.chord)
     : a.kind === "scroll" ? t.scroll : a.kind === "close_window" ? t.closeWindow : a.kind === "focus_window" ? t.focusWindow
-    : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, shortUrl(a.url)) : t.openWindow(a.app)) : t.wait;
+    : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, shortUrl(a.url, lang)) : t.openWindow(a.app)) : t.wait;
   return `${where && a.kind !== "open_window" && a.kind !== "wait" ? t.at(where) : ""}${what}`;
 }
 
