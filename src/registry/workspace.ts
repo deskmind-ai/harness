@@ -13,11 +13,13 @@ export const TRASH = ".deskmind-trash";
  *  own name, whatever that name is), so sweeping it can never delete the user's data. */
 export const TMP = ".deskmind-tmp";
 /** The copies undo restores from (fs.replace_text keeps the file it overwrites here): hidden at the root, never listed,
- *  never a change, never credited. The executor removes its own when the undo window closes; a copy a process that
- *  died left is swept once it is older than STALE_UNDO_MS. */
+ *  never a change, never credited. Each run keeps its own in `UNDO_DIR/<run>/` with an `owner.json` (its process id):
+ *  the executor removes its folder on every exit; the app's next run sweeps the folders whose owner process is gone (a
+ *  SIGKILL, a crash), and anything older than STALE_UNDO_MS whoever owns it. */
 export const UNDO_DIR = ".deskmind-undo";
-/** A copy older than this is left by a process that died: no undo window lasts that long. */
+/** A copy older than this is stale whatever its owner says: no run lingers that long. */
 const STALE_UNDO_MS = 24 * 60 * 60_000;
+const pidAlive = (pid: unknown): boolean => { if (typeof pid !== "number" || !(pid > 0)) return false; try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 /** A folder's version, from entries (path → file digest | "dir"): its direct members and their digests. One formula
  *  for the disk (Workspace.version) and for undo's paper folder, so the two cannot drift apart. */
 export function folderVersion(e: Record<string, string>, p: string): string {
@@ -58,6 +60,19 @@ export class Workspace {
     this.root = path.resolve(root);
   }
 
+  /** The run whose undo copies this workspace keeps (the executor's task id), so they live in a folder of its own. */
+  undoOwner?: string;
+  /** Where this run's undo copies go (made on first use, with its owner record). */
+  undoDir(): string {
+    const rel = `${UNDO_DIR}/${(this.undoOwner ?? "_").replace(/[^\w.-]/g, "_")}`;
+    const full = this.abs(rel);
+    if (!fs.existsSync(full)) {
+      fs.mkdirSync(full, { recursive: true });
+      try { fs.writeFileSync(path.join(full, "owner.json"), JSON.stringify({ pid: process.pid, run: this.undoOwner ?? null })); } catch { /* swept by age */ }
+    }
+    return rel;
+  }
+
   /** Remove tools' temporary outputs a crashed process left in TMP: only there, and only old ones, so another run
    *  checking its output right now keeps it. */
   sweepTemp() {
@@ -72,13 +87,24 @@ export class Workspace {
     }
   }
 
-  /** Undo copies a process that died left behind (older than any undo window). */
-  sweepUndo() {
+  /** Undo copies no live run will use: a run folder whose owner process is gone (it was killed or crashed: no exit path
+   *  ran), and anything older than STALE_UNDO_MS. `except`: the calling run's own folder, never touched. */
+  sweepUndo(o: { except?: string } = {}) {
     const dir = path.join(this.root, UNDO_DIR);
     let names: string[] = [];
     try { names = fs.readdirSync(dir); } catch { return; }
     const cutoff = Date.now() - STALE_UNDO_MS;
-    for (const n of names) { try { if (fs.lstatSync(path.join(dir, n)).mtimeMs < cutoff) fs.rmSync(path.join(dir, n), { force: true }); } catch { /* raced */ } }
+    for (const n of names) {
+      if (o.except !== undefined && n === o.except.replace(/[^\w.-]/g, "_")) continue;
+      const full = path.join(dir, n);
+      try {
+        const st = fs.lstatSync(full);
+        let owner: { pid?: unknown } | null = null;
+        if (st.isDirectory()) { try { owner = JSON.parse(fs.readFileSync(path.join(full, "owner.json"), "utf-8")); } catch { owner = null; } }
+        const dead = st.isDirectory() && owner !== null && !pidAlive(owner.pid);
+        if (dead || st.mtimeMs < cutoff) fs.rmSync(full, { recursive: true, force: true });
+      } catch { /* raced */ }
+    }
     try { fs.rmdirSync(dir); } catch { /* not empty, or gone */ }
   }
 

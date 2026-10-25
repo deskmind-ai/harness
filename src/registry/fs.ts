@@ -25,8 +25,7 @@ export const fsCreateText = make({
 /** fs.replace_text's undo copy: the file as it was, kept in UNDO_DIR before the write (prep, recorded in the step's
  *  journal intent: it outlives a crash), restored byte for byte only while the file is exactly as the step left it. */
 const keepCopy = (ws: Workspace, q: string): { backup: string; version: string } => {
-  fs.mkdirSync(ws.abs(UNDO_DIR), { recursive: true });
-  const backup = `${UNDO_DIR}/${randomUUID()}`;
+  const backup = `${ws.undoDir()}/${randomUUID()}`;
   fs.copyFileSync(ws.abs(q), ws.abs(backup), fs.constants.COPYFILE_EXCL);
   return { backup, version: ws.version(q) };
 };
@@ -152,21 +151,37 @@ export const fsTrash = make({
   run: (ws, a) => {
     const q = norm(a.target!);
     const version = ws.version(q);
-    fs.mkdirSync(ws.abs(TRASH), { recursive: true });
-    const name = `${randomUUID().slice(0, 8)}-${q.replaceAll("/", "_")}`;
-    fs.renameSync(ws.abs(q), path.join(ws.abs(TRASH), name));
+    // (a folder of its own per trashed file: the name keeps its length — a long name still fits)
+    const slot = `${TRASH}/${randomUUID().slice(0, 8)}`;
+    fs.mkdirSync(ws.abs(slot), { recursive: true });
+    const trashed = `${slot}/${q.replaceAll("/", "_")}`;
+    fs.renameSync(ws.abs(q), ws.abs(trashed));
     maybeCrash();
-    return { ...after(ws, [q]), undo: { trashed: `${TRASH}/${name}`, version } };
+    return { ...after(ws, [q]), undo: { trashed, version } };
   },
-  check: (ws, _a, r) => trashedProblem(ws, r.undo),
+  // check refuses on every condition undo refuses on (review of #74: it checked only the trashed file, so later steps
+  // were undone first and the undo stopped half way). It runs on undo's paper folder: the path and its folder as
+  // they will be when this step's undo runs; a symlink at the path (never in the entries) from the real disk
+  check: (ws, a, r) => backProblem(ws, norm(a.target!), r.undo, "paper"),
   undo: (ws, a, r) => {
     const q = norm(a.target!);
-    const e = untouched(ws, r, [q]) ?? trashedProblem(ws, r.undo) ?? (fs.existsSync(ws.abs(q)) ? `${q} exists again` : null) ?? (folderOk(ws, parentOf(q)) ? null : `folder ${parentOf(q)} is gone`);
+    const e = untouched(ws, r, [q]) ?? backProblem(ws, q, r.undo, "disk");
     if (e) return e;
     fs.renameSync(ws.abs(String(r.undo!.trashed)), ws.abs(q));
+    try { fs.rmdirSync(path.dirname(ws.abs(String(r.undo!.trashed)))); } catch { /* not ours to keep empty */ }
     return null;
   },
 });
+/** Why the trashed file cannot go back to `q` now: what was recorded, the trashed file itself, `q` taken (on the
+ *  paper folder or the disk; a symlink there, which no entry lists, from the disk in either), its folder gone. */
+const backProblem = (ws: Workspace, q: string, u: Record<string, unknown> | undefined, where: "paper" | "disk"): string | null => {
+  const t = trashedProblem(ws, u);
+  if (t) return t;
+  let taken = ws.exists(q);
+  if (!taken) { try { const st = fs.lstatSync(ws.abs(q)); taken = where === "disk" || st.isSymbolicLink(); } catch { /* nothing there */ } }
+  if (taken) return `${q} exists again`;
+  return folderOk(ws, parentOf(q)) ? null : `folder ${parentOf(q)} is gone`;
+};
 const trashedProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
   if (!u || typeof u.trashed !== "string" || typeof u.version !== "string") return "where the file was put is not recorded";
   const full = ws.abs(u.trashed);

@@ -269,7 +269,8 @@ describe("tool capabilities", () => {
     fs.utimesSync(w.abs(`${TMP}/left-by-a-crash.zip`), new Date(Date.now() - 3600_000), new Date(Date.now() - 3600_000));
     fs.writeFileSync(w.abs(`${TMP}/another-run-checking-it-now.zip`), "fresh");
     new Orchestrator(logPath(), w, new Gateway(table()), nobody, fileRegistry());
-    expect(fs.readdirSync(w.abs(TRASH)).some((n) => fs.readFileSync(w.abs(`${TRASH}/${n}`), "utf-8") === "the user's notes")).toBe(true);
+    // (each trashed file in a folder of its own under TRASH, its name kept)
+    expect(fs.readdirSync(w.abs(TRASH), { recursive: true }).map(String).some((n) => fs.statSync(w.abs(`${TRASH}/${n}`)).isFile() && fs.readFileSync(w.abs(`${TRASH}/${n}`), "utf-8") === "the user's notes")).toBe(true);
     expect(fs.readdirSync(w.abs(TMP))).toEqual(["another-run-checking-it-now.zip"]);
   });
 

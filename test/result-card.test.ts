@@ -276,7 +276,7 @@ describe("H2 property: a task that changed only what can be taken back, ended an
       expect(response.undone, ctx).toBe(response.total);
       expect(tree(d.scope), ctx).toEqual(d.before);
       // and no undo copy is left once the window closed (appRun returned)
-      expect(fs.existsSync(path.join(d.scope, ".deskmind-undo")) ? fs.readdirSync(path.join(d.scope, ".deskmind-undo")) : [], ctx).toEqual([]);
+      expect(undoCopies(d.scope), ctx).toEqual([]);
     }
   }, 60_000);
 });
@@ -1078,6 +1078,9 @@ describe("H2 round 8: the result card is registered before task_done announces i
   });
 });
 
+/** The undo copies on disk (files under .deskmind-undo, its owner records left out). */
+const undoCopies = (scope: string): string[] => { const dir = path.join(scope, ".deskmind-undo"); return fs.existsSync(dir) ? fs.readdirSync(dir, { recursive: true }).map(String).filter((p) => !p.endsWith("owner.json") && fs.statSync(path.join(dir, p)).isFile()) : []; };
+
 describe("file undo: replace_text keeps a copy, trash moves back — both only while untouched (the disk is the oracle)", () => {
   /** app-run on the desk: `steps`, finish; at task_done `between` runs (another program, the situation), then the undo. */
   async function runAndUndo(d: Desk, steps: Step[], between: () => void = () => {}) {
@@ -1091,7 +1094,7 @@ describe("file undo: replace_text keeps a copy, trash moves back — both only w
       if (e.kind === "task_done") setTimeout(() => {
         // while the window is open: the copy is on disk, and never in what the model or the app is shown
         listing = new Workspace(d.scope).listing().entries.map((x) => x.path);
-        copies = fs.existsSync(path.join(d.scope, ".deskmind-undo")) ? fs.readdirSync(path.join(d.scope, ".deskmind-undo")) : [];
+        copies = undoCopies(d.scope);
         between();
         const i = e.result_card?.options.findIndex((x) => x.kind === "undo") ?? -1;
         if (i >= 0) write({ type: "respond", option: i }); else input.end();
@@ -1120,7 +1123,7 @@ describe("file undo: replace_text keeps a copy, trash moves back — both only w
       const d = desk();
       const r = await runAndUndo(d, [STEP[cap]!], () => {
         if (sit === "changed_since") fs.writeFileSync(path.join(d.scope, WROTE[cap]!), "another program wrote this");
-        if (sit === "copy_gone") for (const dir of [".deskmind-undo", ".deskmind-trash"]) if (fs.existsSync(path.join(d.scope, dir))) for (const f of fs.readdirSync(path.join(d.scope, dir))) fs.rmSync(path.join(d.scope, dir, f));
+        if (sit === "copy_gone") { for (const c of undoCopies(d.scope)) fs.rmSync(path.join(d.scope, ".deskmind-undo", c)); const t = path.join(d.scope, ".deskmind-trash"); if (fs.existsSync(t)) for (const f of fs.readdirSync(t, { recursive: true }).map(String)) if (fs.statSync(path.join(t, f)).isFile()) fs.rmSync(path.join(t, f)); }
       });
       const row = `${cap} × ${sit}`;
       rows.push(row);
@@ -1159,7 +1162,7 @@ describe("file undo: replace_text keeps a copy, trash moves back — both only w
       inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream([{ calls: [{ name: "plan", args: { steps: [{ purpose: "改", objects: ["path:u2.txt"], consequence: "modify_user" }] } }] }, STEP.replace!, { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] }]) } } });
     const j = parseJournal(fs.readFileSync(path.join(runs, "run_j", "journal.jsonl"), "utf-8"));
     const i = j.findIndex((l) => l.kind === "intent");
-    expect(j[i]).toMatchObject({ undo_prep: { backup: expect.stringMatching(/^\.deskmind-undo\//), version: expect.stringMatching(/^sha256:/) } });
+    expect(j[i]).toMatchObject({ undo_prep: { backup: expect.stringMatching(/^\.deskmind-undo\/run_j\//), version: expect.stringMatching(/^sha256:/) } });
     expect(j[i + 1]).toMatchObject({ kind: "receipt", status: "ok" });
   });
 
@@ -1181,7 +1184,7 @@ describe("file undo: replace_text keeps a copy, trash moves back — both only w
     expect(s.of("session.task_undo")[0]).toMatchObject({ undone: 1, total: 1, refused: null });
     expect(tree(s.desks[0]!.scope)).toEqual(s.desks[0]!.before);
     await waitFor(() => s.of("session.task_closed").length === 1);
-    expect(fs.existsSync(path.join(s.desks[0]!.scope, ".deskmind-undo")) ? fs.readdirSync(path.join(s.desks[0]!.scope, ".deskmind-undo")) : []).toEqual([]);
+    expect(undoCopies(s.desks[0]!.scope)).toEqual([]);
   });
 
   it("policy unchanged: replace_text and trash stay not reversible (never done on the model's reading of an ambiguous request)", () => {
@@ -1191,4 +1194,170 @@ describe("file undo: replace_text keeps a copy, trash moves back — both only w
     expect(typeof reg.get("fs.replace_text")!.undo).toBe("function");
     expect(typeof reg.get("fs.trash")!.undo).toBe("function");
   });
+});
+
+describe("REV74 (review of #74, adopted)", () => {
+  const plan = { calls: [{ name: "plan", args: { steps: [{ purpose: "改", objects: ["path:u2.txt", "path:notes/u1.txt"], consequence: "modify_user" }] } }] };
+  function start(d: Desk, steps: Step[], onDone: (e: any, write: (c: unknown) => void, input: PassThrough) => void, signals?: any) {
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    const write = (c: unknown) => input.write(JSON.stringify(c) + "\n");
+    const out = (e: AppEvent) => {
+      events.push(e);
+      if (e.kind === "ask") setTimeout(() => write({ type: "answer", ask_id: e.ask_id, option: e.card.options.findIndex((x) => x.kind === "approve") }), 1);
+      if (e.kind === "task_done") setTimeout(() => onDone(e, write, input), 1);
+      if (e.kind === "result_response") input.end();
+    };
+    const run = appRun({ run_id: "run_r", raw: "改文件", config: "ds-flash", scope: d.scope }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "rev74-runs-")), out, input: new LineReader(input), linger: 600,
+      ...(signals ? { signals } : {}),
+      inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream([plan, ...steps, { calls: [{ name: "finish", args: { outcome: "done", summary: "改了" } }] }]) } } });
+    return { run, events };
+  }
+  const copiesIn = (d: Desk) => undoCopies(d.scope);
+
+  it("A: SIGTERM while the card lingers (session ending a lingering holder) leaves the copy", async () => {
+    const d = desk();
+    let signal!: (s: string) => void; let exited = false;
+    const r = start(d, [{ calls: [{ name: "fs_replace_text", args: { target: "u2.txt", text: "新的\n" } }] }], () => { signal("SIGTERM"); },
+      { onSignal: (h: any) => { signal = h; }, exit: () => { exited = true; }, exitNow: () => { exited = true; }, deadlineMs: 50, waitMs: 100 });
+    await waitFor(() => exited, 8000);
+    expect(copiesIn(d)).toEqual([]);
+  });
+
+  it("B: trash of a file in a subfolder, the subfolder removed afterwards, a newer step: undo must refuse with nothing taken back", async () => {
+    const d = desk();
+    const r = start(d, [
+      { calls: [{ name: "fs_trash", args: { target: "notes/u1.txt" } }] },
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+    ], (e, write, input) => {
+      fs.rmdirSync(path.join(d.scope, "notes"));       // another program removes the now-empty folder
+      const i = e.result_card?.options.findIndex((x: any) => x.kind === "undo") ?? -1;
+      if (i >= 0) write({ type: "respond", option: i }); else input.end();
+    });
+    await r.run;
+    const resp = r.events.find((e) => e.kind === "result_response") as any;
+    expect(resp?.refused).toBeTruthy();
+    expect(resp.undone).toBe(0);
+    expect(fs.existsSync(path.join(d.scope, "a.txt"))).toBe(true);    // nothing taken back
+  });
+
+  it("C: same file replaced twice, then undo: byte-equal, mode kept", async () => {
+    const d = desk();
+    fs.chmodSync(path.join(d.scope, "u2.txt"), 0o600);
+    const r = start(d, [
+      { calls: [{ name: "fs_replace_text", args: { target: "u2.txt", text: "一次\n" } }] },
+      { calls: [{ name: "fs_replace_text", args: { target: "u2.txt", text: "两次\n" } }] },
+    ], (e, write, input) => { const i = e.result_card?.options.findIndex((x: any) => x.kind === "undo") ?? -1; if (i >= 0) write({ type: "respond", option: i }); else input.end(); });
+    await r.run;
+    expect(r.events.find((e) => e.kind === "result_response")).toMatchObject({ undone: 2, refused: null });
+    expect(tree(d.scope)).toEqual(d.before);
+    expect(fs.statSync(path.join(d.scope, "u2.txt")).mode & 0o777).toBe(0o600);
+    expect(copiesIn(d)).toEqual([]);
+  });
+
+  it("D: trash a file whose name is 250 bytes (worked on main)", async () => {
+    const d = desk();
+    const name = "长".repeat(81) + ".txt";   // 244 bytes
+    fs.writeFileSync(path.join(d.scope, name), "x");
+    const r = start(d, [{ calls: [{ name: "fs_trash", args: { target: name } }] }], (e, write, input) => input.end());
+    await r.run;
+    expect(fs.existsSync(path.join(d.scope, name))).toBe(false);
+  });
+});
+
+describe("file undo: every exit path of the executor discards its own copies; the next app run sweeps a dead run's", () => {
+  const copies = undoCopies;
+  const REPLACE: Step = { calls: [{ name: "fs_replace_text", args: { target: "u2.txt", text: "新的\n" } }] };
+  const PLAN: Step = { calls: [{ name: "plan", args: { steps: [{ purpose: "改", objects: ["path:u2.txt"], consequence: "modify_user" }] } }] };
+  /** app-run: plan, replace, then `tail` (default: finish); `at`: what the test does at task_done (or at the replace's
+   *  step_result: "running"). Returns when the process would exit. */
+  async function exitBy(how: "end_no_card_wait" | "answered" | "linger_timeout" | "stdin_closed" | "sigterm_running" | "sigterm_lingering") {
+    const d = desk();
+    const input = new PassThrough();
+    const clock = new FakeClock();
+    let signal!: (s: string) => void, exited!: () => void;
+    const exitedP = new Promise<void>((r) => { exited = r; });
+    let sawCopy = false;
+    const out = (e: AppEvent) => {
+      if (e.kind === "ask") setTimeout(() => input.write(JSON.stringify({ type: "answer", ask_id: e.ask_id, option: e.card.options.findIndex((x) => x.kind === "approve") }) + "\n"), 1);
+      if (e.kind === "step_result") { sawCopy ||= copies(d.scope).length > 0; if (how === "sigterm_running") setTimeout(() => signal("SIGTERM"), 1); }
+      if (e.kind === "task_done") setTimeout(() => {
+        sawCopy ||= copies(d.scope).length > 0;
+        if (how === "answered") input.write(JSON.stringify({ type: "respond", option: e.result_card!.options.findIndex((x) => x.kind === "approve") }) + "\n");
+        if (how === "linger_timeout") clock.advance(601_000);
+        if (how === "stdin_closed") input.end();
+        if (how === "sigterm_lingering") signal("SIGTERM");
+      }, 1);
+    };
+    const steps: Step[] = [PLAN, REPLACE, ...(how === "sigterm_running" ? [{ calls: [{ name: "ask_user", args: { question: "还要接着做吗？", options: ["接着做"] } }] } as Step] : []), { calls: [{ name: "finish", args: { outcome: "done", summary: "改了" } }] }];
+    const run = appRun({ run_id: "run_exit", raw: "改", config: "ds-flash", scope: d.scope }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out, input: new LineReader(input), linger: how === "end_no_card_wait" ? 0 : 600,
+      signals: { onSignal: (h: (s: string) => void) => { signal = h; }, exit: () => exited(), exitNow: () => exited(), deadlineMs: 50, waitMs: 100 },
+      inject: { driver: d.sim, gateway: gateway(), clock, model: { model: MODEL, streamFn: scriptedStream(steps) } } });
+    await Promise.race([run, exitedP]);
+    return { d, sawCopy, left: copies(d.scope) };
+  }
+
+  for (const how of ["end_no_card_wait", "answered", "linger_timeout", "stdin_closed", "sigterm_running", "sigterm_lingering"] as const) {
+    it(`${how}: the copy existed while the task ran, and none is left when the process exits`, async () => {
+      const r = await exitBy(how);
+      expect(r.sawCopy, how).toBe(true);
+      expect(r.left, how).toEqual([]);
+    });
+  }
+
+  it("SIGKILL / crash (no exit path ran): the next app run in that folder sweeps the dead run's copies, never a live run's", async () => {
+    const d = desk();
+    const dead = path.join(d.scope, ".deskmind-undo", "run_dead"), live = path.join(d.scope, ".deskmind-undo", "run_live");
+    for (const [dir, pid] of [[dead, 2 ** 22 + 12345], [live, process.pid]] as const) { fs.mkdirSync(dir, { recursive: true }); fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid })); fs.writeFileSync(path.join(dir, "copy"), "x"); }
+    const input = new PassThrough();
+    await appRun({ run_id: "run_next", raw: "看一眼", config: "ds-flash", scope: d.scope }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out: () => {}, input: new LineReader(input), linger: 0,
+      inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream([{ calls: [{ name: "finish", args: { outcome: "cannot", summary: "x" } }] }]) } } });
+    expect(fs.existsSync(dead)).toBe(false);
+    expect(fs.existsSync(path.join(live, "copy"))).toBe(true);
+  });
+});
+
+describe("file undo: a capability's check refuses whenever its undo would (never half way)", () => {
+  const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  it("random file steps, then another program interferes at random: undo takes back all of it or none of it", async () => {
+    for (let seed = 101; seed < 125; seed++) {
+      const rand = rng(seed);
+      const pick = <X,>(xs: X[]) => xs[Math.floor(rand() * xs.length)]!;
+      const d = desk();
+      const files = new Set(["notes/u1.txt", "u2.txt"]);
+      let n = 0;
+      const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "整理", objects: ["path:notes/u1.txt", "path:u2.txt"], consequence: "modify_user" }] } }] }];
+      const ops: string[] = [];
+      for (let i = 0; i < 2 + Math.floor(rand() * 4); i++) {
+        const op = files.size ? pick(["create", "move", "append", "replace", "trash"]) : "create";
+        ops.push(op);
+        if (op === "create") { const p = `n${n++}.txt`; files.add(p); steps.push({ calls: [{ name: "fs_create_text", args: { parent: ".", name: p, text: `t${i}` } }] }); }
+        else if (op === "move") { const src = pick([...files]); const dst = `m${n++}.txt`; files.delete(src); files.add(dst); steps.push({ calls: [{ name: "fs_move", args: { source: src, destination: dst } }] }); }
+        else if (op === "append") steps.push({ calls: [{ name: "fs_append_line", args: { target: pick([...files]), line: `l${i}` } }] });
+        else if (op === "replace") steps.push({ calls: [{ name: "fs_replace_text", args: { target: pick([...files]), text: `r${i}\n` } }] });
+        else { const f = pick([...files]); files.delete(f); steps.push({ calls: [{ name: "fs_trash", args: { target: f } }] }); }
+      }
+      // another program, between the task's end and the undo
+      const interfere = pick(["none", "rm_notes", "retake_trashed", "symlink_trashed", "edit_a_file", "drop_copies"]);
+      const r = runTask(d, steps, "succeeded", { undo: true });
+      // (runTask answers the undo at task_done; interfere in the same tick, before the respond is read)
+      const orig = r.events.push.bind(r.events);
+      r.events.push = (...xs: AppEvent[]) => { for (const e of xs) if (e.kind === "task_done") {
+        const trashed = Object.keys(d.before).filter((p) => !p.endsWith("/") && !fs.existsSync(path.join(d.scope, p)));
+        try {
+          if (interfere === "rm_notes" && fs.existsSync(path.join(d.scope, "notes")) && fs.readdirSync(path.join(d.scope, "notes")).length === 0) fs.rmdirSync(path.join(d.scope, "notes"));
+          if (interfere === "retake_trashed" && trashed[0] && fs.existsSync(path.dirname(path.join(d.scope, trashed[0])))) fs.writeFileSync(path.join(d.scope, trashed[0]), "又放回来一个");
+          if (interfere === "symlink_trashed" && trashed[0] && fs.existsSync(path.dirname(path.join(d.scope, trashed[0])))) fs.symlinkSync("/nonexistent", path.join(d.scope, trashed[0]));
+          if (interfere === "edit_a_file") { const f = [...files].find((p) => fs.existsSync(path.join(d.scope, p))); if (f) fs.appendFileSync(path.join(d.scope, f), "别人加的"); }
+          if (interfere === "drop_copies") fs.rmSync(path.join(d.scope, ".deskmind-undo"), { recursive: true, force: true });
+        } catch { /* the situation does not apply */ }
+      } return orig(...xs); };
+      await r.done;
+      const resp = r.events.find((e) => e.kind === "result_response") as any;
+      const ctx = `seed ${seed}: ${ops.join(",")} / ${interfere}`;
+      if (!resp) continue;
+      expect([0, resp.total], ctx).toContain(resp.undone);
+      if (resp.undone === resp.total) expect(resp.refused, ctx).toBeNull();
+    }
+  }, 60_000);
 });

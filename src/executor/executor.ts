@@ -389,6 +389,8 @@ export class Executor {
     const ws = this.opts.files?.workspace;
     if (!ws) return;
     for (const c of this.undoCopies.splice(0)) { try { fs.rmSync(ws.abs(c), { force: true }); } catch { /* swept later */ } }
+    // this run's folder (its owner record with it), when it has one of its own
+    if (ws.undoOwner !== undefined) { try { fs.rmSync(ws.abs(`${UNDO_DIR}/${ws.undoOwner.replace(/[^\w.-]/g, "_")}`), { recursive: true, force: true }); } catch { /* swept later */ } }
     try { fs.rmdirSync(ws.abs(UNDO_DIR)); } catch { /* another run's copies, or gone */ }
   }
 
@@ -1969,8 +1971,8 @@ export class Executor {
   possiblySteps(): JournalStep[] { return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly); }
 
   /** The task's possibly-done steps (possibly.ts: from the journal, earlier processes' included), newest first, and
-   *  whether each can be taken back: a file action through its capability's undo (create, move, copy, append have one;
-   *  a replaced text or a trashed file do not), a window the task opened by closing it — both only when the step's
+   *  whether each can be taken back: a file action through its capability's undo (create, move, copy, append, mkdir;
+   *  a replaced text from the copy kept before, a trashed file by moving it back), a window the task opened by closing it — both only when the step's
    *  outcome is known and recorded (its receipt ok). Anything else done on screen, a step whose outcome is not known (no
    *  receipt, or not ok: an error, a capability that threw half way, a lock found after it), a step still out at the
    *  driver, and an earlier process's step cannot be. The whole run is reversible only when every step is. */
