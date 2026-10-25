@@ -49,6 +49,7 @@ import { PROTOCOL } from "../protocol/version.js";
 import { current as traceContext, within, type ModelCallRecord } from "../otel/context.js";
 import { Tracer, exportTrace } from "../otel/trace.js";
 import type { Answer, Card } from "../orchestrator/index.js";
+import { answersOpenCard } from "../protocol/cards.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
 
@@ -200,7 +201,7 @@ export class StdioUser implements RuntimeUser {
     // its signal's handler closes it here and now
     this.open?.expired?.();
     const o = this.open;
-    if (o && (a.ask_id === o.id || (a.ask_id === undefined && !this.voided))) {
+    if (o && answersOpenCard(a, o.id, this.voided)) {
       this.closeOpen("answered");
       o.taken?.();                 // the card is answered now: the next line (a steer in the same chunk) finds none open
       this.log.emit({ kind: "resumed", ask_id: o.id });

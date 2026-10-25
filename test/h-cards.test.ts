@@ -517,3 +517,41 @@ describe("review of #77: every new field survives the protocol (EventLog validat
     expect(got.map(({ seq: _s, t: _t, run_id: _r, ...rest }) => rest)).toEqual(sent);
   });
 });
+
+describe("review of #77 (Codex @bb47371): one rule for which answer line answers the open card — session and executor alike", () => {
+  /** A session whose executor is a fake: it shows the reconciliation card, records every line it is sent. */
+  async function session() {
+    const { SessionHost } = await import("../src/session/host.js");
+    const written: any[] = [];
+    let cb: ((l: string) => void) | null = null;
+    const launch = (() => ({ write: (l: string) => written.push(JSON.parse(l)), close: () => {}, onLine: (f: (l: string) => void) => { cb = f; }, exited: new Promise(() => {}) })) as never;
+    const evs: any[] = [];
+    const h = new SessionHost({ dir: fs.mkdtempSync(path.join(os.tmpdir(), "h5-rule-")), sessionId: "ses_rule", out: (e: any) => evs.push(e), coalesceMs: 5, model: { model: MODEL, streamFn: scriptedStream([]) }, launch, linger: 0 });
+    h.start();
+    h.handle(JSON.stringify({ type: "cua", text: "接着改 plan.txt" }));
+    await waitFor(() => cb);
+    const emit = (e: Record<string, unknown>) => cb!(JSON.stringify(e));
+    return { h, evs, written, emit };
+  }
+  const recon = { kind: "action", text: "上次运行在做……", options: [{ kind: "approve", text: "继续" }, { kind: "cancel", text: "先停下" }], free_text: false, blocking: true, reconcile: true };
+
+  it("an answer with or without ask_id, then a steer, in one go: the session releases the hold exactly when the executor's rule says the answer is the card's", async () => {
+    const rows: string[] = [];
+    for (const named of [true, false]) for (const voidedBefore of [false, true]) {
+      const s = await session();
+      if (voidedBefore) { s.emit({ kind: "ask", ask_id: "ask_0", card: { ...recon, reconcile: undefined, kind: "plan" } }); s.emit({ kind: "ask_void", ask_id: "ask_0", why: "steer" }); }
+      s.emit({ kind: "ask", ask_id: "ask_1", card: recon });
+      s.h.handle(JSON.stringify({ type: "answer", ...(named ? { ask_id: "ask_1" } : {}), option: 0 }));
+      s.h.handle(JSON.stringify({ type: "steer", text: "顺便去掉空行", client_id: "k1" }));
+      // the executor's own rule decides whether that line answered the card (cli/app.ts StdioUser.route)
+      const { answersOpenCard } = await import("../src/protocol/cards.js");
+      const answered = answersOpenCard(named ? { ask_id: "ask_1" } : {}, "ask_1", voidedBefore);
+      const refused = s.evs.some((e) => e.kind === "session.error" && e.code === "card_open" && e.control === "steer");
+      const forwarded = s.written.some((l) => l.type === "steer");
+      rows.push(`named ${named} voided ${voidedBefore}: answered ${answered} refused ${refused} forwarded ${forwarded}`);
+      expect(refused, rows.at(-1)).toBe(!answered);
+      expect(forwarded, rows.at(-1)).toBe(answered);
+    }
+    expect(rows).toHaveLength(4);
+  });
+});

@@ -89,3 +89,11 @@ export interface CardAsker { ask(card: Card, o?: { signal?: AbortSignal; expired
   /** Called by the asker the moment it takes an answer for this card (synchronously, before anything after it on the
    *  same input is read): the card is no longer open from then on (review of #77: a steer right behind an answer). */
   taken?: () => void }): Promise<Answer | null> | Answer | null }
+
+/** Whether an answer line answers the card open now (`open`: its ask_id, null when none): it names that card, or names
+ *  none while no card of the run was voided (steer, timeout) — after a void an answer must say which card it is for.
+ *  The one rule, read by the executor's asker (cli/app.ts StdioUser) and by the session (session/host.ts) alike, so
+ *  the two never disagree on which line answered the card (review of #77). */
+export function answersOpenCard(line: { ask_id?: unknown }, open: string | null, voidedBefore: boolean): boolean {
+  return open !== null && (line.ask_id === open || (line.ask_id === undefined && !voidedBefore));
+}

@@ -28,6 +28,7 @@ import { configSyntaxProblem, configTable, normalizeConfig, PROVIDERS, providerO
 import { loopModel } from "../runtime/model.js";
 import { PROTOCOL } from "../protocol/version.js";
 import type { CardEvent as CardEventSchema } from "../protocol/events.js";
+import { answersOpenCard } from "../protocol/cards.js";
 type CardEvent = import("zod").infer<typeof CardEventSchema>;
 import { T } from "../executor/text.js";
 import { WALL_CLOCK, type Clock } from "../executor/clock.js";
@@ -197,6 +198,9 @@ interface Task {
   card: string | null;
   /** That card is one a steer does not void (the card about an interrupted step: `reconcile`) — H5. */
   cardHolds?: boolean;
+  /** A card of this run was voided (ask_void steer / timeout): from then on an answer must name its card — the executor's
+   *  own rule (answersOpenCard), read from the same events. */
+  cardVoided?: boolean;
   steers: string[];
   end: TaskEnd | null;
   ended: Promise<TaskEnd>;
@@ -794,6 +798,8 @@ export class SessionHost {
     // is set at task_done above (cardOf), before it is forwarded; its closing by deadline is taken here, before too
     if (ev.kind === "ask") { task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; task.cardHolds = (ev.card as { reconcile?: unknown } | undefined)?.reconcile === true; }
     else if ((ev.kind === "resumed" || ev.kind === "ask_void") && ev.ask_id === task.card) task.card = null;
+    // (as the executor's asker marks it: a card let go by a steer or its deadline, not by the task's end)
+    if (ev.kind === "ask_void" && (ev.why === "steer" || ev.why === "timeout")) task.cardVoided = true;
     else if (ev.kind === "result_card_closed" && task.resultCard.s === "open") task.resultCard = { s: "closed", why: "expired" };
     // a task that does not linger keeps its result card (M2 H2: a task that changed something always shows one): its
     // undo is none in session.task_end, and the deadline it would have had is not said
@@ -1081,7 +1087,7 @@ export class SessionHost {
     const t = this.find(runId, "answer", reqId);
     // an answer to the card that holds steers goes to the executor before anything sent after it: a steer behind it is
     // read once the card is answered — no longer held here (review of #77). (Refused there, the executor holds it itself)
-    if (t && t.cardHolds && line.ask_id === t.card) t.cardHolds = false;
+    if (t && t.cardHolds && answersOpenCard(line, t.card, !!t.cardVoided)) t.cardHolds = false;
     if (t) t.handle.write(JSON.stringify(line));
   }
 
