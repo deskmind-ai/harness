@@ -1031,7 +1031,7 @@ export class ExecutorService {
   }
 
   /** The user's answer to the result card: undo takes everything back (all or nothing) and the run ends cancelled. */
-  async respond(answer: Answer): Promise<{ undone: number; total: number; refused: string | null } | null> {
+  async respond(answer: Answer): Promise<{ undone: number; total: number; refused: string | null; unsure?: string } | null> {
     const card = this.resultCard();
     if (!card || !("option" in answer)) return null;
     const pick = card.options[answer.option];

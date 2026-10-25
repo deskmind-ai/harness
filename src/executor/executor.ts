@@ -18,12 +18,13 @@ import * as P from "../orchestrator/prompts.js";
 import { POLICY, type TaskOpenedPolicy } from "../orchestrator/index.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
-import { norm, parentOf } from "../registry/spec.js";
+import { norm, parentOf, untouched } from "../registry/spec.js";
+import type { ExecResult } from "../registry/capability.js";
 import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
-import type { Workspace } from "../registry/workspace.js";
+import { UNDO_DIR, type Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, isEffectUnknown, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
@@ -404,6 +405,19 @@ export class Executor {
   /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
   private planAccepted: PlanProposal | null = null;
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
+  /** The undo copies this process made (registry/workspace.ts UNDO_DIR): removed when its undo window closes. */
+  private undoCopies: string[] = [];
+  /** The undo window closed (the process is about to exit): this process's undo copies go. Twice is harmless. */
+  discardUndoCopies() {
+    const ws = this.opts.files?.workspace;
+    if (!ws) return;
+    // only ever strictly inside UNDO_DIR (Workspace.inside: no ".." part, no link out of it)
+    for (const c of this.undoCopies.splice(0)) { const full = ws.inside(UNDO_DIR, c); if (full) try { fs.rmSync(full, { force: true }); } catch { /* swept later */ } }
+    // this run's folder (its owner record with it), when it has one of its own
+    if (ws.undoOwner !== undefined) { const full = ws.inside(UNDO_DIR, ws.undoRunDir()); if (full) try { fs.rmSync(full, { recursive: true, force: true }); } catch { /* swept later */ } }
+    try { if (fs.lstatSync(ws.abs(UNDO_DIR)).isDirectory()) fs.rmdirSync(ws.abs(UNDO_DIR)); } catch { /* another run's copies, or gone */ }
+  }
+
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; madeParents: string[]; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
   /** Paths the task has seen listed in a folder (fs.list): known to be there, though not read. */
   private listed = new Set<string>();
@@ -1935,7 +1949,10 @@ export class Executor {
     // the written files' text before (small text files): what a restart shows the user when this step's effect is unknown
     const contents_before: Record<string, string> = {};
     for (const p of fp.writes) { const t = smallText(ws, p); if (t !== undefined) contents_before[p] = t; }
-    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {}, writes: fp.writes, contents_before });
+    // what undo needs from before (a copy of the file a replace overwrites: its place and version) is in the intent,
+    // written before the action: it outlives a crash. A copy is this process's to remove when its undo window closes
+    if (typeof undo_prep?.backup === "string") this.undoCopies.push(undo_prep.backup);
+    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {}, writes: fp.writes, contents_before, ...(undo_prep ? { undo_prep } : {}) });
     let r: ReturnType<Capability["execute"]>;
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
@@ -2072,8 +2089,8 @@ export class Executor {
   possiblySteps(): JournalStep[] { return journalSteps(this.jlines, this.ownFrom).filter((x) => x.possibly); }
 
   /** The task's possibly-done steps (possibly.ts: from the journal, earlier processes' included), newest first, and
-   *  whether each can be taken back: a file action through its capability's undo (create, move, copy, append have one;
-   *  a replaced text or a trashed file do not), a window the task opened by closing it — both only when the step's
+   *  whether each can be taken back: a file action through its capability's undo (create, move, copy, append, mkdir;
+   *  a replaced text from the copy kept before, a trashed file by moving it back), a window the task opened by closing it — both only when the step's
    *  outcome is known and recorded (its receipt ok). Anything else done on screen, a step whose outcome is not known (no
    *  receipt, or not ok: an error, a capability that threw half way, a lock found after it), a step still out at the
    *  driver, and an earlier process's step cannot be. The whole run is reversible only when every step is. */
@@ -2098,11 +2115,9 @@ export class Executor {
     return { reversible: steps.every((s) => s.can), steps };
   }
 
-  /** Take every effect back, newest first; nothing is touched unless all of them can be (the orchestrator's rule).
-   *  A file a later program changed is refused by the capability's own check. */
-  async undo(): Promise<{ undone: number; total: number; refused: string | null }> {
-    const plan = this.undoable();
-    if (!plan.reversible) return { undone: 0, total: plan.steps.length, refused: plan.steps.find((s) => !s.can)?.why ?? "cannot undo" };
+  /** Undo's check of every step, before anything is touched: null when all of them can be taken back. */
+  private undoPrecheck(plan: ReturnType<Executor["undoable"]>): string | null {
+    if (!plan.reversible) return plan.steps.find((s) => !s.can)?.why ?? "cannot undo";
     const ws = this.opts.files?.workspace;
     // check every file step first, as the orchestrator's undoRun does: nothing is touched unless all of them can be
     // taken back (review of #16: second.txt was deleted, then the user's edit to first.txt stopped the undo). The
@@ -2115,25 +2130,57 @@ export class Executor {
     const paper = files.length ? new PaperFolder(ws!) : null;
     for (const f of files) {
       const before = (p: string) => f.versions_before[p] ?? "absent", left = (p: string) => f.exec.versions_after[p];
-      const moved = f.writes.find((p) => left(p) !== undefined && left(p) !== paper!.version(p));
-      const why = moved !== undefined ? `changed since the action: ${moved}` : f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
-      if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
-      paper!.takeBack(f.writes, before, left, f.madeParents);
+      // the step's own untouched test (registry/spec.ts), asked of the paper folder: the very predicate its undo asks the
+      // disk — what is at each path as the volume resolves its name, nothing at all where the step left nothing — then
+      // the capability's check, which its undo also asks after untouched
+      const why = untouched(paper!.asWorkspace, { ...f.exec, output: {} } as ExecResult, f.writes) ?? f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return why; }
+      paper!.takeBack(f.writes, before, left, f.madeParents, f.cap.undoWrites?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never).restores);
     }
+    return null;
+  }
+
+  /** Take every effect back, newest first; nothing is touched unless all of them can be (the orchestrator's rule).
+   *  A file a later program changed is refused by the capability's own check. */
+  async undo(): Promise<{ undone: number; total: number; refused: string | null; unsure?: string }> {
+    // everything before the first change — the plan, the paper folder (it reads the whole folder: an unreadable
+    // subfolder throws), every check — refuses as a whole when it throws: nothing has been touched yet (review of #74)
+    let plan: ReturnType<Executor["undoable"]>;
+    try {
+      plan = this.undoable();
+      const why = this.undoPrecheck(plan);
+      if (why) return { undone: 0, total: plan.steps.length, refused: why };
+    } catch (e) {
+      const why = `could not check the undo: ${errText(e)}`;
+      this.emit("executor.undo_refused", { why, undone: 0, checked_first: true });
+      return { undone: 0, total: this.possiblySteps().length, refused: why };
+    }
+    const ws = this.opts.files?.workspace;
     let undone = 0;
     for (const step of plan.steps) {
       const r = this.receipts.find((x) => x.seq === step.seq)!;
       const a = r.request.action;
       let err: string | null = null;
-      if (a.kind === "file") {
-        const f = this.fileReceipts.get(r.seq)!;
-        err = f.cap.undo!(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never);
-        ws!.invalidate();
-        if (!err) for (const p of f.cap.footprint(ws!, f.args).writes) this.seen[p] = ws!.version(p);
-      } else if (a.kind === "open_window") {
-        const id = this.openedWindows.get(r.seq);
-        const snap = await this.driver.snapshot();
-        if (id && snap.windows.some((w) => w.id === id)) { const pr = await this.driver.perform({ kind: "close_window", window: id }); if (pr.status !== "ok") err = pr.why ?? pr.status; }
+      // an undo never throws out of here (review of #74): what nothing could foresee (a full disk, an I/O error) stops
+      // the undo at that step, and the answer says exactly how far it got — the steps before it taken back, this one
+      // perhaps partly, the rest untouched — the only partial undo there is
+      try {
+        if (a.kind === "file") {
+          const f = this.fileReceipts.get(r.seq)!;
+          err = f.cap.undo!(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never);
+          ws!.invalidate();
+          if (!err) for (const p of f.cap.footprint(ws!, f.args).writes) this.seen[p] = ws!.version(p);
+        } else if (a.kind === "open_window") {
+          const id = this.openedWindows.get(r.seq);
+          const snap = await this.driver.snapshot();
+          if (id && snap.windows.some((w) => w.id === id)) { const pr = await this.driver.perform({ kind: "close_window", window: id }); if (pr.status !== "ok") err = pr.why ?? pr.status; }
+        }
+      } catch (e) {
+        ws?.invalidate();
+        const rest = plan.steps.length - undone - 1;
+        const why = `taking back「${step.text}」failed (${errText(e)}): ${undone} step(s) before it were taken back, this one may be partly taken back, ${rest} older step(s) were not touched`;
+        this.emit("executor.undo_failed", { seq: step.seq, why, error: errText(e), undone, not_touched: rest });
+        return { undone, total: plan.steps.length, refused: why, unsure: step.text };
       }
       if (err) { this.emit("executor.undo_refused", { seq: step.seq, why: err, undone }); return { undone, total: plan.steps.length, refused: err }; }
       undone += 1;
@@ -2337,3 +2384,6 @@ export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, c
 }
 
 export type { WindowInfo };
+
+/** An error's message for a result: never a stack. */
+function errText(e: unknown): string { return e instanceof Error ? e.message : String(e); }

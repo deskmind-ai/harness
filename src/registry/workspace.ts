@@ -2,7 +2,8 @@
  * A Workspace is the directory a task may touch. Paths are relative, '/'-separated and compared by exact name.
  * A path's version is its content digest, or "dir:" + a digest of its direct members, or "absent".
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -12,6 +13,14 @@ export const TRASH = ".deskmind-trash";
  *  the task's files and never listed. Nothing a user owns is ever put there (a trashed file goes to TRASH, under its
  *  own name, whatever that name is), so sweeping it can never delete the user's data. */
 export const TMP = ".deskmind-tmp";
+/** The copies undo restores from (fs.replace_text keeps the file it overwrites here): hidden at the root, never listed,
+ *  never a change, never credited. Each run keeps its own in `UNDO_DIR/<run>/` with an `owner.json` (its process id):
+ *  the executor removes its folder on every exit; the app's next run sweeps the folders whose owner process is gone (a
+ *  SIGKILL, a crash), and anything older than STALE_UNDO_MS whoever owns it. */
+export const UNDO_DIR = ".deskmind-undo";
+/** A copy older than this is stale whatever its owner says: no run lingers that long. */
+const STALE_UNDO_MS = 24 * 60 * 60_000;
+const pidAlive = (pid: unknown): boolean => { if (typeof pid !== "number" || !(pid > 0)) return false; try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } };
 /** A folder's version, from entries (path → file digest | "dir"): its direct members and their digests. One formula
  *  for the disk (Workspace.version) and for undo's paper folder, so the two cannot drift apart. */
 export function folderVersion(e: Record<string, string>, p: string): string {
@@ -52,17 +61,84 @@ export class Workspace {
     this.root = path.resolve(root);
   }
 
+  /** The run whose undo copies this workspace keeps (the executor's task id), so they live in a folder of its own. */
+  undoOwner?: string;
+  private ownerWritten = false;
+  /** Where this run's undo copies go. Its owner record is (re)written by the first use in each process: a restarted
+   *  run's folder names the live process, not the one that died (the sweep would take its copies). */
+  undoDir(): string {
+    const rel = this.undoRunDir();
+    const full = this.inside(UNDO_DIR, rel, { make: true });
+    if (!full) throw new Error(`the undo folder ${rel} is not inside ${UNDO_DIR}`);
+    fs.mkdirSync(full, { recursive: true });
+    if (!this.ownerWritten) {
+      try { fs.writeFileSync(path.join(full, "owner.json"), JSON.stringify({ pid: process.pid, run: this.undoOwner ?? null })); this.ownerWritten = true; } catch { /* swept by age */ }
+    }
+    return rel;
+  }
+
+  /** This run's folder under UNDO_DIR: its owner's id with anything but letters, digits, _ and - replaced (never "."). */
+  undoRunDir(): string { return `${UNDO_DIR}/${undoName(this.undoOwner ?? "_")}`; }
+
+  /** `rel`'s place on the disk when it lies strictly inside the hidden folder `base` (UNDO_DIR, TRASH, TMP), else null:
+   *  no "." or ".." part, `base` a real folder at the root (not a link), and the folder holding `rel` — links resolved —
+   *  inside it. Every removal and rename of ours under those folders goes through it (review of #74, Codex: a run id
+   *  ".." made the undo folder the task folder, which the cleanup removed). `make`: create `rel` as a folder first. */
+  inside(base: string, rel: string, o: { make?: boolean } = {}): string | null {
+    const parts = rel.split("/");
+    if (parts[0] !== base || parts.length < 2 || parts.some((x) => x === "" || x === "." || x === "..")) return null;
+    const b = path.join(this.root, base), full = path.join(this.root, rel);
+    try {
+      if (o.make) fs.mkdirSync(b, { recursive: true });
+      // no base: nothing under it exists to reach (a removal finds nothing)
+      try { if (!fs.lstatSync(b).isDirectory()) return null; } catch { return full; }
+      if (o.make) fs.mkdirSync(full, { recursive: true });
+      // the nearest folder on the way that exists, links resolved, must be the base or inside it
+      let up = path.dirname(full);
+      while (up.length > b.length && !fs.existsSync(up)) up = path.dirname(up);
+      const realBase = fs.realpathSync(b), holder = fs.realpathSync(up);
+      if (holder !== realBase && !holder.startsWith(realBase + path.sep)) return null;
+      if (o.make && fs.realpathSync(full) !== path.join(holder, path.basename(full))) return null;
+      return full;
+    } catch { return null; }
+  }
+
   /** Remove tools' temporary outputs a crashed process left in TMP: only there, and only old ones, so another run
    *  checking its output right now keeps it. */
-  sweepTemp() {
+  sweepTemp(o: { except?: string } = {}) {
+    this.sweepUndo(o);
     const dir = path.join(this.root, TMP);
     let names: string[] = [];
-    try { names = fs.readdirSync(dir); } catch { return; }
+    try { if (!fs.lstatSync(dir).isDirectory()) return; names = fs.readdirSync(dir); } catch { return; }
     const cutoff = Date.now() - STALE_TEMP_MS;
     for (const n of names) {
       const full = path.join(dir, n);
-      try { if (fs.lstatSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true }); } catch { /* raced, or next time */ }
+      // a volume probe (names()) lives for milliseconds: one a minute old was left by a process that died
+      const until = n.startsWith(PROBE) ? Date.now() - 60_000 : cutoff;
+      try { if (fs.lstatSync(full).mtimeMs < until) fs.rmSync(full, { force: true }); } catch { /* raced, or next time */ }
     }
+  }
+
+  /** Undo copies no live run will use: a run folder whose owner process is gone (it was killed or crashed: no exit path
+   *  ran), and anything older than STALE_UNDO_MS. `except`: the calling run's own folder, never touched. */
+  sweepUndo(o: { except?: string } = {}) {
+    const dir = path.join(this.root, UNDO_DIR);
+    let names: string[] = [];
+    try { if (!fs.lstatSync(dir).isDirectory()) return; names = fs.readdirSync(dir); } catch { return; }
+    const cutoff = Date.now() - STALE_UNDO_MS;
+    for (const n of names) {
+      if (o.except !== undefined && n === undoName(o.except)) continue;
+      const full = this.inside(UNDO_DIR, `${UNDO_DIR}/${n}`);
+      if (!full) continue;
+      try {
+        const st = fs.lstatSync(full);
+        let owner: { pid?: unknown } | null = null;
+        if (st.isDirectory()) { try { owner = JSON.parse(fs.readFileSync(path.join(full, "owner.json"), "utf-8")); } catch { owner = null; } }
+        const dead = st.isDirectory() && owner !== null && !pidAlive(owner.pid);
+        if (dead || st.mtimeMs < cutoff) fs.rmSync(full, { recursive: true, force: true });
+      } catch { /* raced */ }
+    }
+    try { fs.rmdirSync(dir); } catch { /* not empty, or gone */ }
   }
 
   /** A path as it is spelled on disk: each part that exists under another case or Unicode form (macOS volumes are
@@ -71,7 +147,10 @@ export class Workspace {
    *  consent and every guard see the file a write would really reach. */
   onDisk(p: string): string {
     const parts = p.split("/").filter(Boolean);
-    const fold = (x: string) => x.normalize("NFC").toLowerCase();
+    // only what this volume ignores is folded: on a case-sensitive volume 「A.txt」 is another file than a.txt
+    const { caseless, formless } = this.names();
+    const fold = (x: string) => { const y = formless ? x.normalize("NFC") : x; return caseless ? y.toLowerCase() : y; };
+    if (!caseless && !formless) return p;
     let dir = this.root;
     const out: string[] = [];
     for (let i = 0; i < parts.length; i += 1) {
@@ -84,6 +163,30 @@ export class Workspace {
       dir = path.join(dir, hit);
     }
     return out.join("/");
+  }
+
+  /** How the volume under the root compares names: does it ignore case, does it ignore the Unicode form (NFC/NFD)?
+   *  Asked of the volume itself, once per volume (a probe file in TMP, looked up under the other spelling). */
+  names(): VolumeNames {
+    let dev: number;
+    try { dev = fs.statSync(this.root).dev; } catch { return defaultNames(); }
+    const known = VOLUME_NAMES.get(dev);
+    if (known) return known;
+    const dir = path.join(this.root, TMP), base = `${PROBE}${randomUUID().slice(0, 8)}-a\u00e9`;
+    let found: VolumeNames;
+    const made = !fs.existsSync(dir);
+    let wrote = false;
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      if (!fs.lstatSync(dir).isDirectory()) throw new Error(`${TMP} is not a folder`);   // a link out: never written through
+      fs.writeFileSync(path.join(dir, base), "", { flag: "wx" });
+      wrote = true;
+      const there = (n: string) => { try { fs.lstatSync(path.join(dir, n)); return true; } catch { return false; } };
+      found = { caseless: there(base.toUpperCase()), formless: there(base.normalize("NFD")) };
+    } catch { found = defaultNames(); }
+    try { if (wrote) fs.rmSync(path.join(dir, base), { force: true }); if (made && wrote) fs.rmdirSync(dir); } catch { /* not empty: another run's outputs */ }
+    VOLUME_NAMES.set(dev, found);
+    return found;
   }
 
   /** Forget the cached snapshot (after our own effect or a known external change). */
@@ -99,7 +202,7 @@ export class Workspace {
       let names: fs.Dirent[];
       try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && dir !== this.root) return; throw e; }   // vanished meanwhile: not there
       for (const d of names) {
-        if (d.name === TRASH || d.name === TMP || d.name === HANDS || d.name === ".keep") continue;
+        if (d.name === TRASH || d.name === TMP || d.name === UNDO_DIR || d.name === HANDS || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
         let st: fs.Stats;
         try { st = fs.lstatSync(full); } catch (e) { if (gone(e)) continue; throw e; }   // a link (even a dangling one) is not followed
@@ -139,7 +242,7 @@ export class Workspace {
     const walk = (dir: string, rel: string) => {
       let names: fs.Dirent[];
       try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && rel) { delete out[rel]; return; } throw e; }
-      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP && d.name !== HANDS).map((d) => d.name).sort();
+      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP && d.name !== UNDO_DIR && d.name !== HANDS).map((d) => d.name).sort();
       const files = names.filter((d) => d.isFile() && d.name !== ".keep").map((d) => d.name).sort();
       for (const d of dirs) out[rel ? `${rel}/${d}` : d] = "dir";
       for (const f of files) {
@@ -180,6 +283,37 @@ export class Workspace {
 
   exists(p: string): boolean {
     return this.version(p) !== ABSENT;
+  }
+
+  // --- what an undo asks the disk (one set of questions, for its check and for itself) -----------------------------
+  /** The version of what is at `p` now, the name resolved as the volume resolves it (another case, another Unicode
+   *  form: 「U2.txt」 is at 「u2.txt」 on a case-insensitive volume). ABSENT when nothing listed is there. */
+  at(p: string): string { return this.version(this.onDisk(p)); }
+  /** Something is at `p` — a file, a folder, a symlink, listed or not — as the volume sees the name. */
+  occupied(p: string): boolean { try { fs.lstatSync(this.abs(p)); return true; } catch { return false; } }
+  /** Why what is at `p` could not be written back now, or null — the permission question an undo asks before it acts
+   *  (review of #74: a file made read-only or locked after the task let undo start and then throw half way):
+   *  - "content": its bytes can be written (replace, append: the file writable, not locked or append-only);
+   *  - "remove": it can be unlinked or renamed away (the entry not locked, its folder accepts the change);
+   *  - "into": a folder that takes an entry in (writable and searchable, not locked);
+   *  - "cross": it can be renamed into another folder — a folder moved across parents needs write permission on
+   *    itself (macOS refuses EACCES on a 555 folder); a file needs nothing more.
+   *  Nothing there: null (whether something must be there is untouched's and the capability's question). */
+  writeBlocked(p: string, how: "content" | "remove" | "into" | "cross"): string | null {
+    if (how === "remove") return this.entryBlocked(p) ?? this.writeBlocked(parentRel(p), "into");
+    const full = this.abs(p), name = p === "" ? "." : p;
+    let st: fs.Stats;
+    try { st = fs.lstatSync(full); } catch { return null; }
+    if ((how === "into" || how === "cross") && !st.isDirectory()) return null;
+    if (fileFlags(full) & LOCK_FLAGS) return how === "content" ? `${name} is locked` : `folder ${name} is locked`;
+    try { fs.accessSync(full, how === "into" ? fs.constants.W_OK | fs.constants.X_OK : fs.constants.W_OK); } catch { return how === "content" ? `${name} is read-only` : `folder ${name} is read-only`; }
+    return null;
+  }
+  /** The entry at `p` itself can be unlinked or renamed: not locked (its folder is asked apart). */
+  entryBlocked(p: string): string | null {
+    const full = this.abs(p);
+    try { fs.lstatSync(full); } catch { return null; }
+    return fileFlags(full) & LOCK_FLAGS ? `${p} is locked` : null;
   }
 
   isDir(p: string): boolean {
@@ -230,4 +364,50 @@ export function build(root: string, files: Record<string, string | null>) {
       fs.writeFileSync(full, text, "utf-8");
     }
   }
+}
+
+/** How a volume compares names (Workspace.names). */
+export interface VolumeNames { caseless: boolean; formless: boolean }
+const VOLUME_NAMES = new Map<number, VolumeNames>();
+/** When the volume cannot be asked (the folder is read-only): macOS volumes are case- and form-insensitive by default. */
+const defaultNames = (): VolumeNames => ({ caseless: process.platform === "darwin", formless: process.platform === "darwin" });
+/** Test seam: forget what was probed. */
+export const forgetVolumeNames = () => VOLUME_NAMES.clear();
+
+/** The BSD file flags that refuse a write, an unlink or a rename whatever the mode says: the Finder's lock (uchg),
+ *  append-only (uappnd), and their system forms (schg, sappnd). */
+const LOCK_FLAGS = 0x2 | 0x4 | 0x20000 | 0x40000;
+/** A path's BSD flags (st_flags; Node's stat does not carry them), not following a link. 0 where there are none. */
+export function fileFlags(full: string): number {
+  if (process.platform !== "darwin") return 0;
+  try { return Number(execFileSync("/usr/bin/stat", ["-f", "%f", full], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim()) || 0; } catch { return 0; }
+}
+const parentRel = (p: string) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
+/** The name a volume probe starts with (Workspace.names): swept by sweepTemp. */
+const PROBE = "probe-";
+/** A run id as a folder name: letters, digits, _ and - kept, anything else (a dot too) replaced. */
+export const undoName = (run: string) => run.replace(/[^A-Za-z0-9_-]/g, "_");
+
+/** What a trashed object's undo compares whole (review of #74, Codex: a trashed folder passed with a file added
+ *  inside it): a file's digest; a folder's digest over everything under it — each name (hidden ones too), its kind,
+ *  a file's bytes, a link's target. Null above TREE_LIMIT entries or bytes: recorded as "no digest", so that undo is
+ *  refused rather than left to hang on a huge folder. */
+export const TREE_LIMIT = { entries: 20_000, bytes: 512 * 1024 ** 2 };
+export function treeDigest(full: string): string | null {
+  const st = fs.lstatSync(full);
+  if (st.isFile()) return st.size > TREE_LIMIT.bytes ? null : sha(fs.readFileSync(full));
+  const h = createHash("sha256");
+  let n = 0, bytes = 0;
+  const walk = (dir: string, rel: string): boolean => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      if (++n > TREE_LIMIT.entries) return false;
+      const f = path.join(dir, name), r = rel ? `${rel}/${name}` : name, s = fs.lstatSync(f);
+      if (s.isDirectory()) { h.update(`D ${r}\n`); if (!walk(f, r)) return false; }
+      else if (s.isSymbolicLink()) h.update(`L ${r} ${fs.readlinkSync(f)}\n`);
+      else if (s.isFile()) { bytes += s.size; if (bytes > TREE_LIMIT.bytes) return false; h.update(`F ${r} ${sha(fs.readFileSync(f))}\n`); }
+      else h.update(`O ${r}\n`);
+    }
+    return true;
+  };
+  return walk(full, "") ? "tree:" + h.digest("hex").slice(0, 32) : null;
 }

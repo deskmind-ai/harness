@@ -842,7 +842,7 @@ export class Orchestrator {
 
   /** Take back what this run wrote, newest first, using each capability's undo. Stops at the first step that cannot be
    *  undone (no undo, or a path changed since), and says which. */
-  undoRun(): { undone: number; total: number; refused: string | null } {
+  undoRun(): { undone: number; total: number; refused: string | null; unsure?: string } {
     const st = this.st;
     const done = [...st.ops].filter(([, v]) => v.state === "ok" && (v.intent.writes ?? []).length > 0).reverse();
     // a step with no undo, which records no writes (a GUI action), would otherwise be skipped and the rest reported done
@@ -855,25 +855,40 @@ export class Orchestrator {
     // back, each written path must be exactly as that step left it, given that the later steps' undos have run:
     // expected[p] starts at the current version and becomes the version before each step (a run may append to the
     // same file twice, or move A→B→C).
-    const expected: Record<string, string> = {};
-    for (const [id, op] of done) {
-      const cap = this.registry.get(op.intent.capability);
-      const rec = record(op) as { versions_after: Record<string, string> } | null;
-      let why = !cap?.undo ? `${op.intent.capability} has no undo` : !rec ? `no record of what「${op.intent.text}」left` : null;
-      if (!why) for (const p of op.intent.writes) {
-        const now = p in expected ? expected[p]! : this.ws.version(p);
-        // a folder's version follows its contents, which later steps (and their undos) change; folders are checked
-        // by the capability (mkdir: holds nothing but ours)
-        const left = rec!.versions_after[p];
-        if (left !== undefined && !left.startsWith("dir:") && left !== now) { why = `changed since the action: ${p}`; break; }
-        expected[p] = op.intent.versions_before[p] ?? ABSENT;
+    // every check before the first change: one that throws (an unreadable folder) refuses as a whole — nothing touched
+    try {
+      const expected: Record<string, string> = {};
+      for (const [id, op] of done) {
+        const cap = this.registry.get(op.intent.capability);
+        const rec = record(op) as { versions_after: Record<string, string> } | null;
+        let why = !cap?.undo ? `${op.intent.capability} has no undo` : !rec ? `no record of what「${op.intent.text}」left` : null;
+        if (!why) for (const p of op.intent.writes) {
+          const now = p in expected ? expected[p]! : this.ws.version(p);
+          // a folder's version follows its contents, which later steps (and their undos) change; folders are checked
+          // by the capability (mkdir: holds nothing but ours)
+          const left = rec!.versions_after[p];
+          if (left !== undefined && !left.startsWith("dir:") && left !== now) { why = `changed since the action: ${p}`; break; }
+          expected[p] = op.intent.versions_before[p] ?? ABSENT;
+        }
+        why ??= cap!.undoCheck?.(this.ws, op.intent.args, rec as never, ours) ?? null;
+        if (why) { this.emit("execution.undo_refused", { operation_id: id, why, checked_first: true }); return { undone: 0, total: done.length, refused: why }; }
       }
-      why ??= cap!.undoCheck?.(this.ws, op.intent.args, rec as never, ours) ?? null;
-      if (why) { this.emit("execution.undo_refused", { operation_id: id, why, checked_first: true }); return { undone: 0, total: done.length, refused: why }; }
+    } catch (e) {
+      const why = `could not check the undo: ${e instanceof Error ? e.message : String(e)}`;
+      this.emit("execution.undo_refused", { why, checked_first: true });
+      return { undone: 0, total: done.length, refused: why };
     }
     let undone = 0;
     for (const [id, op] of done) {
-      const err = this.registry.get(op.intent.capability)!.undo!(this.ws, op.intent.args, record(op)!);
+      // an undo never throws out of here: the unforeseen (an I/O error) stops it at this step, said exactly
+      let err: string | null;
+      try { err = this.registry.get(op.intent.capability)!.undo!(this.ws, op.intent.args, record(op)!); }
+      catch (e) {
+        this.ws.invalidate();
+        const why = `taking back「${op.intent.text ?? op.intent.capability}」failed (${e instanceof Error ? e.message : String(e)}): ${undone} step(s) before it were taken back, this one may be partly taken back, ${done.length - undone - 1} older step(s) were not touched`;
+        this.emit("execution.undo_refused", { operation_id: id, why, undone, failed: true });
+        return { undone, total: done.length, refused: why, unsure: op.intent.text ?? op.intent.capability };
+      }
       this.ws.invalidate();
       if (err) { this.emit("execution.undo_refused", { operation_id: id, why: err, undone }); return { undone, total: done.length, refused: err }; }
       const versions: Record<string, string> = {};
