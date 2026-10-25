@@ -12,6 +12,12 @@ export const TRASH = ".deskmind-trash";
  *  the task's files and never listed. Nothing a user owns is ever put there (a trashed file goes to TRASH, under its
  *  own name, whatever that name is), so sweeping it can never delete the user's data. */
 export const TMP = ".deskmind-tmp";
+/** The copies undo restores from (fs.replace_text keeps the file it overwrites here): hidden at the root, never listed,
+ *  never a change, never credited. The executor removes its own when the undo window closes; a copy a process that
+ *  died left is swept once it is older than STALE_UNDO_MS. */
+export const UNDO_DIR = ".deskmind-undo";
+/** A copy older than this is left by a process that died: no undo window lasts that long. */
+const STALE_UNDO_MS = 24 * 60 * 60_000;
 /** A folder's version, from entries (path → file digest | "dir"): its direct members and their digests. One formula
  *  for the disk (Workspace.version) and for undo's paper folder, so the two cannot drift apart. */
 export function folderVersion(e: Record<string, string>, p: string): string {
@@ -55,6 +61,7 @@ export class Workspace {
   /** Remove tools' temporary outputs a crashed process left in TMP: only there, and only old ones, so another run
    *  checking its output right now keeps it. */
   sweepTemp() {
+    this.sweepUndo();
     const dir = path.join(this.root, TMP);
     let names: string[] = [];
     try { names = fs.readdirSync(dir); } catch { return; }
@@ -63,6 +70,16 @@ export class Workspace {
       const full = path.join(dir, n);
       try { if (fs.lstatSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true }); } catch { /* raced, or next time */ }
     }
+  }
+
+  /** Undo copies a process that died left behind (older than any undo window). */
+  sweepUndo() {
+    const dir = path.join(this.root, UNDO_DIR);
+    let names: string[] = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    const cutoff = Date.now() - STALE_UNDO_MS;
+    for (const n of names) { try { if (fs.lstatSync(path.join(dir, n)).mtimeMs < cutoff) fs.rmSync(path.join(dir, n), { force: true }); } catch { /* raced */ } }
+    try { fs.rmdirSync(dir); } catch { /* not empty, or gone */ }
   }
 
   /** A path as it is spelled on disk: each part that exists under another case or Unicode form (macOS volumes are
@@ -99,7 +116,7 @@ export class Workspace {
       let names: fs.Dirent[];
       try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && dir !== this.root) return; throw e; }   // vanished meanwhile: not there
       for (const d of names) {
-        if (d.name === TRASH || d.name === TMP || d.name === HANDS || d.name === ".keep") continue;
+        if (d.name === TRASH || d.name === TMP || d.name === UNDO_DIR || d.name === HANDS || d.name === ".keep") continue;
         const full = path.join(dir, d.name);
         let st: fs.Stats;
         try { st = fs.lstatSync(full); } catch (e) { if (gone(e)) continue; throw e; }   // a link (even a dangling one) is not followed
@@ -139,7 +156,7 @@ export class Workspace {
     const walk = (dir: string, rel: string) => {
       let names: fs.Dirent[];
       try { names = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (gone(e) && rel) { delete out[rel]; return; } throw e; }
-      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP && d.name !== HANDS).map((d) => d.name).sort();
+      const dirs = names.filter((d) => d.isDirectory() && d.name !== TRASH && d.name !== TMP && d.name !== UNDO_DIR && d.name !== HANDS).map((d) => d.name).sort();
       const files = names.filter((d) => d.isFile() && d.name !== ".keep").map((d) => d.name).sort();
       for (const d of dirs) out[rel ? `${rel}/${d}` : d] = "dir";
       for (const f of files) {

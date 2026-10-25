@@ -29,6 +29,9 @@ export interface Spec {
   effect: Effect;
   confirm?: boolean;
   discards?: boolean;
+  /** Declared outright, whatever `undo` says: an action with an undo recipe that is still not one to take on the
+   *  model's reading of an ambiguous request (it overwrites or deletes the user's file: fs.replace_text, fs.trash). */
+  reversible?: boolean;
   pathFields?: string[];
   footprint: (ws: Workspace, a: Args) => Footprint;
   pre: (ws: Workspace, a: Args) => string | null;
@@ -46,7 +49,7 @@ export interface Spec {
 export function make(sp: Spec): Capability {
   const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
   return {
-    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, pathFields: sp.pathFields ?? [], discards: !!sp.discards, reversible: sp.effect === "observe" || !!sp.undo,
+    id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, pathFields: sp.pathFields ?? [], discards: !!sp.discards, reversible: sp.reversible ?? (sp.effect === "observe" || !!sp.undo),
     typecheck(a) {
       if (sp.derive) a = Object.fromEntries(Object.entries(a).filter(([k]) => !sp.derive!.fields.includes(k)));
       const err = schemaCheck(schema, a);

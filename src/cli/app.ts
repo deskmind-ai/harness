@@ -449,7 +449,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   o.signals?.onSignal((sig) => {
     const sg = o.signals!;
     if (done) return sg.exit();
-    if (++signals > 1) { forceDone(); return sg.exitNow(); }
+    if (++signals > 1) { forceDone(); executor.discardUndoCopies(); return sg.exitNow(); }
     o.input.stop(`stopped by ${sig}`, sig === "SIGINT" ? "user_stopped" : undefined);
     void (async () => {
       await sleep(sg.deadlineMs ?? 800);
@@ -458,7 +458,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
         // the receipt came: the runtime writes its own task_done a moment later
         if (!executor.inFlight) await Promise.race([whenDone, sleep(500)]);
       }
-      forceDone(); sg.exit();
+      forceDone(); executor.discardUndoCopies(); sg.exit();
     })();
   });
   const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
@@ -478,7 +478,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // the card waits from the moment task_done says so: from here a stop closes it (armed before task_done is written)
   if (lingers) o.input.stopsAsLines = true;
   taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, ...undoUntil, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
-  if (signals) return o.signals!.exit();
+  // the undo window closes when this process stops waiting for the card: its undo copies go then (an undo restored and
+  // removed its own already)
+  if (signals) { executor.discardUndoCopies(); return o.signals!.exit(); }
   // Any other line in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the
   // wait goes on: only a respond, the app closing stdin (or stopping), or the deadline ends it (deskmind S0: undo was
   // dead when the first line after task_done was not the respond)
@@ -525,6 +527,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
       }
     } finally { cancel(); o.input.stopsAsLines = false; }
   }
+  executor.discardUndoCopies();
 }
 
 /** After the result card's deadline, how long the process still reads stdin to answer responds already on their way

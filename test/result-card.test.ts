@@ -72,7 +72,8 @@ function tree(root: string): Record<string, string> {
   const out: Record<string, string> = {};
   const walk = (rel: string) => {
     for (const e of fs.readdirSync(path.join(root, rel), { withFileTypes: true })) {
-      if (!rel && e.name === ".deskmind-tmp") continue;   // the harness's own scratch folder (registry/workspace.ts TMP), never the user's
+      // the harness's own folders (registry/workspace.ts TMP, TRASH, UNDO_DIR): never the user's, never listed
+      if (!rel && (e.name === ".deskmind-tmp" || e.name === ".deskmind-trash" || e.name === ".deskmind-undo")) continue;
       const p = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) { out[p + "/"] = "dir"; walk(p); } else out[p] = fs.readFileSync(path.join(root, p), "utf-8");
     }
@@ -246,11 +247,13 @@ describe("H2 property: a task that changed only what can be taken back, ended an
       const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "整理", objects: ["path:notes/u1.txt", "path:u2.txt"], consequence: "modify_user" }] } }] }];
       const k = 2 + Math.floor(rand() * 5);
       for (let i = 0; i < k; i++) {
-        const op = pick(["create", "mkdir", "copy", "move", "append"]);
+        const op = files.size ? pick(["create", "mkdir", "copy", "move", "append", "replace", "trash"]) : "create";
         if (op === "create") { const dir = pick([...dirs]); const p = fresh(dir); files.add(p); steps.push({ calls: [{ name: "fs_create_text", args: { parent: dir, name: path.basename(p), text: `t${i}` } }] }); }
         else if (op === "mkdir") { const p = `d${n++}`; dirs.add(p); steps.push({ calls: [{ name: "fs_mkdir", args: { path: p } }] }); }
         else if (op === "copy") { const src = pick([...files]); const dst = fresh(pick([...dirs])); files.add(dst); steps.push({ calls: [{ name: "fs_copy", args: { source: src, destination: dst } }] }); }
         else if (op === "move") { const src = pick([...files]); const dst = fresh(pick([...dirs])); files.delete(src); files.add(dst); steps.push({ calls: [{ name: "fs_move", args: { source: src, destination: dst } }] }); }
+        else if (op === "replace") { const f = pick([...files]); steps.push({ calls: [{ name: "fs_replace_text", args: { target: f, text: `r${i}\n` } }] }); }
+        else if (op === "trash") { const f = pick([...files]); files.delete(f); steps.push({ calls: [{ name: "fs_trash", args: { target: f } }] }); }
         else { const f = pick([...files]); steps.push({ calls: [{ name: "fs_append_line", args: { target: f, line: `l${i}` } }] }); }
       }
       const end = pick<End>(["succeeded", "failed", "unconfirmed", "cancelled", "stopped"]);
@@ -272,6 +275,8 @@ describe("H2 property: a task that changed only what can be taken back, ended an
       expect(response, ctx).toMatchObject({ picked: "undo", refused: null });
       expect(response.undone, ctx).toBe(response.total);
       expect(tree(d.scope), ctx).toEqual(d.before);
+      // and no undo copy is left once the window closed (appRun returned)
+      expect(fs.existsSync(path.join(d.scope, ".deskmind-undo")) ? fs.readdirSync(path.join(d.scope, ".deskmind-undo")) : [], ctx).toEqual([]);
     }
   }, 60_000);
 });
@@ -1070,5 +1075,120 @@ describe("H2 round 8: the result card is registered before task_done announces i
         expect(fs.existsSync(path.join(s.desks[0]!.scope, "b.txt"))).toBe(true);
       }
     }
+  });
+});
+
+describe("file undo: replace_text keeps a copy, trash moves back — both only while untouched (the disk is the oracle)", () => {
+  /** app-run on the desk: `steps`, finish; at task_done `between` runs (another program, the situation), then the undo. */
+  async function runAndUndo(d: Desk, steps: Step[], between: () => void = () => {}) {
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    const write = (c: unknown) => input.write(JSON.stringify(c) + "\n");
+    let listing: string[] = [], copies: string[] = [];
+    const out = (e: AppEvent) => {
+      events.push(e);
+      if (e.kind === "ask") setTimeout(() => write({ type: "answer", ask_id: e.ask_id, option: e.card.options.findIndex((x) => x.kind === "approve") }), 1);
+      if (e.kind === "task_done") setTimeout(() => {
+        // while the window is open: the copy is on disk, and never in what the model or the app is shown
+        listing = new Workspace(d.scope).listing().entries.map((x) => x.path);
+        copies = fs.existsSync(path.join(d.scope, ".deskmind-undo")) ? fs.readdirSync(path.join(d.scope, ".deskmind-undo")) : [];
+        between();
+        const i = e.result_card?.options.findIndex((x) => x.kind === "undo") ?? -1;
+        if (i >= 0) write({ type: "respond", option: i }); else input.end();
+      }, 1);
+      if (e.kind === "result_response") input.end();
+    };
+    await appRun({ run_id: "run_fu", raw: "改文件", config: "ds-flash", scope: d.scope }, { runs: fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-")), out, input: new LineReader(input), linger: 600,
+      inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream([{ calls: [{ name: "plan", args: { steps: [{ purpose: "改", objects: ["path:u2.txt", "path:notes/u1.txt"], consequence: "modify_user" }] } }] }, ...steps, { calls: [{ name: "finish", args: { outcome: "done", summary: "改了" } }] }]) } } });
+    const done = events.find((e) => e.kind === "task_done") as Extract<AppEvent, { kind: "task_done" }>;
+    return { done, response: events.find((e) => e.kind === "result_response") as any, listing, copies, left: fs.existsSync(path.join(d.scope, ".deskmind-undo")) ? fs.readdirSync(path.join(d.scope, ".deskmind-undo")) : [] };
+  }
+  const STEP: Record<string, Step> = {
+    replace: { calls: [{ name: "fs_replace_text", args: { target: "u2.txt", text: "新的\n" } }] },
+    trash: { calls: [{ name: "fs_trash", args: { target: "u2.txt" } }] },
+    move: { calls: [{ name: "fs_move", args: { source: "u2.txt", destination: "notes/u3.txt" } }] },
+    append: { calls: [{ name: "fs_append_line", args: { target: "u2.txt", line: "加一行" } }] },
+    create: { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+  };
+  /** The path the step changed, to be touched by another program afterwards. */
+  const WROTE: Record<string, string> = { replace: "u2.txt", trash: "u2.txt", move: "notes/u3.txt", append: "u2.txt", create: "a.txt" };
+
+  it("the table: capability × (untouched | changed since | its undo copy gone) → undo offered, refused or done, and the folder after it", async () => {
+    const rows: string[] = [];
+    for (const cap of Object.keys(STEP)) for (const sit of ["untouched", "changed_since", "copy_gone"] as const) {
+      if (sit === "copy_gone" && cap !== "replace" && cap !== "trash") continue;
+      const d = desk();
+      const r = await runAndUndo(d, [STEP[cap]!], () => {
+        if (sit === "changed_since") fs.writeFileSync(path.join(d.scope, WROTE[cap]!), "another program wrote this");
+        if (sit === "copy_gone") for (const dir of [".deskmind-undo", ".deskmind-trash"]) if (fs.existsSync(path.join(d.scope, dir))) for (const f of fs.readdirSync(path.join(d.scope, dir))) fs.rmSync(path.join(d.scope, dir, f));
+      });
+      const row = `${cap} × ${sit}`;
+      rows.push(row);
+      expect(r.done.status, row).toBe("succeeded");
+      expect(r.done.result_card!.options.some((x) => x.kind === "undo"), row).toBe(true);        // every one has a recipe
+      expect(r.listing.some((p) => p.startsWith(".deskmind")), row).toBe(false);                  // never shown
+      expect(Object.values(r.done.changes ?? {}).flat().some((p) => String(p).startsWith(".deskmind")), row).toBe(false);   // never a change
+      if (cap === "replace") expect(r.copies, row).toHaveLength(1);                               // kept before the write
+      if (sit === "untouched") {
+        expect(r.response, row).toMatchObject({ picked: "undo", undone: 1, total: 1, refused: null });
+        expect(tree(d.scope), row).toEqual(d.before);
+      } else {
+        expect(r.response.undone, row).toBe(0);
+        expect(r.response.refused, row).toBeTruthy();
+        expect(tree(d.scope), row).not.toEqual(d.before);                                         // nothing taken back on a guess
+      }
+      expect(r.left, row).toEqual([]);                                                            // the copies go with the window
+    }
+    expect(rows).toHaveLength(12);
+  }, 60_000);
+
+  it("trash keeps every trashed file under its own name: two files of the same name trashed, undo puts each back", async () => {
+    const d = desk();
+    fs.writeFileSync(path.join(d.scope, "notes", "u2.txt"), "notes 里的");
+    const before = tree(d.scope);
+    const r = await runAndUndo(d, [STEP.trash!, { calls: [{ name: "fs_trash", args: { target: "notes/u2.txt" } }] }, { calls: [{ name: "fs_create_text", args: { parent: ".", name: "u2.txt", text: "新的同名" } }] }, { calls: [{ name: "fs_trash", args: { target: "u2.txt" } }] }]);
+    expect(r.response).toMatchObject({ picked: "undo", undone: 4, total: 4, refused: null });
+    expect(tree(d.scope)).toEqual(before);
+  });
+
+  it("the copy's place and version are in the step's journal intent, written before the write (a crash leaves it findable)", async () => {
+    const d = desk();
+    const runs = fs.mkdtempSync(path.join(os.tmpdir(), "result-card-runs-"));
+    const input = new PassThrough();
+    await appRun({ run_id: "run_j", raw: "改", config: "ds-flash", scope: d.scope }, { runs, out: (e) => { if (e.kind === "ask") setTimeout(() => input.write(JSON.stringify({ type: "answer", ask_id: e.ask_id, option: 0 }) + "\n"), 1); }, input: new LineReader(input), linger: 0,
+      inject: { driver: d.sim, gateway: gateway(), model: { model: MODEL, streamFn: scriptedStream([{ calls: [{ name: "plan", args: { steps: [{ purpose: "改", objects: ["path:u2.txt"], consequence: "modify_user" }] } }] }, STEP.replace!, { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] }]) } } });
+    const j = parseJournal(fs.readFileSync(path.join(runs, "run_j", "journal.jsonl"), "utf-8"));
+    const i = j.findIndex((l) => l.kind === "intent");
+    expect(j[i]).toMatchObject({ undo_prep: { backup: expect.stringMatching(/^\.deskmind-undo\//), version: expect.stringMatching(/^sha256:/) } });
+    expect(j[i + 1]).toMatchObject({ kind: "receipt", status: "ok" });
+  });
+
+  it("through the session (the 清单 case): a /cua replaces 「苹果」 with 「香蕉」 in the user's file — task_end undo open, the undo puts the file back", async () => {
+    const clock = new FakeClock();
+    const s = session({ clock, scripts: [(d) => { fs.writeFileSync(path.join(d.scope, "清单.txt"), "购物清单\n苹果 3 个\n牛奶 1 盒\n"); d.before = tree(d.scope); return [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "把苹果改成香蕉", objects: ["path:清单.txt"], consequence: "modify_user" }] } }] },
+      { calls: [{ name: "fs_replace_text", args: { target: "清单.txt", text: "购物清单\n香蕉 3 个\n牛奶 1 盒\n" } }] },
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "改好了" } }] },
+    ]; }] });
+    s.send({ type: "cua", text: "把 清单.txt 里的「苹果」都改成「香蕉」" });
+    await waitFor(() => s.of("session.task_end").length === 1);
+    const done = s.of("task_done")[0];
+    expect(done.changes.modified).toEqual(["清单.txt"]);
+    expect(s.of("session.task_end")[0]).toMatchObject({ status: "succeeded", undo: "open" });
+    expect(fs.readFileSync(path.join(s.desks[0]!.scope, "清单.txt"), "utf-8")).toContain("香蕉");
+    s.send({ type: "respond", run_id: done.run_id, option: done.result_card.options.findIndex((x: any) => x.kind === "undo") });
+    await waitFor(() => s.of("session.task_undo").length === 1);
+    expect(s.of("session.task_undo")[0]).toMatchObject({ undone: 1, total: 1, refused: null });
+    expect(tree(s.desks[0]!.scope)).toEqual(s.desks[0]!.before);
+    await waitFor(() => s.of("session.task_closed").length === 1);
+    expect(fs.existsSync(path.join(s.desks[0]!.scope, ".deskmind-undo")) ? fs.readdirSync(path.join(s.desks[0]!.scope, ".deskmind-undo")) : []).toEqual([]);
+  });
+
+  it("policy unchanged: replace_text and trash stay not reversible (never done on the model's reading of an ambiguous request)", () => {
+    const reg = fileRegistry();
+    expect(reg.get("fs.replace_text")).toMatchObject({ reversible: false });
+    expect(reg.get("fs.trash")).toMatchObject({ reversible: false });
+    expect(typeof reg.get("fs.replace_text")!.undo).toBe("function");
+    expect(typeof reg.get("fs.trash")!.undo).toBe("function");
   });
 });

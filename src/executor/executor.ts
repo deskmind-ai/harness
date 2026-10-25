@@ -22,7 +22,7 @@ import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
-import type { Workspace } from "../registry/workspace.js";
+import { UNDO_DIR, type Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, isEffectUnknown, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger } from "./ledger.js";
@@ -382,6 +382,16 @@ export class Executor {
   /** The plan the user's things may be touched under: none until one passed the judge (and, upstream, the user). */
   private planAccepted: PlanProposal | null = null;
   /** What undo needs of each file action (by receipt seq): the capability's own record and what it noted beforehand. */
+  /** The undo copies this process made (registry/workspace.ts UNDO_DIR): removed when its undo window closes. */
+  private undoCopies: string[] = [];
+  /** The undo window closed (the process is about to exit): this process's undo copies go. Twice is harmless. */
+  discardUndoCopies() {
+    const ws = this.opts.files?.workspace;
+    if (!ws) return;
+    for (const c of this.undoCopies.splice(0)) { try { fs.rmSync(ws.abs(c), { force: true }); } catch { /* swept later */ } }
+    try { fs.rmdirSync(ws.abs(UNDO_DIR)); } catch { /* another run's copies, or gone */ }
+  }
+
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; madeParents: string[]; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();
   /** Paths the task has seen listed in a folder (fs.list): known to be there, though not read. */
   private listed = new Set<string>();
@@ -1819,7 +1829,10 @@ export class Executor {
     // the written files' text before (small text files): what a restart shows the user when this step's effect is unknown
     const contents_before: Record<string, string> = {};
     for (const p of fp.writes) { const t = smallText(ws, p); if (t !== undefined) contents_before[p] = t; }
-    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {}, writes: fp.writes, contents_before });
+    // what undo needs from before (a copy of the file a replace overwrites: its place and version) is in the intent,
+    // written before the action: it outlives a crash. A copy is this process's to remove when its undo window closes
+    if (typeof undo_prep?.backup === "string") this.undoCopies.push(undo_prep.backup);
+    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {}, writes: fp.writes, contents_before, ...(undo_prep ? { undo_prep } : {}) });
     let r: ReturnType<Capability["execute"]>;
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();

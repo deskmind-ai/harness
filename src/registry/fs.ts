@@ -5,7 +5,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Registry, type ExecResult } from "./capability.js";
-import { ABSENT, NOT_UTF8_EN, TRASH, Workspace, sha } from "./workspace.js";
+import { randomUUID } from "node:crypto";
+import { ABSENT, NOT_UTF8_EN, TRASH, UNDO_DIR, Workspace, sha } from "./workspace.js";
 import { CRASH_FLAG, after, folderOk, join, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
 import { toolCapabilities } from "./tools.js";
 
@@ -21,12 +22,39 @@ export const fsCreateText = make({
   undo: (ws, a, r) => { const q = join(a.parent!, a.name!); const e = untouched(ws, r, [q]); if (e) return e; fs.unlinkSync(ws.abs(q)); return null; },
 });
 
+/** fs.replace_text's undo copy: the file as it was, kept in UNDO_DIR before the write (prep, recorded in the step's
+ *  journal intent: it outlives a crash), restored byte for byte only while the file is exactly as the step left it. */
+const keepCopy = (ws: Workspace, q: string): { backup: string; version: string } => {
+  fs.mkdirSync(ws.abs(UNDO_DIR), { recursive: true });
+  const backup = `${UNDO_DIR}/${randomUUID()}`;
+  fs.copyFileSync(ws.abs(q), ws.abs(backup), fs.constants.COPYFILE_EXCL);
+  return { backup, version: ws.version(q) };
+};
+const copyProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
+  if (!u || typeof u.backup !== "string" || typeof u.version !== "string") return "no copy of the file was kept before it was replaced";
+  const full = ws.abs(u.backup);
+  if (!fs.existsSync(full)) return "the copy kept for undo is gone";
+  return sha(fs.readFileSync(full)) === u.version ? null : "the copy kept for undo does not match the file as it was";
+};
+
 export const fsReplaceText = make({
   id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true,
+  // undo has its copy, but overwriting stays a step not taken on a guess (docs/ask-policy.md): policy unchanged
+  reversible: false,
   fields: { target: p("要改写的文件"), text: s("新的全部正文") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: sha(a.text!) } }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
+  prep: (ws, a) => keepCopy(ws, norm(a.target!)),
   run: (ws, a) => { const q = norm(a.target!); fs.writeFileSync(ws.abs(q), a.text!, "utf-8"); maybeCrash(); return after(ws, [q]); },
+  check: (ws, a, r) => copyProblem(ws, r.undo),
+  undo: (ws, a, r) => {
+    const q = norm(a.target!);
+    const e = untouched(ws, r, [q]) ?? copyProblem(ws, r.undo);
+    if (e) return e;
+    fs.copyFileSync(ws.abs(String(r.undo!.backup)), ws.abs(q));
+    try { fs.rmSync(ws.abs(String(r.undo!.backup)), { force: true }); } catch { /* swept later */ }
+    return null;
+  },
 });
 
 const appended = (old: string, line: string) => old + (old === "" || old.endsWith("\n") ? "" : "\n") + line + "\n";
@@ -114,11 +142,37 @@ export const fsMkdir = make({
 
 export const fsTrash = make({
   id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true, discards: true,
+  // undo moves it back, but deleting stays a step not taken on a guess: policy unchanged
+  reversible: false,
   fields: { target: p("要移到废纸篓的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: ABSENT } }),
   pre: (ws, a) => (ws.exists(norm(a.target!)) ? null : `${norm(a.target!)} does not exist`),
-  run: (ws, a) => { const q = norm(a.target!); fs.mkdirSync(ws.abs(TRASH), { recursive: true }); fs.renameSync(ws.abs(q), path.join(ws.abs(TRASH), q.replaceAll("/", "_"))); maybeCrash(); return after(ws, [q]); },
+  // each trashed file under a name of its own (an earlier one of the same name is never replaced), recorded with its
+  // version: undo moves exactly that file back
+  run: (ws, a) => {
+    const q = norm(a.target!);
+    const version = ws.version(q);
+    fs.mkdirSync(ws.abs(TRASH), { recursive: true });
+    const name = `${randomUUID().slice(0, 8)}-${q.replaceAll("/", "_")}`;
+    fs.renameSync(ws.abs(q), path.join(ws.abs(TRASH), name));
+    maybeCrash();
+    return { ...after(ws, [q]), undo: { trashed: `${TRASH}/${name}`, version } };
+  },
+  check: (ws, _a, r) => trashedProblem(ws, r.undo),
+  undo: (ws, a, r) => {
+    const q = norm(a.target!);
+    const e = untouched(ws, r, [q]) ?? trashedProblem(ws, r.undo) ?? (fs.existsSync(ws.abs(q)) ? `${q} exists again` : null) ?? (folderOk(ws, parentOf(q)) ? null : `folder ${parentOf(q)} is gone`);
+    if (e) return e;
+    fs.renameSync(ws.abs(String(r.undo!.trashed)), ws.abs(q));
+    return null;
+  },
 });
+const trashedProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
+  if (!u || typeof u.trashed !== "string" || typeof u.version !== "string") return "where the file was put is not recorded";
+  const full = ws.abs(u.trashed);
+  if (!fs.existsSync(full)) return "the trashed file is gone";
+  return u.version.startsWith("dir:") || sha(fs.readFileSync(full)) === u.version ? null : "the trashed file was changed";
+};
 
 export const fsReadText = make({
   id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe",

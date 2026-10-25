@@ -15,7 +15,7 @@ export class PaperFolder {
   /** folder → the names it holds that entries do not list */
   private readonly other = new Map<string, Set<string>>();
 
-  constructor(ws: Workspace) {
+  constructor(private readonly ws: Workspace) {
     this.e = { ...ws.entries() };
     for (const d of ["", ...Object.keys(this.e).filter((p) => this.e[p] === "dir")]) {
       const rest = ws.members(d).filter((n) => !((d ? `${d}/${n}` : n) in this.e));
@@ -36,6 +36,9 @@ export class PaperFolder {
     const listed = Object.keys(this.e).filter((x) => parentOf(x) === d).map((x) => (d ? x.slice(d.length + 1) : x));
     return [...listed, ...(this.other.get(d) ?? [])];
   }
+  /** A hidden path's place on the real disk (an undo copy, a trashed file: never in the entries, so never moved on
+   *  paper): what an undo check reads to see that what it will restore from is there. */
+  abs(p: string): string { return this.ws.abs(p); }
   /** Read as a Workspace by the capabilities' undo checks. */
   get asWorkspace(): Workspace { return this as unknown as Workspace; }
 
