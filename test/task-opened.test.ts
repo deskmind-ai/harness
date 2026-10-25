@@ -131,9 +131,7 @@ describe("H1: a window the task's launch brought up — the table (source × jud
     // in such a window — a click on the close button is still a click the outgoing judge sees, as any click is
     const asked = judge && kind !== "close_window" && (kind === "click" || kind === "close_button" || (source === "opened" && policy === "task" && !CLOSING.has(kind)));
     // 「会删改」raises only under "task"; the "user" arm is the behaviour before 10-25 (review of #75, C)
-    // (since the split, rc.17: 会删改 is its own question, asked only in a window DeskMind opened under "task"; in the
-    // task's own window — its content is the task's — it is not asked)
-    const raised = asked ? (outgoing === "sends" || outgoing === "unsure" || outgoing === null ? "external" : outgoing === "alters" && policy === "task" && source === "opened" ? "modify_user" : null) : null;
+    const raised = asked ? (outgoing === "sends" || outgoing === "unsure" || outgoing === null ? "external" : outgoing === "alters" && policy === "task" ? "modify_user" : null) : null;
     let cls: string;
     if (raised === "external") cls = "external";
     // closing, quitting and undoing ask for the user's windows and for one DeskMind opened (it may hold their state, and
@@ -436,8 +434,8 @@ describe("review of #75", () => {
       await rt.run();
       expect([policy, cards.map((c) => c.kind)]).toEqual([policy, want]);
     }
-    // the judge's「会删改」in the task's own window: not asked there since the split (rc.17) — its content is the task's
-    for (const [policy, status] of [["user", "ok"], ["task", "ok"]] as const) {
+    // the judge's answer in the task's own window (the alters question, asked there too under "task")
+    for (const [policy, status] of [["user", "ok"], ["task", "needs_consent"]] as const) {
       const { desk, ex, target, o } = await stage("made", policy, fakeJudge("alters", "matches").judge);
       const before = desk.effects.length;
       const r = await ex.act({ action: action("click", target.id), epoch: o.epoch });

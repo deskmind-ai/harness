@@ -8,12 +8,14 @@ import { describe, expect, it } from "vitest";
 import { Gateway } from "../src/gateway/index.js";
 import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor, pixelSendBindingFrom, sameScreen, type ExecutorOptions } from "../src/executor/executor.js";
-import { INTENT_QUESTION, Judge, OUTGOING_QUESTION, TierStats, type JudgeTier } from "../src/executor/judge.js";
+import { ALTERS_QUESTION, INTENT_QUESTION, Judge, OUTGOING_QUESTION, TierStats, type JudgeTier } from "../src/executor/judge.js";
 import { McpExecutorServer } from "../src/cli/mcp.js";
 import type { Action, Driver, Element, WindowInfo } from "../src/executor/types.js";
 
 const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
 const isOutgoing = (u: string) => u.includes(OUTGOING_QUESTION.slice(0, 12));
+/** The alters question (asked after「不会」 of a click under taskOpened "task", since the split): answered「不会」 here. */
+const isAlters = (u: string) => u.includes(ALTERS_QUESTION.slice(0, 12));
 
 interface FakeWin { info: WindowInfo; elements: Element[]; text: string }
 /** A desktop of fixed windows: actions are logged and move the epoch, the windows' contents never change — as a window
@@ -49,7 +51,7 @@ const chat = (): FakeWin => ({
 /** One judge tier (or two) over scripted gateways; `outgoing` answers the outgoing question, the intent check matches. */
 function judged(outgoing: (u: string) => unknown, extra: Partial<{ lower: (u: string) => unknown; stats: TierStats; events: Record<string, unknown>[] }> = {}) {
   const top = new Gateway(table), prompts: string[] = [];
-  top.script = Array(80).fill((_r: string, _s: string, u: string) => { prompts.push(u); return isOutgoing(u) ? outgoing(u) : { choice: "matches" }; });
+  top.script = Array(80).fill((_r: string, _s: string, u: string) => { prompts.push(u); return isAlters(u) ? { choice: "keeps" } : isOutgoing(u) ? outgoing(u) : { choice: "matches" }; });
   const tiers: JudgeTier[] = [];
   let low: Gateway | null = null;
   if (extra.lower) { low = new Gateway(table); low.script = Array(80).fill((_r: string, _s: string, u: string) => extra.lower!(u)); tiers.push({ name: "brain", gateway: low, floor: 0.9 }); }

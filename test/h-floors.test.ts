@@ -78,8 +78,7 @@ describe("H-floors 1: a close button by its AX subrole closes the window", () =>
       // the rule: closing a window that is not the task's own asks, whatever the judge says; otherwise a click is a click
       // like any other: the outgoing judge is asked of every click, and alters / unsure / no answer raise it
       const closeAsks = btn === "x" && source !== "made";
-      // (since the split, rc.17: 会删改 is asked only in a window DeskMind opened — in the task's own window it is no card)
-      const judgeRaises = outgoing !== "stays" && !(outgoing === "alters" && source !== "opened");
+      const judgeRaises = outgoing !== "stays";
       const wantCard = source === "user" || closeAsks || judgeRaises;
       rows.push(`${source} ${outgoing} ${btn} → ${r.status} ${r.consequence}`);
       expect(r.status === "needs_consent", rows.at(-1)).toBe(wantCard);

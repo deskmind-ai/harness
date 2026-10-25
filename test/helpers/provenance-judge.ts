@@ -5,16 +5,18 @@
  * local first tier (Brain) in front; `only`: Brain alone. `prompts`: every provenance prompt asked.
  */
 import { Gateway } from "../../src/gateway/index.js";
-import { Judge, OUTGOING_QUESTION, PROVENANCE_QUESTION, type JudgeTier } from "../../src/executor/judge.js";
+import { ALTERS_QUESTION, Judge, OUTGOING_QUESTION, PROVENANCE_QUESTION, type JudgeTier } from "../../src/executor/judge.js";
 
 const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
 export const isProvenance = (u: string) => u.includes(PROVENANCE_QUESTION.slice(0, 12));
 const isOutgoing = (u: string) => u.includes(OUTGOING_QUESTION.slice(0, 12));
+const isAlters = (u: string) => u.includes(ALTERS_QUESTION.slice(0, 12));
 
 /** A scripted gateway answer for every role: provenance questions by `answer`, the rest as above. */
 export const scripted = (answer: (u: string) => unknown, prompts: string[] = []) => (role: string, _s: string, u: string) => {
   if (isProvenance(u)) { prompts.push(u); return answer(u); }
   if (isOutgoing(u)) return { choice: "stays" };
+  if (isAlters(u)) return { choice: "keeps" };          // (the alters question, its own since rc.17)
   return role === "verify" ? { choice: "pass", reason: "ok" } : { choice: "matches" };
 };
 

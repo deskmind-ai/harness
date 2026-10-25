@@ -294,21 +294,23 @@ export const PROVENANCE_OPTIONS: JudgeOption[] = [
  *    `openai:volcengine|doubao-seed-2-1-lite-260915`: any fast model the gateway can reach, same contract.
  *  Opt-in until measured on these questions: in the 10-18 probe Brain was confidently wrong on 2 of 13
  *  (docs/0.5-decisions.md D24). The floor is a calibration output, not a rule. */
-/** The evidence question's template (executor.plan: the point it names and its readings vary), as JudgeTier.trained
- *  knows it. */
-export const EVIDENCE_FORM = `evidence:${P.evidenceQuestion("{point}")}`;
+/** The evidence question's last option, the same on every one (executor.plan): the readings cannot be told apart. */
+export const EVIDENCE_UNCLEAR = "说不清：这些证据区分不了";
+/** The evidence question's template (executor.plan: the point it names and its readings vary) with its fixed option,
+ *  as JudgeTier.trained knows it. */
+export const EVIDENCE_FORM = `evidence:${P.evidenceQuestion("{point}")}|${EVIDENCE_UNCLEAR}`;
 
-/** The questions Brain (the local judge, DeskMind Brain g18b) was trained on — their digests as they were then, written
- *  out, not computed from today's words: a question whose words or options change drops out on its own and goes to
- *  the tiers above until Brain is trained on it (test/judge-trained.test.ts names each). intent, outgoing (the words
- *  before #75), provenance, verify, the evidence template. */
-export const BRAIN_TRAINED: ReadonlySet<string> = new Set(["c452a12c7ac206c7", "f28565a8062bc1f0", "4fc1ac9c98534559", "ebc53ba9c538a602", "523bbf88f22929f5"]);
+/** The wordings Brain (the local judge, DeskMind Brain g18b) ran with through rc.16 — what it was trained and measured
+ *  on — as digests written out, not computed from today's words: a question whose words or options change drops out
+ *  on its own and goes to the tiers above until Brain runs with it (test/judge-trained.test.ts names each). intent,
+ *  outgoing (the words before #75), provenance, verify, the evidence template with its fixed option. */
+export const BRAIN_RC16_WORDINGS: ReadonlySet<string> = new Set(["c452a12c7ac206c7", "f28565a8062bc1f0", "4fc1ac9c98534559", "ebc53ba9c538a602", "c5143b66b92f977a"]);
 
 export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Record<string, unknown>) => void): Judge {
   const tiers: JudgeTier[] = [];
   const url = process.env.DESKMIND_BRAIN_URL;
   const table = (backend: string, model: string) => Object.fromEntries(R.ROLES.map((r) => [r, { backend, model }])) as RoleTable;
-  if (url && process.env.DESKMIND_BRAIN_JUDGE === "1") tiers.push({ name: "brain", gateway: new Gateway(table("systemone", url)), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9), local: true, trained: BRAIN_TRAINED });
+  if (url && process.env.DESKMIND_BRAIN_JUDGE === "1") tiers.push({ name: "brain", gateway: new Gateway(table("systemone", url)), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9), local: true, trained: BRAIN_RC16_WORDINGS });
   const first = firstTier(process.env.DESKMIND_JUDGE_FIRST, process.env.DESKMIND_JUDGE_FIRST_FLOOR);
   if (first) { const t = table(first.backend, first.model); for (const r of R.ROLES) t[r] = { ...t[r], think: false }; tiers.push({ name: first.name, gateway: new Gateway(t), floor: first.floor }); }   // a choice wants a fast answer
   tiers.push({ name: "frontier", gateway });
