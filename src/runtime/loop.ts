@@ -161,7 +161,13 @@ export class AgentLoop {
     const skills = b.skills.length ? "\n\n## 可能适用的教程\n" + b.skills.map((c) => `- ${c.name}：${c.description}`).join("\n") + "\n适用的用 read_skill 读全文。" : "";
     // the folder's absolute path too: a save sheet in an app (⌘⇧G) needs it, and the model cannot find it out otherwise
     const ws = b.workspace ? `\n\n## 任务目录\n用户选定的文件夹，文件工具的路径都相对它；它在这台电脑上的完整路径是 ${b.workspace.root}（应用的存储对话框里用这个）。现在的内容：${J(b.workspace.listing)}` : "";
-    return `你是桌面助手 DeskMind。只用工具做事；每一轮要么调用工具，要么用 finish 结束。\n\n${base}${skills}${ws}`;
+    // one interface, one language (H3, plan §1.7): every word the user reads — a step's purpose, a summary, a question
+    // and its options, a reading and its detail, what goes to a site — is written in the app's language; names (apps,
+    // window titles, files, sites) stay as they are
+    const lang = b.lang === "en"
+      ? "\n\n## 用户界面的语言：英文\n写给用户看的字一律用英文：每一步的 purpose、finish 的 summary、ask_user 的问题和选项、计划里理解的说明（details）、opens 的 sends。应用名、窗口标题、文件名、网站照原样写，不翻译。"
+      : "\n\n## 用户界面的语言：中文\n写给用户看的字一律用中文：每一步的 purpose、finish 的 summary、ask_user 的问题和选项、计划里理解的说明（details）、opens 的 sends。应用名、窗口标题、文件名、网站照原样写，不翻译。";
+    return `你是桌面助手 DeskMind。只用工具做事；每一轮要么调用工具，要么用 finish 结束。${lang}\n\n${base}${skills}${ws}`;
   }
 
   async run(): Promise<TaskResult> {

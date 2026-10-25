@@ -73,8 +73,14 @@ type Maybe<T> = T | Promise<T>;
  *  reply came, the caller gave up, the process died). `late_reply`: an answer to a request the caller had already given
  *  up on (its timeout) — for the trace: what it says may have happened after the step was recorded. */
 export type DriverEvent =
-  | { kind: "user_wait"; op: string; app?: string; what?: string }
-  | { kind: "user_resumed"; op: string; waited_s?: number; ended: "driver" | "reply" | "timeout" | "exit" }
+  | { kind: "user_wait"; op: string; app?: string; what?: string;
+      /** (hands#70, K1) how long the Mac must be still (absent: it waits for the user to leave the app), whether the step
+       *  needs the app in front, when the wait began and when it gives up — ms since the epoch */
+      quiet_s?: number; needs_front?: boolean; started_at?: number; gives_up_at?: number }
+  | { kind: "user_resumed"; op: string; waited_s?: number; ended: "driver" | "reply" | "timeout" | "exit";
+      /** (hands#70) how the driver's wait ended: "" the user went quiet and the step goes on, "stopped", "timed_out",
+       *  "failed" (the wait itself could not go on) */
+      why?: "" | "stopped" | "timed_out" | "failed" }
   | { kind: "late_reply"; op: string; id: number; late_ms: number; ok: boolean; status?: string; why?: string };
 /** A request whose effect is unknown, unlike an error: the driver gave up waiting for it (it may still land after
  *  this), or the driver's process died while it was out and not known to be only waiting for the user (it may have

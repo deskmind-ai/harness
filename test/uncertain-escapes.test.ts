@@ -156,7 +156,7 @@ describe("possibly-done steps that escaped the list", () => {
     ({ o, e } = await el("发送"));
     const again = await ex.act({ action: { kind: "click", window: mine.id, target: e.id }, epoch: o.epoch });
     const head = again.challenge!.text.split("\n")[0]!;
-    expect(head).toMatch(/^Earlier, ".*: .*" has an unknown result/);
+    expect(head).toMatch(/^Earlier, \u201c.*: .*\u201d has an unknown result/);
     expect(again.challenge!.text).not.toMatch(/（共 \d+ 字）|」：/);
     expect(again.challenge!.text).toMatch(/characters in all\)/);
   });

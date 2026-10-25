@@ -289,6 +289,52 @@ describe("the app's answer to the reconciliation card (deskmind HarnessEvents.an
     return { env, sent, lines };
   }
 
+  // H5 / review of #77: the card about the interrupted step is answered first — a steer while it is open is refused; one
+  // right behind its answer in the same stdin chunk is taken (the hold ends the moment the answer is taken)
+  async function withSteer(batch: "answer+steer" | "steer alone", named = true) {
+    const runs = fs.mkdtempSync(path.join(os.tmpdir(), "recon-steer-"));
+    const env = await crashed({ "plan.txt": "全被改了\n" }, path.join(runs, "run_recon", "journal.jsonl"));
+    const gw = new Gateway(scriptedTable);
+    gw.script = Array(40).fill((role: string) => (role === "verify" ? { choice: "pass", reason: "ok" } : { choice: "matches" }));
+    const input = new PassThrough();
+    const sent: AppEvent[] = [];
+    let first = true;
+    await appRun({ run_id: "run_recon", raw: RAW, scope: env.root, driver: "sim", config: "ds-flash" }, {
+      runs, input: new LineReader(input), linger: 0,
+      out: (ev) => {
+        sent.push(ev);
+        if (ev.kind === "task_done") setTimeout(() => input.end(), 1);
+        if (ev.kind !== "ask") return;
+        const approve = { ...(named || !first ? { ask_id: ev.ask_id } : {}), option: ev.card.options.findIndex((o) => o.kind === "approve") };
+        if (first) {
+          first = false;
+          const steer = { type: "steer", text: "顺便把末尾的空行去掉" };
+          if (batch === "answer+steer") setTimeout(() => input.write(JSON.stringify(approve) + "\n" + JSON.stringify(steer) + "\n"), 5);
+          else setTimeout(() => { input.write(JSON.stringify(steer) + "\n"); setTimeout(() => input.write(JSON.stringify(approve) + "\n"), 5); }, 5);
+        } else setTimeout(() => input.write(JSON.stringify(approve) + "\n"), 5);
+      },
+      inject: { gateway: gw, model: { ...model, streamFn: scriptedStream([PLAN, APPEND, finish("在现在的内容末尾加了一行")]) } },
+    });
+    return sent;
+  }
+  it("an answer and a steer in one chunk at the reconciliation card: the card is answered, the steer is taken (not card_open) — the answer naming its card or not", async () => {
+    for (const named of [true, false]) {
+    const sent = await withSteer("answer+steer", named);
+    const ask = sent.find((e) => e.kind === "ask") as any;
+    expect(ask.card.reconcile).toBe(true);
+    expect(sent.some((e: any) => e.kind === "resumed" && e.ask_id === ask.ask_id && !e.voided)).toBe(true);
+    expect(sent.some((e: any) => e.kind === "refused" && String(e.what).startsWith("steer"))).toBe(false);
+    expect(sent.find((e) => e.kind === "steered")).toMatchObject({ text: "顺便把末尾的空行去掉" });
+    }
+  });
+  it("a steer alone while the reconciliation card is open: refused card_open, the card stays and is answered after", async () => {
+    const sent = await withSteer("steer alone");
+    const ask = sent.find((e) => e.kind === "ask") as any;
+    expect(sent.find((e: any) => e.kind === "refused" && String(e.what).startsWith("steer"))).toMatchObject({ why: expect.stringContaining("card_open") });
+    expect(sent.some((e: any) => e.kind === "ask_void" && e.ask_id === ask.ask_id)).toBe(false);
+    expect(sent.some((e: any) => e.kind === "resumed" && e.ask_id === ask.ask_id && !e.voided)).toBe(true);
+  });
+
   it("the card is an approval card: Deny sends the cancel option — the run stops needs_reconciliation, nothing written", async () => {
     const { env, sent, lines } = await viaApp("deny");
     const ask = sent.find((e) => e.kind === "ask") as any;

@@ -5,7 +5,7 @@
  * executor/types.ts and executor/consent.ts re-export all of it, so older imports keep working.
  */
 import { createHash } from "node:crypto";
-import type { ActionCardFacts } from "./cards.js";
+import type { ActionCardFacts, Beyond } from "./cards.js";
 
 /** Ordered: a guard compares classes, so the order is the law. */
 export const CONSEQUENCES = ["read", "create", "modify_user", "external"] as const;
@@ -32,7 +32,10 @@ export interface ConsentToken {
  *  read material): the app answers it with a site token for that host, not a one-time action token. */
 export interface Challenge { nonce: string; digest: string; object: string; consequence: Consequence; text: string; expires_at: number; site?: string;
   /** The card's facts in fields (M0): what the app may lay out itself; `text` says the same. Not signed or digested. */
-  facts?: ActionCardFacts }
+  facts?: ActionCardFacts;
+  /** The card's one sentence and what its yes covers (H2), made in the same pass as the challenge from the same object
+   *  (and the site a yes approves): not signed or digested — the digest is of the action, object, class and binding. */
+  headline?: string; beyond?: Beyond[] }
 
 /** JSON with object keys sorted, at every depth: the form a digest and a signature are computed over. */
 export const canon = (x: unknown): string => JSON.stringify(x, (_, v) => (v && typeof v === "object" && !Array.isArray(v) ? Object.fromEntries(Object.entries(v as object).sort()) : v));

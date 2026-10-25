@@ -417,6 +417,13 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "details": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "每个理解一句说明，顺序和 [reading, ...alternatives] 一一对应（比如那份文件的日期和位置）；用户界面的语言写"
               }
             }
           }

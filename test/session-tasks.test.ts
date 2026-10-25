@@ -161,21 +161,28 @@ describe("session tasks: controls into the task", () => {
     expect(s2.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
   });
 
-  it("say and steer are refused while the task's card is open (card_open); the queue and the steers stay as they were", async () => {
+  it("while the task's card is open: say is refused (card_open); a steer voids the card (ask_void steer) and is taken (H5); the voided card's answer is refused", async () => {
     const ed = editorSim();
     const s = session({ sim: ed.make, model: [CALL("改笔记"), { text: "好" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
     let asked: any = null;
-    s.on((e) => { if (e.kind === "ask") asked = e; });
+    const later: any[] = [];
+    s.on((e) => { if (e.kind === "ask") { if (!asked) asked = e; else later.push(e); } });
     s.send({ type: "say", text: "把笔记的正文改成「新的」" });
     await waitFor(() => asked);
     s.send({ type: "say", text: "顺便说一句" });
     s.send({ type: "steer", text: "改成「更新的」" });
-    expect(s.kinds("session.error").map((e) => [e.code, e.control])).toEqual([["card_open", "say"], ["card_open", "steer"]]);
+    expect(s.kinds("session.error").map((e) => [e.code, e.control])).toEqual([["card_open", "say"]]);
     expect(s.kinds("session.queue")).toHaveLength(0);
-    expect(s.stored().some((e: any) => e.kind === "session.steer")).toBe(false);
+    expect(s.stored().filter((e: any) => e.kind === "session.steer").map((e: any) => e.text)).toEqual(["改成「更新的」"]);
+    await waitFor(() => s.kinds("ask_void").some((e: any) => e.ask_id === asked.ask_id));
+    expect(s.kinds("ask_void").find((e: any) => e.ask_id === asked.ask_id)).toMatchObject({ why: "steer" });
+    // the voided card's answer, late: refused by the executor, never a consent
     s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: asked.card.options.findIndex((x: any) => x.kind === "approve") });
+    await waitFor(() => s.kinds("refused").some((e: any) => String(e.why).includes("voided")) || s.kinds("session.task_end").length || later.length);
+    for (const a of later) s.send({ type: "answer", run_id: a.run_id, ask_id: a.ask_id, option: a.card.options.findIndex((x: any) => x.kind === "cancel") });
+    s.on((e) => { if (e.kind === "ask" && e !== asked) s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: e.card.options.findIndex((x: any) => x.kind === "cancel") }); });
     await s.h.idle();
-    expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+    expect(s.kinds("consent").filter((e: any) => e.picked === "approve")).toEqual([]);
   });
 
   it("a steer is forwarded, acknowledged (steered) and kept: in the history and in what the model is told", async () => {
@@ -274,7 +281,8 @@ describe("session tasks: client_id on steer, /cua, the card, the queue's edits, 
     await s.h.idle();
     expect(s.stored().filter((e: any) => e.kind === "session.steer").map((e: any) => [e.text, e.client_id])).toEqual([["内容就写 hi 吧", "k1"], ["一改", "k2"]]);
 
-    // a card waits: a say and a steer are refused card_open, naming their client_id
+    // a card waits: a say is refused card_open naming its client_id; the queued entry sent now and a steer are taken —
+    // they void the card (H5)
     const ed = editorSim();
     const t = session({ scope: tmp(), sim: ed.make, model: [CALL("改笔记"), { text: "改好了" }, { text: "嗯" }], tasks: [[{ text: "想想", delayMs: 300 }, ...EDIT("editor-1")]] });
     t.send({ type: "say", text: "把笔记的正文改成「新的」" });
@@ -282,14 +290,18 @@ describe("session tasks: client_id on steer, /cua, the card, the queue's edits, 
     t.send({ type: "say", text: "排着的", client_id: "k6" });        // queued before the card
     await waitFor(() => t.kinds("ask").length);
     const qid = t.kinds("session.queue").at(-1).items[0].id;
+    const ask = t.kinds("ask").at(-1);
     t.send({ type: "queue_send_now", id: qid });
-    expect(t.kinds("session.error").at(-1)).toMatchObject({ code: "card_open", control: "queue_send_now", client_id: "k6" });
-    expect(t.kinds("session.queue").at(-1).items).toEqual([{ id: qid, text: "排着的", client_id: "k6" }]);
+    expect(t.kinds("session.error").filter((e: any) => e.control === "queue_send_now")).toEqual([]);
+    expect(t.kinds("session.queue").at(-1).items).toEqual([]);
+    // (the card is already voided by the words sent now — ask_void came in the same tick — so a say is queued, not refused)
+    expect(t.kinds("ask_void").find((e: any) => e.ask_id === ask.ask_id)).toMatchObject({ why: "steer" });
     t.send({ type: "say", text: "顺便", client_id: "k3" });
     t.send({ type: "steer", text: "改成别的", client_id: "k4" });
-    expect(t.kinds("session.error").slice(-2).map((e: any) => [e.code, e.control, e.client_id])).toEqual([["card_open", "say", "k3"], ["card_open", "steer", "k4"]]);
-    const ask = t.kinds("ask").at(-1);
-    t.send({ type: "answer", run_id: ask.run_id, ask_id: ask.ask_id, option: 0 });
+    expect(t.kinds("session.error").filter((e: any) => e.control !== "say")).toEqual([]);
+    expect(t.stored().filter((e: any) => e.kind === "session.steer").map((e: any) => [e.text, e.client_id])).toEqual([["排着的", "k6"], ["改成别的", "k4"]]);
+    await waitFor(() => t.kinds("ask_void").some((e: any) => e.ask_id === ask.ask_id));
+    t.on((e) => { if (e.kind === "ask") t.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: e.card.options.findIndex((x: any) => x.kind === "cancel") }); });
     await t.h.idle();
   });
 

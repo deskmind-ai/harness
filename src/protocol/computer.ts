@@ -37,6 +37,8 @@ export interface Frame { x: number; y: number; w: number; h: number }
 
 /** The whole computer, every app in one format. Read-only, so nothing is hidden: the user's windows are listed too. */
 export interface Snapshot { epoch: number; locked: boolean; front_app: string; windows: WindowInfo[]; user_active?: boolean;
+  /** How long the Mac must be still before a step goes on, seconds (hands#70, K1). */
+  user_quiet_s?: number;
   /** What the hands driver hears of the user's input: "keys" (keyboard and mouse, by target), "mouse" (no Input Monitoring:
    *  every key press counts), "" (no tap: every input counts). Told in the run's trace so a check knows which it had. */
   input_watch?: string;
@@ -120,7 +122,9 @@ export type StopCause = (typeof STOP_CAUSES)[number];
 /** One place the request can be read more than one way: the reading the plan takes, the others, and the evidence
  *  for the choice (things seen: a window title, a file name, a line of a file, the user's answer — never the
  *  request's own words). The judge decides whether the evidence settles it; if not, the user is asked first. */
-export interface Reading { point: string; reading: string; alternatives: string[]; evidence: string[] }
+export interface Reading { point: string; reading: string; alternatives: string[]; evidence: string[];
+  /** One line per reading, in the order [reading, ...alternatives] (H2): the second line of its option on the card. */
+  details?: string[] }
 export interface PlanStep { purpose: string; objects: string[]; consequence: Consequence }
 export interface PlanProposal { steps: PlanStep[]; readings?: Reading[] }
 export type PlanVerdict = { accepted: true; steps: PlanStep[] } | { accepted: false; open: Reading[]; why: string };

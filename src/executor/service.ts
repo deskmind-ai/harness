@@ -18,7 +18,7 @@
 import * as R from "../protocol/roles.js";
 import * as P from "../orchestrator/prompts.js";
 import type { Gateway } from "../gateway/index.js";
-import type { Answer, Card, CardAsker, CardOption, PlanCardFacts } from "../protocol/cards.js";
+import type { Answer, Beyond, Card, CardAsker, CardOption, PlanCardFacts } from "../protocol/cards.js";
 import { canon, siteOf, type ConsentProvider } from "../protocol/consent.js";
 import type { Begun, Classified, ExecutorPort, FileTool, FinishOutcome, PlanStepIn, TaskResult, TaskStatus, ToolReply } from "../protocol/port.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
@@ -147,6 +147,8 @@ export class ExecutorService {
   /** Steers that arrived and are not applied yet (they are, between steps), and the open card a steer voids. */
   private pending: string[] = [];
   private openCard: AbortController | null = null;
+  /** The open card is one a steer does not void (reconcile, H5). */
+  private openCardHolds = false;
   /** The request changed since the user accepted a plan: a step beyond that plan asks for a new one. */
   private steeredSincePlan = false;
   /** A reply carried a steer: every further step the caller decided before hearing it (the rest of the model's turn)
@@ -231,6 +233,8 @@ export class ExecutorService {
   steer(raw: string) {
     // the task is over (a verdict passed, a cancel, a stop, the run ended): the words change nothing, and the app is told
     if (this.status || this.executorEnded) { this.emit("steer.refused", { raw, why: "the task already finished" }); return; }
+    // the card about an interrupted step is answered first: words are not taken while it is open (H5)
+    if (this.openCardHolds) { this.emit("steer.refused", { raw, why: "card_open: answer the card about the interrupted step first" }); return; }
     this.pending.push(raw);
     this.count("steers");
     this.emit("steer", { raw });
@@ -319,6 +323,7 @@ export class ExecutorService {
     if (stop.aborted) return null;
     const open = new AbortController();
     this.openCard = open;
+    this.openCardHolds = !!card.reconcile;
     // the deadline, by the wall clock: a Mac that slept past it expires the card within a second of waking (its timers
     // stood still meanwhile). It voids the card like a steer, with the reason "timeout"
     const ms = expires ? this.o.cardExpiryMs : undefined;
@@ -341,7 +346,9 @@ export class ExecutorService {
       // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16); a steer
       // voids it (the asker is told through the signal, and lets the app know). `expired`: the asker asks it before it
       // takes an answer
-      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal, ...(deadline !== null ? { expired } : {}) }));
+      // the hold of the card about an interrupted step ends the moment the asker takes its answer — synchronously, so a
+      // steer right behind the answer on the same input finds no card holding it (review of #77)
+      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal, ...(deadline !== null ? { expired } : {}), taken: () => { if (this.openCard === open) this.openCardHolds = false; } }));
       p.catch(() => undefined);
       const a = await Promise.race([p,
         new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true })),
@@ -358,7 +365,7 @@ export class ExecutorService {
       if (!askerChecked && expired()) { this.emit("card.voided", { kind: card.kind, why: "timeout", late_answer: true }); return "expired"; }
       if ("option" in a) { const o = card.options[a.option]; return o ? { option: o, text: o.text } : null; }
       return { option: null, text: a.text };
-    } finally { cancel(); if (this.openCard === open) this.openCard = null; if (this.expireOpen === check) this.expireOpen = null; }
+    } finally { cancel(); if (this.openCard === open) { this.openCard = null; this.openCardHolds = false; } if (this.expireOpen === check) this.expireOpen = null; }
   }
 
   /** After an action card expired: the task stays where it is, acting on nothing, until the user taps 「现在回答」
@@ -375,7 +382,7 @@ export class ExecutorService {
 
   /** The user is asked for this one action; a yes becomes a signed, single-use token. */
   private async consentFor(c: Challenge): Promise<ConsentToken | "declined" | "cancel" | "voided" | "expired" | null> {
-    const card: Card = { kind: "action", text: c.text, free_text: false, blocking: true, options: [{ kind: "approve", text: this.t.ok }, { kind: "skip_step", text: this.t.skipStep }, { kind: "cancel", text: this.t.cancel }], ...(c.facts ? { consent: c.facts } : {}) };
+    const card: Card = { kind: "action", text: c.text, ...(c.headline ? { headline: c.headline } : {}), ...(c.beyond ? { beyond: c.beyond } : {}), free_text: false, blocking: true, options: [{ kind: "approve", text: this.t.ok }, { kind: "skip_step", text: this.t.skipStep }, { kind: "cancel", text: this.t.cancel }], ...(c.facts ? { consent: c.facts } : {}) };
     const got = await this.askExpiring(card);
     // expired: nothing was answered, nothing is signed; the caller waits for the user
     if (got === "expired") return "expired";
@@ -431,6 +438,7 @@ export class ExecutorService {
       workspace: ws ? { root: ws.root, listing: ws.listing() } : null,
       skills: this.o.skills?.candidates(this.o.raw) ?? [],
       skillsOffered: !!this.o.skills,
+      lang: this.o.lang === "en" ? "en" : "zh",
       files: this.fileTools(),
     };
   }
@@ -441,7 +449,7 @@ export class ExecutorService {
    *  with reason "needs_reconciliation", nothing written. No answer stops the same way. */
   private async reconcile(): Promise<"continue" | "voided" | ToolReply> {
     const ex = this.o.executor, rc = ex.reconciliation!;
-    const t = this.t, q = (x: string) => `「${cardText(x.replace(/\s+/g, " ").trim(), 80)}」`;
+    const t = this.t, q = (x: string) => t.quote(cardText(x.replace(/\s+/g, " ").trim(), 80, this.o.lang));
     const lines = [t.reconcileHead(cardText(rc.step, 160))];
     for (const f of rc.files) {
       lines.push(t.reconcileFile(cardText(f.path, 160)));
@@ -455,7 +463,7 @@ export class ExecutorService {
     lines.push(t.reconcileAsk);
     // an approval card (kind "action": the app shows Approve / Deny and answers with the approve or the cancel option —
     // a question card's buttons all answer as approve in the app as shipped, deskmind GoalRunView / answerLine)
-    const card: Card = { kind: "action", text: lines.join("\n"), free_text: false, blocking: true, options: [{ kind: "approve", text: t.reconcileContinue }, { kind: "cancel", text: t.reconcileStop }] };
+    const card: Card = { kind: "action", text: lines.join("\n"), headline: lines[0]!, reconcile: true, free_text: false, blocking: true, options: [{ kind: "approve", text: t.reconcileContinue }, { kind: "cancel", text: t.reconcileStop }] };
     const got = await this.askCard(card);
     if (got === "voided") return "voided";
     this.emit("reconcile.asked", { object: rc.object, paths: rc.files.map((f) => f.path), picked: got?.option?.kind ?? null });
@@ -669,7 +677,7 @@ export class ExecutorService {
     this.count("actions"); this.count(`actions:${r.status}`);
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     if (a.kind === "file") this.emit("fs.act", { cap: a.capability, args: a.args, status: r.status, consequence: r.consequence, why: r.why ?? "" });
-    if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(a.kind === "file" ? describeAction(a, undefined, r.consequence, cap) : `${p.purpose}：${describeAction(a, r.after, r.consequence)}`);
+    if (r.status === "ok" && rank(r.consequence) >= rank("create")) this.effects.push(a.kind === "file" ? describeAction(a, undefined, r.consequence, cap, this.o.lang) : `${p.purpose}${this.o.lang === "en" ? ": " : "："}${describeAction(a, r.after, r.consequence, undefined, this.o.lang)}`);
     if (r.status === "needs_plan") {
       this.count("needs_plan");
       // a URL that would land in the user's browser window: say how the plan covers it (structure, not the words)
@@ -715,8 +723,9 @@ export class ExecutorService {
       if (v.accepted) break;
       const r = v.open[0]!;
       this.count("asks");
-      const card: Card = { kind: "ambiguity", text: this.t.ambiguity(r.point), free_text: true, blocking: true, options: [
-        ...[r.reading, ...r.alternatives].map((t) => ({ kind: "reading" as const, text: t })), { kind: "delegate", text: this.t.delegate }, { kind: "cancel", text: this.t.cancel }] };
+      // each reading's second line from the field the plan role wrote it in (H2), never parsed from its words
+      const card: Card = { kind: "ambiguity", text: this.t.ambiguity(r.point), headline: this.t.ambiguity(r.point), free_text: true, blocking: true, options: [
+        ...[r.reading, ...r.alternatives].map((t, i) => ({ kind: "reading" as const, text: t, ...(r.details?.[i]?.trim() ? { detail: cardText(r.details[i]!.trim(), 200, this.o.lang) } : {}) })), { kind: "delegate", text: this.t.delegate }, { kind: "cancel", text: this.t.cancel }] };
       const got = await this.askCard(card);
       if (got === "voided") { this.count("asks", -1); return this.steered() ?? err("这张卡作废了：计划没有交上。"); }
       if (!got) return this.endWith("failed", "no answer from the user");
@@ -815,8 +824,8 @@ export class ExecutorService {
     const shown = (o: string): string | null => {
       const id = o.slice(o.indexOf(":") + 1);
       if (o.startsWith("window:")) { const w = snap.windows.find((x) => x.id === id); if (w) return windowLabel(w, this.o.lang); }
-      if (o.startsWith("tab:")) for (const w of snap.windows) { const t = w.tabs?.find((x) => x.id === id); if (t) { let site = ""; try { site = new URL(t.url).host; } catch { /* no site */ } return `「${t.title}」${site ? `（${site}）` : ""}`; } }
-      if (o.startsWith("path:") && there.has(o)) return id;
+      if (o.startsWith("tab:")) for (const w of snap.windows) { const t = w.tabs?.find((x) => x.id === id); if (t) { let site = ""; try { site = new URL(t.url).host; } catch { /* no site */ } return `${this.t.quote(t.title)}${site ? (this.o.lang === "en" ? ` (${site})` : `（${site}）`) : ""}`; } }
+      if (o.startsWith("path:") && there.has(o)) return this.t.quote(id);       // a name, quoted as the language quotes it
       return null;
     };
     const listed = steps.map((_s, i) => [
@@ -825,10 +834,10 @@ export class ExecutorService {
     ]);
     // a card says what it signs: every declared site, with what goes there, on the step's line
     const siteList = (i: number) => [...new Map(sitesOf[i]!.map((d) => [d.host, this.t.site(d.host, d.what)])).values()];
-    const lines = steps.map((s, i) => {
-      const label = classes[i] === "modify_user" ? this.t.modifyYours : classes[i] === "external" ? (mine(i) ? this.t.modifyAndExternal : this.t.external) : "";
-      return `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${label}${sitesOf[i]!.length ? this.t.sendsTo(siteList(i), !!label) : ""}`;
-    });
+    // every step in full, without line-end markers (H2: the class is in plan.steps[].class and the headline): what it
+    // touches, and the sites it sends to
+    const lines = steps.map((s, i) => `${i + 1}. ${s.purpose}${listed[i]!.length ? this.t.listed(listed[i]!) : ""}${sitesOf[i]!.length ? this.t.sendsTo(siteList(i)) : ""}`);
+    void mine;
     // the same card in fields (M0), for an app that lays it out: only what the text says, by the same rules
     // who owns it (the content of a window DeskMind opened is the user's, even where the step inside asks no card)
     const owner = (o: string): "user" | "task" | null => (there.has(o) ? ex.ledger.ownerOf(o) : null);
@@ -850,7 +859,30 @@ export class ExecutorService {
       }),
       foreground: fgApps.length ? { apps: fgApps, note: this.t.foreground(fgApps) } : null,
     };
-    const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }], plan: facts };
+    // what a yes signs, worked out once, before the card (H2): the card's headline and beyond[] are made from it, and the
+    // signing below walks the very same lists — the card names what is signed, no more and no fewer. A step of this run
+    // is uncertain: nothing is signed (every change or send then asks on its own card), and the card says so
+    const uncertain = ex.uncertainCount > 0;
+    const siteGrants = new Map<string, { hosts: Set<string>; sends: Record<string, string[]> }>();
+    for (const ds of sitesOf) for (const d of ds) {
+      const g = siteGrants.get(d.object) ?? { hosts: new Set<string>(), sends: {} };
+      g.hosts.add(d.host);
+      if (d.what && !(g.sends[d.host] ??= []).includes(d.what)) g.sends[d.host]!.push(d.what);
+      siteGrants.set(d.object, g);
+    }
+    const signed = { objects: uncertain ? [] : signFor, sites: uncertain ? [] : [...siteGrants] };
+    // exactly what the yes signs: each object token's object; each site token's place (forSite signs the landing object
+    // with its hosts) when it is the user's — a page opened into their Chrome changes their window; and each site at
+    // its place (one host at two places is two entries, as it is two tokens' worth)
+    const objectsShown = [...signed.objects, ...signed.sites.map(([o]) => o).filter((o) => theirs(o) && !signed.objects.includes(o))];
+    const placeLabel = (o: string) => shown(o) ?? this.o.executor.labelOf(o);
+    const beyond: Beyond[] = [
+      ...[...new Set(objectsShown)].map((o) => ({ kind: "object" as const, ref: o, label: placeLabel(o) })),
+      ...signed.sites.flatMap(([o, g]) => [...g.hosts].map((h) => ({ kind: "site" as const, ref: h, label: h, at: o, at_label: placeLabel(o), ...(g.sends[h]?.length ? { sends: true as const } : {}) }))),
+    ];
+    const headline = this.t.planHeadline(beyond.filter((b) => b.kind === "object").map((b) => b.label),
+      beyond.filter((b) => b.kind === "site").map((b) => ({ host: b.label, at: b.at_label!, sends: !!b.sends })), uncertain, fgApps);
+    const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, headline, beyond, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }], plan: facts };
     const got = await this.askCard(card);
     if (got === "voided") return this.steered() ?? err("这张卡作废了：计划没有交上。");
     if (!got) return this.endWith("failed", "no answer from the user");
@@ -861,8 +893,7 @@ export class ExecutorService {
     // a step of this run is uncertain: the plan is accepted, but no standing grant is signed for it — every change or
     // send asks on its own card naming that step (the executor would not take one anyway: uncertainGate), so the plan
     // says no more than holds
-    const uncertain = ex.uncertainCount > 0;
-    for (const obj of uncertain ? [] : signFor) {
+    for (const obj of signed.objects) {
       const t = this.#signer.forObject(obj, "modify_user", this.o.task);
       this.tokens.set(obj, t);
       this.consents.push({ scope: "object", object: obj, consequence: "modify_user" });
@@ -871,14 +902,7 @@ export class ExecutorService {
     // puts them (the user's window, or the app a window of the task's own opens in), at modify_user — it covers pages
     // landing in the user's window, never a send. The executor checks it and gives the approved content to the
     // provenance judge (review of #35: the plan approves its stated content, it does not bypass the question)
-    const siteGrants = new Map<string, { hosts: Set<string>; sends: Record<string, string[]> }>();
-    for (const ds of sitesOf) for (const d of ds) {
-      const g = siteGrants.get(d.object) ?? { hosts: new Set<string>(), sends: {} };
-      g.hosts.add(d.host);
-      if (d.what && !(g.sends[d.host] ??= []).includes(d.what)) g.sends[d.host]!.push(d.what);
-      siteGrants.set(d.object, g);
-    }
-    for (const [obj, g] of uncertain ? [] : siteGrants) {
+    for (const [obj, g] of signed.sites) {
       const t = this.#signer.forSite(obj, [...g.hosts], this.o.task, "modify_user", undefined, g.sends);
       this.siteTokens.push(t);
       ex.acceptPlanSites(t);
@@ -919,7 +943,7 @@ export class ExecutorService {
     const s = this.steered(); if (s) return s;
     if ((this.counters["asks"] ?? 0) >= this.budget.asks) return err("问得太多了：先按已知的做，或者 finish 说明缺什么");
     this.count("asks");
-    const card: Card = { kind: "missing", text: p.question, free_text: true, blocking: true, options: [...p.options.slice(0, 6).map((t) => ({ kind: "value" as const, text: t })), { kind: "delegate", text: this.t.delegate }, { kind: "cancel", text: this.t.cancel }] };
+    const card: Card = { kind: "missing", text: p.question, headline: p.question, free_text: true, blocking: true, options: [...p.options.slice(0, 6).map((t) => ({ kind: "value" as const, text: t })), { kind: "delegate", text: this.t.delegate }, { kind: "cancel", text: this.t.cancel }] };
     const got = await this.askCard(card);
     if (got === "voided") { this.count("asks", -1); return this.steered() ?? err("这张卡作废了：问题没有答。"); }
     if (!got) return this.endWith("failed", "no answer from the user");
@@ -1024,10 +1048,10 @@ export class ExecutorService {
     const why = u.steps.find((x) => !x.can)?.why ?? this.t.undoable;
     const text = [...(this.status && this.status !== "succeeded" ? [this.t.notFinished(this.status)] : []),
       ...(did.length ? [this.t.did(did.slice(-6))] : []), ...(unsure.length ? [this.t.didUnsure(unsure.slice(-6))] : []),
-      ...(consented.length ? [this.t.changedYours([...new Set(consented)])] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(reversible ? [] : [this.t.noUndo(why)]),
+      ...(consented.length ? [this.t.changedYours([...new Set(consented)].map((o) => ex.labelOf(o)))] : []), ...(rules.length ? [this.t.byRule(rules)] : []), ...(reversible ? [] : [this.t.noUndo(why)]),
       // undo takes the run back but leaves open what a launch brought up of the user's apps: said, not implied
       ...(reversible && u.steps.some((x) => x.left_open) ? [this.t.undoKeepsOpen([...new Set(u.steps.flatMap((x) => (x.left_open ? [x.left_open] : [])))])] : [])].join("\n");
-    return { kind: "result", text, options, free_text: false, blocking: false };
+    return { kind: "result", text, headline: this.t.resultHeadline(did.length, unsure.length) || text.split("\n")[0]!, options, free_text: false, blocking: false };
   }
 
   /** The user's answer to the result card: undo takes everything back (all or nothing) and the run ends cancelled. */

@@ -49,6 +49,7 @@ import { PROTOCOL } from "../protocol/version.js";
 import { current as traceContext, within, type ModelCallRecord } from "../otel/context.js";
 import { Tracer, exportTrace } from "../otel/trace.js";
 import type { Answer, Card } from "../orchestrator/index.js";
+import { answersOpenCard } from "../protocol/cards.js";
 import { fileRegistry } from "../registry/fs.js";
 import { Workspace } from "../registry/workspace.js";
 
@@ -176,7 +177,7 @@ export class StdioUser implements RuntimeUser {
   /** The cards no longer open, and how they closed: timeout, steer, stop, ended, answered. */
   private readonly closed = new Map<string, string>();
   /** The card open now: its id, what checks its deadline, and how it is answered or let go. */
-  private open: { id: string; card: Card; expired?: () => boolean; settle: (a: Answer | null) => void } | null = null;
+  private open: { id: string; card: Card; expired?: () => boolean; taken?: () => void; settle: (a: Answer | null) => void } | null = null;
   /** The task stopped ("stop"), the app went away ("ended"), or the task is over ("done"): every reply is refused. */
   private over: "stop" | "ended" | "done" | null = null;
 
@@ -200,8 +201,9 @@ export class StdioUser implements RuntimeUser {
     // its signal's handler closes it here and now
     this.open?.expired?.();
     const o = this.open;
-    if (o && (a.ask_id === o.id || (a.ask_id === undefined && !this.voided))) {
+    if (o && answersOpenCard(a, o.id, this.voided)) {
       this.closeOpen("answered");
+      o.taken?.();                 // the card is answered now: the next line (a steer in the same chunk) finds none open
       this.log.emit({ kind: "resumed", ask_id: o.id });
       if (typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length) return o.settle({ option: a.option });
       if (typeof a.text === "string" && a.text.trim()) return o.settle({ text: a.text });
@@ -227,7 +229,7 @@ export class StdioUser implements RuntimeUser {
   /** The task is over (task_done): replies after it are refused as such. */
   taskOver() { this.end("done"); }
 
-  ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
+  ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean; taken?: () => void } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     // registered (the open record, its settle, its signal; the deadline is the service's, set before this call) BEFORE
     // anything announces it: the app may answer inside the very `ask` it is handed (an in-process sink, a synchronous
@@ -248,9 +250,9 @@ export class StdioUser implements RuntimeUser {
       else { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why }); }
       settle(null);
     };
-    this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), settle };
+    this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), ...(o.taken ? { taken: o.taken } : {}), settle };
     o.signal?.addEventListener("abort", voided, { once: true });
-    this.log.emit({ kind: "ask", ask_id, card: { kind: card.kind, text: card.text, options: card.options.map((o) => ({ kind: o.kind, text: o.text })), free_text: card.free_text, blocking: card.blocking, ...(card.plan ? { plan: card.plan } : {}), ...(card.consent ? { consent: card.consent } : {}) } });
+    this.log.emit({ kind: "ask", ask_id, card: cardEvent(card) });
     // (answered or let go inside its own announcement: nothing more is said of it)
     if (this.open?.id !== ask_id) return p;
     this.log.emit({ kind: "waiting", ask_id });
@@ -275,8 +277,11 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
     case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(typeof body.possibly_done === "boolean" ? { possibly_done: body.possibly_done } : {}),
       ...(body.shot ? { shot: s(body.shot), ...(body.shot_pending ? { shot_pending: true } : {}) } : {}), ...(body.target_frame ? { target_frame: body.target_frame as never } : {}), ...(body.window_frame ? { window_frame: body.window_frame as never } : {}) };
     case "shot.ready": return { kind: "shot_ready", step_id: s(body.step_id), shot: s(body.shot) };
-    case "executor.user_wait": return { kind: "waiting" };            // the user is at the keyboard: the app says "paused while you use your Mac"
-    case "executor.user_resumed": return { kind: "resumed", why: body.stopped ? "stopped" : body.timed_out ? "timed_out" : "" };
+    // the user is at the keyboard, or the step's app needs the front: the app says what it waits for and until when (H4)
+    case "executor.user_wait": return { kind: "waiting", ...(body.why === "user_active" || body.why === "needs_front" ? { why: body.why } : {}), ...(typeof body.quiet_s === "number" ? { quiet_s: body.quiet_s } : {}),
+      ...(typeof body.needs_front === "boolean" ? { needs_front: body.needs_front } : {}), ...(typeof body.app_label === "string" ? { app_label: body.app_label } : {}),
+      ...(typeof body.started_at === "number" ? { started_at: body.started_at } : {}), ...(typeof body.gives_up_at === "number" ? { gives_up_at: body.gives_up_at } : {}) };
+    case "executor.user_resumed": return { kind: "resumed", why: body.why === "paused" || body.why === "stopped" || body.why === "timed_out" || body.why === "failed" || body.why === "" ? body.why : body.stopped ? "stopped" : body.timed_out ? "timed_out" : "", ...(typeof body.waited_s === "number" ? { waited_s: body.waited_s } : {}) };
     case "steer.applied": return { kind: "steered", text: s(body.raw) };
     case "executor.verdict": return { kind: "verify", verdict: body.verdict as never, ...(body.by ? { by: s(body.by) } : {}), reason: s(body.reason ?? "").slice(0, 500), ...(body.missing_kind ? { missing_kind: body.missing_kind as never } : {}), ...(body.judge_id ? { judge_id: s(body.judge_id) } : {}) };
     case "changes": { const c = body as Record<string, string[]>; return { kind: "changes", created: c.created ?? [], modified: c.modified ?? [], deleted: c.deleted ?? [], external: c.external ?? [], unconfirmed: c.unconfirmed ?? [], ...(c.created_windows?.length ? { created_windows: c.created_windows } : {}) }; }
@@ -563,9 +568,12 @@ export const EXPIRED_GRACE_MS = 2000;
 
 /** A result card as the protocol carries it. `offerUndo` false: nothing will wait to carry an undo out, so its option is
  *  left off and the card says why. */
-const cardEvent = (c: Card, offerUndo = true, lang?: string) => {
+export const cardEvent = (c: Card, offerUndo = true, lang?: string) => {
   const drop = !offerUndo && c.options.some((x) => x.kind === "undo");
-  return { kind: c.kind, text: drop ? `${c.text}\n${T(lang).noUndo(T(lang).noWait)}` : c.text, options: c.options.filter((x) => !drop || x.kind !== "undo").map((x) => ({ kind: x.kind, text: x.text })), free_text: c.free_text, blocking: c.blocking };
+  return { kind: c.kind, text: drop ? `${c.text}\n${T(lang).noUndo(T(lang).noWait)}` : c.text, options: c.options.filter((x) => !drop || x.kind !== "undo").map((x) => ({ kind: x.kind, text: x.text, ...(x.detail ? { detail: x.detail } : {}) })), free_text: c.free_text, blocking: c.blocking,
+    // (H2) the headline from the signed facts, what the yes covers beyond the request; the card a steer does not void (H5)
+    ...(c.headline ? { headline: c.headline } : {}), ...(c.beyond ? { beyond: c.beyond } : {}), ...(c.reconcile ? { reconcile: true as const } : {}),
+    ...(c.plan ? { plan: c.plan } : {}), ...(c.consent ? { consent: c.consent } : {}) };
 };
 
 export function respond(runId: string, runs: string, answer: Record<string, unknown>, out: (ev: AppEvent) => void) {
