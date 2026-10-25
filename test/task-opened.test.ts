@@ -163,6 +163,22 @@ describe("H1: a window the task's launch brought up — the table (source × jud
   it("the judge's option exists, and the question still starts as it did (TierStats routes by its first words)", () => {
     expect(OUTGOING_OPTIONS.map((o) => o.id)).toEqual(["sends", "alters", "stays", "unsure"]);
     expect(OUTGOING_QUESTION.slice(0, 12)).toBe("这一步会不会把内容发出去");
+    // the option's three backstops, where structure cannot see: closing / quitting from a menu or a plain button, and a
+    // save over an existing file on disk (another's app's Save As, the overwrite sheet's 替换) — review of #75
+    const alters = OUTGOING_OPTIONS.find((o) => o.id === "alters")!.text;
+    for (const word of ["关掉窗口", "退出应用", "另存为", "替换"]) { expect(alters).toContain(word); expect(OUTGOING_QUESTION).toContain(word); }
+  });
+
+  it("a save over the user's file from a window DeskMind opened (the overwrite sheet's 替换): the judge is the guard — alters asks, stays runs", async () => {
+    ELS.push({ id: "replace", role: "button", label: "替换", actions: ["click"], in_modal: true });
+    try {
+      for (const [answer, status] of [["alters", "needs_consent"], ["stays", "ok"]] as const) {
+        const { desk, ex, target, o } = await stage("opened", "task", fakeJudge(answer, "matches").judge);
+        const before = desk.effects.length;
+        const r = await ex.act({ action: { kind: "click", window: target.id, target: "replace" }, epoch: o.epoch });
+        expect([answer, r.status, desk.effects.length > before]).toEqual([answer, status, status === "ok"]);
+      }
+    } finally { ELS.pop(); }
   });
 
   it("the card for a change the judge raised names the window as one DeskMind opened; the step the judge cleared is journaled so, without 「改动你的东西」", async () => {
