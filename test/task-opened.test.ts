@@ -441,28 +441,18 @@ describe("review of #75, delta round", () => {
     expect([ex2.opened("window:com.apple.mail#9"), ex2.protects("window:com.apple.mail#9")]).toEqual([false, true]);
   });
 
-  it("D: the typed-text fact — one character typed in the search box does not make the user's note read as the task's; a field the task filled does", async () => {
+  it("D: the content fact — a field holding anything is the user's, even text the task itself just typed (nothing is credited to the task: Codex round 3)", async () => {
     const { desk, ex, target, o } = await stage("opened", "task", undefined);
     const seen: Record<string, unknown>[] = [];
     (ex as unknown as { opts: { judge: Judge; raw: string } }).opts.judge = { choose: async (q: string, ctx: Record<string, unknown>) => { if (q === OUTGOING_QUESTION) seen.push(ctx); return { choice: q === OUTGOING_QUESTION ? "stays" : "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
     expect((await ex.act({ action: { kind: "type", window: target.id, target: "search", text: "的" }, epoch: o.epoch })).status).toBe("ok");
-    const fact = () => { const el = seen.at(-1)!["目标元素"] as Record<string, unknown>; return [el["目标里已有内容"], el["已有内容是本次任务打的"]]; };
-    // the user's note body holds their own text with 的 in it
-    const note = ELS.find((e) => e.id === "body")!; (note as { value?: string }).value = "周末的购物清单：牛奶";
-    desk.epoch += 1; let o2 = await ex.observe(target.id);
-    await ex.act({ action: { kind: "type", window: target.id, target: "body", text: "删掉" }, epoch: o2.epoch });
-    expect(fact()).toEqual([true, false]);
-    // the search box now holds exactly what the task typed: the task's own
+    const fact = () => { const el = seen.at(-1)!["目标元素"] as Record<string, unknown>; return [el["目标里已有内容"], "已有内容是本次任务打的" in el]; };
+    expect(fact()).toEqual([false, false]);                              // an empty field, and no "task's own" fact exists any more
     const search = ELS.find((e) => e.id === "search")!; (search as { value?: string }).value = "的";
-    desk.epoch += 1; o2 = await ex.observe(target.id);
+    desk.epoch += 1; const o2 = await ex.observe(target.id);
     await ex.act({ action: { kind: "type", window: target.id, target: "search", text: "会议" }, epoch: o2.epoch });
-    expect(fact()).toEqual([true, true]);
-    // the note now holds the user's text plus the task's appended word: not the task's own
-    (note as { value?: string }).value = "周末的购物清单：牛奶删掉";
-    desk.epoch += 1; o2 = await ex.observe(target.id);
-    await ex.act({ action: { kind: "type", window: target.id, target: "body", text: "！" }, epoch: o2.epoch });
-    expect(fact()).toEqual([true, false]);
-    delete (note as { value?: string }).value; delete (search as { value?: string }).value;
+    expect(fact()).toEqual([true, false]);                               // the task's own text in the box: still "holds content" — the judge asks
+    delete (search as { value?: string }).value;
   });
 });
 
@@ -509,7 +499,7 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
     const facts: Record<string, unknown>[] = [];
     const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
       let choice = "matches";
-      if (q === OUTGOING_QUESTION) { const el = ctx["目标元素"] as Record<string, unknown>; facts.push(el); choice = el["目标里已有内容"] && !el["已有内容是本次任务打的"] ? "alters" : "stays"; }
+      if (q === OUTGOING_QUESTION) { const el = ctx["目标元素"] as Record<string, unknown>; facts.push(el); choice = el["目标里已有内容"] ? "alters" : "stays"; }
       return { choice, by: "fake", confidence: 1, reason: "follow the supplied ownership facts" };
     } } as unknown as Judge;
     const { desk, ex, target, o } = await stage("opened", "task", judge);
@@ -521,15 +511,15 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
     const current = await ex.observe(target.id);
     const before = desk.effects.length;
     const r = await ex.act({ action: { kind: "set_value", window: target.id, target: "search", value: "overwrite" }, epoch: current.epoch });
-    expect({ own: facts.at(-1)!["已有内容是本次任务打的"], status: r.status, effect: desk.effects.length > before }).toEqual({ own: false, status: "needs_consent", effect: false });
-    // and the renumbered search box itself, holding exactly the task's text, is still the task's
+    expect({ holds: facts.at(-1)!["目标里已有内容"], status: r.status, effect: desk.effects.length > before }).toEqual({ holds: true, status: "needs_consent", effect: false });
+    // the renumbered search box itself, holding exactly the task's text, asks too: nothing is credited to the task (round 3)
     const o2 = await ex.observe(target.id);
     const searchNow = o2.elements.find((e) => e.id === "search-moved")!; (searchNow as { value?: string }).value = "hello";
     desk.observe = (id) => { const ob = originalObserve(id); return { ...ob, elements: ob.elements.map((e) => (e.id === "search" ? { ...e, id: "search-moved", value: "hello" } : e)) }; };
     desk.epoch += 1;
     const o3 = await ex.observe(target.id);
-    expect((await ex.act({ action: { kind: "type", window: target.id, target: "search-moved", text: " world" }, epoch: o3.epoch })).status).toBe("ok");
-    expect(facts.at(-1)!["已有内容是本次任务打的"]).toBe(true);
+    expect((await ex.act({ action: { kind: "type", window: target.id, target: "search-moved", text: " world" }, epoch: o3.epoch })).status).toBe("needs_consent");
+    expect(facts.at(-1)!["目标里已有内容"]).toBe(true);
   });
 
   it("2: a user app seen only in act's own snapshots (a wait) is remembered: its later relaunch is the user's", async () => {
@@ -567,9 +557,8 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
   it("property: random looks, snapshots, user actions (apps opened and quit, fields filled, ids renumbered) and task actions under a fact-following judge — no user object changed without a card", async () => {
     const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
     const pick = <T,>(r: () => number, xs: readonly T[]): T => xs[Math.floor(r() * xs.length)]!;
-    /** `taskText`: what the task's own writes alone would leave in the field — content is the user's when the field holds
-     *  anything else (the user's text, or theirs plus the task's; a user retyping exactly the task's text loses nothing) */
-    type Field = { key: string; role: string; label: string; value: string; taskText: string };
+    /** content is the user's whenever the field holds anything at all (round 3: nothing is credited to the task) */
+    type Field = { key: string; role: string; label: string; value: string };
     /** A desk whose element ids are numbered per observation, whose fields remember who wrote them (the ground truth), and
      *  that knows which windows the user opened (at begin or mid-task): those are theirs whatever a launch calls them. */
     class World implements Driver {
@@ -583,7 +572,7 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
       idMap = new Map<string, string>();        // current observation-local id → window:key
       constructor(public r: () => number) {}
       snapshot(): Snapshot { this.shown(); return { epoch: this.epoch, locked: false, front_app: "DeskMind", windows: [...this.wins] }; }
-      fieldsOf(w: string) { if (!this.fields.has(w)) this.fields.set(w, [{ key: "search", role: "textField", label: "搜索", value: "", taskText: "" }, { key: "body", role: "textArea", label: "正文", value: "", taskText: "" }]); return this.fields.get(w)!; }
+      fieldsOf(w: string) { if (!this.fields.has(w)) this.fields.set(w, [{ key: "search", role: "textField", label: "搜索", value: "" }, { key: "body", role: "textArea", label: "正文", value: "" }]); return this.fields.get(w)!; }
       observe(id: string): Observation {
         const w = this.wins.find((x) => x.id === id); if (!w) throw new Error(`no window ${id}`);
         this.shown(); this.gen += 1; this.idMap = new Map();
@@ -603,8 +592,8 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
         if (a.kind === "type" || a.kind === "set_value") {
           const key = this.idMap.get(a.target)?.split(":")[1]; const f = this.fieldsOf(a.window).find((x) => x.key === key);
           if (!f) return { status: "error" as const, why: "no such field" };
-          const userContent = f.value !== "" && f.value !== f.taskText;
-          if (a.kind === "set_value") { f.value = a.value; f.taskText = a.value; } else { f.value += a.text; f.taskText += a.text; }
+          const userContent = f.value !== "";
+          if (a.kind === "set_value") f.value = a.value; else f.value += a.text;
           this.effects.push({ action: a, window: a.window, userContent }); this.epoch += 1; return { status: "ok" as const, window: a.window };
         }
         if (a.kind === "scroll" || a.kind === "focus_window") return { status: "ok" as const, window: a.window };
@@ -625,7 +614,7 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
       const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
         if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
         const el = ctx["目标元素"] as Record<string, unknown> | null;
-        return { choice: el && el["目标里已有内容"] && !el["已有内容是本次任务打的"] ? "alters" : "stays", by: "fake", confidence: 1, reason: "" };
+        return { choice: el && el["目标里已有内容"] ? "alters" : "stays", by: "fake", confidence: 1, reason: "" };
       } } as unknown as Judge;
       const app = ConsentSigner.fresh();
       const journal = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "h1p2-")), "journal.jsonl");
@@ -661,9 +650,9 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
         }
       }
       // the oracle, from the world: a window of an app the user opened (at begin or mid-task) is theirs, whatever a launch
-      // called it; in a window the task launched for an app the user never opened, a write over the user's content and a
-      // close need consent (the judge sees the content facts; closing is structure) — a click or another key there runs on
-      // the judge's「不会」by design, a write into an empty field or over the task's own text runs free
+      // called it; in a window the task launched for an app the user never opened, a write into a field that holds anything
+      // and a close need consent (the judge sees the content fact; closing is structure) — a click or another key there
+      // runs on the judge's「不会」by design, only a write into an empty field runs free
       for (const e of record) {
         const needs = e.theirs || ((e.kind === "type" || e.kind === "set_value") && e.userContent) || e.kind === "close_window" || /cmd\+w/i.test(e.chord);
         if (needs) expect([e.label, e.kind, e.consent]).toEqual([e.label, e.kind, true]);
@@ -711,5 +700,53 @@ describe("review of #75, probe R — the ledger survives the process", () => {
     desk.epoch += 1;
     await ex.act({ action: { kind: "open_window", app: "邮件" }, epoch: (await ex.snapshot()).epoch });
     expect([ex.opened("window:com.apple.mail#9"), ex.protects("window:com.apple.mail#9")]).toEqual([false, true]);
+  });
+});
+
+describe("Codex review of #75, round 3", () => {
+  it("a same-looking body field in another document of the same window, holding the task's earlier text: still a card (nothing is credited to the task)", async () => {
+    let value = "", doc = "新建文稿", holds: unknown;
+    const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
+      if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
+      const el = ctx["目标元素"] as Record<string, unknown>; holds = el["目标里已有内容"];
+      return { choice: holds ? "alters" : "stays", by: "fake", confidence: 1, reason: "follow the supplied content fact" };
+    } } as unknown as Judge;
+    const { desk, ex, target } = await stage("opened", "task", judge);
+    target.title = doc; desk.epoch += 1;
+    const observe = desk.observe.bind(desk);
+    desk.observe = (id) => { const ob = observe(id); return { ...ob, window: { ...ob.window, title: doc }, elements: ob.elements.map((e) => (e.id === "body" ? { ...e, value, rect: [10, 10, 300, 400] as [number, number, number, number] } : e)) }; };
+    const perform = desk.perform.bind(desk);
+    desk.perform = ((a: Action, opts?: { foreground_ok?: boolean }) => { if (a.kind === "set_value" && a.target === "body") value = a.value; return perform(a, opts); }) as typeof desk.perform;
+    const o = await ex.observe(target.id);
+    expect((await ex.act({ action: { kind: "set_value", window: target.id, target: "body", value: "hello" }, epoch: o.epoch })).status).toBe("ok");
+    // the same app window switches to the user's existing document: same role, label and bounds, the same text
+    doc = "用户已有的笔记"; target.title = doc; value = "hello"; desk.epoch += 1;
+    const current = await ex.observe(target.id), before = desk.effects.length;
+    const r = await ex.act({ action: { kind: "set_value", window: target.id, target: "body", value: "overwrite" }, epoch: current.epoch });
+    expect({ holds, status: r.status, effect: desk.effects.length > before }).toEqual({ holds: true, status: "needs_consent", effect: false });
+  });
+
+  it("recovery pairs intents with receipts and ignores every other line: a `seen` line after the interrupted intent, or a look at begin, hides nothing", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r75r3-")), journal = path.join(dir, "journal.jsonl");
+    // an earlier process: a receipted intent, then an intent with no receipt, then a `seen` line its last look wrote
+    const lines = [
+      { t: 1, kind: "seen", windows: [{ id: "com.apple.mail#7", app: "邮件", bundle: "com.apple.mail" }] },
+      { t: 2, kind: "intent", action: { kind: "click", window: "com.apple.mail#7", target: "a" }, object: "window:com.apple.mail#7", consequence: "modify_user", text: "点「回复」" },
+      { t: 3, kind: "receipt", status: "ok", seq: 1, driver_status: "ok" },
+      { t: 4, kind: "intent", action: { kind: "click", window: "com.apple.mail#7", target: "b" }, object: "window:com.apple.mail#7", consequence: "modify_user", text: "点「删除」" },
+      { t: 5, kind: "seen", windows: [{ id: "com.apple.notes#2", app: "备忘录", bundle: "com.apple.notes" }] },
+    ];
+    fs.writeFileSync(journal, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    const desk = new Desk([win("Notes#1", "Notes", "购物清单")]);           // a window on screen at restart: the first look writes a `seen` line
+    const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
+    const ex = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "x", taskOpened: "task", journal, onEvent: (k, b) => events.push({ k, b }) });
+    await ex.begin();
+    expect(ex.recovered).toMatchObject({ finding: "unknown", text: "点「删除」" });
+    // the receipted step is not in doubt; the journal's order is as the earlier process left it, this process's lines after
+    const kinds = fs.readFileSync(journal, "utf-8").split("\n").filter(Boolean).map((l) => (JSON.parse(l) as { kind: string }).kind);
+    expect(kinds.slice(0, 5)).toEqual(["seen", "intent", "receipt", "intent", "seen"]);
+    expect(kinds.slice(5)).toEqual(["receipt", "seen"]);                 // recovery's record of the step in doubt, then this process's first look
+    // and both apps the earlier process saw are the user's now
+    expect([ex.ledger.seenApp({ id: "com.apple.mail#9", app: "邮件" }), ex.ledger.seenApp({ id: "x#1", app: "备忘录" })]).toEqual([true, true]);
   });
 });

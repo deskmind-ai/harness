@@ -161,15 +161,6 @@ const NEAR_PX = 16;
  *  every look, and so does Peekaboo for the accessibility tree (elem_N in traversal order: an incoming message ahead of
  *  the Send button shifts every later id). An id is a handle into one observation, not an identity (review of #25). */
 interface Ident { c: string; at: [number, number] | null; act?: true; ax?: true; anon?: true }
-/** A field's identity without its value: what it is (role, label, read from the tree or the screen) and where it is when
- *  the driver gives a place. What the task typed into a field is credited to the same field later only by this, never by
- *  an element id (numbered per observation). Stored in the journal's intent (`field`). */
-export interface FieldIdent { key: string; at: [number, number] | null }
-export function fieldIdent(e: Element): FieldIdent | null {
-  if (!e.actions.includes("type") && !e.actions.includes("set_value")) return null;
-  return { key: canon([e.role, e.label, fromScreen(e) ? "pixels" : "ax"]), at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null };
-}
-const sameField = (a: FieldIdent, b: FieldIdent) => a.key === b.key && (a.at && b.at ? close(a.at, b.at) : !a.at && !b.at);
 const identOf = (e: Element, withFocus = true): Ident => ({
   c: canon([e.role, e.label, e.value ?? null, fromScreen(e) ? "pixels" : "ax", ...(withFocus ? [!!e.focused] : [])]),
   at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null,
@@ -430,25 +421,6 @@ export class Executor {
   /** Whether a field's whole value is what this task put there: the text typed or set into that very element (by the
    *  caller's element id) since its last set_value, joined, is the value. Anything else — a character of the task's inside
    *  the user's note, text in another field, an element renumbered since — is not the task's (review of #75, D). */
-  private ownValue(w: string, el: Element, obs: Observation): boolean {
-    // the field's identity, across observations: element ids are numbered per observation (Codex review of #75, round 2:
-    // a later layout gave the search box's id to the user's note), so a field is known by what it is — role, label, how
-    // it was read, its place when it has one — and only when that names one element in both observations
-    const me = fieldIdent(el);
-    if (!me || obs.elements.filter((e) => fieldIdent(e)?.key === me.key).length !== 1) return false;
-    let seq: { kind: "type" | "set_value"; text: string }[] = [];
-    const lines = this.jlines;
-    for (const s of journalSteps(lines)) {
-      const act = s.action as Action | undefined;
-      if (!act || !("window" in act) || act.window !== w) continue;
-      if ((lines[s.intent] as { takes_typed?: unknown } | undefined)?.takes_typed === true && s.receipt?.status === "ok") { seq = []; continue; }
-      if (!(act.kind === "type" || act.kind === "set_value") || !s.possibly) continue;
-      const field = (lines[s.intent] as { field?: FieldIdent }).field;
-      if (!field || !sameField(field, me)) continue;           // an intent without the field's identity (an older journal) is not the task's own
-      if (act.kind === "set_value") seq = [{ kind: "set_value", text: act.value }]; else seq.push({ kind: "type", text: act.text });
-    }
-    return seq.length > 0 && (el.value ?? "").trim() === seq.map((x) => x.text).join("").trim();
-  }
   private typedIn(a: Action): string[] {
     if (!("window" in a)) return [];
     return [...this.typedOn(a.window), ...(a.kind === "type" ? [a.text] : a.kind === "set_value" ? [a.value] : [])];
@@ -667,8 +639,13 @@ export class Executor {
     let pending: Record<string, unknown> | null = null;
     for (const l of lines) { if (l.kind === "reconcile_pending") pending = l; else if (l.kind === "reconciled") pending = null; }
     if (pending && this.opts.files) this.restorePending(pending);
-    const last = lines.at(-1);
-    if (!last || last.kind !== "intent") { if (this.reconciliation) this.emit("executor.reconcile_needed", { object: this.reconciliation.object, paths: this.reconciliation.files.map((f) => f.path), still: true }); return; }
+    // the last intent of the earlier processes, and whether a receipt answered it: the next receipt before another intent.
+    // Anything else between them — a `seen` line a look wrote, a reconciliation record — is invisible to recovery, and the
+    // journal's last line is nothing special (Codex round 3 of #75)
+    const receiptOf = (i: number): number | null => { for (let j = i + 1; j < lines.length; j += 1) { if (lines[j]!.kind === "intent") return null; if (lines[j]!.kind === "receipt") return j; } return null; };
+    let lastIdx = -1; for (let i = lines.length - 1; i >= 0; i -= 1) if (lines[i]!.kind === "intent") { lastIdx = i; break; }
+    const last = lastIdx >= 0 && receiptOf(lastIdx) === null ? lines[lastIdx]! : null;
+    if (!last) { if (this.reconciliation) this.emit("executor.reconcile_needed", { object: this.reconciliation.object, paths: this.reconciliation.files.map((f) => f.path), still: true }); return; }
     const action = last.action as Action;
     let finding: "happened" | "not_happened" | "unknown" = "unknown";
     const ws = this.opts.files?.workspace;
@@ -681,9 +658,10 @@ export class Executor {
       for (let i = 0; i < lines.length; i += 1) {
         const l = lines[i]!;
         if (l.kind === "begin" && l.versions) Object.assign(known, l.versions as Record<string, string>);
-        if (l.kind === "intent" && l.versions_before && lines[i + 1]?.kind === "receipt" && (i + 1 < lines.length - 1 || last.kind !== "intent")) {
+        const rj = l.kind === "intent" && l.versions_before ? receiptOf(i) : null;
+        if (rj !== null) {
           Object.assign(known, l.versions_before as Record<string, string>);                          // what it saw before writing
-          if ((lines[i + 1] as { versions_after?: Record<string, string> }).versions_after) Object.assign(known, (lines[i + 1] as { versions_after: Record<string, string> }).versions_after);
+          if ((lines[rj] as { versions_after?: Record<string, string> }).versions_after) Object.assign(known, (lines[rj] as { versions_after: Record<string, string> }).versions_after);
         }
       }
       if (finding === "happened") Object.assign(known, last.expect_after as Record<string, string>);
@@ -928,7 +906,6 @@ export class Executor {
 
   async begin(paths: string[] = [], rules: ConsentToken[] = []): Promise<Snapshot> {
     if (rules.length) { const r = this.consent.loadRules(rules); this.emit("executor.rules", r); }
-    const raw = await this.see();
     const ws = this.opts.files?.workspace;
     if (ws) {
       const contents: Record<string, string> = {};
@@ -938,8 +915,11 @@ export class Executor {
       }
       this.startTree = { versions: { ...this.seen }, contents };
     }
-    this.ledger.begin(raw, paths);
+    // the journal is read back before anything is appended to it — the first look writes `seen` lines — so recovery finds
+    // the earlier process's records as it left them (Codex round 3 of #75: a look before recover hid an interrupted write)
     this.recover();
+    const raw = await this.see();
+    this.ledger.begin(raw, paths);
     if (ws && !this.recovered) this.journal("begin", { versions: { ...this.seen }, contents: boundedTexts(this.startTree!.contents) });     // what a restart compares against
     // a task the journal saw begin before (a restart): its start is the folder as it first began, not as found now. A
     // journal from before contents were recorded: the text of what is unchanged since is the text it began with
@@ -1430,8 +1410,10 @@ export class Executor {
       ...(a.kind === "key" ? { 按的键: a.chord } : {}),
       ...(a.kind === "type" ? { 输入的文字: a.text } : {}),
       目标元素: h.el ? { 角色: h.el.role, 名字: h.el.label, ...(h.el.value ? { 值: h.el.value } : {}), 来源: screen(h.el), 名字命中发送词表: !!h.el.sends,
-        // for the second direction: what is in the field now, and whether this task put it there (review of #75, 3)
-        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim(), 已有内容是本次任务打的: !!h.el.value?.trim() && !!h.obs && this.ownValue(a.window, h.el, h.obs) } : {}) } : null,
+        // for the second direction: whether the field holds anything now. Nothing in it is ever credited to the task — the
+        // fourth bug of that family was a same-looking field in another document (Codex round 3 of #75): a write into a
+        // field that holds anything is a change of the user's content, a card; only an empty field is clear
+        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim() } : {}) } : null,
       窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.opened ? { 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : {}), ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
       窗口里标了会发出的其他元素: els.filter((e) => e.sends && e !== h.el).map((e) => ({ 角色: e.role, 名字: e.label, 来源: screen(e) })),
       窗口里的其他控件: els.filter((e) => e !== h.el && e.actions.length).slice(0, 60).map((e) => ({ 角色: e.role, 名字: e.label, ...(e.value ? { 值: e.value.slice(0, 80) } : {}), 来源: screen(e) })),
@@ -1777,10 +1759,7 @@ export class Executor {
       // a certain send (the judge's 会, or a control marked as sending) takes the window's typed text with it once it
       // ends ok (typedOn); a 拿不准 one does not
       const takesTyped = consequence === "external" && "window" in req.action && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends));
-      const typedInto = obs && "target" in req.action && req.action.target && (req.action.kind === "type" || req.action.kind === "set_value") ? obs.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
-      const field = typedInto ? fieldIdent(typedInto) : null;
-      const fieldUnique = !!field && obs!.elements.filter((e) => fieldIdent(e)?.key === field.key).length === 1;
-      this.journal("intent", { action: act, object: base.object, consequence, text, ...(field && fieldUnique ? { field } : {}), ...(takesTyped ? { takes_typed: true } : {}), ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
+      this.journal("intent", { action: act, object: base.object, consequence, text, ...(takesTyped ? { takes_typed: true } : {}), ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
