@@ -137,6 +137,7 @@ describe("H2: a card's headline and beyond[] are what its yes signs (one pass)",
   it("plan cards, table: (objects | sites into the user's browser | both) → beyond = the objects and hosts signed on accept; no line-end markers", async () => {
     const browser = () => {
       const sim = new SimComputer();
+      sim.capabilities.urlInOwnBrowserWindow = false;      // a url goes to the user's open browser window (rc11's floor)
       const m = sim.addMail({ app: "信鸽", texts: ZH_MAIL_TEXTS, flagged: [], inbox: [{ id: "m1", from: "林晓", subject: "Q3 预算", body: ["x"], time: "14:00" }] }).id;
       const b = sim.addBrowser("Google Chrome", [{ title: "新标签页", url: "about:blank" }]).id;
       return { sim, m, b };
@@ -144,6 +145,8 @@ describe("H2: a card's headline and beyond[] are what its yes signs (one pass)",
     const cases: { name: string; plan: (m: string, b: string) => unknown[] }[] = [
       { name: "objects", plan: (m) => [{ purpose: "给邮件加旗标", objects: [`window:${m}`], consequence: "modify_user" }] },
       { name: "sites", plan: (_m, b) => [{ purpose: "查天气", objects: [], consequence: "create", opens: [{ app: "Google Chrome", url: "https://www.google.com/search?q=weather", sends: "搜索 weather" }, { app: "Google Chrome", url: "https://wttr.in/" }] }].map((s) => ({ ...s, objects: [`window:${b}`] })) },
+      // (review of #77: the user's Chrome window, named by no step: its site token is signed on it, so the card says so)
+      { name: "sites, no objects", plan: () => [{ purpose: "查天气", objects: [], consequence: "create", opens: [{ app: "Google Chrome", url: "https://wttr.in/" }] }] },
       { name: "both", plan: (m, b) => [{ purpose: "加旗标", objects: [`window:${m}`], consequence: "modify_user" }, { purpose: "查天气", objects: [`window:${b}`], consequence: "create", opens: [{ app: "Google Chrome", url: "https://wttr.in/" }] }] },
     ];
     for (const k of cases) {
@@ -153,12 +156,19 @@ describe("H2: a card's headline and beyond[] are what its yes signs (one pass)",
       const card = cards.find((c) => c.kind === "plan")!;
       expect(card, k.name).toBeTruthy();
       const confirmed = events.find((e) => e.k === "plan.confirmed")!.b;
-      const signedObjects = confirmed.objects as string[];
-      const signedHosts = [...new Set(Object.values(confirmed.sites as Record<string, { hosts: string[] }>).flatMap((g) => g.hosts))];
-      expect(card.beyond!.filter((x) => x.kind === "object").map((x) => x.ref).sort(), k.name).toEqual([...signedObjects].sort());
-      expect(card.beyond!.filter((x) => x.kind === "site").map((x) => x.ref).sort(), k.name).toEqual(signedHosts.sort());
+      // the signed set, from what accept signed: object tokens, and site tokens (place + hosts); a place is the user's
+      // when the ledger says so — the sim's windows are all the user's here
+      const sites = confirmed.sites as Record<string, { hosts: string[]; sends: Record<string, string[]> }>;
+      const userWindows = new Set(sim.snapshot().windows.map((w) => `window:${w.id}`));
+      const signedObjects = [...new Set([...(confirmed.objects as string[]), ...Object.keys(sites).filter((o) => userWindows.has(o))])];
+      const signedSites = Object.entries(sites).flatMap(([o, g]) => g.hosts.map((h) => `${o}|${h}`));
+      expect(card.beyond!.filter((x) => x.kind === "object").map((x) => x.ref).sort(), k.name).toEqual(signedObjects.sort());
+      expect(card.beyond!.filter((x) => x.kind === "site").map((x) => `${x.at}|${x.ref}`).sort(), k.name).toEqual(signedSites.sort());
       expect(card.headline, k.name).toBeTruthy();
       for (const x of card.beyond!) expect(card.headline, k.name).toContain(x.label);
+      // "takes content there" only when something goes there
+      const sends = Object.values(sites).some((g) => Object.values(g.sends ?? {}).some((v) => v.length));
+      expect(card.headline!.includes("把内容带到"), k.name).toBe(sends);
       expect(card.text, k.name).not.toMatch(/——/);
       expect(card.plan!.steps.length, k.name).toBeGreaterThan(0);
     }
@@ -225,7 +235,8 @@ describe("H3: one run, one language; actions in plain words", () => {
       expect(texts.length, lang).toBeGreaterThan(5);
       for (const t of texts) {
         expect(t, `${lang}: ${t}`).not.toMatch(/\w+=「/);
-        if (lang === "en") expect(unquoted(t), `en: ${t}`).not.toMatch(/[一-鿿]/);
+        // (CJK ideographs and CJK punctuation — 「」（）、。： — none in English outside quoted names)
+        if (lang === "en") expect(unquoted(t), `en: ${t}`).not.toMatch(/[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]/);
         else expect(unquoted(t).replace(/\b(OK|PDF|URL|DeskMind)\b/g, ""), `zh: ${unquoted(t)}`).not.toMatch(/[A-Za-z]{3,}/);
       }
       // the result card lists the steps in the run's language (the journal's words)

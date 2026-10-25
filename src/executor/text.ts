@@ -9,8 +9,13 @@ const ZH = {
   ok: "可以", okPlan: "可以，就这样做", skipStep: "这一步不要", cancel: "先别做了", delegate: "由你决定", fine: "好的", undo: "撤回",
   planTitle: "我打算这样做：", planAsk: "可以吗？",
   listed: (objs: string[]) => `（${objs.join("、")}）`,
-  planHeadline: (objs: string[], sites: string[], uncertain: boolean) => [objs.length ? `会改你已开着的 ${objs.join("、")}` : "", sites.length ? `会打开这些网站并把内容带过去：${sites.join("、")}` : "", uncertain ? "这次任务有一步结果不确定，改你的东西或往外发的每一步到时候都会单独问你" : ""].filter(Boolean).join("；") || "要按这个计划做吗？",
-  actionHeadline: (what: string, selected: string[]) => `要${what}吗？${selected.length ? `选中的是${selected.map((x) => `「${x}」`).join("、")}。` : ""}`,
+  planHeadline: (objs: string[], sites: { host: string; at: string; sends: boolean }[], uncertain: boolean, front: string[] = []) => {
+    const at = [...new Set(sites.map((x) => x.at))].map((a) => `在 ${a} 里打开 ${sites.filter((x) => x.at === a).map((x) => x.host).join("、")}`);
+    const carry = sites.filter((x) => x.sends).map((x) => x.host);
+    const first = [objs.length ? `会改你已开着的 ${objs.join("、")}` : "", ...at, carry.length ? `会把内容带到 ${[...new Set(carry)].join("、")}` : "", uncertain ? "这次任务有一步结果不确定，改你的东西或往外发的每一步到时候都会单独问你" : ""].filter(Boolean).join("；") || "要按这个计划做吗？";
+    return front.length ? `${first}。${front.join("、")} 只能在前台操作，做的时候请先别动键盘鼠标` : first;
+  },
+  actionHeadline: (what: string, selected: string[], uncertain = 0) => `要${what}吗？${selected.length ? `选中的是${selected.slice(0, 3).map((x) => `「${x}」`).join("、")}${selected.length > 3 ? ` 等 ${selected.length} 项` : ""}。` : ""}${uncertain ? `（之前有 ${uncertain} 步结果不确定，先看一眼）` : ""}`,
   resultHeadline: (done: number, unsure: number) => [done ? `做了 ${done} 步` : "", unsure ? `${unsure} 步做没做成没法确认` : ""].filter(Boolean).join("，"),
   ambiguity: (point: string) => `「${point}」可以有几种理解，你指的是哪一种？`,
   did: (what: string[]) => `做了：${what.join("；")}`, changedYours: (objs: string[]) => `改动了你的：${objs.join("、")}`, noUndo: (why: string) => `（${why}）`,
@@ -25,7 +30,7 @@ const ZH = {
   outgoing: (fields: string[], shown: string[]) => `\n要发出去的：${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : "窗口里看不到要发出的内容"}`,
   byRule: (rules: string[]) => `按你以前定的规则做的：${rules.join("、")}`,
   typed: (t: string) => `这次任务打的字：${t}`,
-  mainWindow: (app: string) => `${app} 的主窗口`, titled: (app: string, title: string) => `${app}「${title}」`, quote: (x: string) => `「${x}」`,
+  mainWindow: (app: string) => `${app} 的主窗口`, titled: (app: string, title: string) => `${app}「${title}」`, quote: (x: string) => `「${x}」`, paren: (x: string) => `（${x}）`,
   openInYours: (app: string) => `在你的 ${app} 窗口里打开网页`,
   openUrl: (app: string, url: string) => `在 ${app} 里打开网页 ${url}`,
   openSite: (app: string, host: string, url: string) => `在 ${app} 里打开网站 ${host}（这次是 ${url}）。这次任务读过你的文件或窗口里的内容，打开 ${host} 可能把这些内容带过去。同意后，这次任务里再打开 ${host} 的网页不再问`,
@@ -51,8 +56,13 @@ const EN: typeof ZH = {
   ok: "OK", okPlan: "OK, go ahead", skipStep: "Skip this step", cancel: "Stop here", delegate: "You decide", fine: "Fine", undo: "Undo",
   planTitle: "Here is what I plan to do:", planAsk: "OK?",
   listed: (objs: string[]) => ` (${objs.join(", ")})`,
-  planHeadline: (objs: string[], sites: string[], uncertain: boolean) => [objs.length ? `Changes your open ${objs.join(", ")}` : "", sites.length ? `Opens these sites and takes content there: ${sites.join(", ")}` : "", uncertain ? "One step of this task has an unknown result, so each change or send will ask you on its own" : ""].filter(Boolean).join("; ") || "Go ahead with this plan?",
-  actionHeadline: (what: string, selected: string[]) => `${what.charAt(0).toUpperCase()}${what.slice(1)}?${selected.length ? ` Selected: ${selected.map((x) => `\u201c${x}\u201d`).join(", ")}.` : ""}`,
+  planHeadline: (objs: string[], sites: { host: string; at: string; sends: boolean }[], uncertain: boolean, front: string[] = []) => {
+    const at = [...new Set(sites.map((x) => x.at))].map((a) => `Opens ${sites.filter((x) => x.at === a).map((x) => x.host).join(", ")} in ${a}`);
+    const carry = sites.filter((x) => x.sends).map((x) => x.host);
+    const first = [objs.length ? `Changes your open ${objs.join(", ")}` : "", ...at, carry.length ? `Takes content to ${[...new Set(carry)].join(", ")}` : "", uncertain ? "One step of this task has an unknown result, so each change or send will ask you on its own" : ""].filter(Boolean).join("; ") || "Go ahead with this plan?";
+    return front.length ? `${first}. ${front.join(", ")} can only be operated in front; please leave the keyboard and mouse alone while I work` : first;
+  },
+  actionHeadline: (what: string, selected: string[], uncertain = 0) => `${what.charAt(0).toUpperCase()}${what.slice(1)}?${selected.length ? ` Selected: ${selected.slice(0, 3).map((x) => `\u201c${x}\u201d`).join(", ")}${selected.length > 3 ? ` and ${selected.length - 3} more` : ""}.` : ""}${uncertain ? ` (${uncertain} earlier step${uncertain > 1 ? "s have" : " has"} an unknown result: look first)` : ""}`,
   resultHeadline: (done: number, unsure: number) => [done ? `Did ${done} step${done > 1 ? "s" : ""}` : "", unsure ? `${unsure} not known to have taken effect` : ""].filter(Boolean).join(", "),
   ambiguity: (point: string) => `“${point}” can be read in more than one way. Which do you mean?`,
   did: (what: string[]) => `Done: ${what.join("; ")}`, changedYours: (objs: string[]) => `Changed yours: ${objs.join(", ")}`, noUndo: (why: string) => `(${why})`,
@@ -67,7 +77,7 @@ const EN: typeof ZH = {
   outgoing: (fields: string[], shown: string[]) => `\nWhat goes out:${fields.length || shown.length ? [...fields, ...shown].map((f) => `\n· ${f}`).join("") : " not visible in the window"}`,
   byRule: (rules: string[]) => `Under your standing rule: ${rules.join(", ")}`,
   typed: (t: string) => `typed by this task: ${t}`,
-  mainWindow: (app: string) => `${app}'s main window`, titled: (app: string, title: string) => `${app} “${title}”`, quote: (x: string) => `“${x}”`,
+  mainWindow: (app: string) => `${app}'s main window`, titled: (app: string, title: string) => `${app} “${title}”`, quote: (x: string) => `“${x}”`, paren: (x: string) => ` (${x})`,
   openInYours: (app: string) => `open pages in your ${app} window`,
   openUrl: (app: string, url: string) => `open ${url} in ${app}`,
   openSite: (app: string, host: string, url: string) => `open the site ${host} in ${app} (this time ${url}). This task has read your files or windows; opening ${host} may carry what it read there. Once you agree, other pages of ${host} open without asking in this task`,

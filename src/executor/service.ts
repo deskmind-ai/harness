@@ -447,7 +447,7 @@ export class ExecutorService {
    *  with reason "needs_reconciliation", nothing written. No answer stops the same way. */
   private async reconcile(): Promise<"continue" | "voided" | ToolReply> {
     const ex = this.o.executor, rc = ex.reconciliation!;
-    const t = this.t, q = (x: string) => `「${cardText(x.replace(/\s+/g, " ").trim(), 80)}」`;
+    const t = this.t, q = (x: string) => t.quote(cardText(x.replace(/\s+/g, " ").trim(), 80, this.o.lang));
     const lines = [t.reconcileHead(cardText(rc.step, 160))];
     for (const f of rc.files) {
       lines.push(t.reconcileFile(cardText(f.path, 160)));
@@ -869,11 +869,17 @@ export class ExecutorService {
       siteGrants.set(d.object, g);
     }
     const signed = { objects: uncertain ? [] : signFor, sites: uncertain ? [] : [...siteGrants] };
+    // exactly what the yes signs: each object token's object; each site token's place (forSite signs the landing object
+    // with its hosts) when it is the user's — a page opened into their Chrome changes their window; and each site at
+    // its place (one host at two places is two entries, as it is two tokens' worth)
+    const objectsShown = [...signed.objects, ...signed.sites.map(([o]) => o).filter((o) => theirs(o) && !signed.objects.includes(o))];
+    const placeLabel = (o: string) => shown(o) ?? this.o.executor.labelOf(o);
     const beyond: Beyond[] = [
-      ...signed.objects.map((o) => ({ kind: "object" as const, ref: o, label: shown(o) ?? o })),
-      ...[...new Set(signed.sites.flatMap(([, g]) => [...g.hosts]))].map((h) => ({ kind: "site" as const, ref: h, label: h })),
+      ...[...new Set(objectsShown)].map((o) => ({ kind: "object" as const, ref: o, label: placeLabel(o) })),
+      ...signed.sites.flatMap(([o, g]) => [...g.hosts].map((h) => ({ kind: "site" as const, ref: h, label: h, at: o, at_label: placeLabel(o), ...(g.sends[h]?.length ? { sends: true as const } : {}) }))),
     ];
-    const headline = this.t.planHeadline(beyond.filter((b) => b.kind === "object").map((b) => b.label), beyond.filter((b) => b.kind === "site").map((b) => b.label), uncertain);
+    const headline = this.t.planHeadline(beyond.filter((b) => b.kind === "object").map((b) => b.label),
+      beyond.filter((b) => b.kind === "site").map((b) => ({ host: b.label, at: b.at_label!, sends: !!b.sends })), uncertain, fgApps);
     const card: Card = { kind: "plan", text: `${this.t.planTitle}\n${lines.join("\n")}${fgApps.length ? "\n" + this.t.foreground(fgApps) : ""}\n${this.t.planAsk}`, headline, beyond, free_text: true, blocking: true, options: [{ kind: "approve", text: this.t.okPlan }, { kind: "cancel", text: this.t.cancel }], plan: facts };
     const got = await this.askCard(card);
     if (got === "voided") return this.steered() ?? err("这张卡作废了：计划没有交上。");

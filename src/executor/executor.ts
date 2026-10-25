@@ -482,7 +482,7 @@ export class Executor {
     const beyond: Beyond[] = [{ kind: "object", ref: object, label: base.object_label }, ...(site ? [{ kind: "site" as const, ref: site, label: site }] : [])];
     const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
       // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
-      facts, headline: t.actionHeadline(base.action_text, base.selected ?? []), beyond };
+      facts, headline: t.actionHeadline(base.action_text, base.selected ?? [], steps.length), beyond };
     this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: new Set(steps.map((x) => x.intent)) });
     // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
     while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
@@ -2418,7 +2418,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
   const t = T(lang);
   if (a.kind === "file") {
     const what = fileWords(a, cap, lang);
-    return consequence === "external" ? `${what}（${t.sends}）` : consequence === "modify_user" ? `${what}（${t.modifiesFile}）` : what;
+    return consequence === "external" ? `${what}${t.paren(t.sends)}` : consequence === "modify_user" ? `${what}${t.paren(t.modifiesFile)}` : what;
   }
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
   const where = obs ? (obs.window.opened ? windowLabel(obs.window, lang) : t.titled(appName(obs.window), obs.window.title)) : "window" in a ? a.window : "";
@@ -2429,7 +2429,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
     : a.kind === "key" ? t.key(a.chord)
     : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, a.url) : t.openWindow(a.app)) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
   const cls = consequence === "external" ? t.sends : consequence === "modify_user" ? t.modifies : "";
-  return `${where ? t.at(where) : ""}${what}${cls ? "（" + cls + "）" : ""}`;
+  return `${where ? t.at(where) : ""}${what}${cls ? t.paren(cls) : ""}`;
 }
 
 /** An element as the user would name it: its own label; one whose label only names its role (hands' label_from_role)

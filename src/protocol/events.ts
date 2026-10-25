@@ -34,7 +34,7 @@ export const CardEvent = z.object({
   // additive (H2): one sentence from the facts the yes signs; what the yes covers beyond the request (exactly the signed
   // objects and sites); the card about an interrupted step, which a steer does not void (H5)
   headline: z.string().optional(),
-  beyond: z.array(z.object({ kind: z.enum(["object", "site"]), ref: z.string(), label: z.string() })).optional(),
+  beyond: z.array(z.object({ kind: z.enum(["object", "site"]), ref: z.string(), label: z.string(), at: z.string().optional(), at_label: z.string().optional(), sends: z.literal(true).optional() })).optional(),
   reconcile: z.literal(true).optional(),
   // additive (events v1, M0): the card's facts in fields, for an app that lays them out itself; `text` says all of it.
   // plan: kind "plan"; consent: kind "action" when it asks consent for one action

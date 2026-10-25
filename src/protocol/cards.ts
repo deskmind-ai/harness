@@ -19,7 +19,10 @@ export interface CardOption {
 }
 /** One thing a card's yes covers, beyond what was asked (H2): exactly what the yes signs — an object (window, tab,
  *  file) or a site — as the user knows it. */
-export interface Beyond { kind: "object" | "site"; ref: string; label: string }
+export interface Beyond { kind: "object" | "site"; ref: string; label: string;
+  /** A site: the place its pages land (the object its token is signed on) and how the user knows it; `sends` when the
+   *  card said something goes there. */
+  at?: string; at_label?: string; sends?: true }
 export type CardKind = "missing" | "ambiguity" | "plan" | "action" | "result_check" | "cannot" | "result";
 /** Every interaction with the user is a card: the situation, options that cover what can happen next, and free text
  *  (「其他」). Blocking cards stop the run until answered; the result card is shown with the result. `plan` / `consent`:

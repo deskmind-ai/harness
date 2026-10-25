@@ -202,6 +202,20 @@ describe("H1: a window the task's launch brought up — the table (source × jud
     expect(cleared.ex.undoable().steps.map((s) => ({ can: s.can, left_open: s.left_open ?? null }))).toEqual([{ can: false, left_open: null }, { can: true, left_open: "Mail" }]);
   });
 
+  it("(H2, #77) the card for a change the judge raised in a window DeskMind opened: beyond is that window, the signed object; the headline names 「删除」 and the selected mail", async () => {
+    const row = ELS[0]!;
+    row.focused = true;                                   // the mail selected in it (the selection flag)
+    try {
+      const raised = await stage("opened", "task", fakeJudge("alters", "matches").judge);
+      const r = await raised.ex.act({ action: action("click", raised.target.id), epoch: raised.o.epoch });
+      expect(r.status).toBe("needs_consent");
+      const tok = raised.app.forAction(r.challenge!);
+      expect(r.challenge!.beyond).toEqual([{ kind: "object", ref: tok.object, label: "DeskMind 打开的 Mail「收件箱」" }]);
+      expect(r.challenge!.headline).toContain("「删除」");
+      expect(r.challenge!.headline).toContain("「张三 · 会议时间」");
+    } finally { delete row.focused; }
+  });
+
   it("a window the user had at begin stays theirs even when the launch lists it again as opened_window (brought back), under both policies", async () => {
     for (const policy of ["task", "user"] as TaskOpenedPolicy[]) {
       const { ex, target, o } = await stage("back", policy, fakeJudge("stays", "matches").judge);
@@ -316,7 +330,9 @@ describe("H1: the plan card (service level) — a plan on a window DeskMind open
     const { cards, events } = await planRun("user", "create");
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
     expect(cards[0]!.text).toContain("DeskMind 打开的 Mail「收件箱」");
-    expect(cards[0]!.text).toContain("改你的东西");
+    // (#77: the class is in plan.steps and the headline, not a line-end marker)
+    expect((cards[0] as any).plan.steps[0].class).toBe("modify_user");
+    expect((cards[0] as any).headline).toContain("会改你已开着的 DeskMind 打开的 Mail「收件箱」");
     expect(events.some((e) => e.k === "plan.no_card")).toBe(false);
   });
 });
