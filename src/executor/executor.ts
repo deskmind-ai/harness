@@ -389,10 +389,11 @@ export class Executor {
   discardUndoCopies() {
     const ws = this.opts.files?.workspace;
     if (!ws) return;
-    for (const c of this.undoCopies.splice(0)) { try { fs.rmSync(ws.abs(c), { force: true }); } catch { /* swept later */ } }
+    // only ever strictly inside UNDO_DIR (Workspace.inside: no ".." part, no link out of it)
+    for (const c of this.undoCopies.splice(0)) { const full = ws.inside(UNDO_DIR, c); if (full) try { fs.rmSync(full, { force: true }); } catch { /* swept later */ } }
     // this run's folder (its owner record with it), when it has one of its own
-    if (ws.undoOwner !== undefined) { try { fs.rmSync(ws.abs(`${UNDO_DIR}/${ws.undoOwner.replace(/[^\w.-]/g, "_")}`), { recursive: true, force: true }); } catch { /* swept later */ } }
-    try { fs.rmdirSync(ws.abs(UNDO_DIR)); } catch { /* another run's copies, or gone */ }
+    if (ws.undoOwner !== undefined) { const full = ws.inside(UNDO_DIR, ws.undoRunDir()); if (full) try { fs.rmSync(full, { recursive: true, force: true }); } catch { /* swept later */ } }
+    try { if (fs.lstatSync(ws.abs(UNDO_DIR)).isDirectory()) fs.rmdirSync(ws.abs(UNDO_DIR)); } catch { /* another run's copies, or gone */ }
   }
 
   private fileReceipts = new Map<number, { cap: Capability; args: Record<string, string>; writes: string[]; versions_before: Record<string, string>; madeParents: string[]; exec: { status: string; versions_after: Record<string, string>; undo?: Record<string, unknown> }; undo_prep?: Record<string, unknown> }>();

@@ -67,13 +67,40 @@ export class Workspace {
   /** Where this run's undo copies go. Its owner record is (re)written by the first use in each process: a restarted
    *  run's folder names the live process, not the one that died (the sweep would take its copies). */
   undoDir(): string {
-    const rel = `${UNDO_DIR}/${(this.undoOwner ?? "_").replace(/[^\w.-]/g, "_")}`;
-    const full = this.abs(rel);
+    const rel = this.undoRunDir();
+    const full = this.inside(UNDO_DIR, rel, { make: true });
+    if (!full) throw new Error(`the undo folder ${rel} is not inside ${UNDO_DIR}`);
     fs.mkdirSync(full, { recursive: true });
     if (!this.ownerWritten) {
       try { fs.writeFileSync(path.join(full, "owner.json"), JSON.stringify({ pid: process.pid, run: this.undoOwner ?? null })); this.ownerWritten = true; } catch { /* swept by age */ }
     }
     return rel;
+  }
+
+  /** This run's folder under UNDO_DIR: its owner's id with anything but letters, digits, _ and - replaced (never "."). */
+  undoRunDir(): string { return `${UNDO_DIR}/${undoName(this.undoOwner ?? "_")}`; }
+
+  /** `rel`'s place on the disk when it lies strictly inside the hidden folder `base` (UNDO_DIR, TRASH, TMP), else null:
+   *  no "." or ".." part, `base` a real folder at the root (not a link), and the folder holding `rel` — links resolved —
+   *  inside it. Every removal and rename of ours under those folders goes through it (review of #74, Codex: a run id
+   *  ".." made the undo folder the task folder, which the cleanup removed). `make`: create `rel` as a folder first. */
+  inside(base: string, rel: string, o: { make?: boolean } = {}): string | null {
+    const parts = rel.split("/");
+    if (parts[0] !== base || parts.length < 2 || parts.some((x) => x === "" || x === "." || x === "..")) return null;
+    const b = path.join(this.root, base), full = path.join(this.root, rel);
+    try {
+      if (o.make) fs.mkdirSync(b, { recursive: true });
+      // no base: nothing under it exists to reach (a removal finds nothing)
+      try { if (!fs.lstatSync(b).isDirectory()) return null; } catch { return full; }
+      if (o.make) fs.mkdirSync(full, { recursive: true });
+      // the nearest folder on the way that exists, links resolved, must be the base or inside it
+      let up = path.dirname(full);
+      while (up.length > b.length && !fs.existsSync(up)) up = path.dirname(up);
+      const realBase = fs.realpathSync(b), holder = fs.realpathSync(up);
+      if (holder !== realBase && !holder.startsWith(realBase + path.sep)) return null;
+      if (o.make && fs.realpathSync(full) !== path.join(holder, path.basename(full))) return null;
+      return full;
+    } catch { return null; }
   }
 
   /** Remove tools' temporary outputs a crashed process left in TMP: only there, and only old ones, so another run
@@ -82,7 +109,7 @@ export class Workspace {
     this.sweepUndo(o);
     const dir = path.join(this.root, TMP);
     let names: string[] = [];
-    try { names = fs.readdirSync(dir); } catch { return; }
+    try { if (!fs.lstatSync(dir).isDirectory()) return; names = fs.readdirSync(dir); } catch { return; }
     const cutoff = Date.now() - STALE_TEMP_MS;
     for (const n of names) {
       const full = path.join(dir, n);
@@ -97,11 +124,12 @@ export class Workspace {
   sweepUndo(o: { except?: string } = {}) {
     const dir = path.join(this.root, UNDO_DIR);
     let names: string[] = [];
-    try { names = fs.readdirSync(dir); } catch { return; }
+    try { if (!fs.lstatSync(dir).isDirectory()) return; names = fs.readdirSync(dir); } catch { return; }
     const cutoff = Date.now() - STALE_UNDO_MS;
     for (const n of names) {
-      if (o.except !== undefined && n === o.except.replace(/[^\w.-]/g, "_")) continue;
-      const full = path.join(dir, n);
+      if (o.except !== undefined && n === undoName(o.except)) continue;
+      const full = this.inside(UNDO_DIR, `${UNDO_DIR}/${n}`);
+      if (!full) continue;
       try {
         const st = fs.lstatSync(full);
         let owner: { pid?: unknown } | null = null;
@@ -147,13 +175,16 @@ export class Workspace {
     const dir = path.join(this.root, TMP), base = `${PROBE}${randomUUID().slice(0, 8)}-a\u00e9`;
     let found: VolumeNames;
     const made = !fs.existsSync(dir);
+    let wrote = false;
     try {
       fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, base), "");
+      if (!fs.lstatSync(dir).isDirectory()) throw new Error(`${TMP} is not a folder`);   // a link out: never written through
+      fs.writeFileSync(path.join(dir, base), "", { flag: "wx" });
+      wrote = true;
       const there = (n: string) => { try { fs.lstatSync(path.join(dir, n)); return true; } catch { return false; } };
       found = { caseless: there(base.toUpperCase()), formless: there(base.normalize("NFD")) };
     } catch { found = defaultNames(); }
-    try { fs.rmSync(path.join(dir, base), { force: true }); if (made) fs.rmdirSync(dir); } catch { /* not empty: another run's outputs */ }
+    try { if (wrote) fs.rmSync(path.join(dir, base), { force: true }); if (made && wrote) fs.rmdirSync(dir); } catch { /* not empty: another run's outputs */ }
     VOLUME_NAMES.set(dev, found);
     return found;
   }
@@ -354,3 +385,29 @@ export function fileFlags(full: string): number {
 const parentRel = (p: string) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
 /** The name a volume probe starts with (Workspace.names): swept by sweepTemp. */
 const PROBE = "probe-";
+/** A run id as a folder name: letters, digits, _ and - kept, anything else (a dot too) replaced. */
+export const undoName = (run: string) => run.replace(/[^A-Za-z0-9_-]/g, "_");
+
+/** What a trashed object's undo compares whole (review of #74, Codex: a trashed folder passed with a file added
+ *  inside it): a file's digest; a folder's digest over everything under it — each name (hidden ones too), its kind,
+ *  a file's bytes, a link's target. Null above TREE_LIMIT entries or bytes: recorded as "no digest", so that undo is
+ *  refused rather than left to hang on a huge folder. */
+export const TREE_LIMIT = { entries: 20_000, bytes: 512 * 1024 ** 2 };
+export function treeDigest(full: string): string | null {
+  const st = fs.lstatSync(full);
+  if (st.isFile()) return st.size > TREE_LIMIT.bytes ? null : sha(fs.readFileSync(full));
+  const h = createHash("sha256");
+  let n = 0, bytes = 0;
+  const walk = (dir: string, rel: string): boolean => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      if (++n > TREE_LIMIT.entries) return false;
+      const f = path.join(dir, name), r = rel ? `${rel}/${name}` : name, s = fs.lstatSync(f);
+      if (s.isDirectory()) { h.update(`D ${r}\n`); if (!walk(f, r)) return false; }
+      else if (s.isSymbolicLink()) h.update(`L ${r} ${fs.readlinkSync(f)}\n`);
+      else if (s.isFile()) { bytes += s.size; if (bytes > TREE_LIMIT.bytes) return false; h.update(`F ${r} ${sha(fs.readFileSync(f))}\n`); }
+      else h.update(`O ${r}\n`);
+    }
+    return true;
+  };
+  return walk(full, "") ? "tree:" + h.digest("hex").slice(0, 32) : null;
+}

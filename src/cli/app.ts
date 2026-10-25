@@ -346,6 +346,9 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
   };
 }
 
+/** What a run id may be: it names folders. */
+export const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
 /** `signals` (the CLI only): SIGINT / SIGTERM stop the run through the same one-time stop as a stop line. When the
  *  run has not ended `deadlineMs` after the signal: if an action is still out at the driver (it may land after a stop),
  *  wait up to `waitMs` more for its receipt; then write task_done (stopped) — with the action under
@@ -354,6 +357,9 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number;
   signals?: { onSignal: (h: (sig: string) => void) => void; exit: () => void; exitNow: () => void; deadlineMs?: number; waitMs?: number };
   inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"]; cardExpiryMs?: number; clock?: Clock } }) {
+  // a run id names folders (the run's events, its undo copies): letters, digits, _ and - only, never "." or ".." —
+  // checked here as well as at the CLI (review of #74, Codex: run_id ".." made the undo folder the task folder)
+  if (req.run_id !== undefined && !RUN_ID.test(String(req.run_id))) throw new Error(`run_id must match ${RUN_ID}`);
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
@@ -632,6 +638,7 @@ async function main() {
     for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => onSignal(sig));
     const req: Request = JSON.parse(a.request ? fs.readFileSync(a.request, "utf-8") : await input.next());
     if (!req.raw) throw new Error("request needs raw");
+    if (req.run_id !== undefined && !RUN_ID.test(String(req.run_id))) throw new Error(`run_id must match ${RUN_ID}`);
     await appRun(req, { runs: path.resolve(a.runs!), out, input, linger: Number(a.linger ?? 0), signals: { onSignal: (h) => { onSignal = h; }, exit, exitNow } });
     exit();
     return;

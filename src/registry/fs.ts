@@ -6,7 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Registry, type ExecResult } from "./capability.js";
 import { randomUUID } from "node:crypto";
-import { ABSENT, NOT_UTF8_EN, TRASH, UNDO_DIR, Workspace, sha } from "./workspace.js";
+import { ABSENT, NOT_UTF8_EN, TRASH, UNDO_DIR, Workspace, sha, treeDigest } from "./workspace.js";
 import { CRASH_FLAG, after, folderOk, join, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
 import { toolCapabilities } from "./tools.js";
 
@@ -32,7 +32,8 @@ const keepCopy = (ws: Workspace, q: string): { backup: string; version: string }
 };
 const copyProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
   if (!u || typeof u.backup !== "string" || typeof u.version !== "string") return "no copy of the file was kept before it was replaced";
-  const full = ws.abs(u.backup);
+  const full = ws.inside(UNDO_DIR, u.backup);
+  if (!full) return "the copy kept for undo is not in the undo folder";
   if (!fs.existsSync(full)) return "the copy kept for undo is gone";
   return sha(fs.readFileSync(full)) === u.version ? null : "the copy kept for undo does not match the file as it was";
 };
@@ -56,8 +57,9 @@ export const fsReplaceText = make({
     const q = norm(a.target!);
     const e = untouched(ws, r, [q]) ?? replaceBlocked(ws, a, r);
     if (e) return e;
-    fs.copyFileSync(ws.abs(String(r.undo!.backup)), ws.abs(q));
-    try { fs.rmSync(ws.abs(String(r.undo!.backup)), { force: true }); } catch { /* swept later */ }
+    const copy = ws.inside(UNDO_DIR, String(r.undo!.backup))!;     // replaceBlocked: inside, there, as it was
+    fs.copyFileSync(copy, ws.abs(q));
+    try { fs.rmSync(copy, { force: true }); } catch { /* swept later */ }
     return null;
   },
 });
@@ -173,7 +175,10 @@ export const fsTrash = make({
     const trashed = `${slot}/${q.replaceAll("/", "_")}`;
     fs.renameSync(ws.abs(q), ws.abs(trashed));
     maybeCrash();
-    return { ...after(ws, [q]), undo: { trashed, version } };
+    // what it is, whole (a folder: everything under it), compared before it is moved back; null when too big to read
+    let tree: string | null = null;
+    try { tree = treeDigest(ws.abs(trashed)); } catch { tree = null; }
+    return { ...after(ws, [q]), undo: { trashed, version, tree } };
   },
   // check refuses on every condition undo refuses on (review of #74: it checked only the trashed file, so later steps
   // were undone first and the undo stopped half way). It runs on undo's paper folder: the path and its folder as
@@ -184,8 +189,11 @@ export const fsTrash = make({
     const q = norm(a.target!);
     const e = untouched(ws, r, [q]) ?? trashBlocked(ws, a, r);
     if (e) return e;
-    fs.renameSync(ws.abs(String(r.undo!.trashed)), ws.abs(q));
-    try { fs.rmdirSync(path.dirname(ws.abs(String(r.undo!.trashed)))); } catch { /* not ours to keep empty */ }
+    const from = ws.inside(TRASH, String(r.undo!.trashed))!;       // trashBlocked: inside the trash, there, as it was
+    fs.renameSync(from, ws.abs(q));
+    // its own slot, emptied: only a folder strictly inside the trash
+    const slot = ws.inside(TRASH, String(r.undo!.trashed).split("/").slice(0, -1).join("/"));
+    if (slot) try { fs.rmdirSync(slot); } catch { /* not empty */ }
     return null;
   },
 });
@@ -199,9 +207,12 @@ const trashBlocked = (ws: Workspace, a: Record<string, string>, r: ExecResult): 
 };
 const trashedProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
   if (!u || typeof u.trashed !== "string" || typeof u.version !== "string") return "where the file was put is not recorded";
-  const full = ws.abs(u.trashed);
+  const full = ws.inside(TRASH, u.trashed);
+  if (!full) return "the trashed file is not in the trash";
   if (!fs.existsSync(full)) return "the trashed file is gone";
-  return u.version.startsWith("dir:") || sha(fs.readFileSync(full)) === u.version ? null : "the trashed file was changed";
+  // compared whole: a folder with anything added, removed or changed under it is not what was trashed
+  if (typeof u.tree !== "string") return "what was trashed was too large to record, so it cannot be checked";
+  return treeDigest(full) === u.tree ? null : "the trashed file was changed";
 };
 
 export const fsReadText = make({
