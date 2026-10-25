@@ -26,6 +26,13 @@ const PlanFacts = z.object({
 const ActionFacts = z.object({
   action: z.string(), action_text: z.string(), target: z.string().nullable(), object: z.string(), object_label: z.string(), consequence: Consequence,
   outgoing: z.array(z.object({ kind: z.enum(["field", "selected", "typed", "text"]), label: z.string(), value: z.string() })), site: z.string().nullable(),
+  // (every field the card's facts carry reaches the app: EventBody.parse strips what the schema leaves out — review of
+  // #77) the steps of this run with an unknown result, how many in all, what the model says (not checked); and what is
+  // selected in the window (H2)
+  uncertain: z.array(z.object({ consequence: Consequence, object: z.string(), text: z.string(),
+    outgoing: z.array(z.object({ kind: z.enum(["field", "selected", "typed", "text"]), label: z.string(), value: z.string() })) })).optional(),
+  uncertain_total: z.number().int().optional(), model_says_unchecked: z.string().optional(),
+  selected: z.array(z.string()).optional(),
 });
 export const CardEvent = z.object({
   kind: z.string(), text: z.string(),

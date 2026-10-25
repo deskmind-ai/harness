@@ -85,4 +85,7 @@ export interface ActionCardFacts {
  *  stopped): the asker lets go of it (the app is told) and the answer, if any, is not used. `expired` (an action card
  *  with a deadline): asked when an answer arrives, before it is taken — true means the card has just expired (its
  *  signal fired with "timeout") and the answer is a late one. */
-export interface CardAsker { ask(card: Card, o?: { signal?: AbortSignal; expired?: () => boolean }): Promise<Answer | null> | Answer | null }
+export interface CardAsker { ask(card: Card, o?: { signal?: AbortSignal; expired?: () => boolean;
+  /** Called by the asker the moment it takes an answer for this card (synchronously, before anything after it on the
+   *  same input is read): the card is no longer open from then on (review of #77: a steer right behind an answer). */
+  taken?: () => void }): Promise<Answer | null> | Answer | null }

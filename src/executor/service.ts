@@ -346,7 +346,9 @@ export class ExecutorService {
       // the stop does not wait for the card: an open card is left unanswered and the run ends (review of #16); a steer
       // voids it (the asker is told through the signal, and lets the app know). `expired`: the asker asks it before it
       // takes an answer
-      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal, ...(deadline !== null ? { expired } : {}) }));
+      // the hold of the card about an interrupted step ends the moment the asker takes its answer — synchronously, so a
+      // steer right behind the answer on the same input finds no card holding it (review of #77)
+      const p = Promise.resolve(this.#user.ask(card, { signal: open.signal, ...(deadline !== null ? { expired } : {}), taken: () => { if (this.openCard === open) this.openCardHolds = false; } }));
       p.catch(() => undefined);
       const a = await Promise.race([p,
         new Promise<null>((r) => stop.addEventListener("abort", () => r(null), { once: true })),

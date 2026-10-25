@@ -176,7 +176,7 @@ export class StdioUser implements RuntimeUser {
   /** The cards no longer open, and how they closed: timeout, steer, stop, ended, answered. */
   private readonly closed = new Map<string, string>();
   /** The card open now: its id, what checks its deadline, and how it is answered or let go. */
-  private open: { id: string; card: Card; expired?: () => boolean; settle: (a: Answer | null) => void } | null = null;
+  private open: { id: string; card: Card; expired?: () => boolean; taken?: () => void; settle: (a: Answer | null) => void } | null = null;
   /** The task stopped ("stop"), the app went away ("ended"), or the task is over ("done"): every reply is refused. */
   private over: "stop" | "ended" | "done" | null = null;
 
@@ -202,6 +202,7 @@ export class StdioUser implements RuntimeUser {
     const o = this.open;
     if (o && (a.ask_id === o.id || (a.ask_id === undefined && !this.voided))) {
       this.closeOpen("answered");
+      o.taken?.();                 // the card is answered now: the next line (a steer in the same chunk) finds none open
       this.log.emit({ kind: "resumed", ask_id: o.id });
       if (typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length) return o.settle({ option: a.option });
       if (typeof a.text === "string" && a.text.trim()) return o.settle({ text: a.text });
@@ -227,7 +228,7 @@ export class StdioUser implements RuntimeUser {
   /** The task is over (task_done): replies after it are refused as such. */
   taskOver() { this.end("done"); }
 
-  ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean } = {}): Promise<Answer | null> {
+  ask(card: Card, o: { signal?: AbortSignal; expired?: () => boolean; taken?: () => void } = {}): Promise<Answer | null> {
     const ask_id = `ask_${randomUUID().slice(0, 8)}`;
     // registered (the open record, its settle, its signal; the deadline is the service's, set before this call) BEFORE
     // anything announces it: the app may answer inside the very `ask` it is handed (an in-process sink, a synchronous
@@ -248,7 +249,7 @@ export class StdioUser implements RuntimeUser {
       else { this.voided = true; this.log.emit({ kind: "resumed", ask_id, voided: why }); this.log.emit({ kind: "ask_void", ask_id, why }); }
       settle(null);
     };
-    this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), settle };
+    this.open = { id: ask_id, card, ...(o.expired ? { expired: o.expired } : {}), ...(o.taken ? { taken: o.taken } : {}), settle };
     o.signal?.addEventListener("abort", voided, { once: true });
     this.log.emit({ kind: "ask", ask_id, card: cardEvent(card) });
     // (answered or let go inside its own announcement: nothing more is said of it)

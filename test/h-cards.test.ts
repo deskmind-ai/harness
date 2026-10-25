@@ -495,3 +495,25 @@ describe("H5: a steer while a card is open voids it first, then is taken; a void
     expect(errs.at(-1)).toMatchObject({ code: "no_task", control: "steer", client_id: "k2" });
   });
 });
+
+describe("review of #77: every new field survives the protocol (EventLog validates and strips what its schema leaves out)", () => {
+  it("ask (headline, beyond with places, option.detail, plan.steps[].class, consent.selected / uncertain), waiting and resumed: emitted through EventLog, each field arrives", async () => {
+    const { EventLog } = await import("../src/protocol/events.js");
+    const got: any[] = [];
+    const log = new EventLog(path.join(fs.mkdtempSync(path.join(os.tmpdir(), "h-fields-")), "events.jsonl"), "run_f", (e: any) => got.push(e));
+    const consent = { action: "click", action_text: "在 邮件「收件箱」 点「删除」", target: "删除", object: "window:m#1", object_label: "邮件「收件箱」", consequence: "modify_user", outgoing: [], site: null,
+      selected: ["林晓 · Q3 预算"], uncertain: [{ consequence: "external", object: "window:m#1", text: "点「发送」", outgoing: [{ kind: "field", label: "收件人", value: "a@b" }] }], uncertain_total: 1, model_says_unchecked: "已经发过了" };
+    const plan = { steps: [{ purpose: "查天气", class: "modify_user", objects: [{ ref: "window:c#1", label: "Chrome「新标签页」", owner: "user", marks: ["opens_pages"] }], sites: [{ host: "wttr.in", sends: null, asks_each: false }] }], foreground: null };
+    const card = (kind: string, extra: Record<string, unknown>) => ({ kind, text: "t", options: [{ kind: "reading", text: "Q3 预算", detail: "林晓 10-20 发的" }, { kind: "cancel", text: "先别做了" }], free_text: false, blocking: true,
+      headline: "一句话", beyond: [{ kind: "object", ref: "window:c#1", label: "Chrome「新标签页」" }, { kind: "site", ref: "wttr.in", label: "wttr.in", at: "window:c#1", at_label: "Chrome「新标签页」", sends: true }], reconcile: true, ...extra });
+    const sent = [
+      { kind: "ask", ask_id: "ask_1", card: card("action", { consent }) },
+      { kind: "ask", ask_id: "ask_2", card: card("plan", { plan }) },
+      { kind: "waiting", why: "needs_front", quiet_s: 3, needs_front: true, app_label: "网易云音乐", started_at: 1_700_000_000_000, gives_up_at: 1_700_000_120_000 },
+      { kind: "resumed", why: "paused", waited_s: 4.2 },
+      { kind: "resumed", why: "failed" },
+    ];
+    for (const e of sent) log.emit(e as never);
+    expect(got.map(({ seq: _s, t: _t, run_id: _r, ...rest }) => rest)).toEqual(sent);
+  });
+});

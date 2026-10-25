@@ -1079,6 +1079,9 @@ export class SessionHost {
 
   answer(line: Record<string, unknown>, runId?: string, reqId?: string) {
     const t = this.find(runId, "answer", reqId);
+    // an answer to the card that holds steers goes to the executor before anything sent after it: a steer behind it is
+    // read once the card is answered — no longer held here (review of #77). (Refused there, the executor holds it itself)
+    if (t && t.cardHolds && line.ask_id === t.card) t.cardHolds = false;
     if (t) t.handle.write(JSON.stringify(line));
   }
 
