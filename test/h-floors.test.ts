@@ -205,3 +205,66 @@ describe("review of #78 (adopted): dotted names with a hidden extension; a relat
   });
 });
 
+
+describe("Codex review of #78 (adopted): floors are worked out on live facts at act time, and only ever raise what was classified", () => {
+  const sh = (folder: string, name = "new.txt"): SaveSheet => ({ read: true, name, stem: name.replace(/\.[^.]*$/, ""), name_focused: true, folder, path: path.join(folder, name), nested_sheet: false });
+
+  it("pressing a close button any way (click, double-click, Space / Return on it focused) in a window DeskMind opened asks; judge stays", async () => {
+    for (const how of ["click", "double_click", "space", "return"] as const) {
+      const s = await stage("opened");
+      if (how === "space" || how === "return") {
+        const observe = s.desk.observe.bind(s.desk);
+        s.desk.observe = (id: string) => { const o = observe(id); return { ...o, elements: o.elements.map((e) => ({ ...e, focused: e.id === "x" })) }; };
+        s.look = await s.ex.observe(s.target.id);
+      }
+      const a: Action = how === "click" || how === "double_click" ? { kind: how, window: s.target.id, target: "x" } : { kind: "key", window: s.target.id, chord: how };
+      expect(await act(s, a), how).toEqual({ status: "needs_consent", consequence: "modify_user" });
+    }
+  });
+
+  it("a file created after classify must raise the live save-sheet floor", async () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "review78-cache-"));
+    const s = await stage("made", { sheet: sh(d) });
+    const action: Action = { kind: "click", window: s.target.id, target: "save" };
+    expect((await s.ex.classify(action, s.look.epoch)).consequence).toBe("create");
+    fs.writeFileSync(path.join(d, "new.txt"), "user file added by another app");
+    expect(s.ex.structure(action).consequence).toBe("modify_user");
+    expect(await act(s, action)).toEqual({ status: "needs_consent", consequence: "modify_user" });
+  });
+
+  it("save-sheet risk in the final look must be enforced before perform", async () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "review78-final-"));
+    const riskyFolder = path.join(d, "user-docs");
+    fs.mkdirSync(riskyFolder);
+    fs.writeFileSync(path.join(riskyFolder, "new.txt"), "user original");
+    const s = await stage("made", { sheet: sh(d) });
+    const observe = s.desk.observe.bind(s.desk);
+    s.desk.observe = (id: string) => ({ ...observe(id), save_sheet: sh(riskyFolder) });
+    const r = await act(s, { kind: "click", window: s.target.id, target: "save" });
+    expect(["needs_consent", "stale"]).toContain(r.status);
+  });
+
+  it("property: random interleavings of classify / a file appearing / the sheet's folder changing by the final look / judge answers — a floored save never reaches the driver without a card", async () => {
+    const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    for (let seed = 1; seed <= 60; seed++) {
+      const rand = rng(seed);
+      const d = fs.mkdtempSync(path.join(os.tmpdir(), "review78-prop-"));
+      const other = path.join(d, "other"); fs.mkdirSync(other);
+      if (rand() < 0.3) fs.writeFileSync(path.join(other, "new.txt"), "theirs");
+      const source = rand() < 0.5 ? "made" : "opened";
+      const s = await stage(source as Source, { sheet: sh(d), outgoing: rand() < 0.7 ? "stays" : null });
+      const action: Action = rand() < 0.5 ? { kind: "click", window: s.target.id, target: "save" } : { kind: "key", window: s.target.id, chord: "return" };
+      if (rand() < 0.5) await s.ex.classify(action, s.look.epoch);
+      if (rand() < 0.4) fs.writeFileSync(path.join(d, "new.txt"), "appeared");
+      let finalFolder = d;
+      if (rand() < 0.4) { finalFolder = other; const observe = s.desk.observe.bind(s.desk); s.desk.observe = (id: string) => ({ ...observe(id), save_sheet: sh(other) }); }
+      // ground truth at the moment the driver would act: the sheet's folder then, and the disk then
+      let performed = false, riskyThen = false;
+      const perform = s.desk.perform.bind(s.desk);
+      s.desk.perform = (a: Action) => { if (a.kind !== "open_window") { performed = true; riskyThen = fs.existsSync(path.join(finalFolder, "new.txt")); } return perform(a); };
+      const r = await act(s, action);
+      const ctx = `seed ${seed}: ${source} ${action.kind} final ${finalFolder === d ? "same" : "other"} → ${r.status}`;
+      if (performed) expect(riskyThen, ctx).toBe(false);
+    }
+  });
+});

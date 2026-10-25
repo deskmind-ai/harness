@@ -1164,7 +1164,8 @@ export class Executor {
     const k = a.kind === "key" ? chord(a.chord) : null;
     // a close button by its AX subrole (hands#70, K1: from the window's own buttons, never from a label), or a role that
     // says close
-    const closeButton = a.kind === "click" && !!this.lastObs.get(a.window)?.elements.find((e) => e.id === a.target && (e.ax_subrole === "AXCloseButton" || /close/i.test(e.role)));
+    // pressing a close button (any way of pressing it: pressesClose), on the caller's look
+    const closeButton = "window" in a && pressesClose(a, this.lastObs.get(a.window));
     const closes = a.kind === "close_window" || closeButton || (!!k && k.cmd && k.key === "w" && !k.shift);
     const quits = !!k && k.cmd && (k.key === "q" || (k.key === "w" && k.shift));
     const undoes = !!k && k.cmd && k.key === "z";
@@ -1185,12 +1186,30 @@ export class Executor {
     // that is there (its stem in that folder, or the path itself), into an alert inside the sheet (the "already exists"
     // one: 替换), or where the sheet could not be read: the user's file, whoever's window it is. A floor of structure,
     // read before any judge is asked (a judge's "stays" never lowers it)
-    const sheet = "window" in a ? this.lastObs.get(a.window)?.save_sheet : undefined;
-    if (sheet && commits(a)) { const risk = this.sheetRisk(sheet); if (risk) return { consequence: "modify_user", object, why: risk }; }
+    const sheetRisk = "window" in a ? this.sheetFloor(a, this.lastObs.get(a.window)) : null;
+    if (sheetRisk) return { consequence: "modify_user", object, why: sheetRisk };
     // under POLICY.taskOpened "task" a step inside such a window is the task's own (M3–M6 plan §1.2): the judge's
     //「会删掉或改掉用户已有的内容」(classify) and the intent check (act) stand where the card stood
     if (owner === "user" && this.relaxed(object)) return { consequence: "create", object, why: "acts in a window DeskMind opened for the user's app; its content is theirs, so the judge checks the step deletes or changes none of it", opened: true };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
+  }
+
+  /** The floors that rest on live facts — what a look shows (the element pressed, an open save sheet) and what the disk
+   *  holds (a file of the sheet's name) — worked out from `look` and the disk now. act asks it after its last look and
+   *  takes the higher of it and whatever was classified before: a cached class (classify keys on the screen, not on the
+   *  disk) or an earlier look never lowers it (Codex review of #78: a file that appeared after classify; a sheet whose
+   *  folder changed by the final look; a double-click on a close button). null: no floor beyond the class. */
+  floorsNow(a: Action, look: Observation | undefined): { consequence: Consequence; why: string } | null {
+    if (!("window" in a) || !look) return null;
+    const object = `window:${a.window}`;
+    if (pressesClose(a, look) && this.ledger.ownerOf(object) === "user") return { consequence: "modify_user", why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" };
+    const risk = this.sheetFloor(a, look);
+    return risk ? { consequence: "modify_user", why: risk } : null;
+  }
+  /** The save-sheet floor of `a` on `look`: why committing its sheet may write over a file, or null. */
+  private sheetFloor(a: Action, look: Observation | undefined): string | null {
+    const sheet = look?.save_sheet;
+    return sheet && commits(a) ? this.sheetRisk(sheet) : null;
   }
 
   /** Why committing this save sheet may write over a file that is there (null: a new name in a folder read whole):
@@ -1641,7 +1660,11 @@ export class Executor {
     // the class, settled here and never taken from the caller: structure, the model's class, and the judge's "will this
     // send something out?" (only raises; cached, so a preview's or a classify call's answer is the same one)
     const asked = this.classified.size;
-    const c = await this.classify(req.action, req.epoch, req.consequence);
+    const c0 = await this.classify(req.action, req.epoch, req.consequence);
+    // the live floors on the latest look and the disk now, never lowered by a class cached earlier (Codex review of #78)
+    const liveFloor = this.floorsNow(req.action, target ? this.looks.get(target) ?? obs : obs);
+    const c = liveFloor && rank(liveFloor.consequence) > rank(c0.consequence) ? { ...c0, consequence: liveFloor.consequence, why: liveFloor.why, by: "structure" as const, opened: undefined } : c0;
+    if (c !== c0) this.emit("executor.floor_raised", { action: req.action, from: c0.consequence, to: c.consequence, why: liveFloor!.why });
     consequence = c.consequence; base = { consequence, object: c.object };
     // stopped while the judges were asked: the step ends here (no further judge, no card)
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -1749,13 +1772,20 @@ export class Executor {
     // a step cleared in a window DeskMind opened is looked at again too: the facts the clearance rested on — the target's
     // content (empty, or the task's own), the focus — must hold at the moment of acting; a sync that filled the field
     // meanwhile moves no epoch (Codex review of #75, P1-2)
-    if (target && obs && (this.mightSend(req.action) || consequence === "external" || c.opened)) {
+    // and whenever a floor of live facts could hold for it: a sheet open on the window, a close button pressed — the floors
+    // are worked out again on that look, right before the effect
+    const floorsLive = !!target && !!obs && (!!(this.looks.get(target) ?? obs)?.save_sheet || pressesClose(req.action, this.looks.get(target) ?? obs));
+    if (target && obs && (this.mightSend(req.action) || consequence === "external" || c.opened || floorsLive)) {
       let fresh: Observation;
       try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
       // why it moved: from a snapshot taken now (the look itself carries no reason). Taking it may move the epoch again,
       // so the reason may describe a later change; a snapshot that fails leaves the reason out, the result is the same
       if (fresh.epoch !== req.epoch) return staleOn(await Promise.resolve().then(() => this.see()).catch(() => ({ epoch: fresh.epoch } as Snapshot)), { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
       const changed = (what: string) => done({ ...base, status: "stale", why: `${target} changed right before acting (${what}); observe it again and decide anew`, epoch: fresh.epoch });
+      // the floors again, on this very look and the disk now: one that rose above the class decided on is a step not
+      // covered by what was decided (or consented): nothing is done, the caller looks again (and asks, when it must)
+      const lastFloor = this.floorsNow(req.action, fresh);
+      if (lastFloor && rank(lastFloor.consequence) > rank(consequence)) return changed(`now: ${lastFloor.why}`);
       // the target, always found again by identity (content, and id or place) and required one of a kind: the driver acts
       // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
       const again = this.card(req.action, obs, consequence, fresh);
@@ -2437,6 +2467,16 @@ export function shortUrl(u: string, lang?: Lang): string {
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
+/** Whether `a` presses a close button on `look` (its AX subrole AXCloseButton, hands#70; or a role that says close):
+ *  a click or double-click on it, or Space / Return on it focused — every way of pressing it, not one action name. */
+function pressesClose(a: Action, look: Observation | undefined): boolean {
+  if (!look) return false;
+  const isClose = (e: Element | undefined) => !!e && (e.ax_subrole === "AXCloseButton" || /close/i.test(e.role));
+  if ((a.kind === "click" || a.kind === "double_click") && isClose(look.elements.find((e) => e.id === a.target))) return true;
+  if (a.kind === "key") { const k = chord(a.chord); if (!k.cmd && (k.key === "space" || k.key === "return" || k.key === "enter") && isClose(look.elements.find((e) => e.focused))) return true; }
+  return false;
+}
+
 /** A step that can commit an open sheet: a click, a double-click, a key (Return), a menu choice, typed text with a
  *  newline in it (Return typed). Typing a name into it or scrolling does not. */
 const commits = (a: Action): boolean => a.kind === "click" || a.kind === "double_click" || a.kind === "key" || a.kind === "select" || (a.kind === "type" && /[\r\n]/.test(a.text));
