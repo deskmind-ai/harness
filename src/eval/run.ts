@@ -339,7 +339,7 @@ function report(paths: string[], supersede = false, tasksPath?: string) {
 
 /** --policy name=value, for the switches in orchestrator POLICY; an unknown name or value stops the run. */
 function parsePolicy(args: string[]): Partial<Policy> {
-  const choices: Record<string, string[]> = { cannot: ["ask", "report"], evidence: ["v1", "v2"] };
+  const choices: Record<string, string[]> = { cannot: ["ask", "report"], evidence: ["v1", "v2"], taskOpened: ["user", "task"] };
   const out: Record<string, string> = {};
   for (const arg of args) {
     const [k, v] = arg.split("=");
@@ -352,7 +352,8 @@ function parsePolicy(args: string[]): Partial<Policy> {
 async function main() {
   const { values: a, positionals } = parseArgs({ args: process.argv.slice(2).filter((x) => x !== "--"), allowPositionals: true, options: {
     tasks: { type: "string" }, config: { type: "string", default: "B0-luna" }, split: { type: "string", default: "dev" },
-    groups: { type: "string", default: "1,2,3,4,5,6,7" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
+    // groups: 8 is the opened category (practice set, 10-25: harness H1)
+    groups: { type: "string", default: "1,2,3,4,5,6,7,8" }, only: { type: "string" }, limit: { type: "string" }, "max-cost": { type: "string", default: "12" },
     out: { type: "string" }, v: { type: "boolean", default: false }, report: { type: "string", multiple: true },
     supersede: { type: "boolean", default: false },      // with --report: a later file's row replaces an earlier one for the same task
     rescore: { type: "string" },                           // with --report: the tasks file, to score rows from before false_claim again
@@ -394,7 +395,7 @@ async function main() {
     for (const t of tasks) {
       if (done.has(`${t.id}#${rep}`)) continue;
       if (a.v) console.log(`\n=== ${t.id} (${t.split}, rep ${rep}): ${t.raw}`);
-      const r = { ...(model ? await runTaskRuntime(t, gw, model, capsFor(t), new SimUser(t), out, a.v!, rep, a.loop ?? roleTable.goal.model) : await runTask(t, gw, out, a.v!, library, rep, policy)), rep };
+      const r = { ...(model ? await runTaskRuntime(t, gw, model, capsFor(t), new SimUser(t), out, a.v!, rep, a.loop ?? roleTable.goal.model, policy) : await runTask(t, gw, out, a.v!, library, rep, policy)), rep };
       fs.appendFileSync(resPath, JSON.stringify(r) + "\n");
       console.log(`${r.correct ? "✓" : "✗"} ${t.id}#${rep} ${r.status} (${(r.reason ?? "").slice(0, 60)}) calls=${r.model_calls} $${r.cost_usd.toFixed(4)} ${r.seconds}s ${r.correct ? "" : r.why.slice(0, 80)}`);
       if (gw.spentUsd >= Number(a["max-cost"])) { console.log("cost cap reached, stopping"); break outer; }

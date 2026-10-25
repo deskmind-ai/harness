@@ -185,6 +185,18 @@ describe("reconciliation on resume: an interrupted write, the file changed meanw
   });
 });
 
+describe("reconciliation on resume: a window on screen at restart (Codex round 3 of #75)", () => {
+  it("still reconciles an interrupted file write when the first look at begin writes `seen` lines", async () => {
+    const env = await crashed({ "plan.txt": "全被改了\n" });
+    expect(JSON.parse(fs.readFileSync(env.journal, "utf8").trim().split("\n").at(-1)!)).toMatchObject({ kind: "intent" });
+    const desk = new SimComputer(env.root);
+    desk.addEditor("用户编辑器", { title: "便笺", text: "留着", path: null });
+    const ex = new Executor(desk, { task: "t1", publicKey: env.app.publicKey, files: { workspace: env.ws, registry: fileRegistry() }, journal: env.journal });
+    await ex.begin();
+    expect({ recovered: ex.recovered?.finding ?? null, reconciliation: ex.reconciliation?.object ?? null }).toEqual({ recovered: "unknown", reconciliation: "path:plan.txt" });
+  });
+});
+
 describe("reconciliation on resume: the executor's guard", () => {
   it("refuses writes to the file until the user settles it, lets reads through, and allows the write after", async () => {
     const env = await crashed({ "plan.txt": "全被改了\n" });

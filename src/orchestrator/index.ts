@@ -98,8 +98,16 @@ const EVIDENCE_TEXT = 3000;
  *    "report" ends the run and puts the same choice on the result's card, without stopping (harness#6).
  *  - evidence: the wording the evidence judge is asked with (prompts.EVIDENCE_WORDINGS); "v2" lets a marker the
  *    user's words point to count and refuses a pick among bare candidates by association (harness#7), "v1" is the
- *    wording before it. */
-export const POLICY = { cannot: "ask" as "ask" | "report", evidence: "v2" as P.EvidenceWording };
+ *    wording before it.
+ *  - taskOpened (owner 10-25, decision 1 of the M3–M6 plan §1.2): what a window the task's own launch of an app brought
+ *    up (hands `opened_window`: no proof the task made it, never seen in this task before) counts as. "task": acting
+ *    in it asks no plan card and no action card — unless the outgoing judge says the step deletes or changes the
+ *    user's existing content (or sends, or cannot tell, or does not answer), and every change there still passes the
+ *    intent judge; its content stays the user's (undo leaves it open, closing it asks). "user": the window is the
+ *    user's as before — every change in it asks (rc.16: a plan card re-asking what the user had just asked for). */
+export const POLICY = { cannot: "ask" as "ask" | "report", evidence: "v2" as P.EvidenceWording, taskOpened: "task" as TaskOpenedPolicy };
+/** How a window the task's launch brought up is classed (POLICY.taskOpened). */
+export type TaskOpenedPolicy = "user" | "task";
 export type Policy = typeof POLICY;
 
 const canon = (x: unknown) => JSON.stringify(x, Object.keys(x as object).sort());

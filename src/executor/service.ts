@@ -733,7 +733,7 @@ export class ExecutorService {
     // music app's window the executor counted as the user's, so no plan card was shown and every step asked on its own
     // card — 「打开网易云播放安溥的宝贝」, 10-20). A declared external stays external; sending still asks per action
     // only looks: nothing to ask, nothing to resolve
-    if (steps.every((s) => s.consequence === "read" && !s.opens?.length)) { this.steeredSincePlan = false; return text("计划记下了；这些步骤不需要用户同意，直接做。"); }
+    if (steps.every((s) => s.consequence === "read" && !s.opens?.length)) { this.emit("plan.no_card", { why: "only_looks" }); this.steeredSincePlan = false; return text("计划记下了；这些步骤不需要用户同意，直接做。"); }
     const snap = await ex.snapshot();           // one look for the whole plan
     // a URL a step opens lands where the executor's floor for that open_window says: in the user's browser window when
     // the app has one (「搜索今天北京天气」, rc.10: nine cards for nine pages in the user's Chrome). That window is one
@@ -765,10 +765,21 @@ export class ExecutorService {
     // only what is there: a window or tab on screen, a file in the task folder (a raw "window:…" the caller wrote that
     // names nothing would otherwise be called the user's by the ledger and signed — review of #31)
     const there = new Set([...snap.windows.flatMap((w) => [`window:${w.id}`, ...(w.tabs ?? []).map((t) => `tab:${t.id}`)]), ...(this.o.workspace ? Object.keys(this.o.workspace.entries()).map((p) => `path:${p}`) : [])]);
-    const theirs = (o: string) => there.has(o) && ex.ledger.ownerOf(o) === "user";
+    // the user's to ask about, by the executor's structure: theirs by the ledger, and not a window DeskMind opened for
+    // their app under POLICY.taskOpened "task" (M3–M6 plan §1.2: rule 1 is for what the user had when the task began)
+    const theirs = (o: string) => there.has(o) && ex.protects(o);
     // a step declared "read" stays a look (the floor of looking is read; an action it turns into asks on its own)
     // (a URL opened into the user's window is no look, whatever the step was declared)
-    const classes = steps.map((s, i) => (s.consequence === "external" ? s.consequence : [...opensInto[i]!.keys()].some(theirs) ? higher(s.consequence, "modify_user") : s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : s.consequence));
+    // a step the caller calls modify_user that names a window, tab or file on screen and nothing the user's to ask about
+    // (the task's own window, or one DeskMind opened under POLICY.taskOpened "task") is no reason for a plan card: rule 1 of
+    // §1.2 is for what the user had at begin. The caller's class is taken again at act time (classify: the model only
+    // raises), so the step still asks on its own card there; here it only no longer re-asks on the plan (practice run
+    // 10-25: 「删掉张三那封」 drew a plan card and then the action card). Names that resolve to nothing (an element id, a
+    // row's words) sign nothing and decide nothing here either: the step they belong to is judged by the objects that did
+    // resolve — a step naming none keeps the caller's class. Only under POLICY.taskOpened "task": the "user" arm is the
+    // behaviour before 10-25 (review of #75, C)
+    const lowered = (s: PlanStepIn, i: number) => (ex.taskOpenedPolicy === "task" && s.consequence === "modify_user" && objectsOf[i]!.some((o) => there.has(o)) && !objectsOf[i]!.some(theirs) ? "create" : s.consequence);
+    const classes = steps.map((s, i) => (s.consequence === "external" ? s.consequence : [...opensInto[i]!.keys()].some(theirs) ? higher(s.consequence, "modify_user") : s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : lowered(s, i)));
     const signFor = [...new Set(objectsOf.flatMap((os, i) => (classes[i] === "read" ? [] : os.filter(theirs))))];
     // an app the hands driver can only operate in front: hands#54 lists bundle ids on the snapshot (`needs_foreground`,
     // known once the app was observed or brought forward), matched against a window's app or its id's "bundle#" prefix;
@@ -782,10 +793,16 @@ export class ExecutorService {
     const inFront = (w: { id: string; app: string; needs_foreground?: boolean }) => !!w.needs_foreground || fgList.some((b) => b === w.app.toLowerCase() || w.id.toLowerCase().startsWith(b + "#"));
     const fgApps = [...new Set(snap.windows.filter((w) => named.has(`window:${w.id}`) && inFront(w)).map((w) => appName(w)))];
     if (fgApps.length) this.emit("plan.foreground", { apps: fgApps });
-    this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor, opens: intoYours });
+    // the windows DeskMind opened for the user's app that the plan names (for the trace: under POLICY.taskOpened "user"
+    // each would have made this a card — M3–M6 plan §1.2, H1)
+    const opened = [...named].filter((o) => there.has(o) && ex.opened(o));
+    this.emit("plan.classes", { declared: steps.map((s) => s.consequence), settled: classes, objects: signFor, opens: intoYours, ...(opened.length ? { task_opened: opened, task_opened_policy: ex.taskOpenedPolicy } : {}) });
     const toSites = sitesOf.map((ds) => ds.some((d) => d.sends));
     // a plan that needs no card covers the request as it stands too: a step beyond it then asks on its own card again
-    if (!classes.some((c) => NEEDS_CONSENT.has(c)) && !toSites.some(Boolean)) { this.steeredSincePlan = false; return text("计划记下了；这些步骤不需要用户同意，直接做。"); }
+    if (!classes.some((c) => NEEDS_CONSENT.has(c)) && !toSites.some(Boolean)) {
+      this.emit("plan.no_card", { why: "within_request", ...(opened.length ? { task_opened: opened, task_opened_policy: ex.taskOpenedPolicy } : {}) });
+      this.steeredSincePlan = false; return text("计划记下了；这些步骤不需要用户同意，直接做。");
+    }
     // a step that sends from the user's window also changes the user's things on the way (the row picked, the reply
     // opened, the body filled): the card says both, and only what the card says changes the user's things is signed
     // (review of #31: 「回复并发送」 signed the mail window under a line that said only 「会发出去」)
@@ -813,7 +830,8 @@ export class ExecutorService {
       return `${i + 1}. ${s.purpose}${listed[i]!.length ? "（" + listed[i]!.join("、") + "）" : ""}${label}${sitesOf[i]!.length ? this.t.sendsTo(siteList(i), !!label) : ""}`;
     });
     // the same card in fields (M0), for an app that lays it out: only what the text says, by the same rules
-    const owner = (o: string): "user" | "task" | null => (theirs(o) ? "user" : there.has(o) && ex.ledger.ownerOf(o) === "task" ? "task" : null);
+    // who owns it (the content of a window DeskMind opened is the user's, even where the step inside asks no card)
+    const owner = (o: string): "user" | "task" | null => (there.has(o) ? ex.ledger.ownerOf(o) : null);
     const facts: PlanCardFacts = {
       steps: steps.map((s, i) => {
         const objects: PlanCardFacts["steps"][number]["objects"] = [];
@@ -821,7 +839,7 @@ export class ExecutorService {
         for (const o of objectsOf[i]!) {
           const label = shown(o), who = owner(o);
           if (label === null || !who) continue;
-          objects.push({ ref: o, label, owner: who, marks: [...(who === "user" && changes ? ["changes" as const] : []), ...(classes[i] === "external" ? ["sends" as const] : []), ...(opensInto[i]!.has(o) ? ["opens_pages" as const] : [])] });
+          objects.push({ ref: o, label, owner: who, marks: [...(theirs(o) && changes ? ["changes" as const] : []), ...(classes[i] === "external" ? ["sends" as const] : []), ...(opensInto[i]!.has(o) ? ["opens_pages" as const] : [])] });
         }
         for (const w of opensInto[i]!.keys()) {
           if (!theirs(w) || objects.some((x) => x.ref === w)) continue;

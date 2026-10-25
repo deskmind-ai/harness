@@ -165,10 +165,12 @@ describe("a window the launch brought up (hands#54 opened_window)", () => {
       return { status: "ok" as const, window: info.id, opened_window: info };
     }
   }
+  // under POLICY.taskOpened "user" (the policy before the owner's 10-25 decision; H1 keeps it as the other arm of the
+  // experiment). The "task" arm is test/task-opened.test.ts
   async function launched() {
     const desk = new LaunchDesk([]);
     const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
-    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, onEvent: (k, b) => events.push({ k, b }) });
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, taskOpened: "user", onEvent: (k, b) => events.push({ k, b }) });
     await ex.begin(); await ex.plan({ steps: [] });
     expect((await ex.act({ action: { kind: "open_window", app: "网易云音乐" }, epoch: ex.currentEpoch })).status).toBe("ok");
     return { desk, app, ex, events };
@@ -188,14 +190,14 @@ describe("a window the launch brought up (hands#54 opened_window)", () => {
     expect(r.challenge!.text).toContain("改动你的东西");
   });
 
-  it("the plan card names it as the window DeskMind opened, still 「改你的东西」", async () => {
+  it("the plan card names it as the window DeskMind opened, still 「改你的东西」 (POLICY.taskOpened \"user\")", async () => {
     const { Gateway } = await import("../src/gateway/index.js");
     const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
     const desk = new LaunchDesk([]);
     const app = ConsentSigner.fresh();
-    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, taskOpened: "user" });
     const gw = new Gateway(table); gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));
     const cards: { text: string }[] = [];
     const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } as any };

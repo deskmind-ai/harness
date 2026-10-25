@@ -13,8 +13,8 @@ import type { Gateway } from "../gateway/index.js";
 import { ConsentSigner } from "../executor/consent.js";
 import { Executor } from "../executor/executor.js";
 import { Crash } from "../registry/capability.js";
-import { SimComputer } from "../executor/sim.js";
-import type { Answer, Card } from "../orchestrator/index.js";
+import { SimComputer, ZH_MAIL_TEXTS, type MailMessage } from "../executor/sim.js";
+import type { Answer, Card, Policy } from "../orchestrator/index.js";
 import { FrontierRuntime, type RuntimeStatus, type RuntimeUser } from "../host/frontier.js";
 import type { loopModel } from "../runtime/model.js";
 import type { Registry } from "../registry/capability.js";
@@ -31,7 +31,7 @@ interface Seen { kind: Card["kind"]; picked: string | null; at: number }
 /** `loopSpec` (`<provider>|<model>`): the loop runs as its own process, as in the app (executor split P2), its logs
  *  beside the task's events (runtime.jsonl, model_calls.jsonl, runtime.log); DESKMIND_EXECUTOR_INPROC=1 keeps it in
  *  this process. Without it, `model` in this process. */
-export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<typeof loopModel>, registry: Registry, user: RuntimeUser & { clarifies: number; authorizes: number; asked: string[]; approvals: unknown[]; sim: unknown }, outDir: string, verbose: boolean, rep = 0, loopSpec?: string) {
+export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<typeof loopModel>, registry: Registry, user: RuntimeUser & { clarifies: number; authorizes: number; asked: string[]; approvals: unknown[]; sim: unknown }, outDir: string, verbose: boolean, rep = 0, loopSpec?: string, policy: Partial<Policy> = {}) {
   const runDir = path.join(outDir, `rep${rep}`, task.id);
   fs.rmSync(runDir, { recursive: true, force: true });
   fs.mkdirSync(runDir, { recursive: true });
@@ -53,6 +53,11 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   // the task's hooks, as the orchestrator engine fires them: another program changes files after N effects; the user
   // changes the request after N model calls (steer). Crash and GUI disturbances are not carried over.
   const h = task.hooks ?? {};
+  // apps on the computer but not on screen (hooks.desktop.installed): the task's launch brings up their restored window,
+  // reported as `opened_window` — the practice items of M3–M6 plan §1.2 (H1: a delete inside a window the task opened)
+  type Installed = { app: string; names?: string[]; bundle?: string } & ({ kind: "mail"; inbox: MailMessage[]; flagged?: string[] } | { kind: "editor"; doc: { title: string; text: string; path: string | null } });
+  const desktop = h.desktop as { installed?: Installed[] } | undefined;
+  for (const i of desktop?.installed ?? []) { const o = { names: i.names, bundle: i.bundle }; if (i.kind === "mail") sim.installMail({ app: i.app, inbox: i.inbox, flagged: i.flagged ?? [], texts: ZH_MAIL_TEXTS }, o); else sim.installEditor(i.app, i.doc, o); }
   const fired = { ext: false, upd: false };
   let rt: FrontierRuntime | null = null;
   // the GUI disturbances, as run.ts injects them into EditorSim: after the k-th screen action that went through, the
@@ -84,7 +89,7 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
   // a crash task dies after its first effect; the next process finds the intent without a receipt in the journal,
   // reconciles it, and the model is told (as the orchestrator engine recovers from its log)
   const journal = path.join(runDir, "journal.jsonl");
-  const makeExecutor = (crash: boolean) => { const e = new Executor(sim, { task: task.id, publicKey: app.publicKey, onEvent, journal, ...(crash ? { crashAfterFirstEffect: true } : {}) }); for (const id of ex_taskWindows) e.ledger.created(`window:${id}`); return e; };
+  const makeExecutor = (crash: boolean) => { const e = new Executor(sim, { task: task.id, publicKey: app.publicKey, onEvent, journal, ...(crash ? { crashAfterFirstEffect: true } : {}), ...(policy.taskOpened ? { taskOpened: policy.taskOpened } : {}) }); for (const id of ex_taskWindows) e.ledger.created(`window:${id}`); return e; };
   let ex = makeExecutor(!!h.crash);
   // every card the user answers is noted with its pick, in order with the writes
   const cardUser: RuntimeUser = {
@@ -157,8 +162,10 @@ export async function runTaskRuntime(task: Task, gw: Gateway, model: ReturnType<
     task: task.id, group: task.group, split: task.split, kind: task.kind ?? task.stage, config: `${gw.name}@runtime`, engine: "runtime", status: summ.status, runtime_status: r.status, reason: r.reason,
     ...sc, crashed, runtime_mode: rt.mode, counters: summ.counters, model_calls: gw.calls - calls0 + (r.counters["model_calls"] ?? 0), loop_calls: r.counters["model_calls"] ?? 0, cost_usd: Number((gw.spentUsd - spent0).toFixed(5)),
     tokens_in: r.counters["tokens_in"] ?? 0, tokens_out: r.counters["tokens_out"] ?? 0,
-    category: task.category, policy: {}, skill: null, skills: store ? store.admitted().map((x) => x.name) : null, taught, learned: null, skills_read: r.counters["skills_read"] ?? 0, asked: user.asked, approvals: user.approvals, result_response: null, sim: user.sim,
+    category: task.category, policy, skill: null, skills: store ? store.admitted().map((x) => x.name) : null, taught, learned: null, skills_read: r.counters["skills_read"] ?? 0, asked: user.asked, approvals: user.approvals, result_response: null, sim: user.sim,
     ask_decisions: [], consents: r.consents, cards: seen.map((s) => `${s.kind}:${s.picked ?? "-"}`), verdicts: r.verdicts, answer: r.answer, summary: r.summary,
+    // what the simulated apps did (the sim's own log: a mail deleted or sent, a window launched), beside the file tree
+    gui_log: sim.log,
     first_outcome: task.gold.outcomes?.[0]?.name ?? "gold", seconds: Number(((Date.now() - t0) / 1000).toFixed(1)), impl: "ts",
   };
   fs.writeFileSync(path.join(runDir, "events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
