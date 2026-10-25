@@ -55,8 +55,8 @@ class Desk implements Driver {
 const ELS: Element[] = [
   { id: "row", role: "row", label: "张三 · 会议时间", actions: ["click"] },
   { id: "del", role: "button", label: "删除", actions: ["click"] },
-  { id: "search", role: "textField", label: "搜索", actions: ["set_value", "type"] },
-  { id: "body", role: "textArea", label: "正文", actions: ["type", "set_value"] },
+  { id: "search", role: "textField", label: "搜索", actions: ["set_value", "type"], value: "" },
+  { id: "body", role: "textArea", label: "正文", actions: ["type", "set_value"], value: "" },
   { id: "dd", role: "popUpButton", label: "排序", actions: ["select"], options: ["日期", "发件人"] },
   { id: "closebtn", role: "AXCloseButton", label: "", actions: ["click"] },
 ];
@@ -452,7 +452,7 @@ describe("review of #75, delta round", () => {
     desk.epoch += 1; const o2 = await ex.observe(target.id);
     await ex.act({ action: { kind: "type", window: target.id, target: "search", text: "会议" }, epoch: o2.epoch });
     expect(fact()).toEqual([true, false]);                               // the task's own text in the box: still "holds content" — the judge asks
-    delete (search as { value?: string }).value;
+    (search as { value?: string }).value = "";
   });
 });
 
@@ -476,7 +476,7 @@ describe("Codex review of #75", () => {
   it("P1-2: a cleared write re-checks the field right before acting — content that arrived while judging (no epoch moved) stops it", async () => {
     for (const kind of ["set_value", "type"] as const) {
       const search = ELS.find((e) => e.id === "search")!;
-      delete (search as { value?: string }).value;
+      (search as { value?: string }).value = "";
       // the judge answers, and meanwhile the field fills with the user's synced content, the epoch unmoved
       const judge = { choose: async (q: string) => { if (q === OUTGOING_QUESTION) (search as { value?: string }).value = "用户同步过来的草稿"; return { choice: q === OUTGOING_QUESTION ? "stays" : "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
       const { desk, ex, target, o } = await stage("opened", "task", judge);
@@ -486,7 +486,7 @@ describe("Codex review of #75", () => {
       expect([kind, r.status, desk.effects.length > before]).toEqual([kind, "stale", false]);
       // either reading of the same fact ends it: the field's content differs, or the target no longer resolves by identity
       expect(r.why).toMatch(/content changed|no longer one of a kind/);
-      delete (search as { value?: string }).value;
+      (search as { value?: string }).value = "";
       // and with the field as it was judged, the write goes through
       const quiet = await stage("opened", "task", fakeJudge("stays", "matches").judge);
       expect((await quiet.ex.act({ action: kind === "set_value" ? { kind, window: quiet.target.id, target: "search", value: "会议" } : { kind, window: quiet.target.id, target: "search", text: "会议" }, epoch: quiet.o.epoch })).status).toBe("ok");
@@ -577,7 +577,7 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
         const w = this.wins.find((x) => x.id === id); if (!w) throw new Error(`no window ${id}`);
         this.shown(); this.gen += 1; this.idMap = new Map();
         const els: Element[] = [{ id: `del@${this.gen}`, role: "button", label: "删除", actions: ["click"] }];
-        for (const f of this.fieldsOf(id)) { const eid = `${f.key}@${this.gen}`; this.idMap.set(eid, `${id}:${f.key}`); els.push({ id: eid, role: f.role, label: f.label, actions: ["type", "set_value"], ...(f.value ? { value: f.value } : {}) }); }
+        for (const f of this.fieldsOf(id)) { const eid = `${f.key}@${this.gen}`; this.idMap.set(eid, `${id}:${f.key}`); els.push({ id: eid, role: f.role, label: f.label, actions: ["type", "set_value"], value: f.value }); }
         return { epoch: this.epoch, window: w, modal: null, elements: els, text: "" };
       }
       perform(a: Action) {
@@ -614,7 +614,8 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
       const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
         if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
         const el = ctx["目标元素"] as Record<string, unknown> | null;
-        return { choice: el && el["目标里已有内容"] ? "alters" : "stays", by: "fake", confidence: 1, reason: "" };
+        const holds = el ? el["目标里已有内容"] : false;
+        return { choice: holds === true ? "alters" : holds === false ? "stays" : "unsure", by: "fake", confidence: 1, reason: "" };
       } } as unknown as Judge;
       const app = ConsentSigner.fresh();
       const journal = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "h1p2-")), "journal.jsonl");
@@ -748,5 +749,52 @@ describe("Codex review of #75, round 3", () => {
     expect(kinds.slice(5)).toEqual(["receipt", "seen"]);                 // recovery's record of the step in doubt, then this process's first look
     // and both apps the earlier process saw are the user's now
     expect([ex.ledger.seenApp({ id: "com.apple.mail#9", app: "邮件" }), ex.ledger.seenApp({ id: "x#1", app: "备忘录" })]).toEqual([true, true]);
+  });
+});
+
+describe("Codex review of #75, round 4 — unknown is never the safe value", () => {
+  it("an editable field whose value the driver could not read (the screen) is unknown, not empty: the judge gets no 「已有内容」 fact and a flag, and the write asks", async () => {
+    let value = "用户原有的正文", fact: unknown, flag: unknown;
+    const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
+      if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
+      const el = ctx["目标元素"] as Record<string, unknown>; fact = el["目标里已有内容"]; flag = el["目标内容读不出来"];
+      const choice = fact === true ? "alters" : fact === false ? "stays" : "unsure";
+      return { choice, by: "fake", confidence: 1, reason: "follow the supplied content fact" };
+    } } as unknown as Judge;
+    const { desk, ex, target } = await stage("opened", "task", judge);
+    (ex as unknown as { opts: { raw: string } }).opts.raw = "打开邮件，在正文里填写回复";
+    const observe = desk.observe.bind(desk), perform = desk.perform.bind(desk);
+    desk.observe = (id) => { const o = observe(id); return { ...o, text: "", elements: [{ id: "body", role: "textArea", label: "正文", source: "pixels", actions: ["type", "set_value"] }] }; };
+    desk.perform = ((a: Action, opts?: { foreground_ok?: boolean }) => { if (a.kind === "set_value" && a.target === "body") value = a.value; return perform(a, opts); }) as typeof desk.perform;
+    const ob = await ex.observe(target.id);
+    const result = await ex.act({ action: { kind: "set_value", window: target.id, target: "body", value: "任务的新回复" }, epoch: ob.epoch });
+    expect({ fact, flag, status: result.status, value }).toEqual({ fact: undefined, flag: true, status: "needs_consent", value: "用户原有的正文" });
+    // a screen-read field with text in it is known to hold content; an accessibility field with "" is known empty
+    const { fieldHolds } = await import("../src/executor/executor.js");
+    expect([fieldHolds({ id: "ocr:1", role: "textArea", label: "", actions: ["type"], value: "hi" }), fieldHolds({ id: "ocr:2", role: "textArea", label: "", actions: ["type"], value: "" }), fieldHolds({ id: "ax", role: "textArea", label: "", actions: ["type"], value: "" }), fieldHolds({ id: "ax2", role: "textArea", label: "", actions: ["type"] })]).toEqual([true, undefined, false, undefined]);
+  });
+
+  it("legacy window history survives a second restart after new seen lines: both sources are read every time", async () => {
+    const journal = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pr75legacy-")), "journal.jsonl");
+    const lines = [
+      { t: 1, kind: "intent", action: { kind: "click", window: "com.apple.mail#3", target: "x" }, object: "window:com.apple.mail#3", consequence: "modify_user", text: "点删除" },
+      { t: 2, kind: "receipt", status: "ok", seq: 1, driver_status: "ok" },
+    ];
+    fs.writeFileSync(journal, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    const app = ConsentSigner.fresh();
+    const desk = new Desk([win("Notes#1", "Notes", "购物清单")]);
+    const make = () => new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "打开邮件，删掉张三那封", taskOpened: "task", journal, judge: fakeJudge("stays", "matches").judge });
+    const first = make();
+    await first.begin();
+    expect(first.ledger.seenApp({ id: "com.apple.mail#9", app: "邮件" })).toBe(true);
+    // the first upgraded process ends without reopening Mail; its begin appended a `seen` line for Notes
+    const second = make();
+    await second.begin(); await second.plan({ steps: [] });
+    const restored: WindowInfo = { id: "com.apple.mail#9", app: "邮件", app_name: "邮件", bundle: "com.apple.mail", title: "收件箱" };
+    desk.launches["邮件"] = { window: restored, says: "opened_window" };
+    await second.act({ action: { kind: "open_window", app: "邮件" }, epoch: second.currentEpoch });
+    const ob = await second.observe(restored.id), before = desk.effects.length;
+    const result = await second.act({ action: { kind: "click", window: restored.id, target: "del" }, epoch: ob.epoch });
+    expect({ opened: second.opened(`window:${restored.id}`), status: result.status, effect: desk.effects.length > before }).toEqual({ opened: false, status: "needs_consent", effect: false });
   });
 });

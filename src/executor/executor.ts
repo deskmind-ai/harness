@@ -91,6 +91,10 @@ export interface Classification { consequence: Consequence; object: string; why:
 /** An element read from the screen's pixels rather than the accessibility tree: hands' `source` when it sends one,
  *  otherwise its id prefix (text recognition, controls hands made up, Eyes). */
 export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pixels" : /^(ocr|gen|icon|desc):/.test(e.id));
+/** Whether an editable field holds content: true or false only on a value the driver positively read — an accessibility
+ *  value, "" for an empty field — and undefined when it cannot be known: no value at all, or one read off the screen,
+ *  where an empty box and an unread one look alike. Unknown is never taken as the safe side (Codex round 4 of #75). */
+export const fieldHolds = (e: Element): boolean | undefined => (typeof e.value !== "string" ? undefined : fromScreen(e) ? (e.value.trim() ? true : undefined) : e.value.trim() !== "");
 
 const RETURN = /\b(return|enter)\b/i;
 /** A key chord's parts (structure of the action, not the user's words): the command modifier, shift, and the key. */
@@ -626,12 +630,11 @@ export class Executor {
     // what earlier processes of this task saw: their `seen` lines reload the ledger. A journal from before those lines
     // were written has no such record: every window an intent names counts as seen, its id's `bundle#` prefix as its
     // app (fail closed — review of #75, probe R)
+    // both sources, always (Codex round 4: once a newer process had appended one `seen` line, an older journal's intents
+    // were skipped, and the app they named was forgotten): the seen lines, and every window an intent names
     const seenLines = lines.filter((l) => l.kind === "seen" && Array.isArray(l.windows));
-    if (seenLines.length) {
-      for (const l of seenLines) for (const w of l.windows as { id: string; app?: string; app_name?: string; bundle?: string }[]) if (w && typeof w.id === "string") this.ledger.saw(w);
-    } else {
-      for (const l of lines) { const a = l.kind === "intent" ? (l.action as { window?: string } | undefined) : undefined; if (a?.window) this.ledger.saw({ id: a.window, app: a.window.includes("#") ? a.window.slice(0, a.window.lastIndexOf("#")) : a.window }); }
-    }
+    for (const l of seenLines) for (const w of l.windows as { id: string; app?: string; app_name?: string; bundle?: string }[]) if (w && typeof w.id === "string") this.ledger.saw(w);
+    for (const l of lines) { const a = l.kind === "intent" ? (l.action as { window?: string } | undefined) : undefined; if (a?.window) this.ledger.saw({ id: a.window, app: a.window.includes("#") ? a.window.slice(0, a.window.lastIndexOf("#")) : a.window }); }
     if (seenLines.length || lines.some((l) => l.kind === "intent")) this.emit("executor.ledger_reloaded", { seen_lines: seenLines.length });
     for (const l of lines) if (l.kind === "intent") for (const p of writesOf(l)) this.journalWrites.add(p);
     // a reconciliation an earlier process raised and the user has not settled (the process died with the card open, or
@@ -1413,7 +1416,7 @@ export class Executor {
         // for the second direction: whether the field holds anything now. Nothing in it is ever credited to the task — the
         // fourth bug of that family was a same-looking field in another document (Codex round 3 of #75): a write into a
         // field that holds anything is a change of the user's content, a card; only an empty field is clear
-        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim() } : {}) } : null,
+        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: fieldHolds(h.el), ...(fieldHolds(h.el) === undefined ? { 目标内容读不出来: true } : {}) } : {}) } : null,
       窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.opened ? { 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : {}), ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
       窗口里标了会发出的其他元素: els.filter((e) => e.sends && e !== h.el).map((e) => ({ 角色: e.role, 名字: e.label, 来源: screen(e) })),
       窗口里的其他控件: els.filter((e) => e !== h.el && e.actions.length).slice(0, 60).map((e) => ({ 角色: e.role, 名字: e.label, ...(e.value ? { 值: e.value.slice(0, 80) } : {}), 来源: screen(e) })),
@@ -1711,7 +1714,8 @@ export class Executor {
         if ("target" in req.action && req.action.target && (req.action.kind === "type" || req.action.kind === "set_value")) {
           const was = obs.elements.find((e) => e.id === (req.action as { target: string }).target);
           const nowEl = fresh.elements.find((e) => e.id === (again.act as { target?: string }).target);
-          if ((was?.value ?? "") !== (nowEl?.value ?? "")) return changed("the target's content changed while this step was being checked");
+          // the same reading of the field, three ways: known empty, known content, not readable — and the same text
+          if (!was || !nowEl || fieldHolds(was) !== fieldHolds(nowEl) || (was.value ?? null) !== (nowEl.value ?? null)) return changed("the target's content changed while this step was being checked");
         }
         // a cleared key goes to the focused element: the same one as when it was judged
         if (req.action.kind === "key" && !sameSendFacts(req.action, obs, fresh)) return changed("the focus changed while this step was being checked");
