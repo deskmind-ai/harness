@@ -19,6 +19,7 @@ export const fsCreateText = make({
   footprint: (_ws, a) => { const q = join(a.parent!, a.name!); return { reads: [], writes: [q], expectAfter: { [q]: sha(a.text!) } }; },
   pre: (ws, a) => { const q = join(a.parent!, a.name!); return ws.exists(q) ? `${q} already exists` : !folderOk(ws, parentOf(q)) ? `folder ${parentOf(q)} does not exist` : null; },
   run: (ws, a) => { const q = join(a.parent!, a.name!); fs.writeFileSync(ws.abs(q), a.text!, { encoding: "utf-8", flag: "wx" }); maybeCrash(); return after(ws, [q], { file: q }); },
+  undoWrites: (_ws, a) => ({ remove: [join(a.parent!, a.name!)] }),
   undo: (ws, a, r) => { const q = join(a.parent!, a.name!); const e = untouched(ws, r, [q]); if (e) return e; fs.unlinkSync(ws.abs(q)); return null; },
 });
 
@@ -50,6 +51,7 @@ export const fsReplaceText = make({
   prep: (ws, a) => keepCopy(ws, norm(a.target!)),
   run: (ws, a) => { const q = norm(a.target!); fs.writeFileSync(ws.abs(q), a.text!, "utf-8"); maybeCrash(); return after(ws, [q]); },
   check: (ws, a, r) => replaceBlocked(ws, a, r),
+  undoWrites: (_ws, a) => ({ content: [norm(a.target!)] }),
   undo: (ws, a, r) => {
     const q = norm(a.target!);
     const e = untouched(ws, r, [q]) ?? replaceBlocked(ws, a, r);
@@ -70,6 +72,7 @@ export const fsAppendLine = make({
   run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
   prep: (ws, a) => ({ bytes: Buffer.byteLength(ws.read(norm(a.target!)), "utf-8") }),
   check: (ws, a, r) => appendBlocked(ws, a, r),
+  undoWrites: (_ws, a) => ({ content: [norm(a.target!)] }),
   undo: (ws, a, r) => { const q = norm(a.target!); const e = untouched(ws, r, [q]) ?? appendBlocked(ws, a, r); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
 });
 
@@ -93,6 +96,7 @@ export const fsMove = make({
     fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]);
   },
   check: (ws, a, r) => moveBlocked(ws, a, r),
+  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)], into: [parentOf(norm(a.source!))] }),
   undo: (ws, a, r) => {
     const src = norm(a.source!), dst = norm(a.destination!);
     const e = untouched(ws, r, [src, dst]) ?? moveBlocked(ws, a, r); if (e) return e;
@@ -110,6 +114,7 @@ export const fsCopy = make({
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.isDir(src) ? `${src} is a folder` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   // COPYFILE_EXCL: a destination that exists, under any spelling the volume takes for it, is never overwritten
   run: (ws, a) => { const dst = norm(a.destination!); fs.copyFileSync(ws.abs(norm(a.source!)), ws.abs(dst), fs.constants.COPYFILE_EXCL); maybeCrash(); return after(ws, [dst]); },
+  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)] }),
   undo: (ws, a, r) => { const dst = norm(a.destination!); const e = untouched(ws, r, [dst]); if (e) return e; fs.unlinkSync(ws.abs(dst)); return null; },
 });
 
@@ -142,6 +147,7 @@ export const fsMkdir = make({
     return { ...after(ws, [q]), undo: { made } };
   },
   check: (ws, _a, r, ours) => mkdirBusy(ws, r, ours),
+  undoWrites: (_ws, _a, r) => ({ remove: Array.isArray(r.undo?.made) ? (r.undo!.made as string[]) : [] }),
   undo: (ws, _a, r) => {
     const e = mkdirBusy(ws, r, new Set()); if (e) return e;
     for (const d of r.undo!.made as string[]) fs.rmdirSync(ws.abs(d));
@@ -173,6 +179,7 @@ export const fsTrash = make({
   // were undone first and the undo stopped half way). It runs on undo's paper folder: the path and its folder as
   // they will be when this step's undo runs; a symlink at the path (never in the entries) from the real disk
   check: (ws, a, r) => trashBlocked(ws, a, r),
+  undoWrites: (_ws, a, r) => ({ remove: typeof r.undo?.trashed === "string" ? [r.undo.trashed] : [], into: [parentOf(norm(a.target!))] }),
   undo: (ws, a, r) => {
     const q = norm(a.target!);
     const e = untouched(ws, r, [q]) ?? trashBlocked(ws, a, r);

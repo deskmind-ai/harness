@@ -348,7 +348,7 @@ describe("tool capabilities", () => {
       footprint: (_w, a) => ({ reads: [], writes: [a.name!], expectAfter: { [a.name!]: "file:*" } }),
       pre: () => null,
       run: (w, a) => { fs.writeFileSync(w.abs(a.name!), "half"); return { status: "failed", why: "it went wrong", output: {}, versions_after: {} }; },
-      undo: () => null,
+      undo: () => null, undoWrites: () => ({}),
     });
     const reg = new Registry();
     for (const c of [...FS_CAPABILITIES, liar]) reg.register(c);

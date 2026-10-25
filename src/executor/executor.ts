@@ -2000,7 +2000,7 @@ export class Executor {
 
   /** Take every effect back, newest first; nothing is touched unless all of them can be (the orchestrator's rule).
    *  A file a later program changed is refused by the capability's own check. */
-  async undo(): Promise<{ undone: number; total: number; refused: string | null }> {
+  async undo(): Promise<{ undone: number; total: number; refused: string | null; unsure?: string }> {
     const plan = this.undoable();
     if (!plan.reversible) return { undone: 0, total: plan.steps.length, refused: plan.steps.find((s) => !s.can)?.why ?? "cannot undo" };
     const ws = this.opts.files?.workspace;
@@ -2018,7 +2018,10 @@ export class Executor {
       // the step's own untouched test (registry/spec.ts), asked of the paper folder: the very predicate its undo asks the
       // disk — what is at each path as the volume resolves its name, nothing at all where the step left nothing — then
       // the capability's check, which its undo also asks after untouched
-      const why = untouched(paper!.asWorkspace, { ...f.exec, output: {} } as ExecResult, f.writes) ?? f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      let why: string | null;
+      try {
+        why = untouched(paper!.asWorkspace, { ...f.exec, output: {} } as ExecResult, f.writes) ?? f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      } catch (e) { why = `could not check the undo: ${errText(e)}`; }   // nothing touched yet: refused as a whole
       if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
       paper!.takeBack(f.writes, before, left, f.madeParents);
     }
@@ -2027,15 +2030,26 @@ export class Executor {
       const r = this.receipts.find((x) => x.seq === step.seq)!;
       const a = r.request.action;
       let err: string | null = null;
-      if (a.kind === "file") {
-        const f = this.fileReceipts.get(r.seq)!;
-        err = f.cap.undo!(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never);
-        ws!.invalidate();
-        if (!err) for (const p of f.cap.footprint(ws!, f.args).writes) this.seen[p] = ws!.version(p);
-      } else if (a.kind === "open_window") {
-        const id = this.openedWindows.get(r.seq);
-        const snap = await this.driver.snapshot();
-        if (id && snap.windows.some((w) => w.id === id)) { const pr = await this.driver.perform({ kind: "close_window", window: id }); if (pr.status !== "ok") err = pr.why ?? pr.status; }
+      // an undo never throws out of here (review of #74): what nothing could foresee (a full disk, an I/O error) stops
+      // the undo at that step, and the answer says exactly how far it got — the steps before it taken back, this one
+      // perhaps partly, the rest untouched — the only partial undo there is
+      try {
+        if (a.kind === "file") {
+          const f = this.fileReceipts.get(r.seq)!;
+          err = f.cap.undo!(ws!, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never);
+          ws!.invalidate();
+          if (!err) for (const p of f.cap.footprint(ws!, f.args).writes) this.seen[p] = ws!.version(p);
+        } else if (a.kind === "open_window") {
+          const id = this.openedWindows.get(r.seq);
+          const snap = await this.driver.snapshot();
+          if (id && snap.windows.some((w) => w.id === id)) { const pr = await this.driver.perform({ kind: "close_window", window: id }); if (pr.status !== "ok") err = pr.why ?? pr.status; }
+        }
+      } catch (e) {
+        ws?.invalidate();
+        const rest = plan.steps.length - undone - 1;
+        const why = `taking back「${step.text}」failed (${errText(e)}): ${undone} step(s) before it were taken back, this one may be partly taken back, ${rest} older step(s) were not touched`;
+        this.emit("executor.undo_failed", { seq: step.seq, why, error: errText(e), undone, not_touched: rest });
+        return { undone, total: plan.steps.length, refused: why, unsure: step.text };
       }
       if (err) { this.emit("executor.undo_refused", { seq: step.seq, why: err, undone }); return { undone, total: plan.steps.length, refused: err }; }
       undone += 1;
@@ -2239,3 +2253,6 @@ export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, c
 }
 
 export type { WindowInfo };
+
+/** An error's message for a result: never a stack. */
+function errText(e: unknown): string { return e instanceof Error ? e.message : String(e); }

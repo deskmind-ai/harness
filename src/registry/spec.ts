@@ -41,12 +41,17 @@ export interface Spec {
   /** reversible = `undo` exists (or the capability only observes). `check` says whether undo can run now without
    *  changing anything; `undo` checks again and acts. `prep` records before the action what undo will need. */
   undo?: (ws: Workspace, a: Args, r: ExecResult) => string | null;
+  /** What `undo` writes on the disk (required with `undo`): files whose bytes it writes back, entries it unlinks or
+   *  renames away, folders it puts an entry into. make() asks writeBack of them before the check and before the undo:
+   *  the permission question, one predicate for both, on paper or on the disk. */
+  undoWrites?: (ws: Workspace, a: Args, r: ExecResult) => UndoWrites;
   check?: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => string | null;
   prep?: (ws: Workspace, a: Args) => Record<string, unknown>;
 }
 
 /** A capability from a spec, with the shared argument checks (schema, '..', bare names) applied first. */
 export function make(sp: Spec): Capability {
+  if (sp.undo && !sp.undoWrites) throw new Error(`${sp.id}: an undo must say what it writes (undoWrites)`);
   const schema = { type: "object" as const, properties: sp.fields, required: Object.keys(sp.fields), additionalProperties: false as const };
   return {
     id: sp.id, version: "1.0.0", description: sp.description, schema, effect: sp.effect, channel: "filesystem", requiresConfirmation: !!sp.confirm, pathFields: sp.pathFields ?? [], discards: !!sp.discards, reversible: sp.reversible ?? (sp.effect === "observe" || !!sp.undo),
@@ -61,8 +66,9 @@ export function make(sp: Spec): Capability {
     footprint: sp.footprint,
     preconditions: sp.pre,
     execute: sp.run,
-    ...(sp.undo ? { undo: sp.undo } : {}),
-    ...(sp.check ? { undoCheck: sp.check } : {}),
+    // every undo and its check first ask whether what it writes can be written (writeBack), then their own questions
+    ...(sp.undo ? { undo: (ws: Workspace, a: Args, r: ExecResult) => writeBack(ws, sp.undoWrites!(ws, a, r)) ?? sp.undo!(ws, a, r) } : {}),
+    ...(sp.undo ? { undoCheck: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => writeBack(ws, sp.undoWrites!(ws, a, r)) ?? sp.check?.(ws, a, r, ours) ?? null } : {}),
     ...(sp.prep ? { prepareUndo: sp.prep } : {}),
     ...(sp.derive ? { derive: sp.derive.from } : {}),
   };
@@ -70,6 +76,18 @@ export function make(sp: Spec): Capability {
 
 export const CRASH_FLAG = { crashAfterEffect: false };     // test hook: die after the effect, before the receipt
 export const maybeCrash = () => { if (CRASH_FLAG.crashAfterEffect) throw new Crash("crash after the effect, before the receipt"); };
+
+/** What an undo writes on the disk (Spec.undoWrites). */
+export interface UndoWrites { content?: string[]; remove?: string[]; into?: string[] }
+/** Whether an undo can write what it writes: each file whose bytes it writes back writable and not locked, each entry
+ *  it unlinks or renames not locked and its folder writable, each folder it puts an entry into writable (Workspace.
+ *  writeBlocked: the mode, and the flags the mode does not show — the Finder's lock). Asked by the check (on paper)
+ *  and by the undo (on the disk). */
+export const writeBack = (ws: Workspace, w: UndoWrites): string | null => {
+  for (const [how, ps] of [["content", w.content], ["remove", w.remove], ["into", w.into]] as const)
+    for (const q of ps ?? []) { const e = ws.writeBlocked(q, how); if (e) return e; }
+  return null;
+};
 
 /** An undo may only touch paths still exactly as the action left them: what is at each now (Workspace.at: the name as
  *  the volume resolves it), and where the action left nothing, nothing there at all (Workspace.occupied: a variant of

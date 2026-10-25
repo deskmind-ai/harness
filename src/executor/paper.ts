@@ -60,6 +60,10 @@ export class PaperFolder {
     return this.vacated(p) ? false : this.ws.occupied(p);
   }
 
+  /** Whether what is at `p` can be written back (Workspace.writeBlocked): permissions and locks are the disk's — the
+   *  run's own undos only move entries, they never change a mode or a flag — so asked of the disk, by the same call. */
+  writeBlocked(p: string, how: "content" | "remove" | "into"): string | null { return this.ws.writeBlocked(p, how); }
+
   /** A hidden path's place on the real disk (an undo copy, a trashed file: never in the entries, so never moved on
    *  paper): what an undo check reads to see that what it will restore from is there. */
   abs(p: string): string { return this.ws.abs(p); }

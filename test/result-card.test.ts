@@ -30,7 +30,8 @@ import { fallbackCard } from "../src/session/host.js";
 import { journalSteps, parseJournal, possiblyDone } from "../src/executor/possibly.js";
 import { Executor } from "../src/executor/executor.js";
 import { ConsentSigner } from "../src/executor/consent.js";
-import { Workspace } from "../src/registry/workspace.js";
+import { Workspace, forgetVolumeNames } from "../src/registry/workspace.js";
+import { execFileSync } from "node:child_process";
 import { fileRegistry } from "../src/registry/fs.js";
 import fsCjs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -83,8 +84,8 @@ function tree(root: string): Record<string, string> {
 }
 
 /** A task folder with two of the user's files, and a simulated desktop with the user's editor. */
-function desk() {
-  const scope = fs.mkdtempSync(path.join(os.tmpdir(), "result-card-"));
+function desk(base = os.tmpdir()) {
+  const scope = fs.mkdtempSync(path.join(base, "result-card-"));
   fs.mkdirSync(path.join(scope, "notes"));
   fs.writeFileSync(path.join(scope, "notes", "u1.txt"), "一");
   fs.writeFileSync(path.join(scope, "u2.txt"), "二");
@@ -1194,6 +1195,102 @@ describe("file undo: replace_text keeps a copy, trash moves back — both only w
     expect(typeof reg.get("fs.replace_text")!.undo).toBe("function");
     expect(typeof reg.get("fs.trash")!.undo).toBe("function");
   });
+
+  // review of #74 (REV74 F): a file made read-only or locked after the task let the undo start, take the newer steps
+  // back, and then throw (EACCES) — no result_response, the app crashed, copies left. Invariants: the check asks the
+  // same permission question the undo meets (writeBack: mode, folder, the Finder's lock); and an undo never throws —
+  // the unforeseen (an I/O error) stops it at that step with an honest account, and the exit path still runs
+  it("the table: capability × (read-only target, locked target, read-only folder, I/O error injected) → refused with nothing touched, done, or an honest partial account; never a crash", async () => {
+    // each capability's step, then a newer step in a folder of its own (so a locked folder of the first step's does
+    // not refuse the newer one): a refusal must leave the newer one's file in place
+    const OWN: Record<string, { step: Step; target: (scope: string) => string; folder: string; call: "copyFileSync" | "truncateSync" | "renameSync" | "unlinkSync" }> = {
+      replace: { step: STEP.replace!, target: (s) => path.join(s, "u2.txt"), folder: ".", call: "copyFileSync" },
+      append: { step: STEP.append!, target: (s) => path.join(s, "u2.txt"), folder: ".", call: "truncateSync" },
+      create: { step: STEP.create!, target: (s) => path.join(s, "a.txt"), folder: ".", call: "unlinkSync" },
+      move: { step: STEP.move!, target: (s) => path.join(s, "notes", "u3.txt"), folder: "notes", call: "renameSync" },
+      // the file undo moves back: the one in the trash
+      trash: { step: STEP.trash!, target: (s) => { const t = path.join(s, ".deskmind-trash"); return path.join(t, fs.readdirSync(t)[0]!, "u2.txt"); }, folder: ".", call: "renameSync" },
+    };
+    const NEWER: Step = { calls: [{ name: "fs_create_text", args: { parent: "later", name: "z.txt", text: "newer" } }] };
+    // what each situation leads to, per capability: the undo's own writes decide it
+    const EXPECT: Record<string, Record<string, "refused" | "done" | "partial">> = {
+      readonly_target: { replace: "refused", append: "refused", create: "done", move: "done", trash: "done" },  // a read-only file can still be unlinked or renamed
+      locked_target: { replace: "refused", append: "refused", create: "refused", move: "refused", trash: "refused" },
+      readonly_folder: { replace: "done", append: "done", create: "refused", move: "refused", trash: "refused" },   // bytes written in place need no folder
+      io_error: { replace: "partial", append: "partial", create: "partial", move: "partial", trash: "partial" },
+    };
+    const isMac = process.platform === "darwin";
+    const rows: string[] = [];
+    for (const cap of Object.keys(OWN)) for (const sit of Object.keys(EXPECT)) {
+      if (sit === "locked_target" && !isMac) continue;
+      const o = OWN[cap]!, want = EXPECT[sit]![cap]!, row = `${cap} × ${sit}`;
+      const d = desk();
+      fs.mkdirSync(path.join(d.scope, "later"));
+      d.before = tree(d.scope);
+      const folder = path.join(d.scope, o.folder);
+      const real = (fsCjs as any)[o.call];
+      let target = "";
+      const undoLocks = () => {
+        try { if (target && isMac) execFileSync("chflags", ["nouchg", target]); } catch { /* gone */ }
+        try { if (target) fs.chmodSync(target, 0o644); } catch { /* gone */ }
+        fs.chmodSync(folder, 0o755);
+        (fsCjs as any)[o.call] = real; syncBuiltinESMExports();
+      };
+      let r: Awaited<ReturnType<typeof runAndUndo>>;
+      try {
+        r = await runAndUndo(d, [o.step, NEWER], () => {
+          target = o.target(d.scope);
+          if (sit === "readonly_target") fs.chmodSync(target, 0o444);
+          if (sit === "locked_target") execFileSync("chflags", ["uchg", target]);
+          if (sit === "readonly_folder") fs.chmodSync(folder, 0o555);
+          if (sit === "io_error") {
+            // the disk fails as this step is taken back (and only then): nothing a check could have seen
+            (fsCjs as any)[o.call] = (...xs: unknown[]) => {
+              if (xs.some((x) => typeof x === "string" && (x === target || path.basename(x) === path.basename(target)) && !x.includes(".deskmind-undo"))) throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+              return real(...xs);
+            };
+            syncBuiltinESMExports();
+          }
+        });
+      } finally { undoLocks(); }
+      rows.push(row);
+      const resp = r.response;
+      expect(resp, row).toBeTruthy();                                                               // answered: no crash
+      expect(resp.total, row).toBe(2);
+      if (want === "refused") {
+        expect(resp, row).toMatchObject({ undone: 0, refused: expect.stringMatching(/read-only|locked/) });
+        expect(fs.existsSync(path.join(d.scope, "later", "z.txt")), row).toBe(true);              // nothing touched
+      } else if (want === "done") {
+        expect(resp, row).toMatchObject({ undone: 2, refused: null });
+        expect(tree(d.scope), row).toEqual(d.before);
+      } else {
+        // the newer step taken back, this one failed in: said as such, the older ones (none here) untouched
+        expect(resp, row).toMatchObject({ undone: 1, refused: expect.stringContaining("EIO"), unsure: expect.any(String) });
+        expect(resp.refused, row).toContain("may be partly taken back");
+        expect(fs.existsSync(path.join(d.scope, "later", "z.txt")), row).toBe(false);
+      }
+      expect(r.left, row).toEqual([]);                                                              // the exit path ran: copies gone
+    }
+    expect(rows).toHaveLength(isMac ? 20 : 15);
+  }, 120_000);
+
+  it("a case-sensitive volume: another file whose name differs only in case is another file — no false refusal", async () => {
+    if (process.platform !== "darwin") return;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cs-vol-")), img = path.join(tmp, "cs.dmg"), mnt = path.join(tmp, "mnt");
+    try { execFileSync("hdiutil", ["create", "-size", "20m", "-fs", "Case-sensitive APFS", "-volname", "cs", img], { stdio: "ignore" }); fs.mkdirSync(mnt); execFileSync("hdiutil", ["attach", "-nobrowse", "-mountpoint", mnt, img], { stdio: "ignore" }); }
+    catch { return; }   // no disk images here: nothing to test on
+    try {
+      forgetVolumeNames();
+      const d = desk(mnt);
+      fs.writeFileSync(path.join(d.scope, "U2.txt"), "大写的另一个文件");
+      expect(fs.readFileSync(path.join(d.scope, "u2.txt"), "utf-8")).toBe("二");               // two files on this volume
+      d.before = tree(d.scope);
+      // u2.txt trashed, then a newer step changes U2.txt: on this volume two files, so the undo takes both back
+      const r = await runAndUndo(d, [STEP.trash!, { calls: [{ name: "fs_append_line", args: { target: "U2.txt", line: "加" } }] }]);
+      expect(r.response, "case-sensitive").toMatchObject({ undone: 2, total: 2, refused: null });
+      expect(tree(d.scope)).toEqual(d.before);
+    } finally { try { execFileSync("hdiutil", ["detach", mnt, "-force"], { stdio: "ignore" }); } catch { /* left mounted */ } fs.rmSync(tmp, { recursive: true, force: true }); forgetVolumeNames(); }
+  }, 60_000);
 });
 
 describe("REV74 (review of #74, adopted)", () => {

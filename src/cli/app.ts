@@ -526,7 +526,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
         // waking past it would otherwise be carried out (review of #68). Past it, nothing is undone, and that is said
         if (clock.now() >= until) { deadline.abort(); expired(card!.options[a.option]?.kind ?? "other"); continue; }
         const u = await rt.respond({ option: a.option });
-        log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
+        log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused, ...(u.unsure ? { unsure: u.unsure } : {}) } : {}) } as never);
         break;
       }
     } finally { cancel(); o.input.stopsAsLines = false; }

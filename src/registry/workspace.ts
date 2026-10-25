@@ -2,7 +2,8 @@
  * A Workspace is the directory a task may touch. Paths are relative, '/'-separated and compared by exact name.
  * A path's version is its content digest, or "dir:" + a digest of its direct members, or "absent".
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -116,7 +117,10 @@ export class Workspace {
    *  consent and every guard see the file a write would really reach. */
   onDisk(p: string): string {
     const parts = p.split("/").filter(Boolean);
-    const fold = (x: string) => x.normalize("NFC").toLowerCase();
+    // only what this volume ignores is folded: on a case-sensitive volume 「A.txt」 is another file than a.txt
+    const { caseless, formless } = this.names();
+    const fold = (x: string) => { const y = formless ? x.normalize("NFC") : x; return caseless ? y.toLowerCase() : y; };
+    if (!caseless && !formless) return p;
     let dir = this.root;
     const out: string[] = [];
     for (let i = 0; i < parts.length; i += 1) {
@@ -129,6 +133,27 @@ export class Workspace {
       dir = path.join(dir, hit);
     }
     return out.join("/");
+  }
+
+  /** How the volume under the root compares names: does it ignore case, does it ignore the Unicode form (NFC/NFD)?
+   *  Asked of the volume itself, once per volume (a probe file in TMP, looked up under the other spelling). */
+  names(): VolumeNames {
+    let dev: number;
+    try { dev = fs.statSync(this.root).dev; } catch { return defaultNames(); }
+    const known = VOLUME_NAMES.get(dev);
+    if (known) return known;
+    const dir = path.join(this.root, TMP), base = `probe-${randomUUID().slice(0, 8)}-a\u00e9`;
+    let found: VolumeNames;
+    const made = !fs.existsSync(dir);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, base), "");
+      const there = (n: string) => { try { fs.lstatSync(path.join(dir, n)); return true; } catch { return false; } };
+      found = { caseless: there(base.toUpperCase()), formless: there(base.normalize("NFD")) };
+    } catch { found = defaultNames(); }
+    try { fs.rmSync(path.join(dir, base), { force: true }); if (made) fs.rmdirSync(dir); } catch { /* not empty: another run's outputs */ }
+    VOLUME_NAMES.set(dev, found);
+    return found;
   }
 
   /** Forget the cached snapshot (after our own effect or a known external change). */
@@ -233,6 +258,22 @@ export class Workspace {
   at(p: string): string { return this.version(this.onDisk(p)); }
   /** Something is at `p` — a file, a folder, a symlink, listed or not — as the volume sees the name. */
   occupied(p: string): boolean { try { fs.lstatSync(this.abs(p)); return true; } catch { return false; } }
+  /** Why what is at `p` could not be written back now, or null — the permission question an undo asks before it acts
+   *  (review of #74: a file made read-only or locked after the task let undo start and then throw half way):
+   *  - "content": its bytes can be written (replace, append: the file writable, not locked or append-only);
+   *  - "remove": it can be unlinked or renamed away (the entry not locked, its folder accepts the change);
+   *  - "into": a folder that takes an entry in (writable and searchable, not locked).
+   *  Nothing there: null (whether something must be there is untouched's and the capability's question). */
+  writeBlocked(p: string, how: "content" | "remove" | "into"): string | null {
+    const full = this.abs(p), name = p === "" ? "." : p;
+    let st: fs.Stats;
+    try { st = fs.lstatSync(full); } catch { return how === "remove" ? this.writeBlocked(parentRel(p), "into") : null; }
+    if (how === "into" && !st.isDirectory()) return null;
+    if (fileFlags(full) & LOCK_FLAGS) return how === "into" ? `folder ${name} is locked` : `${name} is locked`;
+    if (how === "remove") return this.writeBlocked(parentRel(p), "into");
+    try { fs.accessSync(full, how === "into" ? fs.constants.W_OK | fs.constants.X_OK : fs.constants.W_OK); } catch { return how === "into" ? `folder ${name} is read-only` : `${name} is read-only`; }
+    return null;
+  }
 
   isDir(p: string): boolean {
     return this.version(p).startsWith("dir:");
@@ -283,3 +324,21 @@ export function build(root: string, files: Record<string, string | null>) {
     }
   }
 }
+
+/** How a volume compares names (Workspace.names). */
+export interface VolumeNames { caseless: boolean; formless: boolean }
+const VOLUME_NAMES = new Map<number, VolumeNames>();
+/** When the volume cannot be asked (the folder is read-only): macOS volumes are case- and form-insensitive by default. */
+const defaultNames = (): VolumeNames => ({ caseless: process.platform === "darwin", formless: process.platform === "darwin" });
+/** Test seam: forget what was probed. */
+export const forgetVolumeNames = () => VOLUME_NAMES.clear();
+
+/** The BSD file flags that refuse a write, an unlink or a rename whatever the mode says: the Finder's lock (uchg),
+ *  append-only (uappnd), and their system forms (schg, sappnd). */
+const LOCK_FLAGS = 0x2 | 0x4 | 0x20000 | 0x40000;
+/** A path's BSD flags (st_flags; Node's stat does not carry them), not following a link. 0 where there are none. */
+export function fileFlags(full: string): number {
+  if (process.platform !== "darwin") return 0;
+  try { return Number(execFileSync("/usr/bin/stat", ["-f", "%f", full], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim()) || 0; } catch { return 0; }
+}
+const parentRel = (p: string) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };

@@ -99,6 +99,7 @@ export const fsTransformText = make({
     if (typeof a.text !== "string" || !a.text) return failed("the rewritten text was never produced");
     return wrote(ws, norm(a.destination!), a.text, () => null);
   },
+  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)] }),
   undo: (ws, a, r) => removeOutput(ws, norm(a.destination!), r),
 });
 
@@ -175,6 +176,7 @@ export const fsZipFiles = make({
     const data = writeZip(names.map((n) => ({ name: n, data: n.endsWith("/") ? Buffer.alloc(0) : ws.readBytes(n) })));
     return wrote(ws, dst, data, (file) => zipMatches(ws, file, names), { entries: names.filter((n) => !n.endsWith("/")) });
   },
+  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)] }),
   undo: (ws, a, r) => removeOutput(ws, norm(a.destination!), r),
 });
 
@@ -227,6 +229,7 @@ export const fsConvertToPdf = make({
       return first && !squash(String(info.text ?? "")).includes(first) ? "the PDF does not contain the document's text" : null;
     });
   },
+  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)] }),
   undo: (ws, a, r) => removeOutput(ws, norm(a.destination!), r),
 });
 
@@ -254,6 +257,7 @@ export const fsOcrImage = make({
     if (!lines.length) return failed("no text was found in the image");
     return wrote(ws, norm(a.destination!), lines.join("\n") + "\n", () => null, { lines: lines.length });
   },
+  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)] }),
   undo: (ws, a, r) => removeOutput(ws, norm(a.destination!), r),
 });
 
