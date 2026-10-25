@@ -4,7 +4,7 @@
  */
 import * as fs from "node:fs";
 import { Crash, schemaCheck, type Args, type Capability, type Derivation, type Effect, type ExecResult, type FieldSchema, type Footprint } from "./capability.js";
-import { Workspace } from "./workspace.js";
+import { ABSENT, Workspace } from "./workspace.js";
 
 export const s = (description: string): FieldSchema => ({ type: "string", minLength: 1, description });
 export const p = (description: string): FieldSchema => s(description + "。相对任务目录的路径，'/' 分隔，不能含 '..'");
@@ -12,7 +12,7 @@ export const p = (description: string): FieldSchema => s(description + "。相�
 export const norm = (x: string) => (x.trim() === "." || x.trim() === "./" ? "" : x.trim().replace(/^(\.\/)+/, "").replace(/^\/+|\/+$/g, ""));
 export const join = (parent: string, name: string) => (norm(parent) === "" ? name : `${norm(parent)}/${name}`);
 export const parentOf = (q: string) => (q.includes("/") ? q.slice(0, q.lastIndexOf("/")) : "");
-export const folderOk = (ws: Workspace, d: string) => d === "" || ws.isDir(d);
+export const folderOk = (ws: Workspace, d: string) => d === "" || ws.at(d).startsWith("dir:");
 
 /** Receipt versions: every written path and its parent folder. */
 export function after(ws: Workspace, writes: string[], output: Record<string, unknown> = {}): ExecResult {
@@ -71,9 +71,11 @@ export function make(sp: Spec): Capability {
 export const CRASH_FLAG = { crashAfterEffect: false };     // test hook: die after the effect, before the receipt
 export const maybeCrash = () => { if (CRASH_FLAG.crashAfterEffect) throw new Crash("crash after the effect, before the receipt"); };
 
-/** An undo may only touch paths still exactly as the action left them. */
+/** An undo may only touch paths still exactly as the action left them: what is at each now (Workspace.at: the name as
+ *  the volume resolves it), and where the action left nothing, nothing there at all (Workspace.occupied: a variant of
+ *  the name, a symlink). The one test the check and the undo both ask, on paper or on the disk. */
 export const untouched = (ws: Workspace, r: ExecResult, paths: string[]) => {
-  const moved = paths.filter((q) => q in r.versions_after && ws.version(q) !== r.versions_after[q]);
+  const moved = paths.filter((q) => q in r.versions_after && (r.versions_after[q] === ABSENT ? ws.occupied(q) : ws.at(q) !== r.versions_after[q]));
   return moved.length ? `changed since the action: ${moved.join(", ")}` : null;
 };
 

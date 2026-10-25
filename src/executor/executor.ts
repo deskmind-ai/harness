@@ -17,7 +17,8 @@ import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToke
 import * as P from "../orchestrator/prompts.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
-import { norm, parentOf } from "../registry/spec.js";
+import { norm, parentOf, untouched } from "../registry/spec.js";
+import type { ExecResult } from "../registry/capability.js";
 import { PaperFolder } from "./paper.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -2014,8 +2015,10 @@ export class Executor {
     const paper = files.length ? new PaperFolder(ws!) : null;
     for (const f of files) {
       const before = (p: string) => f.versions_before[p] ?? "absent", left = (p: string) => f.exec.versions_after[p];
-      const moved = f.writes.find((p) => left(p) !== undefined && left(p) !== paper!.version(p));
-      const why = moved !== undefined ? `changed since the action: ${moved}` : f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      // the step's own untouched test (registry/spec.ts), asked of the paper folder: the very predicate its undo asks the
+      // disk — what is at each path as the volume resolves its name, nothing at all where the step left nothing — then
+      // the capability's check, which its undo also asks after untouched
+      const why = untouched(paper!.asWorkspace, { ...f.exec, output: {} } as ExecResult, f.writes) ?? f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
       if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
       paper!.takeBack(f.writes, before, left, f.madeParents);
     }

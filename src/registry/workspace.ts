@@ -62,13 +62,15 @@ export class Workspace {
 
   /** The run whose undo copies this workspace keeps (the executor's task id), so they live in a folder of its own. */
   undoOwner?: string;
-  /** Where this run's undo copies go (made on first use, with its owner record). */
+  private ownerWritten = false;
+  /** Where this run's undo copies go. Its owner record is (re)written by the first use in each process: a restarted
+   *  run's folder names the live process, not the one that died (the sweep would take its copies). */
   undoDir(): string {
     const rel = `${UNDO_DIR}/${(this.undoOwner ?? "_").replace(/[^\w.-]/g, "_")}`;
     const full = this.abs(rel);
-    if (!fs.existsSync(full)) {
-      fs.mkdirSync(full, { recursive: true });
-      try { fs.writeFileSync(path.join(full, "owner.json"), JSON.stringify({ pid: process.pid, run: this.undoOwner ?? null })); } catch { /* swept by age */ }
+    fs.mkdirSync(full, { recursive: true });
+    if (!this.ownerWritten) {
+      try { fs.writeFileSync(path.join(full, "owner.json"), JSON.stringify({ pid: process.pid, run: this.undoOwner ?? null })); this.ownerWritten = true; } catch { /* swept by age */ }
     }
     return rel;
   }
@@ -224,6 +226,13 @@ export class Workspace {
   exists(p: string): boolean {
     return this.version(p) !== ABSENT;
   }
+
+  // --- what an undo asks the disk (one set of questions, for its check and for itself) -----------------------------
+  /** The version of what is at `p` now, the name resolved as the volume resolves it (another case, another Unicode
+   *  form: 「U2.txt」 is at 「u2.txt」 on a case-insensitive volume). ABSENT when nothing listed is there. */
+  at(p: string): string { return this.version(this.onDisk(p)); }
+  /** Something is at `p` — a file, a folder, a symlink, listed or not — as the volume sees the name. */
+  occupied(p: string): boolean { try { fs.lstatSync(this.abs(p)); return true; } catch { return false; } }
 
   isDir(p: string): boolean {
     return this.version(p).startsWith("dir:");

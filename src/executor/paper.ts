@@ -15,8 +15,12 @@ export class PaperFolder {
   /** folder → the names it holds that entries do not list */
   private readonly other = new Map<string, Set<string>>();
 
+  /** What the folder listed when the paper was made: a name in it and no longer in `e` was taken away by the run's own
+   *  steps undone on paper. */
+  private readonly initial: Set<string>;
   constructor(private readonly ws: Workspace) {
     this.e = { ...ws.entries() };
+    this.initial = new Set(Object.keys(this.e));
     for (const d of ["", ...Object.keys(this.e).filter((p) => this.e[p] === "dir")]) {
       const rest = ws.members(d).filter((n) => !((d ? `${d}/${n}` : n) in this.e));
       if (rest.length) this.other.set(d, new Set(rest));
@@ -36,6 +40,26 @@ export class PaperFolder {
     const listed = Object.keys(this.e).filter((x) => parentOf(x) === d).map((x) => (d ? x.slice(d.length + 1) : x));
     return [...listed, ...(this.other.get(d) ?? [])];
   }
+  // --- the undo questions (Workspace.at / occupied), on paper: the run's own steps undone so far are simulated here,
+  // everything else — what other programs did, under any spelling, a symlink — is read from the disk, by the same
+  // name resolution the volume uses
+  private known(p: string): string | null {
+    if (p in this.e) return p;
+    const d = this.ws.onDisk(p);
+    return d in this.e ? d : null;
+  }
+  private vacated(p: string): boolean { return (this.initial.has(p) && !(p in this.e)) || (() => { const d = this.ws.onDisk(p); return this.initial.has(d) && !(d in this.e); })(); }
+  at(p: string): string {
+    if (p === "" || p === ".") return this.version("");
+    const k = this.known(p);
+    if (k !== null) return this.version(k);
+    return this.vacated(p) ? ABSENT : this.ws.at(p);
+  }
+  occupied(p: string): boolean {
+    if (this.known(p) !== null) return true;
+    return this.vacated(p) ? false : this.ws.occupied(p);
+  }
+
   /** A hidden path's place on the real disk (an undo copy, a trashed file: never in the entries, so never moved on
    *  paper): what an undo check reads to see that what it will restore from is there. */
   abs(p: string): string { return this.ws.abs(p); }

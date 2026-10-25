@@ -1255,6 +1255,40 @@ describe("REV74 (review of #74, adopted)", () => {
     expect(copiesIn(d)).toEqual([]);
   });
 
+  it("E: trash u2.txt + newer create, then another program makes U2.txt (case-insensitive volume): refuse as a whole", async () => {
+    const d = desk();
+    const r = start(d, [
+      { calls: [{ name: "fs_trash", args: { target: "u2.txt" } }] },
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+    ], (e, write, input) => {
+      fs.writeFileSync(path.join(d.scope, "U2.txt"), "user's new file");
+      const i = e.result_card?.options.findIndex((x: any) => x.kind === "undo") ?? -1;
+      if (i >= 0) write({ type: "respond", option: i }); else input.end();
+    });
+    await r.run;
+    const resp = r.events.find((e) => e.kind === "result_response") as any;
+    expect(resp.undone).toBe(0);
+  });
+
+  it("E2: a CJK name taken again in its other Unicode form (NFD) after the trash: refused as a whole, nothing taken back", async () => {
+    const d = desk();
+    const name = "가방.txt";                                   // Hangul: its NFD form is another byte string, the same name to the volume
+    fs.writeFileSync(path.join(d.scope, name.normalize("NFC")), "가방");
+    const r = start(d, [
+      { calls: [{ name: "fs_trash", args: { target: name } }] },
+      { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+    ], (e, write, input) => {
+      fs.writeFileSync(path.join(d.scope, name.normalize("NFD")), "another program's");
+      const i = e.result_card?.options.findIndex((x: any) => x.kind === "undo") ?? -1;
+      if (i >= 0) write({ type: "respond", option: i }); else input.end();
+    });
+    await r.run;
+    const resp = r.events.find((e) => e.kind === "result_response") as any;
+    expect(resp.undone).toBe(0);
+    expect(resp.refused).toBeTruthy();
+    expect(fs.existsSync(path.join(d.scope, "a.txt"))).toBe(true);
+  });
+
   it("D: trash a file whose name is 250 bytes (worked on main)", async () => {
     const d = desk();
     const name = "长".repeat(81) + ".txt";   // 244 bytes
@@ -1320,16 +1354,24 @@ describe("file undo: every exit path of the executor discards its own copies; th
 describe("file undo: a capability's check refuses whenever its undo would (never half way)", () => {
   const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   it("random file steps, then another program interferes at random: undo takes back all of it or none of it", async () => {
-    for (let seed = 101; seed < 125; seed++) {
+    const INTERFERE = ["none", "rm_notes", "retake_trashed", "retake_trashed_case", "retake_trashed_nfd", "symlink_trashed", "edit_a_file", "drop_copies", "rename_case"];
+    for (let seed = 101; seed < 155; seed++) {
       const rand = rng(seed);
       const pick = <X,>(xs: X[]) => xs[Math.floor(rand() * xs.length)]!;
       const d = desk();
-      const files = new Set(["notes/u1.txt", "u2.txt"]);
+      // a CJK name too, whose NFD form is another byte string the volume takes for the same name
+      fs.writeFileSync(path.join(d.scope, "가방.txt"), "가방");
+      d.before = tree(d.scope);
+      const files = new Set(["notes/u1.txt", "u2.txt", "가방.txt"]);
       let n = 0;
-      const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "整理", objects: ["path:notes/u1.txt", "path:u2.txt"], consequence: "modify_user" }] } }] }];
+      const steps: Step[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "整理", objects: ["path:notes/u1.txt", "path:u2.txt", "path:가방.txt"], consequence: "modify_user" }] } }] }];
       const ops: string[] = [];
+      // every interference in turn; one that takes a trashed path again gets a trash first and a newer step after it
+      // (the case a check blind to it undoes half way)
+      const interfere = INTERFERE[seed % INTERFERE.length]!;
+      const trashFirst = interfere.startsWith("retake") || interfere === "symlink_trashed";
       for (let i = 0; i < 2 + Math.floor(rand() * 4); i++) {
-        const op = files.size ? pick(["create", "move", "append", "replace", "trash"]) : "create";
+        const op = trashFirst && i === 0 ? "trash" : files.size ? pick(["create", "move", "append", "replace", "trash"]) : "create";
         ops.push(op);
         if (op === "create") { const p = `n${n++}.txt`; files.add(p); steps.push({ calls: [{ name: "fs_create_text", args: { parent: ".", name: p, text: `t${i}` } }] }); }
         else if (op === "move") { const src = pick([...files]); const dst = `m${n++}.txt`; files.delete(src); files.add(dst); steps.push({ calls: [{ name: "fs_move", args: { source: src, destination: dst } }] }); }
@@ -1338,7 +1380,6 @@ describe("file undo: a capability's check refuses whenever its undo would (never
         else { const f = pick([...files]); files.delete(f); steps.push({ calls: [{ name: "fs_trash", args: { target: f } }] }); }
       }
       // another program, between the task's end and the undo
-      const interfere = pick(["none", "rm_notes", "retake_trashed", "symlink_trashed", "edit_a_file", "drop_copies"]);
       const r = runTask(d, steps, "succeeded", { undo: true });
       // (runTask answers the undo at task_done; interfere in the same tick, before the respond is read)
       const orig = r.events.push.bind(r.events);
@@ -1347,6 +1388,10 @@ describe("file undo: a capability's check refuses whenever its undo would (never
         try {
           if (interfere === "rm_notes" && fs.existsSync(path.join(d.scope, "notes")) && fs.readdirSync(path.join(d.scope, "notes")).length === 0) fs.rmdirSync(path.join(d.scope, "notes"));
           if (interfere === "retake_trashed" && trashed[0] && fs.existsSync(path.dirname(path.join(d.scope, trashed[0])))) fs.writeFileSync(path.join(d.scope, trashed[0]), "又放回来一个");
+          // the same place under another spelling the volume takes for it: upper case; a CJK name's other Unicode form
+          if (interfere === "retake_trashed_case" && trashed[0] && fs.existsSync(path.dirname(path.join(d.scope, trashed[0])))) fs.writeFileSync(path.join(d.scope, path.dirname(trashed[0]), path.basename(trashed[0]).toUpperCase()), "大写的");
+          if (interfere === "retake_trashed_nfd" && trashed[0] && fs.existsSync(path.dirname(path.join(d.scope, trashed[0])))) fs.writeFileSync(path.join(d.scope, path.dirname(trashed[0]), path.basename(trashed[0]).normalize("NFD")), "另一种写法");
+          if (interfere === "rename_case") { const f = [...files].find((p) => fs.existsSync(path.join(d.scope, p))); if (f) fs.renameSync(path.join(d.scope, f), path.join(d.scope, path.dirname(f), path.basename(f).toUpperCase())); }
           if (interfere === "symlink_trashed" && trashed[0] && fs.existsSync(path.dirname(path.join(d.scope, trashed[0])))) fs.symlinkSync("/nonexistent", path.join(d.scope, trashed[0]));
           if (interfere === "edit_a_file") { const f = [...files].find((p) => fs.existsSync(path.join(d.scope, p))); if (f) fs.appendFileSync(path.join(d.scope, f), "别人加的"); }
           if (interfere === "drop_copies") fs.rmSync(path.join(d.scope, ".deskmind-undo"), { recursive: true, force: true });
@@ -1360,4 +1405,19 @@ describe("file undo: a capability's check refuses whenever its undo would (never
       if (resp.undone === resp.total) expect(resp.refused, ctx).toBeNull();
     }
   }, 60_000);
+});
+
+describe("file undo: a restarted run's copy folder names the live process", () => {
+  it("the first use in a process rewrites owner.json (a folder left by the run's dead process is not swept from under it)", () => {
+    const d = desk();
+    const dir = path.join(d.scope, ".deskmind-undo", "run_again");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: 2 ** 22 + 4321, run: "run_again" }));
+    const ws = new Workspace(d.scope);
+    ws.undoOwner = "run_again";
+    ws.undoDir();
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf-8")).pid).toBe(process.pid);
+    new Workspace(d.scope).sweepUndo({ except: "someone_else" });
+    expect(fs.existsSync(dir)).toBe(true);
+  });
 });

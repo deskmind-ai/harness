@@ -36,6 +36,10 @@ const copyProblem = (ws: Workspace, u: Record<string, unknown> | undefined): str
   return sha(fs.readFileSync(full)) === u.version ? null : "the copy kept for undo does not match the file as it was";
 };
 
+/** Why replace_text's undo would refuse beyond "the file changed since" (which untouched asks, along the chain, with the
+ *  same questions): its check, and its undo after untouched. */
+const replaceBlocked = (ws: Workspace, _a: Record<string, string>, r: ExecResult) => copyProblem(ws, r.undo);
+
 export const fsReplaceText = make({
   id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true,
   // undo has its copy, but overwriting stays a step not taken on a guess (docs/ask-policy.md): policy unchanged
@@ -45,10 +49,10 @@ export const fsReplaceText = make({
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
   prep: (ws, a) => keepCopy(ws, norm(a.target!)),
   run: (ws, a) => { const q = norm(a.target!); fs.writeFileSync(ws.abs(q), a.text!, "utf-8"); maybeCrash(); return after(ws, [q]); },
-  check: (ws, a, r) => copyProblem(ws, r.undo),
+  check: (ws, a, r) => replaceBlocked(ws, a, r),
   undo: (ws, a, r) => {
     const q = norm(a.target!);
-    const e = untouched(ws, r, [q]) ?? copyProblem(ws, r.undo);
+    const e = untouched(ws, r, [q]) ?? replaceBlocked(ws, a, r);
     if (e) return e;
     fs.copyFileSync(ws.abs(String(r.undo!.backup)), ws.abs(q));
     try { fs.rmSync(ws.abs(String(r.undo!.backup)), { force: true }); } catch { /* swept later */ }
@@ -57,6 +61,7 @@ export const fsReplaceText = make({
 });
 
 const appended = (old: string, line: string) => old + (old === "" || old.endsWith("\n") ? "" : "\n") + line + "\n";
+const appendBlocked = (_ws: Workspace, _a: Record<string, string>, r: ExecResult) => (typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : null);
 export const fsAppendLine = make({
   id: "fs.append_line", description: "在一个已有文本文件的末尾追加一行。", effect: "update",
   fields: { target: p("要追加的文件"), line: s("追加的那一行文字，不含换行符") }, pathFields: ["target"],
@@ -64,10 +69,16 @@ export const fsAppendLine = make({
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
   run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
   prep: (ws, a) => ({ bytes: Buffer.byteLength(ws.read(norm(a.target!)), "utf-8") }),
-  check: (_ws, _a, r) => typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : null,
-  undo: (ws, a, r) => { const q = norm(a.target!); const e = typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : untouched(ws, r, [q]); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
+  check: (ws, a, r) => appendBlocked(ws, a, r),
+  undo: (ws, a, r) => { const q = norm(a.target!); const e = untouched(ws, r, [q]) ?? appendBlocked(ws, a, r); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
 });
 
+/** Why move's undo would refuse beyond untouched (the source's place taken under any spelling, the destination
+ *  changed: asked along the chain): the source's folder gone. One predicate for its check and itself. */
+const moveBlocked = (ws: Workspace, a: Record<string, string>, _r: ExecResult) => {
+  const src = norm(a.source!);
+  return folderOk(ws, parentOf(src)) ? null : `folder ${parentOf(src)} is gone`;
+};
 export const fsMove = make({
   id: "fs.move", description: "移动或重命名一个文件或文件夹；目标位置已存在时失败。", effect: "update",
   fields: { source: p("要移动的文件或文件夹"), destination: p("新的完整路径（含新文件名）") }, pathFields: ["source", "destination"],
@@ -81,11 +92,10 @@ export const fsMove = make({
     if (fs.existsSync(ws.abs(dst)) && !sameFile(ws.abs(src), ws.abs(dst))) return { status: "error", why: `${dst} already exists`, output: {}, versions_after: {}, performed: false };
     fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]);
   },
-  check: (ws, a) => (folderOk(ws, parentOf(norm(a.source!))) ? null : `folder ${parentOf(norm(a.source!))} is gone`),
+  check: (ws, a, r) => moveBlocked(ws, a, r),
   undo: (ws, a, r) => {
     const src = norm(a.source!), dst = norm(a.destination!);
-    const e = untouched(ws, r, [src, dst]); if (e) return e;
-    if (!folderOk(ws, parentOf(src))) return `folder ${parentOf(src)} is gone`;
+    const e = untouched(ws, r, [src, dst]) ?? moveBlocked(ws, a, r); if (e) return e;
     fs.renameSync(ws.abs(dst), ws.abs(src)); return null;
   },
 });
@@ -162,25 +172,23 @@ export const fsTrash = make({
   // check refuses on every condition undo refuses on (review of #74: it checked only the trashed file, so later steps
   // were undone first and the undo stopped half way). It runs on undo's paper folder: the path and its folder as
   // they will be when this step's undo runs; a symlink at the path (never in the entries) from the real disk
-  check: (ws, a, r) => backProblem(ws, norm(a.target!), r.undo, "paper"),
+  check: (ws, a, r) => trashBlocked(ws, a, r),
   undo: (ws, a, r) => {
     const q = norm(a.target!);
-    const e = untouched(ws, r, [q]) ?? backProblem(ws, q, r.undo, "disk");
+    const e = untouched(ws, r, [q]) ?? trashBlocked(ws, a, r);
     if (e) return e;
     fs.renameSync(ws.abs(String(r.undo!.trashed)), ws.abs(q));
     try { fs.rmdirSync(path.dirname(ws.abs(String(r.undo!.trashed)))); } catch { /* not ours to keep empty */ }
     return null;
   },
 });
-/** Why the trashed file cannot go back to `q` now: what was recorded, the trashed file itself, `q` taken (on the
- *  paper folder or the disk; a symlink there, which no entry lists, from the disk in either), its folder gone. */
-const backProblem = (ws: Workspace, q: string, u: Record<string, unknown> | undefined, where: "paper" | "disk"): string | null => {
-  const t = trashedProblem(ws, u);
-  if (t) return t;
-  let taken = ws.exists(q);
-  if (!taken) { try { const st = fs.lstatSync(ws.abs(q)); taken = where === "disk" || st.isSymbolicLink(); } catch { /* nothing there */ } }
-  if (taken) return `${q} exists again`;
-  return folderOk(ws, parentOf(q)) ? null : `folder ${parentOf(q)} is gone`;
+/** Why trash's undo would refuse beyond untouched — the place taken again under any spelling, or a symlink there, which
+ *  untouched asks (what the step left was nothing, so anything there blocks it) along the chain, with the questions its
+ *  undo asks the disk: the trashed file gone or changed, the folder it goes back into gone. One predicate for its
+ *  check (on paper) and itself (on the disk). */
+const trashBlocked = (ws: Workspace, a: Record<string, string>, r: ExecResult): string | null => {
+  const q = norm(a.target!);
+  return trashedProblem(ws, r.undo) ?? (folderOk(ws, parentOf(q)) ? null : `folder ${parentOf(q)} is gone`);
 };
 const trashedProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
   if (!u || typeof u.trashed !== "string" || typeof u.version !== "string") return "where the file was put is not recorded";
