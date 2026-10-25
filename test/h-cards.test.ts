@@ -84,7 +84,7 @@ class MailDesk implements Driver {
   observe(id: string) { const w = this.wins.find((x) => x.info.id === id)!; return { epoch: this.epoch, window: w.info, modal: null, elements: w.elements, text: "" }; }
   perform(action: Action) {
     this.epoch += 1;
-    if (action.kind === "open_window" && this.opened) { const m = this.mail(); this.wins.push(m); return { status: "ok" as const, window: m.info.id, opened_window: m.info }; }
+    if (action.kind === "open_window" && this.opened) { const m = this.mail(); this.wins.push(m); return { status: "ok" as const, window: m.info.id, opened_window: { ...m.info, bundle: m.info.app, was_running: false } }; }   // (hands' contract: was_running false)
     return { status: "ok" as const, window: "window" in action ? action.window : undefined };
   }
 }

@@ -13,7 +13,7 @@
  *   end       collect the receipts
  */
 import type { ActionCardFacts, Beyond } from "../protocol/cards.js";
-import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, SaveSheet, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
 import { POLICY, type TaskOpenedPolicy } from "../orchestrator/index.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
@@ -1162,7 +1162,10 @@ export class Executor {
     // content is theirs, undo leaves it open, and closing it may lose their state — and cmd+q takes the app's other
     // windows with it, the user's included (review of #75, A)
     const k = a.kind === "key" ? chord(a.chord) : null;
-    const closeButton = a.kind === "click" && !!this.lastObs.get(a.window)?.elements.find((e) => e.id === a.target && /close/i.test(e.role));
+    // a close button by its AX subrole (hands#70, K1: from the window's own buttons, never from a label), or a role that
+    // says close
+    // pressing a close button (any way of pressing it: pressesClose), on the caller's look
+    const closeButton = "window" in a && pressesClose(a, this.lastObs.get(a.window));
     const closes = a.kind === "close_window" || closeButton || (!!k && k.cmd && k.key === "w" && !k.shift);
     const quits = !!k && k.cmd && (k.key === "q" || (k.key === "w" && k.shift));
     const undoes = !!k && k.cmd && k.key === "z";
@@ -1179,10 +1182,57 @@ export class Executor {
     }
     if (closes) return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
     if (undoes) return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "undoes a change in a window DeskMind opened: the user's own edits may go" : "undoes a change in the user's window" } : { consequence: "create", object, why: "undoes a change in the task's own window" };
+    // a save sheet open on the window (hands#70, K1): a step that can commit it saves where the sheet says — over a file
+    // that is there (its stem in that folder, or the path itself), into an alert inside the sheet (the "already exists"
+    // one: 替换), or where the sheet could not be read: the user's file, whoever's window it is. A floor of structure,
+    // read before any judge is asked (a judge's "stays" never lowers it)
+    const sheetRisk = "window" in a ? this.sheetFloor(a, this.lastObs.get(a.window)) : null;
+    if (sheetRisk) return { consequence: "modify_user", object, why: sheetRisk };
     // under POLICY.taskOpened "task" a step inside such a window is the task's own (M3–M6 plan §1.2): the judge's
     //「会删掉或改掉用户已有的内容」(classify) and the intent check (act) stand where the card stood
     if (owner === "user" && this.relaxed(object)) return { consequence: "create", object, why: "acts in a window DeskMind opened for the user's app; its content is theirs, so the judge checks the step deletes or changes none of it", opened: true };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
+  }
+
+  /** The floors that rest on live facts — what a look shows (the element pressed, an open save sheet) and what the disk
+   *  holds (a file of the sheet's name) — worked out from `look` and the disk now. act asks it after its last look and
+   *  takes the higher of it and whatever was classified before: a cached class (classify keys on the screen, not on the
+   *  disk) or an earlier look never lowers it (Codex review of #78: a file that appeared after classify; a sheet whose
+   *  folder changed by the final look; a double-click on a close button). null: no floor beyond the class. */
+  floorsNow(a: Action, look: Observation | undefined): { consequence: Consequence; why: string } | null {
+    if (!("window" in a) || !look) return null;
+    const object = `window:${a.window}`;
+    if (pressesClose(a, look) && this.ledger.ownerOf(object) === "user") return { consequence: "modify_user", why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" };
+    const risk = this.sheetFloor(a, look);
+    return risk ? { consequence: "modify_user", why: risk } : null;
+  }
+  /** The save-sheet floor of `a` on `look`: why committing its sheet may write over a file, or null. */
+  private sheetFloor(a: Action, look: Observation | undefined): string | null {
+    const sheet = look?.save_sheet;
+    return sheet && commits(a) ? this.sheetRisk(sheet) : null;
+  }
+
+  /** Why committing this save sheet may write over a file that is there (null: a new name in a folder read whole):
+   *  an alert inside it; a sheet not read whole or any fact unknown; its path a file of the user's in the task folder;
+   *  a file of its stem (any extension: the panel may add or hide one) in its folder; that folder unreadable. */
+  private sheetRisk(sheet: SaveSheet): string | null {
+    if (sheet.nested_sheet === true) return "the save sheet has an alert open in it (a file of that name exists: replacing it)";
+    if (sheet.read !== true || !sheet.name || !sheet.stem || !sheet.folder || sheet.nested_sheet !== false) return "the save sheet could not be read whole: where it saves, and over what, is not known";
+    // (a folder that is not an absolute path names no place this side can read: it would be read against our own cwd)
+    if (!path.isAbsolute(sheet.folder)) return "the save sheet's folder is not an absolute path: where it saves is not known";
+    const ws = this.opts.files?.workspace;
+    if (ws && sheet.path) {
+      const rel = path.relative(ws.root, sheet.path);
+      if (!rel.startsWith("..") && !path.isAbsolute(rel) && this.ledger.ownerOf(`path:${rel.split(path.sep).join("/")}`) === "user" && fs.existsSync(sheet.path)) return `saves over ${rel}, a file of the user's`;
+    }
+    let names: string[];
+    try { names = fs.readdirSync(sheet.folder); } catch { return "the folder the save sheet saves into could not be read"; }
+    const fold = (x: string) => x.normalize("NFC").toLowerCase();
+    const stemOf = (n: string) => { const e = path.extname(n); return e && e !== n ? n.slice(0, -e.length) : n; };
+    // a file of that stem, or the name as shown, or the name with an extension the panel hides (report.v2 shown for
+    // report.v2.pages, a.tar for a.tar.gz: hands' stem then stops at the shown dot)
+    const same = names.filter((n) => fold(stemOf(n)) === fold(sheet.stem!) || fold(n) === fold(sheet.name!) || fold(n).startsWith(fold(sheet.name!) + "."));
+    return same.length ? `a file named ${sheet.stem} is already in that folder (${same.slice(0, 3).join(", ")}): saving may replace it` : null;
   }
 
   /** The app the model names in an open_window, as the computer knows it: the windows on screen it matches, by every
@@ -1466,8 +1516,7 @@ export class Executor {
   private card(a: Action, decided: Observation | undefined, consequence: Consequence, look: Observation | undefined = decided): { sending: ReturnType<typeof outgoing> | null; typed: string[]; content: SendBinding | undefined; text: string; act: Action; lost: boolean; facts: ActionCardFacts } {
     // the target as the caller decided it (its ids are those of `decided`), found in `look` — what is there now
     const id = "target" in a && a.target ? a.target : null;
-    const el = id && decided && look ? resolve(decided, id, look) : undefined;
-    const act = el && el.id !== id ? ({ ...a, target: el.id } as Action) : a;
+    const { act, el } = mapOnto(a, decided, look);
     const sending = consequence === "external" ? outgoing(look) : null;
     const typed = sending ? this.typedIn(a).filter((t) => t.trim()) : [];
     const typedLines = typed.filter((t) => !sending!.fields.some((l) => l.includes(t.trim())));
@@ -1599,9 +1648,9 @@ export class Executor {
     const latest = target ? this.looks.get(target) ?? obs : undefined;
     let act: Action = req.action;
     if (obs && latest && "target" in req.action && req.action.target) {
-      const el = resolve(obs, req.action.target, latest);
-      if (!el) return done({ ...base, status: "stale", why: `element ${req.action.target} cannot be found for certain in what ${target} shows now (gone, or not one of a kind); observe it again`, epoch: now.epoch });
-      if (el.id !== req.action.target) act = { ...req.action, target: el.id } as Action;
+      const m = mapOnto(req.action, obs, latest);
+      if (m.lost) return done({ ...base, status: "stale", why: `element ${req.action.target} cannot be found for certain in what ${target} shows now (gone, or not one of a kind); observe it again`, epoch: now.epoch });
+      act = m.act;
     }
     if (obs && latest && latest !== obs && (req.action.kind === "key" || req.action.kind === "type")) {
       const f1 = obs.elements.find((e) => e.focused), f2 = latest.elements.find((e) => e.focused);
@@ -1610,7 +1659,12 @@ export class Executor {
     // the class, settled here and never taken from the caller: structure, the model's class, and the judge's "will this
     // send something out?" (only raises; cached, so a preview's or a classify call's answer is the same one)
     const asked = this.classified.size;
-    const c = await this.classify(req.action, req.epoch, req.consequence);
+    const c0 = await this.classify(req.action, req.epoch, req.consequence);
+    // the live floors on the latest look and the disk now, never lowered by a class cached earlier (Codex review of #78)
+    // (the action as mapped onto the look it is judged against: the ids of that look — mapOnto, as the driver gets it)
+    const liveFloor = this.floorsNow(act, latest ?? obs);
+    const c = liveFloor && rank(liveFloor.consequence) > rank(c0.consequence) ? { ...c0, consequence: liveFloor.consequence, why: liveFloor.why, by: "structure" as const, opened: undefined } : c0;
+    if (c !== c0) this.emit("executor.floor_raised", { action: req.action, from: c0.consequence, to: c.consequence, why: liveFloor!.why });
     consequence = c.consequence; base = { consequence, object: c.object };
     // stopped while the judges were asked: the step ends here (no further judge, no card)
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
@@ -1718,7 +1772,10 @@ export class Executor {
     // a step cleared in a window DeskMind opened is looked at again too: the facts the clearance rested on — the target's
     // content (empty, or the task's own), the focus — must hold at the moment of acting; a sync that filled the field
     // meanwhile moves no epoch (Codex review of #75, P1-2)
-    if (target && obs && (this.mightSend(req.action) || consequence === "external" || c.opened)) {
+    // and whenever a floor of live facts could hold for it: a sheet open on the window, a close button pressed — the floors
+    // are worked out again on that look, right before the effect
+    const floorsLive = !!target && !!obs && (!!(this.looks.get(target) ?? obs)?.save_sheet || pressesClose(req.action, this.looks.get(target) ?? obs));
+    if (target && obs && (this.mightSend(req.action) || consequence === "external" || c.opened || floorsLive)) {
       let fresh: Observation;
       try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
       // why it moved: from a snapshot taken now (the look itself carries no reason). Taking it may move the epoch again,
@@ -1757,6 +1814,20 @@ export class Executor {
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+    }
+    // the floors one last time, on the action as the driver will get it (mapped onto the window's latest look — the final
+    // look when one was taken) and the disk read now. Nothing awaits from here to the driver call: a check followed by a
+    // wait would be a check of the past (Codex review of #78, round 2). A floor above what was decided or consented is a
+    // step not covered: nothing is done, the caller looks again (and asks, when it must). (A file another program writes
+    // in the moment between this read and the click itself cannot be ruled out here: the system's own "replace?" sheet —
+    // the nested_sheet floor on the next step — is the backstop.)
+    {
+      const lookNow = (target ? this.looks.get(target) : undefined) ?? obs;
+      const floorNow = this.floorsNow(act, lookNow);
+      if (floorNow && rank(floorNow.consequence) > rank(consequence)) {
+        this.emit("executor.floor_raised", { action: act, from: consequence, to: floorNow.consequence, why: floorNow.why, last: true });
+        return done({ ...base, status: "stale", why: `${target ?? "the window"} changed right before acting (now: ${floorNow.why}); observe it again and decide anew`, epoch: this.epoch });
+      }
     }
     const before = "window" in req.action ? this.lastObs.get(req.action.window) ?? null : null;
     // a real driver can fail on either side of the action: that is a result the model reads, never an exception
@@ -1851,8 +1922,10 @@ export class Executor {
     // only a launch without a url, of an app that is not a browser (hands reports it only so; checked here too), and only
     // of an app no window of which this task has seen: the user's Mail quit mid-task and relaunched by the task comes back
     // with their mailbox under a new window id (review of #75, B)
-    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && !this.ledger.seenApp(r.opened_window) ? r.opened_window.id : undefined;
-    if (req.action.kind === "open_window" && r.opened_window && !broughtUp) this.emit("executor.window_not_opened", { id: r.opened_window.id, why: req.action.url ? "a url launch" : r.opened_window.browser ? "a browser" : "a window of this app was seen in this task" });
+    // and only on hands' proof the app was not running (hands#70: was_running false — one read of the running apps at the
+    // launch); without it (an older hands) the window is plainly the user's: fail closed
+    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && r.opened_window.was_running === false && !this.ledger.seenApp(r.opened_window) ? r.opened_window.id : undefined;
+    if (req.action.kind === "open_window" && r.opened_window && !broughtUp) this.emit("executor.window_not_opened", { id: r.opened_window.id, why: req.action.url ? "a url launch" : r.opened_window.browser ? "a browser" : r.opened_window.was_running !== false ? "no proof the app was not running (was_running)" : "a window of this app was seen in this task" });
     if (fresh(broughtUp)) { this.taskOpened.add(broughtUp); this.openedForUser.set(this.receipts.length + 1, { id: broughtUp, app: appName(r.opened_window!) }); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
     // credited to it once the window is read back (its name there is the evidence), not found later as "changed by
@@ -2404,6 +2477,30 @@ export function shortUrl(u: string, lang?: Lang): string {
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
+/** `a` as the driver gets it on `look`: its target (named by an id of `decided`, the observation it was decided on)
+ *  found in `look` by what it is and where — exactly one, or `lost`. The one mapping, used for the card, the floors and
+ *  the effect alike (Codex review of #78, round 2: floors read an old id that the final look had renumbered). */
+function mapOnto(a: Action, decided: Observation | undefined, look: Observation | undefined): { act: Action; el: Element | undefined; lost: boolean } {
+  const id = "target" in a && a.target ? a.target : null;
+  if (!id) return { act: a, el: undefined, lost: false };
+  const el = (decided && look ? resolve(decided, id, look) : undefined) ?? undefined;
+  return { act: el && el.id !== id ? ({ ...a, target: el.id } as Action) : a, el, lost: !el };
+}
+
+/** Whether `a` presses a close button on `look` (its AX subrole AXCloseButton, hands#70; or a role that says close):
+ *  a click or double-click on it, or Space / Return on it focused — every way of pressing it, not one action name. */
+function pressesClose(a: Action, look: Observation | undefined): boolean {
+  if (!look) return false;
+  const isClose = (e: Element | undefined) => !!e && (e.ax_subrole === "AXCloseButton" || /close/i.test(e.role));
+  if ((a.kind === "click" || a.kind === "double_click") && isClose(look.elements.find((e) => e.id === a.target))) return true;
+  if (a.kind === "key") { const k = chord(a.chord); if (!k.cmd && (k.key === "space" || k.key === "return" || k.key === "enter") && isClose(look.elements.find((e) => e.focused))) return true; }
+  return false;
+}
+
+/** A step that can commit an open sheet: a click, a double-click, a key (Return), a menu choice, typed text with a
+ *  newline in it (Return typed). Typing a name into it or scrolling does not. */
+const commits = (a: Action): boolean => a.kind === "click" || a.kind === "double_click" || a.kind === "key" || a.kind === "select" || (a.kind === "type" && /[\r\n]/.test(a.text));
+
 /** A file action in the user's words (H3): the capability's own sentence in their language (Capability.human) — never
  *  its field names (`text=「↵」`, rc.16) nor the model-facing description. One without a sentence of its own (a
  *  capability from elsewhere) is named by its id and its values, quoted. */
