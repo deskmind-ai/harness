@@ -118,7 +118,9 @@ export const EventBody = z.discriminatedUnion("kind", [
   // the result card's undo window ended by this process's clock (M2 H2, additive): from here every respond it still
   // reads is answered "expired" (result_response, nothing undone); the session stops forwarding and ends its stdin
   z.object({ kind: z.literal("result_card_closed"), why: z.enum(["expired"]) }),
-  z.object({ kind: z.literal("result_response"), picked: z.string().nullable(), text: z.string().optional(), effect: z.string(), undone: z.number().int().optional(), total: z.number().int().optional(), refused: z.string().nullable().optional() }),
+  z.object({ kind: z.literal("result_response"), picked: z.string().nullable(), text: z.string().optional(), effect: z.string(), undone: z.number().int().optional(), total: z.number().int().optional(), refused: z.string().nullable().optional(),
+    // the step an undo failed in, unforeseen (an I/O error): perhaps partly taken back; the steps after it in the undo untouched
+    unsure: z.string().optional() }),
 ]);
 export type EventBody = z.infer<typeof EventBody>;
 

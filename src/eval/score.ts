@@ -55,7 +55,7 @@ export interface Summary { status: string; reason?: string | null; counters: Rec
 export interface Talk { clarify: number; authorize: number; askedBeforeFirstWrite: boolean; wrote: boolean; clarified?: boolean; declinedPlan?: boolean; cancelled?: boolean; plans?: number }
 
 type Tree = Record<string, string | null>;
-const norm = (t: Tree): Tree => Object.fromEntries(Object.entries(t).filter(([k]) => !k.startsWith(".deskmind-trash")).map(([k, v]) => [k, v === null ? null : v.replace(/\n+$/, "")]));
+const norm = (t: Tree): Tree => Object.fromEntries(Object.entries(t).filter(([k]) => !k.startsWith(".deskmind-trash") && !k.startsWith(".deskmind-undo")).map(([k, v]) => [k, v === null ? null : v.replace(/\n+$/, "")]));
 const get = (t: Tree, k: string) => (k in t ? t[k] : "<absent>");
 const diffOf = (a: Tree, b: Tree) => [...new Set([...Object.keys(a), ...Object.keys(b)])].filter((p) => get(a, p) !== get(b, p)).sort();
 

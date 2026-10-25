@@ -346,6 +346,9 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
   };
 }
 
+/** What a run id may be: it names folders. */
+export const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
 /** `signals` (the CLI only): SIGINT / SIGTERM stop the run through the same one-time stop as a stop line. When the
  *  run has not ended `deadlineMs` after the signal: if an action is still out at the driver (it may land after a stop),
  *  wait up to `waitMs` more for its receipt; then write task_done (stopped) — with the action under
@@ -354,6 +357,9 @@ export function traceWriter(file: string): (kind: string, body: Record<string, u
 export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent) => void; input: LineReader; linger: number;
   signals?: { onSignal: (h: (sig: string) => void) => void; exit: () => void; exitNow: () => void; deadlineMs?: number; waitMs?: number };
   inject?: { driver?: Driver; gateway?: Gateway; model?: RuntimeOptions["model"]; agent?: AgentSpec["model"]; cardExpiryMs?: number; clock?: Clock } }) {
+  // a run id names folders (the run's events, its undo copies): letters, digits, _ and - only, never "." or ".." —
+  // checked here as well as at the CLI (review of #74, Codex: run_id ".." made the undo folder the task folder)
+  if (req.run_id !== undefined && !RUN_ID.test(String(req.run_id))) throw new Error(`run_id must match ${RUN_ID}`);
   const runId = req.run_id ?? `run_${randomUUID().slice(0, 8)}`;
   const log = new EventLog(path.join(o.runs, runId, "events.jsonl"), runId, o.out);
   const config = req.config ?? "ds-flash";   // the app's default: DeepSeek; the yy gateway is for in-house testing
@@ -381,6 +387,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   };
   const signer = ConsentSigner.fresh();
   const ws = req.scope ? new Workspace(req.scope) : undefined;
+  // undo copies: this run's in a folder of its own; a run killed before any exit path ran left its folder behind —
+  // swept now, by its owner process being gone
+  if (ws) { ws.undoOwner = runId; ws.sweepTemp({ except: runId }); }   // dead runs' undo copies, old tool outputs, a dead process's volume probe
   // one task_done per run, and it is the last running event: what the runtime or an action still out at the driver says
   // after it (a stop's deadline wrote it) is in the trace only. The words of a steer that came too late are still said
   let done = false;
@@ -448,8 +457,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
   o.signals?.onSignal((sig) => {
     const sg = o.signals!;
-    if (done) return sg.exit();
-    if (++signals > 1) { forceDone(); return sg.exitNow(); }
+    // (after task_done: the card's wait is cut by the signal — a new task ending a lingering one — so the window closes)
+    if (done) { executor.discardUndoCopies(); return sg.exit(); }
+    if (++signals > 1) { forceDone(); executor.discardUndoCopies(); return sg.exitNow(); }
     o.input.stop(`stopped by ${sig}`, sig === "SIGINT" ? "user_stopped" : undefined);
     void (async () => {
       await sleep(sg.deadlineMs ?? 800);
@@ -458,7 +468,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
         // the receipt came: the runtime writes its own task_done a moment later
         if (!executor.inFlight) await Promise.race([whenDone, sleep(500)]);
       }
-      forceDone(); sg.exit();
+      forceDone(); executor.discardUndoCopies(); sg.exit();
     })();
   });
   const r = await within({ onModelCall, tracer, span: root }, () => rt.run());
@@ -478,7 +488,9 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   // the card waits from the moment task_done says so: from here a stop closes it (armed before task_done is written)
   if (lingers) o.input.stopsAsLines = true;
   taskDone({ kind: "task_done", status: r.status, reason: r.reason, ...(r.cause ? { cause: r.cause } : {}), summary: r.summary, result_card: card as never, ...undoUntil, answer: r.answer, changes: executor.changes(), usage, ...(rt.usageIncomplete ? { usage_incomplete: true } : {}) } as never);
-  if (signals) return o.signals!.exit();
+  // the undo window closes when this process stops waiting for the card: its undo copies go then (an undo restored and
+  // removed its own already)
+  if (signals) { executor.discardUndoCopies(); return o.signals!.exit(); }
   // Any other line in that time (a late answer to a card that is gone, a line that is not JSON) is passed over and the
   // wait goes on: only a respond, the app closing stdin (or stopping), or the deadline ends it (deskmind S0: undo was
   // dead when the first line after task_done was not the respond)
@@ -520,11 +532,12 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
         // waking past it would otherwise be carried out (review of #68). Past it, nothing is undone, and that is said
         if (clock.now() >= until) { deadline.abort(); expired(card!.options[a.option]?.kind ?? "other"); continue; }
         const u = await rt.respond({ option: a.option });
-        log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused } : {}) } as never);
+        log.emit({ kind: "result_response", picked: card!.options[a.option]?.kind ?? "other", effect: u ? (u.refused ? `undone ${u.undone}/${u.total}, stopped: ${u.refused}` : `undone ${u.undone}/${u.total}`) : "noted", ...(u ? { undone: u.undone, total: u.total, refused: u.refused, ...(u.unsure ? { unsure: u.unsure } : {}) } : {}) } as never);
         break;
       }
     } finally { cancel(); o.input.stopsAsLines = false; }
   }
+  executor.discardUndoCopies();
 }
 
 /** After the result card's deadline, how long the process still reads stdin to answer responds already on their way
@@ -625,6 +638,7 @@ async function main() {
     for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => onSignal(sig));
     const req: Request = JSON.parse(a.request ? fs.readFileSync(a.request, "utf-8") : await input.next());
     if (!req.raw) throw new Error("request needs raw");
+    if (req.run_id !== undefined && !RUN_ID.test(String(req.run_id))) throw new Error(`run_id must match ${RUN_ID}`);
     await appRun(req, { runs: path.resolve(a.runs!), out, input, linger: Number(a.linger ?? 0), signals: { onSignal: (h) => { onSignal = h; }, exit, exitNow } });
     exit();
     return;

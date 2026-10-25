@@ -5,7 +5,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Registry, type ExecResult } from "./capability.js";
-import { ABSENT, NOT_UTF8_EN, TRASH, Workspace, sha } from "./workspace.js";
+import { randomUUID } from "node:crypto";
+import { ABSENT, NOT_UTF8_EN, TRASH, UNDO_DIR, Workspace, sha, treeDigest } from "./workspace.js";
 import { CRASH_FLAG, after, folderOk, join, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
 import { toolCapabilities } from "./tools.js";
 
@@ -18,18 +19,53 @@ export const fsCreateText = make({
   footprint: (_ws, a) => { const q = join(a.parent!, a.name!); return { reads: [], writes: [q], expectAfter: { [q]: sha(a.text!) } }; },
   pre: (ws, a) => { const q = join(a.parent!, a.name!); return ws.exists(q) ? `${q} already exists` : !folderOk(ws, parentOf(q)) ? `folder ${parentOf(q)} does not exist` : null; },
   run: (ws, a) => { const q = join(a.parent!, a.name!); fs.writeFileSync(ws.abs(q), a.text!, { encoding: "utf-8", flag: "wx" }); maybeCrash(); return after(ws, [q], { file: q }); },
+  undoWrites: (_ws, a) => ({ remove: [join(a.parent!, a.name!)] }),
   undo: (ws, a, r) => { const q = join(a.parent!, a.name!); const e = untouched(ws, r, [q]); if (e) return e; fs.unlinkSync(ws.abs(q)); return null; },
 });
 
+/** fs.replace_text's undo copy: the file as it was, kept in UNDO_DIR before the write (prep, recorded in the step's
+ *  journal intent: it outlives a crash), restored byte for byte only while the file is exactly as the step left it. */
+const keepCopy = (ws: Workspace, q: string): { backup: string; version: string } => {
+  const backup = `${ws.undoDir()}/${randomUUID()}`;
+  fs.copyFileSync(ws.abs(q), ws.abs(backup), fs.constants.COPYFILE_EXCL);
+  return { backup, version: ws.version(q) };
+};
+const copyProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
+  if (!u || typeof u.backup !== "string" || typeof u.version !== "string") return "no copy of the file was kept before it was replaced";
+  const full = ws.inside(UNDO_DIR, u.backup);
+  if (!full) return "the copy kept for undo is not in the undo folder";
+  if (!fs.existsSync(full)) return "the copy kept for undo is gone";
+  return sha(fs.readFileSync(full)) === u.version ? null : "the copy kept for undo does not match the file as it was";
+};
+
+/** Why replace_text's undo would refuse beyond "the file changed since" (which untouched asks, along the chain, with the
+ *  same questions): its check, and its undo after untouched. */
+const replaceBlocked = (ws: Workspace, _a: Record<string, string>, r: ExecResult) => copyProblem(ws, r.undo);
+
 export const fsReplaceText = make({
   id: "fs.replace_text", description: "把一个已有文本文件的全部内容替换成新的正文（覆盖原内容）。", effect: "update", discards: true,
+  // undo has its copy, but overwriting stays a step not taken on a guess (docs/ask-policy.md): policy unchanged
+  reversible: false,
   fields: { target: p("要改写的文件"), text: s("新的全部正文") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: sha(a.text!) } }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
+  prep: (ws, a) => keepCopy(ws, norm(a.target!)),
   run: (ws, a) => { const q = norm(a.target!); fs.writeFileSync(ws.abs(q), a.text!, "utf-8"); maybeCrash(); return after(ws, [q]); },
+  check: (ws, a, r) => replaceBlocked(ws, a, r),
+  undoWrites: (_ws, a) => ({ content: [norm(a.target!)] }),
+  undo: (ws, a, r) => {
+    const q = norm(a.target!);
+    const e = untouched(ws, r, [q]) ?? replaceBlocked(ws, a, r);
+    if (e) return e;
+    const copy = ws.inside(UNDO_DIR, String(r.undo!.backup))!;     // replaceBlocked: inside, there, as it was
+    fs.copyFileSync(copy, ws.abs(q));
+    try { fs.rmSync(copy, { force: true }); } catch { /* swept later */ }
+    return null;
+  },
 });
 
 const appended = (old: string, line: string) => old + (old === "" || old.endsWith("\n") ? "" : "\n") + line + "\n";
+const appendBlocked = (_ws: Workspace, _a: Record<string, string>, r: ExecResult) => (typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : null);
 export const fsAppendLine = make({
   id: "fs.append_line", description: "在一个已有文本文件的末尾追加一行。", effect: "update",
   fields: { target: p("要追加的文件"), line: s("追加的那一行文字，不含换行符") }, pathFields: ["target"],
@@ -37,10 +73,17 @@ export const fsAppendLine = make({
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
   run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
   prep: (ws, a) => ({ bytes: Buffer.byteLength(ws.read(norm(a.target!)), "utf-8") }),
-  check: (_ws, _a, r) => typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : null,
-  undo: (ws, a, r) => { const q = norm(a.target!); const e = typeof r.undo?.bytes !== "number" ? "no record of the file's length before the append" : untouched(ws, r, [q]); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
+  check: (ws, a, r) => appendBlocked(ws, a, r),
+  undoWrites: (_ws, a) => ({ content: [norm(a.target!)] }),
+  undo: (ws, a, r) => { const q = norm(a.target!); const e = untouched(ws, r, [q]) ?? appendBlocked(ws, a, r); if (e) return e; fs.truncateSync(ws.abs(q), Number(r.undo!.bytes)); return null; },
 });
 
+/** Why move's undo would refuse beyond untouched (the source's place taken under any spelling, the destination
+ *  changed: asked along the chain): the source's folder gone. One predicate for its check and itself. */
+const moveBlocked = (ws: Workspace, a: Record<string, string>, _r: ExecResult) => {
+  const src = norm(a.source!);
+  return folderOk(ws, parentOf(src)) ? null : `folder ${parentOf(src)} is gone`;
+};
 export const fsMove = make({
   id: "fs.move", description: "移动或重命名一个文件或文件夹；目标位置已存在时失败。", effect: "update",
   fields: { source: p("要移动的文件或文件夹"), destination: p("新的完整路径（含新文件名）") }, pathFields: ["source", "destination"],
@@ -54,11 +97,11 @@ export const fsMove = make({
     if (fs.existsSync(ws.abs(dst)) && !sameFile(ws.abs(src), ws.abs(dst))) return { status: "error", why: `${dst} already exists`, output: {}, versions_after: {}, performed: false };
     fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]);
   },
-  check: (ws, a) => (folderOk(ws, parentOf(norm(a.source!))) ? null : `folder ${parentOf(norm(a.source!))} is gone`),
+  check: (ws, a, r) => moveBlocked(ws, a, r),
+  undoWrites: (_ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { remove: [dst], into: [parentOf(src)], ...(parentOf(src) !== parentOf(dst) ? { cross: [dst] } : {}), restores: { [src]: dst } }; },
   undo: (ws, a, r) => {
     const src = norm(a.source!), dst = norm(a.destination!);
-    const e = untouched(ws, r, [src, dst]); if (e) return e;
-    if (!folderOk(ws, parentOf(src))) return `folder ${parentOf(src)} is gone`;
+    const e = untouched(ws, r, [src, dst]) ?? moveBlocked(ws, a, r); if (e) return e;
     fs.renameSync(ws.abs(dst), ws.abs(src)); return null;
   },
 });
@@ -73,6 +116,7 @@ export const fsCopy = make({
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.isDir(src) ? `${src} is a folder` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   // COPYFILE_EXCL: a destination that exists, under any spelling the volume takes for it, is never overwritten
   run: (ws, a) => { const dst = norm(a.destination!); fs.copyFileSync(ws.abs(norm(a.source!)), ws.abs(dst), fs.constants.COPYFILE_EXCL); maybeCrash(); return after(ws, [dst]); },
+  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)] }),
   undo: (ws, a, r) => { const dst = norm(a.destination!); const e = untouched(ws, r, [dst]); if (e) return e; fs.unlinkSync(ws.abs(dst)); return null; },
 });
 
@@ -105,6 +149,7 @@ export const fsMkdir = make({
     return { ...after(ws, [q]), undo: { made } };
   },
   check: (ws, _a, r, ours) => mkdirBusy(ws, r, ours),
+  undoWrites: (_ws, _a, r) => ({ remove: Array.isArray(r.undo?.made) ? (r.undo!.made as string[]) : [] }),
   undo: (ws, _a, r) => {
     const e = mkdirBusy(ws, r, new Set()); if (e) return e;
     for (const d of r.undo!.made as string[]) fs.rmdirSync(ws.abs(d));
@@ -114,11 +159,61 @@ export const fsMkdir = make({
 
 export const fsTrash = make({
   id: "fs.trash", description: "把一个文件移到废纸篓（可找回）。有后果的操作，需要用户逐条确认。", effect: "delete", confirm: true, discards: true,
+  // undo moves it back, but deleting stays a step not taken on a guess: policy unchanged
+  reversible: false,
   fields: { target: p("要移到废纸篓的文件") }, pathFields: ["target"],
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: ABSENT } }),
   pre: (ws, a) => (ws.exists(norm(a.target!)) ? null : `${norm(a.target!)} does not exist`),
-  run: (ws, a) => { const q = norm(a.target!); fs.mkdirSync(ws.abs(TRASH), { recursive: true }); fs.renameSync(ws.abs(q), path.join(ws.abs(TRASH), q.replaceAll("/", "_"))); maybeCrash(); return after(ws, [q]); },
+  // each trashed file under a name of its own (an earlier one of the same name is never replaced), recorded with its
+  // version: undo moves exactly that file back
+  run: (ws, a) => {
+    const q = norm(a.target!);
+    const version = ws.version(q);
+    // (a folder of its own per trashed file: the name keeps its length — a long name still fits)
+    const slot = `${TRASH}/${randomUUID().slice(0, 8)}`;
+    fs.mkdirSync(ws.abs(slot), { recursive: true });
+    const trashed = `${slot}/${q.replaceAll("/", "_")}`;
+    fs.renameSync(ws.abs(q), ws.abs(trashed));
+    maybeCrash();
+    // what it is, whole (a folder: everything under it), compared before it is moved back; null when too big to read
+    let tree: string | null = null;
+    try { tree = treeDigest(ws.abs(trashed)); } catch { tree = null; }
+    return { ...after(ws, [q]), undo: { trashed, version, tree } };
+  },
+  // check refuses on every condition undo refuses on (review of #74: it checked only the trashed file, so later steps
+  // were undone first and the undo stopped half way). It runs on undo's paper folder: the path and its folder as
+  // they will be when this step's undo runs; a symlink at the path (never in the entries) from the real disk
+  check: (ws, a, r) => trashBlocked(ws, a, r),
+  undoWrites: (_ws, a, r) => (typeof r.undo?.trashed === "string" ? { remove: [r.undo.trashed], cross: [r.undo.trashed], into: [parentOf(norm(a.target!))], restores: { [norm(a.target!)]: r.undo.trashed } } : { into: [parentOf(norm(a.target!))] }),
+  undo: (ws, a, r) => {
+    const q = norm(a.target!);
+    const e = untouched(ws, r, [q]) ?? trashBlocked(ws, a, r);
+    if (e) return e;
+    const from = ws.inside(TRASH, String(r.undo!.trashed))!;       // trashBlocked: inside the trash, there, as it was
+    fs.renameSync(from, ws.abs(q));
+    // its own slot, emptied: only a folder strictly inside the trash
+    const slot = ws.inside(TRASH, String(r.undo!.trashed).split("/").slice(0, -1).join("/"));
+    if (slot) try { fs.rmdirSync(slot); } catch { /* not empty */ }
+    return null;
+  },
 });
+/** Why trash's undo would refuse beyond untouched — the place taken again under any spelling, or a symlink there, which
+ *  untouched asks (what the step left was nothing, so anything there blocks it) along the chain, with the questions its
+ *  undo asks the disk: the trashed file gone or changed, the folder it goes back into gone. One predicate for its
+ *  check (on paper) and itself (on the disk). */
+const trashBlocked = (ws: Workspace, a: Record<string, string>, r: ExecResult): string | null => {
+  const q = norm(a.target!);
+  return trashedProblem(ws, r.undo) ?? (folderOk(ws, parentOf(q)) ? null : `folder ${parentOf(q)} is gone`);
+};
+const trashedProblem = (ws: Workspace, u: Record<string, unknown> | undefined): string | null => {
+  if (!u || typeof u.trashed !== "string" || typeof u.version !== "string") return "where the file was put is not recorded";
+  const full = ws.inside(TRASH, u.trashed);
+  if (!full) return "the trashed file is not in the trash";
+  if (!fs.existsSync(full)) return "the trashed file is gone";
+  // compared whole: a folder with anything added, removed or changed under it is not what was trashed
+  if (typeof u.tree !== "string") return "what was trashed was too large to record, so it cannot be checked";
+  return treeDigest(full) === u.tree ? null : "the trashed file was changed";
+};
 
 export const fsReadText = make({
   id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe",

@@ -669,10 +669,14 @@ describe("executor: undo", () => {
     await started(ex);
     const file = (capability: string, args: Record<string, string>, consent?: any) => ex.act({ action: { kind: "file", capability, args }, epoch: ex.currentEpoch, consent });
     expect((await file("fs.create_text", { parent: ".", name: "a.txt", text: "1" })).status).toBe("ok");
-    // the task's own text replaced: fs.replace_text has no undo, so the run is not reversible as a whole
+    // the task's own text replaced, and the copy fs.replace_text kept for undo is gone: that step cannot be taken back,
+    // so nothing is — not even the create before it (all or nothing, checked on paper first)
     expect((await file("fs.replace_text", { target: "a.txt", text: "2" })).status).toBe("ok");
-    expect(ex.undoable().reversible).toBe(false);
-    expect((await ex.undo()).undone).toBe(0);
+    expect(ex.undoable().reversible).toBe(true);
+    fs.rmSync(path.join(root, ".deskmind-undo"), { recursive: true, force: true });
+    const gone = await ex.undo();
+    expect(gone.undone).toBe(0);
+    expect(gone.refused).toMatch(/copy kept for undo is gone/);
     expect(ws.read("a.txt")).toBe("2");
     // a reversible run whose file someone changed since: refused by the capability, nothing else undone either
     const ex2 = new Executor(new SimComputer(root), { task: "t2", publicKey: app.publicKey, files: { workspace: ws, registry: fileRegistry() } });
