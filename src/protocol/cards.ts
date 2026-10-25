@@ -14,12 +14,23 @@ export interface CardOption {
   kind: OptionKind; text: string;
   node_id?: string;                                   // skip_step: which step
   point?: string; readings?: string[]; reading_index?: number;   // reading / undo_and_reading: which reading of which point
+  /** A second line under the option (H2): a reading's detail, as the plan role wrote it in a field of its own. */
+  detail?: string;
 }
+/** One thing a card's yes covers, beyond what was asked (H2): exactly what the yes signs — an object (window, tab,
+ *  file) or a site — as the user knows it. */
+export interface Beyond { kind: "object" | "site"; ref: string; label: string }
 export type CardKind = "missing" | "ambiguity" | "plan" | "action" | "result_check" | "cannot" | "result";
 /** Every interaction with the user is a card: the situation, options that cover what can happen next, and free text
  *  (「其他」). Blocking cards stop the run until answered; the result card is shown with the result. `plan` / `consent`:
  *  the same card's facts in fields (M0, additive), for an app that lays them out itself; `text` says all of it. */
-export interface Card { kind: CardKind; text: string; options: CardOption[]; free_text: boolean; blocking: boolean; plan?: PlanCardFacts; consent?: ActionCardFacts }
+export interface Card { kind: CardKind; text: string; options: CardOption[]; free_text: boolean; blocking: boolean; plan?: PlanCardFacts; consent?: ActionCardFacts;
+  /** One sentence saying what the card is about (H2), in the run's language, built from the facts the yes signs. */
+  headline?: string;
+  /** What the yes covers beyond the request (H2): the signed objects and sites, no more and no fewer. */
+  beyond?: Beyond[];
+  /** The card about an interrupted step (recover): a steer does not void it — it is answered first (H5). */
+  reconcile?: true }
 
 type Consequence = "read" | "create" | "modify_user" | "external";
 
@@ -61,6 +72,9 @@ export interface ActionCardFacts {
   /** How many there are in all (the list keeps the last 20; the text shows at most 5 lines and counts the rest). */
   uncertain_total?: number;
   model_says_unchecked?: string;
+  /** What is selected in the window the action acts in (H2): elements whose selection flag is set (focused, and not
+   *  where the keyboard types), by their labels, from the same look the card is made of — which mail a 「删除」 deletes. */
+  selected?: string[];
 }
 
 /** Who answers the executor's cards: the app (stdio: an `ask` event, then the answer line), the evaluation's simulated

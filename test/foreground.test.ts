@@ -129,7 +129,7 @@ describe("app_name on the plan card", () => {
     const steps: any[] = [{ calls: [{ name: "plan", args: { steps: [{ purpose: "搜索并播放", objects: ["窗口 com.netease.163music#1"], consequence: "create" }] } }] }, { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] }];
     const rt = new FrontierRuntime({ task: "t1", raw: "打开网易云播放安溥的宝贝", executor: ex, signer: app, user: { ask: (c: any) => { cards.push(c); return { option: c.options.findIndex((o: any) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
     await rt.run();
-    expect(cards[0]!.text).toContain("1. 搜索并播放（网易云音乐 的主窗口）——改你的东西");
+    expect(cards[0]!.text).toContain("1. 搜索并播放（网易云音乐 的主窗口）");
     expect(cards[0]!.text).toContain("网易云音乐 只能在前台操作");
     expect(cards[0]!.text).not.toContain("com.netease");
   });
@@ -206,7 +206,7 @@ describe("a window the launch brought up (hands#54 opened_window)", () => {
     ];
     const rt = new FrontierRuntime({ task: "t1", raw: "打开网易云播放安溥的宝贝", executor: ex, signer: app, user: { ask: (c: any) => { cards.push(c); return { option: c.options.findIndex((o: any) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
     await rt.run();
-    expect(cards[0]!.text).toContain("1. 搜索并播放（DeskMind 打开的 网易云音乐 主窗口）——改你的东西");
+    expect(cards[0]!.text).toContain("1. 搜索并播放（DeskMind 打开的 网易云音乐 主窗口）");
   });
 
   it("undo leaves it open", async () => {

@@ -124,7 +124,7 @@ describe("pages opened in the user's browser window are planned once", () => {
     ]);
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("1. 打开天气搜索结果（在你的 Google Chrome 窗口里打开网页）——改你的东西；会发到这些网站：www.google.com、wttr.in");
+    expect(cards[0]!.text).toContain("1. 打开天气搜索结果（在你的 Google Chrome 窗口里打开网页）（会发到这些网站：www.google.com、wttr.in）");
     // the consent is to open pages of those sites there, not the whole window
     expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["modify_user", "read"], objects: [], opens: { [`window:${chrome}`]: ["www.google.com", "wttr.in"] } });
     const acts = events.filter((e) => e.k === "tool.result" && e.b.name === "computer_act").map((e) => JSON.parse((e.b.text as string).split("\n")[0]!).status);
@@ -207,7 +207,7 @@ describe("run_ac5345ce: evidence missing after the work is done; element ids on 
   it("element ids and words that name nothing are not on the plan card", async () => {
     const { rt, cards } = mailRun([], (w) => [{ calls: [{ name: "plan", args: { steps: [{ purpose: "加旗标", objects: [`窗口 ${w}`, "ocr:26", "elem_12", "gen:搜索框"], consequence: "create" }] } }] }, done]);
     await rt.run();
-    expect(cards[0]!.text).toContain("1. 加旗标（信鸽「收件箱」）——改你的东西");
+    expect(cards[0]!.text).toContain("1. 加旗标（信鸽「收件箱」）");
     for (const id of ["ocr:26", "elem_12", "gen:搜索框"]) expect(cards[0]!.text).not.toContain(id);
   });
 });

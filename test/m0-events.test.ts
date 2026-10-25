@@ -130,7 +130,8 @@ describe("M0 slice A: step lifecycle and readable text", () => {
   it("in English the words are English", async () => {
     const r = await editorRun({ lang: "en" });
     const steps = r.events.filter((e) => e.kind === "step") as any[];
-    expect(steps[0].human).toBe('In 编辑器「笔记.txt」: set "正文" to "新的"');
+    // (H3: one language — English quotes names with curly quotes, never 「」)
+    expect(steps[0].human).toBe("In 编辑器 \u201c笔记.txt\u201d: set \u201c正文\u201d to \u201c新的\u201d");
   });
 });
 

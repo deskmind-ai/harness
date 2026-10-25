@@ -195,6 +195,8 @@ interface Task {
   state: "running" | "lingering" | "ending" | "closed";
   /** The card waiting for the user (an ask with no resumed / ask_void yet). */
   card: string | null;
+  /** That card is one a steer does not void (the card about an interrupted step: `reconcile`) — H5. */
+  cardHolds?: boolean;
   steers: string[];
   end: TaskEnd | null;
   ended: Promise<TaskEnd>;
@@ -790,7 +792,7 @@ export class SessionHost {
     // a card is the session's to know of before the app hears of it, and gone before the app hears it went (the app may
     // answer or type inside the very event it is handed): card_open reads this (review of #67). The result card's state
     // is set at task_done above (cardOf), before it is forwarded; its closing by deadline is taken here, before too
-    if (ev.kind === "ask") task.card = typeof ev.ask_id === "string" ? ev.ask_id : null;
+    if (ev.kind === "ask") { task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; task.cardHolds = (ev.card as { reconcile?: unknown } | undefined)?.reconcile === true; }
     else if ((ev.kind === "resumed" || ev.kind === "ask_void") && ev.ask_id === task.card) task.card = null;
     else if (ev.kind === "result_card_closed" && task.resultCard.s === "open") task.resultCard = { s: "closed", why: "expired" };
     // a task that does not linger keeps its result card (M2 H2: a task that changed something always shows one): its
@@ -1143,7 +1145,10 @@ export class SessionHost {
     if (this.closing || !text.trim() || (!fromQueue && this.sendsDuplicate(cid, "steer")) || this.tooLong(text, "steer", cid)) return;
     const t = this.current;
     if (!t || (runId && runId !== t.runId)) return this.refuse("no_task", "no task is running", "steer", cid);
-    if (t.card) return this.refuseCard("steer", cid);
+    // a card open is no reason to refuse the user's words (H5, owner 10-25): the executor voids it (ask_void steer) and
+    // takes the words; a voided card never yields consent (its late answer is refused there). Only the card about an
+    // interrupted step stays: it is answered first
+    if (t.card && t.cardHolds) return this.refuseCard("steer", cid);
     // stored first: should storing fail, the executor never has words the history (or the queue) does not account for
     this.log.emit({ kind: "session.steer", run_id: t.runId, text, ...(cid ? { client_id: cid } : {}) });
     t.handle.write(JSON.stringify({ type: "steer", text }));
@@ -1156,7 +1161,7 @@ export class SessionHost {
     if (this.closing) return this.refuse("busy", this.t("会话正在结束", "the session is ending"), "queue_send_now", it.client_id);
     // (stored first, then out of the queue: should storing fail, the words are still queued, never in neither place)
     if (this.current) {
-      if (this.current.card) return this.refuseCard("queue_send_now", it.client_id);
+      if (this.current.card && this.current.cardHolds) return this.refuseCard("queue_send_now", it.client_id);
       this.steer(it.text, undefined, it.client_id, true);
       this.queue = this.queue.filter((q) => q !== it);
       return this.emitQueue();
@@ -1378,7 +1383,7 @@ export function fallbackCard(evs: Record<string, unknown>[], journal: JournalLin
   const files = c ? [...c.created.map((p) => t.fileMade(p)), ...c.modified.map((p) => t.fileChanged(p)), ...c.deleted.map((p) => t.fileGone(p))] : [];
   if (!did.length && !unsure.length && !files.length) return undefined;
   const text = [why === "crashed" ? t.crashed : t.stopUnconfirmed, ...(did.length ? [t.did(did.slice(-6))] : []), ...(unsure.length ? [t.didUnsure(unsure.slice(-6))] : []), ...(files.length ? [t.files(files.slice(0, 12))] : [])].join("\n");
-  return { kind: "result", text, options: [{ kind: "approve", text: t.fine }], free_text: false, blocking: false };
+  return { kind: "result", text, headline: t.resultHeadline(did.length, unsure.length) || text.split("\n")[0]!, options: [{ kind: "approve", text: t.fine }], free_text: false, blocking: false };
 }
 
 /** A run's journal (beside its events), or null when it has none to read. */

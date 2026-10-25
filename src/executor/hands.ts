@@ -95,11 +95,17 @@ export class HandsDriver implements Driver {
       if (this.waiting?.id === id) return;
       this.endWait(null, "reply");                    // one request at a time: an earlier wait is over
       this.waiting = { id, op: p.op };
-      this.tell({ kind: "user_wait", op: p.op, ...(typeof m.app === "string" ? { app: m.app } : {}), ...(typeof m.what === "string" ? { what: m.what } : {}) });
+      // (hands#70: the wait's numbers, epoch seconds there, ms here like every time the app reads)
+      const ms = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? Math.round(x * 1000) : undefined);
+      const started = ms(m.started_at), gives = ms(m.gives_up_at);
+      this.tell({ kind: "user_wait", op: p.op, ...(typeof m.app === "string" ? { app: m.app } : {}), ...(typeof m.what === "string" ? { what: m.what } : {}),
+        ...(typeof m.quiet_s === "number" ? { quiet_s: m.quiet_s } : {}), ...(typeof m.needs_front === "boolean" ? { needs_front: m.needs_front } : {}),
+        ...(started !== undefined ? { started_at: started } : {}), ...(gives !== undefined ? { gives_up_at: gives } : {}) });
     } else if (m.event === "user_resumed") {
       if (id !== null && this.waiting?.id === id) {
         this.waiting = null;
-        this.tell({ kind: "user_resumed", op: p?.op ?? "", ...(typeof m.waited_s === "number" ? { waited_s: m.waited_s } : {}), ended: "driver" });
+        this.tell({ kind: "user_resumed", op: p?.op ?? "", ...(typeof m.waited_s === "number" ? { waited_s: m.waited_s } : {}), ended: "driver",
+          ...(m.why === "" || m.why === "stopped" || m.why === "timed_out" || m.why === "failed" ? { why: m.why } : {}) });
       }
     } else this.log.push("event: " + JSON.stringify(m).slice(0, 200));
   }

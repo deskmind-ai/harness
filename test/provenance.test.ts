@@ -222,7 +222,7 @@ describe("the plan declares the sites it visits", () => {
     const { rt, cards, events } = runLoop([readFile, planWith(declared), snap, open(google("北京天气")), finish], judge);
     const res = await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("1. 搜索北京天气——会发到这些网站：www.google.com（发过去的：搜索「北京天气」）");
+    expect(cards[0]!.text).toContain("1. 搜索北京天气（会发到这些网站：www.google.com（发过去的：搜索「北京天气」））");
     expect(prompts.length).toBe(1);
     expect(prompts[0]).toMatch(/"用户同意发到这个网站的内容（计划卡上写明、用户点了同意）": \[\s*"搜索「北京天气」"/);
     expect(res.consents.filter((c) => c.scope === "site")).toEqual([{ scope: "site", object: "app:Google Chrome", consequence: "modify_user" }]);
@@ -254,7 +254,7 @@ describe("the plan declares the sites it visits", () => {
     const { rt, cards } = runLoop([planWith([...declared, { app: "Google Chrome", url: "https://wttr.in/Beijing" }]), snap, open(google("北京天气")), finish], judge, { chrome: true, files: { "空文件夹": null } });
     const res = await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("1. 搜索北京天气（在你的 Google Chrome 窗口里打开网页）——改你的东西；会发到这些网站：www.google.com（发过去的：搜索「北京天气」）、wttr.in");
+    expect(cards[0]!.text).toContain("1. 搜索北京天气（在你的 Google Chrome 窗口里打开网页）（会发到这些网站：www.google.com（发过去的：搜索「北京天气」）、wttr.in）");
     expect(res.consents.filter((c) => c.scope === "site").map((c) => c.consequence)).toEqual(["modify_user"]);
     expect(prompts.length).toBe(0);                                       // nothing read before the open: no question
   });

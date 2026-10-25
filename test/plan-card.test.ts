@@ -50,7 +50,8 @@ describe("the plan card by the executor's view", () => {
     const { rt, cards, events } = run(sim, [planCreate(w), look(w), act({ kind: "click", window: w, target: `${w}:0:row:m1` }, "create"), act({ kind: "click", window: w, target: `${w}:0:flag` }, "create"), finish]);
     const r = await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("改你的东西");
+    expect(cards[0]!.headline).toContain("会改你已开着的");                 // (H2: the class is in the headline and plan.steps, not a line-end marker)
+    expect(cards[0]!.text).not.toContain("——");
     expect(sim.mailState(w).flagged).toEqual(["m1"]);
     expect(r.status).toBe("succeeded");
     expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ declared: ["create", "create"], settled: ["modify_user", "modify_user"], objects: [`window:${w}`] });
@@ -79,7 +80,7 @@ describe("the plan card by the executor's view", () => {
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan", "action"]);
     // the sending step on the user's window says both: it changes the user's things on the way, and it sends
-    expect(cards[0]!.text.split("\n").find((l) => l.startsWith("3."))).toContain("改你的东西，也会往外发");
+    expect(cards[0]!.plan!.steps[2]!.class).toBe("external");
     expect(cards[1]!.text).toContain("发出去");
     expect(sim.mailState(w).replies).toEqual([{ to: "m1", body: "收到" }]);
   });
@@ -116,7 +117,9 @@ describe("the plan card by the executor's view", () => {
     const { rt, cards, events } = run(sim, steps, "回复林晓：收到");
     await rt.run();
     expect(cards.map((c) => c.kind)).toEqual(["plan"]);
-    expect(cards[0]!.text).toContain("1. 回复并发送（信鸽「收件箱」）——改你的东西，也会往外发");
+    expect(cards[0]!.text).toContain("1. 回复并发送（信鸽「收件箱」）");
+    expect(cards[0]!.plan!.steps[0]!.class).toBe("external");
+    expect(cards[0]!.headline).toContain("信鸽「收件箱」");
     expect(events.find((e) => e.k === "plan.classes")!.b).toMatchObject({ settled: ["external"], objects: [`window:${w}`] });
   });
 
@@ -128,8 +131,8 @@ describe("the plan card by the executor's view", () => {
       finish,
     ], "写好发出去");
     await rt.run();
-    expect(cards[0]!.text).toContain("——往外发，到时候再确认一次");
-    expect(cards[0]!.text).not.toContain("改你的东西");
+    expect(cards[0]!.plan!.steps[0]!.class).toBe("external");
+    expect(cards[0]!.headline ?? "").not.toContain("会改你已开着的");
   });
 
   it("an object written as window:/path: that names nothing on screen or in the folder is not signed and asks nothing", async () => {
@@ -157,7 +160,7 @@ describe("the plan card by the executor's view", () => {
     const rt = new FrontierRuntime({ task: "t1", raw: "打开网易云播放安溥的宝贝", executor: ex, signer: app, user: { ask: (c: Card): Answer => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) } });
     await rt.run();
     expect(cards[0]!.text).toContain("网易云音乐 只能在前台操作");
-    expect(cards[0]!.text).toContain("改你的东西");
+    expect(cards[0]!.headline).toContain("会改你已开着的");
   });
 
   it("steps on the task's own window declared create still need no card", async () => {
@@ -194,7 +197,7 @@ describe("the plan card names the objects as the user knows them (review of #31)
     const rt = new FrontierRuntime({ task: "t1", raw: "整理一下", executor: ex, signer: app, user: { ask: (c: Card): Answer => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...model, streamFn: scriptedStream(steps) }, workspace: ws, registry: fileRegistry() });
     await rt.run();
     // what names nothing (words, an element id) is not on the card (run_ac5345ce: 「…、ocr:26」)
-    expect(cards[0]!.text).toContain("1. 整理（信鸽「收件箱」、编辑器 的主窗口、「合同续签 - Mailora」（127.0.0.1:8977）、notes/todo.txt）——改你的东西");
+    expect(cards[0]!.text).toContain("1. 整理（信鸽「收件箱」、编辑器 的主窗口、「合同续签 - Mailora」（127.0.0.1:8977）、「notes/todo.txt」）");
     expect(cards[0]!.text).not.toContain(mailW);
   });
 

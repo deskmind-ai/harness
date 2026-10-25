@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { Registry, type ExecResult } from "./capability.js";
 import { randomUUID } from "node:crypto";
 import { ABSENT, NOT_UTF8_EN, TRASH, UNDO_DIR, Workspace, sha, treeDigest } from "./workspace.js";
-import { CRASH_FLAG, after, folderOk, join, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
+import { CRASH_FLAG, after, folderOk, join, make, maybeCrash, norm, p, parentOf, q, s, snippet, untouched } from "./spec.js";
 import { toolCapabilities } from "./tools.js";
 
 export { CRASH_FLAG, join, norm, parentOf };
@@ -15,6 +15,7 @@ export { CRASH_FLAG, join, norm, parentOf };
 export const fsCreateText = make({
   id: "fs.create_text", description: "在任务目录里新建一个 UTF-8 文本文件并写入正文；目标已存在时失败，不覆盖。", effect: "create",
   fields: { parent: s('新文件所在的文件夹，相对任务目录；放在任务目录本身时填 "."'), name: s("新文件的文件名（只有 basename，不含目录）"), text: s("原样写入的正文，不自动加换行") },
+  human: (a, l) => (l === "en" ? `create the file ${q(join(a.parent!, a.name!), l)} with ${snippet(a.text ?? "", l)}` : `新建文件${q(join(a.parent!, a.name!), l)}，写入${snippet(a.text ?? "", l)}`),
   pathFields: ["parent"],
   footprint: (_ws, a) => { const q = join(a.parent!, a.name!); return { reads: [], writes: [q], expectAfter: { [q]: sha(a.text!) } }; },
   pre: (ws, a) => { const q = join(a.parent!, a.name!); return ws.exists(q) ? `${q} already exists` : !folderOk(ws, parentOf(q)) ? `folder ${parentOf(q)} does not exist` : null; },
@@ -47,6 +48,7 @@ export const fsReplaceText = make({
   // undo has its copy, but overwriting stays a step not taken on a guess (docs/ask-policy.md): policy unchanged
   reversible: false,
   fields: { target: p("要改写的文件"), text: s("新的全部正文") }, pathFields: ["target"],
+  human: (a, l) => (l === "en" ? `replace everything in ${q(norm(a.target!), l)} with ${snippet(a.text ?? "", l)}` : `把${q(norm(a.target!), l)}的全部内容换成${snippet(a.text ?? "", l)}`),
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: sha(a.text!) } }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
   prep: (ws, a) => keepCopy(ws, norm(a.target!)),
@@ -69,6 +71,7 @@ const appendBlocked = (_ws: Workspace, _a: Record<string, string>, r: ExecResult
 export const fsAppendLine = make({
   id: "fs.append_line", description: "在一个已有文本文件的末尾追加一行。", effect: "update",
   fields: { target: p("要追加的文件"), line: s("追加的那一行文字，不含换行符") }, pathFields: ["target"],
+  human: (a, l) => (l === "en" ? `add the line ${snippet(a.line ?? "", l)} to the end of ${q(norm(a.target!), l)}` : `在${q(norm(a.target!), l)}末尾加一行${snippet(a.line ?? "", l)}`),
   footprint: (ws, a) => { const q = norm(a.target!); return { reads: [], writes: [q], expectAfter: { [q]: sha(appended(ws.read(q), a.line!)) } }; },
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : null; },
   run: (ws, a) => { const q = norm(a.target!); const old = ws.read(q); fs.appendFileSync(ws.abs(q), appended(old, a.line!).slice(old.length), "utf-8"); maybeCrash(); return { ...after(ws, [q]), undo: { bytes: Buffer.byteLength(old, "utf-8") } }; },
@@ -87,6 +90,7 @@ const moveBlocked = (ws: Workspace, a: Record<string, string>, _r: ExecResult) =
 export const fsMove = make({
   id: "fs.move", description: "移动或重命名一个文件或文件夹；目标位置已存在时失败。", effect: "update",
   fields: { source: p("要移动的文件或文件夹"), destination: p("新的完整路径（含新文件名）") }, pathFields: ["source", "destination"],
+  human: (a, l) => (l === "en" ? `move ${q(norm(a.source!), l)} to ${q(norm(a.destination!), l)}` : `把${q(norm(a.source!), l)}移到${q(norm(a.destination!), l)}`),
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [], writes: [src, dst], expectAfter: { [src]: ABSENT, [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   run: (ws, a) => {
@@ -112,6 +116,7 @@ const sameFile = (a: string, b: string) => { try { const x = fs.lstatSync(a), y 
 export const fsCopy = make({
   id: "fs.copy", description: "复制一个文件到新路径；目标已存在时失败。", effect: "create",
   fields: { source: p("要复制的文件"), destination: p("副本的完整路径") }, pathFields: ["source", "destination"],
+  human: (a, l) => (l === "en" ? `copy ${q(norm(a.source!), l)} to ${q(norm(a.destination!), l)}` : `把${q(norm(a.source!), l)}复制到${q(norm(a.destination!), l)}`),
   footprint: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { reads: [src], writes: [dst], expectAfter: { [dst]: ws.version(src) } }; },
   pre: (ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return !ws.exists(src) ? `${src} does not exist` : ws.isDir(src) ? `${src} is a folder` : ws.exists(dst) ? `${dst} already exists` : !folderOk(ws, parentOf(dst)) ? `folder ${parentOf(dst)} does not exist` : null; },
   // COPYFILE_EXCL: a destination that exists, under any spelling the volume takes for it, is never overwritten
@@ -134,6 +139,7 @@ function mkdirBusy(ws: Workspace, r: ExecResult, ours: ReadonlySet<string>): str
 export const fsMkdir = make({
   id: "fs.mkdir", description: "新建一个文件夹，缺失的上级文件夹一并建好；已存在时失败。", effect: "create",
   fields: { path: p("新文件夹的路径") }, pathFields: ["path"],
+  human: (a, l) => (l === "en" ? `create the folder ${q(norm(a.path!), l)}` : `新建文件夹${q(norm(a.path!), l)}`),
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.path!)], expectAfter: { [norm(a.path!)]: "dir:*" } }),
   pre: (ws, a) => {
     const q = norm(a.path!);
@@ -162,6 +168,7 @@ export const fsTrash = make({
   // undo moves it back, but deleting stays a step not taken on a guess: policy unchanged
   reversible: false,
   fields: { target: p("要移到废纸篓的文件") }, pathFields: ["target"],
+  human: (a, l) => (l === "en" ? `move ${q(norm(a.target!), l)} to the trash` : `把${q(norm(a.target!), l)}移到废纸篓`),
   footprint: (_ws, a) => ({ reads: [], writes: [norm(a.target!)], expectAfter: { [norm(a.target!)]: ABSENT } }),
   pre: (ws, a) => (ws.exists(norm(a.target!)) ? null : `${norm(a.target!)} does not exist`),
   // each trashed file under a name of its own (an earlier one of the same name is never replaced), recorded with its
@@ -218,6 +225,7 @@ const trashedProblem = (ws: Workspace, u: Record<string, unknown> | undefined): 
 export const fsReadText = make({
   id: "fs.read_text", description: "读取一个文本文件的内容（只读，不改任何东西）。", effect: "observe",
   fields: { target: p("要读的文件") }, pathFields: ["target"],
+  human: (a, l) => (l === "en" ? `read ${q(norm(a.target!), l)}` : `读${q(norm(a.target!), l)}`),
   footprint: (_ws, a) => ({ reads: [norm(a.target!)], writes: [], expectAfter: {} }),
   pre: (ws, a) => { const q = norm(a.target!); return !ws.exists(q) || ws.isDir(q) ? `${q} is not an existing file` : !ws.isTextFile(q) ? `${q} ${NOT_UTF8_EN}` : null; },
   run: (ws, a) => ({ status: "ok", output: { text: ws.read(norm(a.target!)) }, versions_after: {} }),
@@ -226,6 +234,7 @@ export const fsReadText = make({
 export const fsList = make({
   id: "fs.list", description: "列出一个文件夹里的文件和子文件夹（只读）。", effect: "observe",
   fields: { path: s('要列的文件夹，任务目录本身填 "."') }, pathFields: ["path"],
+  human: (a, l) => { const d = norm(a.path ?? "."); return l === "en" ? `list ${d ? q(d, l) : "the task folder"}` : `列出${d ? q(d, l) : "任务文件夹"}里的东西`; },
   footprint: (_ws, a) => ({ reads: [norm(a.path!)], writes: [], expectAfter: {} }),
   pre: (ws, a) => (folderOk(ws, norm(a.path!)) ? null : `${norm(a.path!)} is not a folder`),
   run: (ws, a) => {
