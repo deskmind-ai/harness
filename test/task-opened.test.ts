@@ -61,8 +61,9 @@ const ELS: Element[] = [
   { id: "closebtn", role: "AXCloseButton", label: "", actions: ["click"] },
 ];
 const win = (id: string, app: string, title = ""): WindowInfo => ({ id, app, app_name: app, bundle: `com.example.${app}`, title });
-/** hands' `opened_window` field set (executor.py:1268): id, app, app_name, title. */
-const handsOpened = (w: WindowInfo): WindowInfo => ({ id: w.id, app: w.app, app_name: w.app_name ?? w.app, title: w.title, ...(w.browser ? { browser: true } : {}) });
+/** hands' `opened_window` field set: exactly the keys of hands' contract fixture (fixtures/contracts/opened_window.json,
+ *  mirrored in test/fixtures/contracts — hands#70: was_running false, sent only on a proven not-running launch). */
+const handsOpened = (w: WindowInfo): WindowInfo => ({ id: w.id, app: w.app, app_name: w.app_name ?? w.app, bundle: w.bundle ?? w.app, title: w.title, was_running: false, ...(w.browser ? { browser: true } : {}) });
 
 /** A judge that answers the outgoing question with `outgoing` (null: no answer) and the intent question with `intent`,
  *  and records which questions were asked. */
@@ -424,7 +425,7 @@ describe("review of #75, delta round", () => {
     desk.wins = []; desk.epoch += 1;
     const restored = { id: "com.apple.mail#8", app: "邮件", app_name: "邮件", title: "收件箱" } as WindowInfo;
     const orig = desk.perform.bind(desk);
-    desk.perform = ((a: Action, op?: { foreground_ok?: boolean }) => { if (a.kind === "open_window") { desk.performed.push({ action: a }); desk.wins.push(restored); return { status: "ok" as const, window: restored.id, opened_window: restored }; } return orig(a, op); }) as typeof desk.perform;
+    desk.perform = ((a: Action, op?: { foreground_ok?: boolean }) => { if (a.kind === "open_window") { desk.performed.push({ action: a }); desk.wins.push(restored); return { status: "ok" as const, window: restored.id, opened_window: { ...restored, was_running: false } }; } return orig(a, op); }) as typeof desk.perform;
     await ex.act({ action: { kind: "open_window", app: "邮件" }, epoch: ex.currentEpoch });
     const o = await ex.observe(restored.id);
     const before = desk.effects.length;
@@ -436,7 +437,7 @@ describe("review of #75, delta round", () => {
     await ex2.begin(); await ex2.plan({ steps: [] });
     desk2.wins = []; desk2.epoch += 1;
     const back = { id: "com.apple.mail#9", app: "Mail", app_name: "Mail", title: "Inbox" } as WindowInfo;
-    desk2.perform = (() => { desk2.wins.push(back); return { status: "ok" as const, window: back.id, opened_window: back }; }) as typeof desk2.perform;
+    desk2.perform = (() => { desk2.wins.push(back); return { status: "ok" as const, window: back.id, opened_window: handsOpened(back) }; }) as typeof desk2.perform;
     await ex2.act({ action: { kind: "open_window", app: "Mail" }, epoch: ex2.currentEpoch });
     expect([ex2.opened("window:com.apple.mail#9"), ex2.protects("window:com.apple.mail#9")]).toEqual([false, true]);
   });
@@ -585,7 +586,7 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
           const id = `${a.app}#${this.gen + 100 + this.wins.length}`;
           const w: WindowInfo = { id, app: a.app, app_name: a.app, title: "收件箱" };
           this.wins.push(w); this.epoch += 1;
-          return { status: "ok" as const, window: id, opened_window: w };          // every launch restores the app's last session
+          return { status: "ok" as const, window: id, opened_window: handsOpened(w) };          // every launch restores the app's last session
         }
         if (!("window" in a)) return { status: "ok" as const };
         if (a.kind === "close_window") { this.wins = this.wins.filter((w) => w.id !== a.window); this.effects.push({ action: a, window: a.window, userContent: true }); return { status: "ok" as const }; }
@@ -677,7 +678,7 @@ describe("review of #75, probe R — the ledger survives the process", () => {
     expect(events.find((e) => e.k === "executor.ledger_reloaded")?.b).toEqual({ seen_lines: 1 });   // process 1's begin (process 2 saw nothing new before reading it)
     const restored = { id: "com.apple.mail#8", app: "邮件", app_name: "邮件", title: "收件箱" } as WindowInfo;
     const orig = desk.perform.bind(desk);
-    desk.perform = ((a: Action, op?: { foreground_ok?: boolean }) => { if (a.kind === "open_window") { desk.wins.push({ ...restored, bundle: "com.apple.mail" }); return { status: "ok" as const, window: restored.id, opened_window: restored }; } return orig(a, op); }) as typeof desk.perform;
+    desk.perform = ((a: Action, op?: { foreground_ok?: boolean }) => { if (a.kind === "open_window") { desk.wins.push({ ...restored, bundle: "com.apple.mail" }); return { status: "ok" as const, window: restored.id, opened_window: { ...restored, was_running: false } }; } return orig(a, op); }) as typeof desk.perform;
     await ex2.act({ action: { kind: "open_window", app: "邮件" }, epoch: ex2.currentEpoch });
     const o = await ex2.observe(restored.id);
     const before = desk.effects.length;
@@ -697,7 +698,7 @@ describe("review of #75, probe R — the ledger survives the process", () => {
     await ex.begin(); await ex.plan({ steps: [] });
     expect(events.filter((e) => e.k.startsWith("executor.ledger") || e.k.startsWith("executor.journal")).map((e) => [e.k, e.b])).toEqual([["executor.ledger_reloaded", { seen_lines: 0 }]]);
     const restored = { id: "com.apple.mail#9", app: "邮件", app_name: "邮件", title: "收件箱" } as WindowInfo;
-    desk.perform = (() => { desk.wins.push(restored); return { status: "ok" as const, window: restored.id, opened_window: restored }; }) as typeof desk.perform;
+    desk.perform = (() => { desk.wins.push(restored); return { status: "ok" as const, window: restored.id, opened_window: { ...restored, was_running: false } }; }) as typeof desk.perform;
     desk.epoch += 1;
     await ex.act({ action: { kind: "open_window", app: "邮件" }, epoch: (await ex.snapshot()).epoch });
     expect([ex.opened("window:com.apple.mail#9"), ex.protects("window:com.apple.mail#9")]).toEqual([false, true]);

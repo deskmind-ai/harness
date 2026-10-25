@@ -1,0 +1,4 @@
+{
+  "keys": ["id", "app", "app_name", "bundle", "title", "was_running"],
+  "example": {"id": "1234", "app": "Example", "app_name": "Example", "bundle": "com.example.app", "title": "Example window", "was_running": false}
+}

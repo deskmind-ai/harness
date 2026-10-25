@@ -162,7 +162,7 @@ describe("a window the launch brought up (hands#54 opened_window)", () => {
       this.performed.push({ action, ...(opts ? { opts } : {}) }); this.epoch += 1;
       const info = music("com.netease.163music#5");
       this.wins.push({ info, elements: els });
-      return { status: "ok" as const, window: info.id, opened_window: info };
+      return { status: "ok" as const, window: info.id, opened_window: { ...info, was_running: false } };
     }
   }
   // under POLICY.taskOpened "user" (the policy before the owner's 10-25 decision; H1 keeps it as the other arm of the
@@ -283,7 +283,7 @@ describe("review of #32", () => {
     const { scriptedStream } = await import("../src/runtime/scripted.js");
     const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as any;
     const desk = new Desk([]);
-    desk.perform = (action: Action) => { desk.epoch += 1; const info = music("com.netease.163music#5"); desk.wins.push({ info, elements: els }); return { status: "ok" as const, window: info.id, opened_window: info } as never; };
+    desk.perform = (action: Action) => { desk.epoch += 1; const info = music("com.netease.163music#5"); desk.wins.push({ info, elements: els }); return { status: "ok" as const, window: info.id, opened_window: { ...info, was_running: false } } as never; };
     const app = ConsentSigner.fresh();
     const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey });
     const gw = new Gateway(table); gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));

@@ -13,7 +13,7 @@
  *   end       collect the receipts
  */
 import type { ActionCardFacts } from "../protocol/cards.js";
-import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
+import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, SaveSheet, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
 import { POLICY, type TaskOpenedPolicy } from "../orchestrator/index.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
@@ -1141,7 +1141,9 @@ export class Executor {
     // content is theirs, undo leaves it open, and closing it may lose their state — and cmd+q takes the app's other
     // windows with it, the user's included (review of #75, A)
     const k = a.kind === "key" ? chord(a.chord) : null;
-    const closeButton = a.kind === "click" && !!this.lastObs.get(a.window)?.elements.find((e) => e.id === a.target && /close/i.test(e.role));
+    // a close button by its AX subrole (hands#70, K1: from the window's own buttons, never from a label), or a role that
+    // says close
+    const closeButton = a.kind === "click" && !!this.lastObs.get(a.window)?.elements.find((e) => e.id === a.target && (e.ax_subrole === "AXCloseButton" || /close/i.test(e.role)));
     const closes = a.kind === "close_window" || closeButton || (!!k && k.cmd && k.key === "w" && !k.shift);
     const quits = !!k && k.cmd && (k.key === "q" || (k.key === "w" && k.shift));
     const undoes = !!k && k.cmd && k.key === "z";
@@ -1158,10 +1160,35 @@ export class Executor {
     }
     if (closes) return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
     if (undoes) return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "undoes a change in a window DeskMind opened: the user's own edits may go" : "undoes a change in the user's window" } : { consequence: "create", object, why: "undoes a change in the task's own window" };
+    // a save sheet open on the window (hands#70, K1): a step that can commit it saves where the sheet says — over a file
+    // that is there (its stem in that folder, or the path itself), into an alert inside the sheet (the "already exists"
+    // one: 替换), or where the sheet could not be read: the user's file, whoever's window it is. A floor of structure,
+    // read before any judge is asked (a judge's "stays" never lowers it)
+    const sheet = "window" in a ? this.lastObs.get(a.window)?.save_sheet : undefined;
+    if (sheet && commits(a)) { const risk = this.sheetRisk(sheet); if (risk) return { consequence: "modify_user", object, why: risk }; }
     // under POLICY.taskOpened "task" a step inside such a window is the task's own (M3–M6 plan §1.2): the judge's
     //「会删掉或改掉用户已有的内容」(classify) and the intent check (act) stand where the card stood
     if (owner === "user" && this.relaxed(object)) return { consequence: "create", object, why: "acts in a window DeskMind opened for the user's app; its content is theirs, so the judge checks the step deletes or changes none of it", opened: true };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
+  }
+
+  /** Why committing this save sheet may write over a file that is there (null: a new name in a folder read whole):
+   *  an alert inside it; a sheet not read whole or any fact unknown; its path a file of the user's in the task folder;
+   *  a file of its stem (any extension: the panel may add or hide one) in its folder; that folder unreadable. */
+  private sheetRisk(sheet: SaveSheet): string | null {
+    if (sheet.nested_sheet === true) return "the save sheet has an alert open in it (a file of that name exists: replacing it)";
+    if (sheet.read !== true || !sheet.name || !sheet.stem || !sheet.folder || sheet.nested_sheet !== false) return "the save sheet could not be read whole: where it saves, and over what, is not known";
+    const ws = this.opts.files?.workspace;
+    if (ws && sheet.path) {
+      const rel = path.relative(ws.root, sheet.path);
+      if (!rel.startsWith("..") && !path.isAbsolute(rel) && this.ledger.ownerOf(`path:${rel.split(path.sep).join("/")}`) === "user" && fs.existsSync(sheet.path)) return `saves over ${rel}, a file of the user's`;
+    }
+    let names: string[];
+    try { names = fs.readdirSync(sheet.folder); } catch { return "the folder the save sheet saves into could not be read"; }
+    const fold = (x: string) => x.normalize("NFC").toLowerCase();
+    const stemOf = (n: string) => { const e = path.extname(n); return e && e !== n ? n.slice(0, -e.length) : n; };
+    const same = names.filter((n) => fold(stemOf(n)) === fold(sheet.stem!) || fold(n) === fold(sheet.name!));
+    return same.length ? `a file named ${sheet.stem} is already in that folder (${same.slice(0, 3).join(", ")}): saving may replace it` : null;
   }
 
   /** The app the model names in an open_window, as the computer knows it: the windows on screen it matches, by every
@@ -1827,8 +1854,10 @@ export class Executor {
     // only a launch without a url, of an app that is not a browser (hands reports it only so; checked here too), and only
     // of an app no window of which this task has seen: the user's Mail quit mid-task and relaunched by the task comes back
     // with their mailbox under a new window id (review of #75, B)
-    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && !this.ledger.seenApp(r.opened_window) ? r.opened_window.id : undefined;
-    if (req.action.kind === "open_window" && r.opened_window && !broughtUp) this.emit("executor.window_not_opened", { id: r.opened_window.id, why: req.action.url ? "a url launch" : r.opened_window.browser ? "a browser" : "a window of this app was seen in this task" });
+    // and only on hands' proof the app was not running (hands#70: was_running false — one read of the running apps at the
+    // launch); without it (an older hands) the window is plainly the user's: fail closed
+    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && r.opened_window.was_running === false && !this.ledger.seenApp(r.opened_window) ? r.opened_window.id : undefined;
+    if (req.action.kind === "open_window" && r.opened_window && !broughtUp) this.emit("executor.window_not_opened", { id: r.opened_window.id, why: req.action.url ? "a url launch" : r.opened_window.browser ? "a browser" : r.opened_window.was_running !== false ? "no proof the app was not running (was_running)" : "a window of this app was seen in this task" });
     if (fresh(broughtUp)) { this.taskOpened.add(broughtUp); this.openedForUser.set(this.receipts.length + 1, { id: broughtUp, app: appName(r.opened_window!) }); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
     // credited to it once the window is read back (its name there is the evidence), not found later as "changed by
@@ -2373,6 +2402,10 @@ export function shortUrl(u: string, lang?: Lang): string {
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
+/** A step that can commit an open sheet: a click, a double-click, a key (Return), a menu choice. Typing a name into it
+ *  or scrolling does not. */
+const commits = (a: Action): boolean => a.kind === "click" || a.kind === "double_click" || a.kind === "key" || a.kind === "select";
+
 export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability, lang?: Lang): string {
   const t = T(lang);
   if (a.kind === "file") {

@@ -22,6 +22,9 @@ export interface WindowInfo {
   app_name?: string; bundle?: string;
   /** Brought up by the task's launch of the app (hands#54 `opened_window`), filled by the executor: still the user's. */
   opened?: boolean;
+  /** (hands#70, K1, on an `opened_window`) the launch's one read of the running apps said the app was not running: the
+   *  only proof the window is the launch's own. Absent (an older hands): not proven — the window stays plainly the user's. */
+  was_running?: boolean;
   /** The driver can operate this window only with its app in front (hands): the plan card says so. */
   needs_foreground?: boolean;
   /** Where the window is on screen, [x, y, w, h] in points, top-left origin (hands' observe): an element's `rect` is
@@ -49,6 +52,9 @@ export interface Snapshot { epoch: number; locked: boolean; front_app: string; w
   needs_foreground?: string[] }
 
 export interface Element {
+  /** The element's AX subrole (hands#70, K1: AXCloseButton, AXMinimizeButton, AXZoomButton, from the window's own
+   *  buttons); "" or absent when not read — never inferred from a label. */
+  ax_subrole?: string;
   id: string; role: string; label: string; actions: string[];
   value?: string; options?: string[]; enabled?: boolean; focused?: boolean; in_modal?: boolean;
   /** Structural evidence that activating this element sends something out of the machine (submits a form, sends a
@@ -72,7 +78,14 @@ export interface Observation {
   /** What this look could not read in the time it was given (hands: a pop-up's choices, left unread while the user
    *  kept using the Mac until the look's deadline). */
   notes?: string[];
+  /** A save sheet open on the window (hands#70, K1), from its accessibility values only; absent: no sheet (or a hands
+   *  before K1). Unknown facts are null; `read` false means the sheet could not be read whole. */
+  save_sheet?: SaveSheet;
 }
+/** hands' save sheet (axchrome.read_save_sheet): `path` only when the name shows its extension and the panel does not
+ *  hide it; `stem` the name without its extension — what a file it would replace is named; `nested_sheet` an alert
+ *  inside it (an overwrite, an invalid name, no permission). */
+export interface SaveSheet { read: boolean; name: string | null; stem: string | null; name_focused: boolean | null; folder: string | null; path: string | null; nested_sheet: boolean | null }
 
 export type Action =
   | { kind: "click"; window: string; target: string }
