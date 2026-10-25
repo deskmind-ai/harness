@@ -27,7 +27,7 @@ import { createHash } from "node:crypto";
 import { UNDO_DIR, type Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, isEffectUnknown, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
-import { Ledger } from "./ledger.js";
+import { Ledger, sameApp } from "./ledger.js";
 import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import { journalSteps, parseJournal, saysNotPerformed, type JournalLine, type JournalStep } from "./possibly.js";
 import { T, type Lang } from "./text.js";
@@ -98,15 +98,6 @@ function chord(c: string): { cmd: boolean; shift: boolean; key: string } {
   const parts = c.toLowerCase().split("+").map((p) => p.trim()).filter(Boolean);
   return { cmd: parts.includes("cmd") || parts.includes("command") || parts.includes("meta"), shift: parts.includes("shift"), key: parts[parts.length - 1] ?? "" };
 }
-/** Every name the driver has for a window's app: its bundle id, its name, its localized name, and the `bundle#` prefix of
- *  its id. hands puts the bundle on snapshot windows but not on `opened_window` (id, app, app_name, title — review of
- *  #75, B2), so an app is matched on any of them; two apps sharing a name are taken for one (the safe side: the user's). */
-function appKeys(w: { id: string; app?: string; app_name?: string; bundle?: string }): string[] {
-  const out = new Set<string>();
-  for (const s of [w.bundle, w.app, w.app_name, w.id.includes("#") ? w.id.slice(0, w.id.lastIndexOf("#")) : undefined]) if (s && s.trim()) out.add(s.trim().toLowerCase());
-  return [...out];
-}
-const sameApp = (a: { id: string; app?: string; app_name?: string; bundle?: string }, b: { id: string; app?: string; app_name?: string; bundle?: string }) => { const ks = new Set(appKeys(a)); return appKeys(b).some((k) => ks.has(k)); };
 
 /** Read material, bounded (characters): what one entry keeps, how many of the latest entries the provenance question
  *  shows, and how much of each. The question says the material may be partial, so a URL the user's words cannot explain
@@ -170,6 +161,15 @@ const NEAR_PX = 16;
  *  every look, and so does Peekaboo for the accessibility tree (elem_N in traversal order: an incoming message ahead of
  *  the Send button shifts every later id). An id is a handle into one observation, not an identity (review of #25). */
 interface Ident { c: string; at: [number, number] | null; act?: true; ax?: true; anon?: true }
+/** A field's identity without its value: what it is (role, label, read from the tree or the screen) and where it is when
+ *  the driver gives a place. What the task typed into a field is credited to the same field later only by this, never by
+ *  an element id (numbered per observation). Stored in the journal's intent (`field`). */
+export interface FieldIdent { key: string; at: [number, number] | null }
+export function fieldIdent(e: Element): FieldIdent | null {
+  if (!e.actions.includes("type") && !e.actions.includes("set_value")) return null;
+  return { key: canon([e.role, e.label, fromScreen(e) ? "pixels" : "ax"]), at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null };
+}
+const sameField = (a: FieldIdent, b: FieldIdent) => a.key === b.key && (a.at && b.at ? close(a.at, b.at) : !a.at && !b.at);
 const identOf = (e: Element, withFocus = true): Ident => ({
   c: canon([e.role, e.label, e.value ?? null, fromScreen(e) ? "pixels" : "ax", ...(withFocus ? [!!e.focused] : [])]),
   at: e.rect ? [e.rect[0] + e.rect[2] / 2, e.rect[1] + e.rect[3] / 2] : null,
@@ -430,17 +430,24 @@ export class Executor {
   /** Whether a field's whole value is what this task put there: the text typed or set into that very element (by the
    *  caller's element id) since its last set_value, joined, is the value. Anything else — a character of the task's inside
    *  the user's note, text in another field, an element renumbered since — is not the task's (review of #75, D). */
-  private ownValue(w: string, target: string, value: string): boolean {
+  private ownValue(w: string, el: Element, obs: Observation): boolean {
+    // the field's identity, across observations: element ids are numbered per observation (Codex review of #75, round 2:
+    // a later layout gave the search box's id to the user's note), so a field is known by what it is — role, label, how
+    // it was read, its place when it has one — and only when that names one element in both observations
+    const me = fieldIdent(el);
+    if (!me || obs.elements.filter((e) => fieldIdent(e)?.key === me.key).length !== 1) return false;
     let seq: { kind: "type" | "set_value"; text: string }[] = [];
     const lines = this.jlines;
     for (const s of journalSteps(lines)) {
       const act = s.action as Action | undefined;
       if (!act || !("window" in act) || act.window !== w) continue;
       if ((lines[s.intent] as { takes_typed?: unknown } | undefined)?.takes_typed === true && s.receipt?.status === "ok") { seq = []; continue; }
-      if (!(act.kind === "type" || act.kind === "set_value") || act.target !== target || !s.possibly) continue;
+      if (!(act.kind === "type" || act.kind === "set_value") || !s.possibly) continue;
+      const field = (lines[s.intent] as { field?: FieldIdent }).field;
+      if (!field || !sameField(field, me)) continue;           // an intent without the field's identity (an older journal) is not the task's own
       if (act.kind === "set_value") seq = [{ kind: "set_value", text: act.value }]; else seq.push({ kind: "type", text: act.text });
     }
-    return seq.length > 0 && value.trim() === seq.map((x) => x.text).join("").trim();
+    return seq.length > 0 && (el.value ?? "").trim() === seq.map((x) => x.text).join("").trim();
   }
   private typedIn(a: Action): string[] {
     if (!("window" in a)) return [];
@@ -911,7 +918,7 @@ export class Executor {
 
   async begin(paths: string[] = [], rules: ConsentToken[] = []): Promise<Snapshot> {
     if (rules.length) { const r = this.consent.loadRules(rules); this.emit("executor.rules", r); }
-    const raw = await this.driver.snapshot();
+    const raw = await this.see();
     const ws = this.opts.files?.workspace;
     if (ws) {
       const contents: Record<string, string> = {};
@@ -952,18 +959,26 @@ export class Executor {
   /** A change to this object is the user's to consent to, by structure: theirs by the ledger, and not a window DeskMind
    *  opened under POLICY.taskOpened "task". The plan card lists, classes and signs by this (service.ts). */
   protects(object: string): boolean { return this.ledger.ownerOf(object) === "user" && !this.relaxed(object); }
-  /** Marks a window the task opened (`opened`), for what the user reads. */
-  private mark<W extends { id: string; app: string; app_name?: string; bundle?: string; opened?: boolean }>(w: W): W { const { opened: _driverSaid, ...rest } = w; this.seenWindows.add(w.id); for (const k of appKeys(w)) this.seenApps.add(k); return (this.taskOpened.has(w.id) ? { ...rest, opened: true } : rest) as W; }
-  /** Every app a window of which this task has seen (the begin snapshot, every snapshot and look since), by bundle id or
-   *  name: an app the user had open and quit mid-task comes back from the task's launch with the same mailbox under a new
-   *  window id — the user's still, whatever hands calls the window (review of #75, B). */
-  private seenApps = new Set<string>();
-  /** Every window id this task has seen (the begin snapshot, every snapshot and look since): a window a launch brings
-   *  back — a minimised or hidden one of the user's — is none the task made or opened (review of #32). */
-  private seenWindows = new Set<string>();
+  /** Marks a window the task opened (`opened`), for what the user reads; the driver's own flag is dropped. */
+  private mark<W extends { id: string; opened?: boolean }>(w: W): W { const { opened: _driverSaid, ...rest } = w; return (this.taskOpened.has(w.id) ? { ...rest, opened: true } : rest) as W; }
+
+  /** The executor's only two reads of the driver (Codex review of #75, round 2: a wait's snapshot saw the user's Mail
+   *  and nothing recorded it). Every snapshot and every look passes through here, and the ledger is told what was seen
+   *  — the windows and their apps — before anyone reads the result. test/task-opened.test.ts checks by the source that
+   *  no other line calls the driver's snapshot or observe. */
+  private async see(): Promise<Snapshot> {
+    const s = await this.driver.snapshot();
+    for (const w of s.windows) this.ledger.saw(w);
+    return s;
+  }
+  private async watch(windowId: string, opts?: { screenshot?: boolean }): Promise<Observation> {
+    const o = await this.driver.observe(windowId, opts);
+    this.ledger.saw(o.window);
+    return o;
+  }
 
   async snapshot(): Promise<Snapshot> {
-    const raw = this.ledger.stamp(await this.driver.snapshot());
+    const raw = this.ledger.stamp(await this.see());
     // a window's screen frame, if a driver ever lists it here, is the app's (see frames), not material for anyone
     const s = { ...raw, windows: raw.windows.map((w) => this.mark((({ frame: _f, ...x }) => x)(w))) };
     this.epoch = s.epoch;
@@ -972,7 +987,7 @@ export class Executor {
   }
 
   async observe(windowId: string, opts?: { screenshot?: boolean }): Promise<Observation> {
-    const o = this.unframed(windowId, await this.driver.observe(windowId, opts));
+    const o = this.unframed(windowId, await this.watch(windowId, opts));
     const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
     this.epoch = o.epoch;
     this.lastObs.set(windowId, stamped);
@@ -989,7 +1004,7 @@ export class Executor {
   /** The executor's own look at a window (right before an effect): kept as what is on screen now, not as what the
    *  caller was shown — the caller's ids stay those of its own observation. */
   private async look(windowId: string): Promise<Observation> {
-    const o = this.unframed(windowId, await this.driver.observe(windowId));
+    const o = this.unframed(windowId, await this.watch(windowId));
     const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
     this.looks.set(windowId, stamped);
     return stamped;
@@ -1399,7 +1414,7 @@ export class Executor {
       ...(a.kind === "type" ? { 输入的文字: a.text } : {}),
       目标元素: h.el ? { 角色: h.el.role, 名字: h.el.label, ...(h.el.value ? { 值: h.el.value } : {}), 来源: screen(h.el), 名字命中发送词表: !!h.el.sends,
         // for the second direction: what is in the field now, and whether this task put it there (review of #75, 3)
-        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim(), 已有内容是本次任务打的: !!h.el.value?.trim() && this.ownValue(a.window, a.target, h.el.value!) } : {}) } : null,
+        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim(), 已有内容是本次任务打的: !!h.el.value?.trim() && !!h.obs && this.ownValue(a.window, h.el, h.obs) } : {}) } : null,
       窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.opened ? { 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : {}), ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
       窗口里标了会发出的其他元素: els.filter((e) => e.sends && e !== h.el).map((e) => ({ 角色: e.role, 名字: e.label, 来源: screen(e) })),
       窗口里的其他控件: els.filter((e) => e !== h.el && e.actions.length).slice(0, 60).map((e) => ({ 角色: e.role, 名字: e.label, ...(e.value ? { 值: e.value.slice(0, 80) } : {}), 来源: screen(e) })),
@@ -1514,7 +1529,7 @@ export class Executor {
       return r;
     };
     if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
-    let now = await this.driver.snapshot();
+    let now = await this.see();
     if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
     if (req.action.kind === "file") return done(await this.actFile(req.action, req.consent, consequence, f.object, now.epoch));
     // the user is at the keyboard: a window action now would fight them for it, whoever owns the window (D20). Read-only
@@ -1580,7 +1595,7 @@ export class Executor {
     if (this.classified.size !== asked && c.by !== "structure" && c.by !== "model" && !NEEDS_CONSENT.has(consequence)) {
       // a judge answered over the network and nothing below waits again: the computer is looked at once more, as after
       // the intent check (an action with consent is looked at again there)
-      now = await this.driver.snapshot();
+      now = await this.see();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, c.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
@@ -1602,7 +1617,7 @@ export class Executor {
       else {
         this.emit("executor.opened_cleared", { object: base.object, by: judged.by ?? "" });
         // the judge answered over the network: the computer is looked at again before the effect, as after any judge
-        now = await this.driver.snapshot();
+        now = await this.see();
         if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
         if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
         if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
@@ -1629,7 +1644,7 @@ export class Executor {
       if (verdict.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${verdict.by}）：不是用户要的。${verdict.reason}`, epoch: now.epoch });
       // the judge answers over the network: the user may have selected another row meanwhile, and the action would land
       // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
-      now = await this.driver.snapshot();
+      now = await this.see();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       // the user came back to the keyboard meanwhile, before anything on screen moved: wait for them, as at the top
       if (now.user_active) {
@@ -1682,7 +1697,7 @@ export class Executor {
       try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
       // why it moved: from a snapshot taken now (the look itself carries no reason). Taking it may move the epoch again,
       // so the reason may describe a later change; a snapshot that fails leaves the reason out, the result is the same
-      if (fresh.epoch !== req.epoch) return staleOn(await Promise.resolve().then(() => this.driver.snapshot()).catch(() => ({ epoch: fresh.epoch } as Snapshot)), { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
+      if (fresh.epoch !== req.epoch) return staleOn(await Promise.resolve().then(() => this.see()).catch(() => ({ epoch: fresh.epoch } as Snapshot)), { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
       const changed = (what: string) => done({ ...base, status: "stale", why: `${target} changed right before acting (${what}); observe it again and decide anew`, epoch: fresh.epoch });
       // the target, always found again by identity (content, and id or place) and required one of a kind: the driver acts
       // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
@@ -1711,7 +1726,7 @@ export class Executor {
         }
       }
       // the user may have come back to the keyboard during the look: wait for them, or stop, as at the top
-      now = await this.driver.snapshot();
+      now = await this.see();
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
@@ -1745,7 +1760,10 @@ export class Executor {
       // a certain send (the judge's 会, or a control marked as sending) takes the window's typed text with it once it
       // ends ok (typedOn); a 拿不准 one does not
       const takesTyped = consequence === "external" && "window" in req.action && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends));
-      this.journal("intent", { action: act, object: base.object, consequence, text, ...(takesTyped ? { takes_typed: true } : {}), ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
+      const typedInto = obs && "target" in req.action && req.action.target && (req.action.kind === "type" || req.action.kind === "set_value") ? obs.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
+      const field = typedInto ? fieldIdent(typedInto) : null;
+      const fieldUnique = !!field && obs!.elements.filter((e) => fieldIdent(e)?.key === field.key).length === 1;
+      this.journal("intent", { action: act, object: base.object, consequence, text, ...(field && fieldUnique ? { field } : {}), ...(takesTyped ? { takes_typed: true } : {}), ...(cardOutgoing?.length ? { outgoing: recordOut(cardOutgoing) } : {}), ...(finalOutgoing?.length ? { outgoing_final: recordOut(finalOutgoing) } : {}) });
       this.flight = { action: act, object: base.object, text, settled: new Promise<void>((res) => { land = res; }) };
     }
     const filesBefore = consequence !== "read" ? this.fileVersions() : null;
@@ -1785,7 +1803,7 @@ export class Executor {
     // driver reports `new_window` only for a window it can prove it made)
     // never a window already there: not in the snapshot just before, nor anything the task saw since it began (a
     // minimised window of the user's that the launch brought back — review of #32)
-    const fresh = (id: string | undefined): id is string => !!id && !now.windows.some((w) => w.id === id) && !this.seenWindows.has(id);
+    const fresh = (id: string | undefined): id is string => !!id && !now.windows.some((w) => w.id === id) && !this.ledger.seen(id);
     // from any action, not only open_window: a 「新建」 button in the user's open panel makes an empty untitled window
     // that is as much the task's as one open_window made (rc.11 run_69ec2a5a: four cards for the steps in it). The
     // driver claims it only on its proof (hands: appeared during this action, never listed, no file and no content,
@@ -1809,7 +1827,7 @@ export class Executor {
     // only a launch without a url, of an app that is not a browser (hands reports it only so; checked here too), and only
     // of an app no window of which this task has seen: the user's Mail quit mid-task and relaunched by the task comes back
     // with their mailbox under a new window id (review of #75, B)
-    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && !appKeys(r.opened_window).some((k) => this.seenApps.has(k)) ? r.opened_window.id : undefined;
+    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && !this.ledger.seenApp(r.opened_window) ? r.opened_window.id : undefined;
     if (req.action.kind === "open_window" && r.opened_window && !broughtUp) this.emit("executor.window_not_opened", { id: r.opened_window.id, why: req.action.url ? "a url launch" : r.opened_window.browser ? "a browser" : "a window of this app was seen in this task" });
     if (fresh(broughtUp)) { this.taskOpened.add(broughtUp); this.openedForUser.set(this.receipts.length + 1, { id: broughtUp, app: appName(r.opened_window!) }); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
@@ -1819,7 +1837,7 @@ export class Executor {
     let after: Snapshot;
     // went out, or may have (ok, unverified): whatever comes next, never reported as an error
     const sent = r.status === "ok" || r.status === "unverified";
-    try { after = await this.driver.snapshot(); } catch (e) { return done({ ...base, status: sent ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
+    try { after = await this.see(); } catch (e) { return done({ ...base, status: sent ? "unverified" : "error", why: `${r.why ?? ""}; after the action the computer could not be read: ${e instanceof Error ? e.message : e}`.replace(/^; /, ""), epoch: this.epoch, ...madeField }); }
     this.epoch = after.epoch;
     if (after.locked) return done({ ...base, status: sent ? "unverified" : "environment", why: `${r.why ?? ""}; the screen is locked`.replace(/^; /, ""), cause: "screen_locked", epoch: after.epoch, ...madeField });
     // user_busy (hands): the step waited for the user to pause until the deadline it was sent with, and nothing was
@@ -1857,7 +1875,7 @@ export class Executor {
     this.emit("executor.user_wait", { object });
     while (now.user_active && (this.opts.now?.() ?? Date.now()) < until && !this.stopped) {
       await new Promise((r) => setTimeout(r, wait.pollMs));
-      now = await this.driver.snapshot();
+      now = await this.see();
     }
     // every wait ends with a resumed, whichever way it ends: the app clears its "paused" state on it (deskmind#85). A
     // stop is said as a stop even when the user is still at the keyboard — it ended the wait, not they (a stop that
@@ -1930,7 +1948,7 @@ export class Executor {
       // the screen first: locked meanwhile, the task stops, a file action as much as a window one. It is the last
       // wait: from the versions read below to the write there is none, or another program's edit made during it
       // would be overwritten unchecked (review of #16: the lock look, put after the checks, opened just that gap)
-      const screen = await this.driver.snapshot();
+      const screen = await this.see();
       if (screen.locked) return { ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: screen.epoch };
       // the judge answers over the network: a file the user changed meanwhile is not the one it judged, and writing
       // now would overwrite their edit (review of #16) — read the versions again, as at the top
@@ -2191,7 +2209,7 @@ export class Executor {
           if (!err) for (const p of f.cap.footprint(ws!, f.args).writes) this.seen[p] = ws!.version(p);
         } else if (a.kind === "open_window") {
           const id = this.openedWindows.get(r.seq);
-          const snap = await this.driver.snapshot();
+          const snap = await this.see();
           if (id && snap.windows.some((w) => w.id === id)) { const pr = await this.driver.perform({ kind: "close_window", window: id }); if (pr.status !== "ok") err = pr.why ?? pr.status; }
         }
       } catch (e) {

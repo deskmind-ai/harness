@@ -4,10 +4,30 @@
  */
 import type { Owner, Snapshot, WindowInfo } from "./types.js";
 
+/** Every name the driver has for a window's app: its bundle id, its name, its localized name, and the `bundle#` prefix of
+ *  its id. hands puts the bundle on snapshot windows but not on `opened_window` (id, app, app_name, title — review of
+ *  #75, B2), so an app is matched on any of them; two apps sharing a name are taken for one (the safe side: the user's). */
+export function appKeys(w: { id: string; app?: string; app_name?: string; bundle?: string }): string[] {
+  const out = new Set<string>();
+  for (const s of [w.bundle, w.app, w.app_name, w.id.includes("#") ? w.id.slice(0, w.id.lastIndexOf("#")) : undefined]) if (s && s.trim()) out.add(s.trim().toLowerCase());
+  return [...out];
+}
+export const sameApp = (a: { id: string; app?: string; app_name?: string; bundle?: string }, b: { id: string; app?: string; app_name?: string; bundle?: string }) => { const ks = new Set(appKeys(a)); return appKeys(b).some((k) => ks.has(k)); };
+
 export class Ledger {
   private readonly userOwned = new Set<string>();
   private readonly taskOwned = new Set<string>();
   private begun = false;
+  /** Every window id this task has seen — the begin snapshot, every snapshot and look since — and every name of every
+   *  app those windows belong to. Fed only by the executor's two driver reads (`see`, `watch`): a window a launch brings
+   *  back (a minimised or hidden one of the user's) is none the task made or opened (review of #32), and an app the
+   *  user had open — seen in any snapshot, a wait's included — and quit mid-task comes back from the task's launch with
+   *  the same mailbox under a new window id, the user's still (review of #75, B; Codex round 2). */
+  private readonly seenWindows = new Set<string>();
+  private readonly seenApps = new Set<string>();
+  saw(w: { id: string; app?: string; app_name?: string; bundle?: string }) { this.seenWindows.add(w.id); for (const k of appKeys(w)) this.seenApps.add(k); }
+  seen(windowId: string): boolean { return this.seenWindows.has(windowId); }
+  seenApp(w: { id: string; app?: string; app_name?: string; bundle?: string }): boolean { return appKeys(w).some((k) => this.seenApps.has(k)); }
 
   /** The inventory at begin: windows and tabs on screen now. */
   begin(s: Snapshot, paths: string[] = []) {

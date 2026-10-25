@@ -500,3 +500,166 @@ describe("Codex review of #75", () => {
     }
   });
 });
+
+describe("Codex review of #75, round 2 — the facts the gate rests on come from one ledger, fed by one pair of driver reads", () => {
+  it("1: text ownership does not follow an element id a later observation gives to another field", async () => {
+    const facts: Record<string, unknown>[] = [];
+    const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
+      let choice = "matches";
+      if (q === OUTGOING_QUESTION) { const el = ctx["目标元素"] as Record<string, unknown>; facts.push(el); choice = el["目标里已有内容"] && !el["已有内容是本次任务打的"] ? "alters" : "stays"; }
+      return { choice, by: "fake", confidence: 1, reason: "follow the supplied ownership facts" };
+    } } as unknown as Judge;
+    const { desk, ex, target, o } = await stage("opened", "task", judge);
+    expect((await ex.act({ action: { kind: "type", window: target.id, target: "search", text: "hello" }, epoch: o.epoch })).status).toBe("ok");
+    // a later layout gives the search box's id to the user's note, whose text happens to equal what the task typed
+    const originalObserve = desk.observe.bind(desk);
+    desk.observe = (id) => { const ob = originalObserve(id); return { ...ob, elements: ob.elements.map((e) => (e.id === "search" ? { ...e, id: "search-moved" } : e.id === "body" ? { ...e, id: "search", value: "hello" } : e)) }; };
+    desk.epoch += 1;
+    const current = await ex.observe(target.id);
+    const before = desk.effects.length;
+    const r = await ex.act({ action: { kind: "set_value", window: target.id, target: "search", value: "overwrite" }, epoch: current.epoch });
+    expect({ own: facts.at(-1)!["已有内容是本次任务打的"], status: r.status, effect: desk.effects.length > before }).toEqual({ own: false, status: "needs_consent", effect: false });
+    // and the renumbered search box itself, holding exactly the task's text, is still the task's
+    const o2 = await ex.observe(target.id);
+    const searchNow = o2.elements.find((e) => e.id === "search-moved")!; (searchNow as { value?: string }).value = "hello";
+    desk.observe = (id) => { const ob = originalObserve(id); return { ...ob, elements: ob.elements.map((e) => (e.id === "search" ? { ...e, id: "search-moved", value: "hello" } : e)) }; };
+    desk.epoch += 1;
+    const o3 = await ex.observe(target.id);
+    expect((await ex.act({ action: { kind: "type", window: target.id, target: "search-moved", text: " world" }, epoch: o3.epoch })).status).toBe("ok");
+    expect(facts.at(-1)!["已有内容是本次任务打的"]).toBe(true);
+  });
+
+  it("2: a user app seen only in act's own snapshots (a wait) is remembered: its later relaunch is the user's", async () => {
+    const desk = new Desk([win("Notes#1", "Notes", "购物清单")]);
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, raw: "打开邮件，删掉张三那封", taskOpened: "task", judge: fakeJudge("stays", "matches").judge });
+    await ex.begin(); await ex.plan({ steps: [] });
+    desk.wins.push(win("Mail#7", "Mail", "收件箱")); desk.epoch += 1;                   // the user opens Mail; only act's snapshots see it
+    expect((await ex.act({ action: { kind: "wait", ms: 0 }, epoch: desk.epoch })).status).toBe("ok");
+    desk.wins = desk.wins.filter((w) => w.app !== "Mail"); desk.epoch += 1;            // the user quits Mail
+    const restored = win("Mail#8", "Mail", "收件箱");
+    desk.launches["Mail"] = { window: restored, says: "opened_window" };
+    expect((await ex.act({ action: { kind: "open_window", app: "Mail" }, epoch: desk.epoch })).status).toBe("ok");
+    const o = await ex.observe(restored.id);
+    const before = desk.effects.length;
+    const r = await ex.act({ action: { kind: "click", window: restored.id, target: "del" }, epoch: o.epoch });
+    expect({ opened: ex.opened("window:Mail#8"), protects: ex.protects("window:Mail#8"), status: r.status, effect: desk.effects.length > before }).toEqual({ opened: false, protects: true, status: "needs_consent", effect: false });
+  });
+
+  it("the executor reads the driver in exactly two places, and both feed the ledger (checked on the source)", async () => {
+    const fs = await import("node:fs");
+    const src = fs.readFileSync(new URL("../src/executor/executor.ts", import.meta.url), "utf-8");
+    const snaps = [...src.matchAll(/this\.driver\.snapshot\(/g)].length, looks = [...src.matchAll(/this\.driver\.observe\(/g)].length;
+    expect({ snaps, looks }).toEqual({ snaps: 1, looks: 1 });
+    const see = src.slice(src.indexOf("private async see()"), src.indexOf("private async watch("));
+    const watch = src.slice(src.indexOf("private async watch("), src.indexOf("private async watch(") + 400);
+    expect(see).toContain("this.driver.snapshot("); expect(see).toContain("this.ledger.saw(");
+    expect(watch).toContain("this.driver.observe("); expect(watch).toContain("this.ledger.saw(");
+    // no other module reaches the executor's driver either
+    for (const f of ["service.ts", "judge.ts", "consent.ts"]) expect(fs.readFileSync(new URL(`../src/executor/${f}`, import.meta.url), "utf-8")).not.toMatch(/executor\.driver\.(snapshot|observe)/);
+  });
+
+  it("property: random looks, snapshots, user actions (apps opened and quit, fields filled, ids renumbered) and task actions under a fact-following judge — no user object changed without a card", async () => {
+    const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    const pick = <T,>(r: () => number, xs: readonly T[]): T => xs[Math.floor(r() * xs.length)]!;
+    /** `taskText`: what the task's own writes alone would leave in the field — content is the user's when the field holds
+     *  anything else (the user's text, or theirs plus the task's; a user retyping exactly the task's text loses nothing) */
+    type Field = { key: string; role: string; label: string; value: string; taskText: string };
+    /** A desk whose element ids are numbered per observation, whose fields remember who wrote them (the ground truth), and
+     *  that knows which windows the user opened (at begin or mid-task): those are theirs whatever a launch calls them. */
+    class World implements Driver {
+      epoch = 1; gen = 0; wins: WindowInfo[] = []; effects: { action: Action; window: string; userContent: boolean }[] = [];
+      /** windows the user opened (at begin or mid-task), and the apps of those among them the harness was ever shown — a
+       *  window opened and quit between two reads was never on anyone's screen but the user's; what a later launch restores
+       *  is their content all the same, which is why its steps are judged, not free */
+      userWins = new Set<string>(); userSeenApps = new Set<string>();
+      private shown() { for (const w of this.wins) if (this.userWins.has(w.id)) this.userSeenApps.add(w.app); }
+      fields = new Map<string, Field[]>();
+      idMap = new Map<string, string>();        // current observation-local id → window:key
+      constructor(public r: () => number) {}
+      snapshot(): Snapshot { this.shown(); return { epoch: this.epoch, locked: false, front_app: "DeskMind", windows: [...this.wins] }; }
+      fieldsOf(w: string) { if (!this.fields.has(w)) this.fields.set(w, [{ key: "search", role: "textField", label: "搜索", value: "", taskText: "" }, { key: "body", role: "textArea", label: "正文", value: "", taskText: "" }]); return this.fields.get(w)!; }
+      observe(id: string): Observation {
+        const w = this.wins.find((x) => x.id === id); if (!w) throw new Error(`no window ${id}`);
+        this.shown(); this.gen += 1; this.idMap = new Map();
+        const els: Element[] = [{ id: `del@${this.gen}`, role: "button", label: "删除", actions: ["click"] }];
+        for (const f of this.fieldsOf(id)) { const eid = `${f.key}@${this.gen}`; this.idMap.set(eid, `${id}:${f.key}`); els.push({ id: eid, role: f.role, label: f.label, actions: ["type", "set_value"], ...(f.value ? { value: f.value } : {}) }); }
+        return { epoch: this.epoch, window: w, modal: null, elements: els, text: "" };
+      }
+      perform(a: Action) {
+        if (a.kind === "open_window") {
+          const id = `${a.app}#${this.gen + 100 + this.wins.length}`;
+          const w: WindowInfo = { id, app: a.app, app_name: a.app, title: "收件箱" };
+          this.wins.push(w); this.epoch += 1;
+          return { status: "ok" as const, window: id, opened_window: w };          // every launch restores the app's last session
+        }
+        if (!("window" in a)) return { status: "ok" as const };
+        if (a.kind === "close_window") { this.wins = this.wins.filter((w) => w.id !== a.window); this.effects.push({ action: a, window: a.window, userContent: true }); return { status: "ok" as const }; }
+        if (a.kind === "type" || a.kind === "set_value") {
+          const key = this.idMap.get(a.target)?.split(":")[1]; const f = this.fieldsOf(a.window).find((x) => x.key === key);
+          if (!f) return { status: "error" as const, why: "no such field" };
+          const userContent = f.value !== "" && f.value !== f.taskText;
+          if (a.kind === "set_value") { f.value = a.value; f.taskText = a.value; } else { f.value += a.text; f.taskText += a.text; }
+          this.effects.push({ action: a, window: a.window, userContent }); this.epoch += 1; return { status: "ok" as const, window: a.window };
+        }
+        if (a.kind === "scroll" || a.kind === "focus_window") return { status: "ok" as const, window: a.window };
+        this.effects.push({ action: a, window: a.window, userContent: true }); this.epoch += 1; return { status: "ok" as const, window: a.window };
+      }
+      /** the user acts: opens an app, quits one, writes into a field (no epoch for a sync; the user's own typing moves it) */
+      userActs() {
+        const k = this.r();
+        if (k < 0.2) { const app = pick(this.r, ["Mail", "Notes"]); if (!this.wins.some((w) => w.app === app)) { const id = `${app}#u${this.gen}`; this.wins.push({ id, app, app_name: app, title: "收件箱" }); this.userWins.add(id); this.epoch += 1; } }
+        else if (k < 0.35) { const app = pick(this.r, ["Mail", "Notes"]); if (this.wins.some((w) => w.app === app)) { this.wins = this.wins.filter((w) => w.app !== app); this.epoch += 1; } }
+        else if (k < 0.7 && this.wins.length) { const w = pick(this.r, this.wins); const f = pick(this.r, this.fieldsOf(w.id)); f.value = pick(this.r, ["用户的笔记", "hello", "牛奶", f.value + "！"]); if (this.r() < 0.5) this.epoch += 1; }
+      }
+    }
+    for (let seed = 1; seed <= 40; seed++) {
+      const r = rng(seed);
+      const world = new World(r);
+      world.wins.push({ id: "Notes#1", app: "Notes", app_name: "Notes", title: "购物清单" }); world.userWins.add("Notes#1");
+      const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
+        if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
+        const el = ctx["目标元素"] as Record<string, unknown> | null;
+        return { choice: el && el["目标里已有内容"] && !el["已有内容是本次任务打的"] ? "alters" : "stays", by: "fake", confidence: 1, reason: "" };
+      } } as unknown as Judge;
+      const app = ConsentSigner.fresh();
+      const ex = new Executor(world, { task: "p2", publicKey: app.publicKey, raw: "随便做点什么", taskOpened: "task", judge });
+      await ex.begin(); await ex.plan({ steps: [] });
+      // `theirs` is taken at the moment of the effect: an app the user opens later does not make an earlier launch theirs
+      const record: { window: string; theirs: boolean; consent: boolean; userContent: boolean; kind: string; chord: string; label: string }[] = [];
+      const theirsNow = (window: string) => world.userSeenApps.has(window.split("#")[0]!);
+      for (let step = 0; step < 30; step++) {
+        if (r() < 0.5) world.userActs();
+        const k = r();
+        let a: Action; let epoch: number;
+        if (k < 0.15) { a = { kind: "wait", ms: 0 }; epoch = (await ex.snapshot()).epoch; }
+        else if (k < 0.3) { a = { kind: "open_window", app: pick(r, ["Mail", "Notes"]) }; epoch = (await ex.snapshot()).epoch; }
+        else {
+          if (!world.wins.length) continue;
+          const w = pick(r, world.wins);
+          const o = await ex.observe(w.id); epoch = o.epoch;
+          const fields = o.elements.filter((e) => e.actions.includes("type"));
+          const kk = r();
+          a = kk < 0.4 ? { kind: "type", window: w.id, target: pick(r, fields).id, text: pick(r, ["会议", "x", "好的"]) } : kk < 0.7 ? { kind: "set_value", window: w.id, target: pick(r, fields).id, value: pick(r, ["会议", "hello"]) } : kk < 0.85 ? { kind: "click", window: w.id, target: o.elements[0]!.id } : { kind: "key", window: w.id, chord: pick(r, ["cmd+a", "cmd+w"]) };
+        }
+        const label = `seed ${seed} step ${step} ${JSON.stringify(a)}`;
+        let before = world.effects.length;
+        const res = await ex.act({ action: a, epoch });
+        for (const e of world.effects.slice(before)) record.push({ window: e.window, theirs: theirsNow(e.window), consent: false, userContent: e.userContent, kind: e.action.kind, chord: e.action.kind === "key" ? e.action.chord : "", label });
+        if (res.status === "needs_consent" && r() < 0.6) {
+          before = world.effects.length;
+          await ex.act({ action: a, epoch, consent: app.forAction(res.challenge!) });
+          for (const e of world.effects.slice(before)) record.push({ window: e.window, theirs: theirsNow(e.window), consent: true, userContent: e.userContent, kind: e.action.kind, chord: e.action.kind === "key" ? e.action.chord : "", label });
+        }
+      }
+      // the oracle, from the world: a window of an app the user opened (at begin or mid-task) is theirs, whatever a launch
+      // called it; in a window the task launched for an app the user never opened, a write over the user's content and a
+      // close need consent (the judge sees the content facts; closing is structure) — a click or another key there runs on
+      // the judge's「不会」by design, a write into an empty field or over the task's own text runs free
+      for (const e of record) {
+        const needs = e.theirs || ((e.kind === "type" || e.kind === "set_value") && e.userContent) || e.kind === "close_window" || /cmd\+w/i.test(e.chord);
+        if (needs) expect([e.label, e.kind, e.consent]).toEqual([e.label, e.kind, true]);
+      }
+    }
+  }, 120_000);
+});
