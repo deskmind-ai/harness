@@ -253,7 +253,7 @@ describe("H1: the property — an object the user had at begin is never changed 
 });
 
 describe("H1: the plan card (service level) — a plan on a window DeskMind opened", () => {
-  async function planRun(policy: TaskOpenedPolicy, declared: "create" | "modify_user") {
+  async function planRun(policy: TaskOpenedPolicy, declared: "create" | "modify_user", objects: string[] = ["窗口 Mail#7"]) {
     const { Gateway } = await import("../src/gateway/index.js");
     const { FrontierRuntime } = await import("../src/host/frontier.js");
     const { scriptedStream } = await import("../src/runtime/scripted.js");
@@ -268,7 +268,7 @@ describe("H1: the plan card (service level) — a plan on a window DeskMind open
     const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } } as never;
     const steps = [
       { calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "Mail" }, epoch: 1, consequence: "create", purpose: "打开邮件" } }] },
-      { calls: [{ name: "plan", args: { steps: [{ purpose: "删掉张三那封", objects: ["窗口 Mail#7"], consequence: declared }] } }] },
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "删掉张三那封", objects, consequence: declared }] } }] },
       { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] },
     ];
     const rt = new FrontierRuntime({ task: "t1", raw: "打开邮件，删掉张三那封", executor: ex, signer: app, user: { ask: (c: { kind: string; text: string; options: { kind: string }[] }) => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...(model as object), streamFn: scriptedStream(steps as never) } as never, onEvent: (k: string, b: Record<string, unknown>) => events.push({ k, b }) });
@@ -283,6 +283,13 @@ describe("H1: the plan card (service level) — a plan on a window DeskMind open
       const no = events.find((e) => e.k === "plan.no_card");
       expect([declared, no?.b]).toEqual([declared, { why: "within_request", task_opened: ["window:Mail#7"], task_opened_policy: "task" }]);
     }
+  });
+
+  it("policy task: a step naming the window and an element id or a row's words (which resolve to nothing) is judged by the window; one naming nothing that resolves, or the user's window too, keeps the card", async () => {
+    expect((await planRun("task", "modify_user", ["窗口 Mail#7", "元素 Mail#7:0:row:m3", "张三 · 报销单"])).cards.map((c) => c.kind)).toEqual([]);
+    // (an element id carries the window's id, so canonObjects resolves it to the window; a row's words alone resolve to nothing)
+    expect((await planRun("task", "modify_user", ["张三 · 报销单"])).cards.map((c) => c.kind)).toEqual(["plan"]);
+    expect((await planRun("task", "modify_user", ["窗口 Mail#7", "窗口 Notes#1"])).cards.map((c) => c.kind)).toEqual(["plan"]);
   });
 
   it("policy user: the plan card as before, naming the window DeskMind opened as 「改你的东西」", async () => {

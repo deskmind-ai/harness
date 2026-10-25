@@ -770,13 +770,15 @@ export class ExecutorService {
     const theirs = (o: string) => there.has(o) && ex.protects(o);
     // a step declared "read" stays a look (the floor of looking is read; an action it turns into asks on its own)
     // (a URL opened into the user's window is no look, whatever the step was declared)
-    // a step the caller calls modify_user whose objects all resolved and none is the user's to ask about (the task's own
-    // window, or one DeskMind opened under POLICY.taskOpened "task") is no reason for a plan card: rule 1 of §1.2 is for
-    // what the user had at begin. The caller's class is taken again at act time (classify: the model only raises), so the
-    // step still asks on its own card there; here it only no longer re-asks on the plan (practice run 10-25: 「删掉张三那封」
-    // drew a plan card and then the action card). Objects that did not resolve keep the caller's class: the safe side
-    // only under POLICY.taskOpened "task": the "user" arm is the behaviour before 10-25 (review of #75, C)
-    const lowered = (s: PlanStepIn, i: number) => (ex.taskOpenedPolicy === "task" && s.consequence === "modify_user" && objectsOf[i]!.length > 0 && objectsOf[i]!.every((o) => there.has(o)) ? "create" : s.consequence);
+    // a step the caller calls modify_user that names a window, tab or file on screen and nothing the user's to ask about
+    // (the task's own window, or one DeskMind opened under POLICY.taskOpened "task") is no reason for a plan card: rule 1 of
+    // §1.2 is for what the user had at begin. The caller's class is taken again at act time (classify: the model only
+    // raises), so the step still asks on its own card there; here it only no longer re-asks on the plan (practice run
+    // 10-25: 「删掉张三那封」 drew a plan card and then the action card). Names that resolve to nothing (an element id, a
+    // row's words) sign nothing and decide nothing here either: the step they belong to is judged by the objects that did
+    // resolve — a step naming none keeps the caller's class. Only under POLICY.taskOpened "task": the "user" arm is the
+    // behaviour before 10-25 (review of #75, C)
+    const lowered = (s: PlanStepIn, i: number) => (ex.taskOpenedPolicy === "task" && s.consequence === "modify_user" && objectsOf[i]!.some((o) => there.has(o)) && !objectsOf[i]!.some(theirs) ? "create" : s.consequence);
     const classes = steps.map((s, i) => (s.consequence === "external" ? s.consequence : [...opensInto[i]!.keys()].some(theirs) ? higher(s.consequence, "modify_user") : s.consequence === "read" ? s.consequence : objectsOf[i]!.some(theirs) ? higher(s.consequence, "modify_user") : lowered(s, i)));
     const signFor = [...new Set(objectsOf.flatMap((os, i) => (classes[i] === "read" ? [] : os.filter(theirs))))];
     // an app the hands driver can only operate in front: hands#54 lists bundle ids on the snapshot (`needs_foreground`,
