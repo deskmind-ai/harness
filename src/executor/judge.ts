@@ -20,7 +20,11 @@ import * as R from "../protocol/roles.js";
 
 /** `local`: a tier that runs on this Mac (DeskMind Brain). A question may refuse to take some answers from it even when
  *  it is the top tier (the provenance question's「没有」, executor.ts). */
-export interface JudgeTier { name: string; gateway: Gateway; role?: Role; floor?: number; local?: boolean }
+export interface JudgeTier { name: string; gateway: Gateway; role?: Role; floor?: number; local?: boolean;
+  /** The questions this tier was trained on (questionDigest of their words and options, as they were when it was
+   *  trained): any other question skips it — a local model is not asked a question it never learned (rc.17: the outgoing
+   *  question rewritten, Brain answered「会发出去」to 「新建纯文本文稿」). Absent: it is asked everything. */
+  trained?: ReadonlySet<string> }
 export interface JudgeOption { id: string; text: string }
 export interface JudgeAnswer { choice: string; by: string; confidence?: number; reason?: string; cached?: boolean; missing_kind?: "action" | "evidence"; claims_contradicted?: string[];
   /** The question's id (protocol `judge.judge_id`): its tiers' model calls and the events about it name it. */
@@ -37,7 +41,16 @@ export interface ChooseOptions { settle?: string; route?: boolean;
   claims?: boolean;
   /** the task's stop: no tier is asked once it has fired, and it aborts a call in flight; the answer is then none
    *  (never cached) */
-  signal?: AbortSignal }
+  signal?: AbortSignal;
+  /** a question built from a template (the evidence question names the point; its options are the readings): the
+   *  template's words, digested in place of the question and its options (questionDigest) */
+  form?: string }
+
+/** A question as a tier knows it: its words and its options (ids and words), or a template's words for a templated one.
+ *  The key of JudgeTier.trained. */
+export function questionDigest(question: string, options: JudgeOption[], form?: string): string {
+  return createHash("sha256").update(JSON.stringify(form !== undefined ? { form } : { q: question, o: options.map((o) => [o.id, o.text]) })).digest("hex").slice(0, 16);
+}
 
 /** How often a lower tier settles each kind of question (kinds: the question's first words — intent, verify, and
  *  the evidence questions share a prefix), kept across tasks when a path is given: a tier that never settles a kind
@@ -147,7 +160,11 @@ export class Judge {
     this.opts.onEvent?.("judge.asked", { judge_id, question_kind: kind, prompt, options });
     const sample = (top: string | null) => { if (this.opts.samples && lower && top) this.opts.onEvent?.("judge.sample", { question_kind: kind, prompt, options, lower, top }); };
     const topTier = this.tiers[this.tiers.length - 1]!;
-    const skipped = new Set(how.route === false ? [] : this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)));
+    // a lower tier is skipped when the stats route it away, or when this is not a question it was trained on (never
+    // routed back: the words decide, not the stats)
+    const digest = questionDigest(question, options, how.form);
+    const untrained = new Set(this.tiers.slice(0, -1).filter((t) => t.trained && !t.trained.has(digest)));
+    const skipped = new Set([...untrained, ...(how.route === false ? [] : this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)))]);
     const lowerAsked = this.tiers.length - 1 > skipped.size;
     // shadow is drawn before the race: a sampled question keeps the raced top answer for the comparison instead of
     // abandoning it (with both on, aborting first left the agreement routing with no samples — deskmind#86 review)
@@ -160,7 +177,7 @@ export class Judge {
       // stopped meanwhile: no further tier is asked (a raced call in flight is aborted by the same signal)
       if (stop?.aborted) break;
       const final = tier === topTier;
-      if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
+      if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind, ...(untrained.has(tier) ? { why: "untrained" } : {}) }); continue; }
       this.calls += 1;
       const rep = final && raced?.promise ? await raced.promise : await within({ tier: tier.name }, () => tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema, "", stop));
       if (rep.outcome !== "answered") { asked.push({ tier: tier.name, outcome: rep.outcome, choice: null, settled: false }); this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }
@@ -212,8 +229,8 @@ export class Judge {
 
 /** Which of the executor's questions this is, by the question itself (the constants below; the evidence questions are
  *  made per reading): for the app and the trace, never for routing. */
-export function questionName(q: string): "intent" | "outgoing" | "provenance" | "verify" | "evidence" | "other" {
-  return q === INTENT_QUESTION ? "intent" : q === OUTGOING_QUESTION ? "outgoing" : q === PROVENANCE_QUESTION ? "provenance" : q === VERIFY_QUESTION ? "verify" : q.startsWith(P.evidenceQuestion("").slice(0, 7)) ? "evidence" : "other";
+export function questionName(q: string): "intent" | "outgoing" | "alters" | "provenance" | "verify" | "evidence" | "other" {
+  return q === INTENT_QUESTION ? "intent" : q === OUTGOING_QUESTION ? "outgoing" : q === ALTERS_QUESTION ? "alters" : q === PROVENANCE_QUESTION ? "provenance" : q === VERIFY_QUESTION ? "verify" : q.startsWith(P.evidenceQuestion("").slice(0, 7)) ? "evidence" : "other";
 }
 
 /** The intent question, as the orchestrator's intent role asks it: is this action what the user asked for? */
@@ -229,14 +246,23 @@ export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取
  *  拿不准 / no answer → external; 不会 → the class stays. A lower tier may settle only「会发出去」alone (the safe
  *  direction), so its「不会」always goes up and is compared with the top's answer (TierStats.noteEscalation). Its
  *  first words differ from INTENT_QUESTION's: TierStats.kindOf routes by the first 12 characters. */
-export const OUTGOING_QUESTION = "这一步会不会把内容发出去——发给别人，或者发到这台电脑以外（发消息、发邮件、提交表单、发布、分享、支付、点赞、关注、转发都算）？只看给出的材料：动作、目标元素（角色、名字、是不是从画面认出来的）、窗口和窗口里的其他控件、按的键、这次任务在这个窗口里打过的字。名字命中发送词表、回车或换行只是线索，不是结论：站内搜索框里按回车、只打开分享面板还没发，都不算发出去；没有名字、只有图标的按钮，要结合它所在的窗口和刚打过的字判断。看不出来就选「拿不准」。不发出去的，再看会不会删掉或改掉用户已有的内容——窗口里本次任务之前就有的东西（一封邮件、一首歌或歌单、一条笔记、已有的文字、设置）被删除、清空、覆盖、改写或追加：会的选「会删掉或改掉用户已有的内容」。不算的只有：选中一行、打开、翻页、切换；往空着的输入框里写。往任何已经有内容的输入框里打字或设值——哪怕只是在末尾追加，哪怕那些字看起来像任务自己刚打的——以及撤销、重做、全选后删除或替换，都算会删改；「目标里已有内容」为是的，就是这种；这一项缺失、或标着「目标内容读不出来」（从画面认的输入框、读不到值的控件），当作有内容。点菜单项或按钮关掉窗口、退出应用，也算「会删掉或改掉用户已有的内容」（窗口里可能有用户的状态）；把文档存成、另存为磁盘上已有的文件，或在「已存在，要替换吗」的对话框里点替换、覆盖，也算（磁盘上用户的文件会被盖掉）。既发出去又删改的，选「会发出去」。";
+export const OUTGOING_QUESTION = "这一步会不会把内容发出去——发给别人，或者发到这台电脑以外（发消息、发邮件、提交表单、发布、分享、支付、点赞、关注、转发都算）？只看给出的材料：动作、目标元素（角色、名字、是不是从画面认出来的）、窗口和窗口里的其他控件、按的键、这次任务在这个窗口里打过的字。名字命中发送词表、回车或换行只是线索，不是结论：站内搜索框里按回车、只打开分享面板还没发，都不算发出去；没有名字、只有图标的按钮，要结合它所在的窗口和刚打过的字判断。看不出来就选「拿不准」。";
 export const OUTGOING_OPTIONS: JudgeOption[] = [
   { id: "sends", text: "会发出去：这一步会把内容发给别人，或发到这台电脑以外" },
-  // M3–M6 plan §1.2 (H1): the second direction the judge may raise in — the user's existing content in the window
-  // deleted or changed, though nothing goes out. Only read for what it raises (to modify_user); never lowers
-  { id: "alters", text: "会删掉或改掉用户已有的内容，或关掉窗口、退出应用，或盖掉磁盘上已有的文件：不发出去，但会删除、清空、覆盖、改写或追加窗口里本次任务之前就有的东西，或者关掉这个窗口、退出这个应用，或者把文档存成 / 另存为已有的文件、在替换对话框里点替换" },
-  { id: "stays", text: "不会：内容留在这台电脑上，用户已有的内容也不动（只往空着的输入框里写、搜索、浏览、选中、打开面板、切换）" },
-  { id: "unsure", text: "拿不准：材料看不出这一步会不会发出去、会不会删改用户已有的内容" },
+  { id: "stays", text: "不会：内容留在这台电脑上（本地编辑、搜索、浏览、打开面板、切换）" },
+  { id: "unsure", text: "拿不准：材料看不出这一步会不会发出去" },
+];
+
+/** The second direction (M3–M6 plan §1.2, H1), asked on its own (rc.17: folded into the outgoing question it tripled that
+ *  question's length and the local model trained on the old one answered「会发出去」for a 「新建纯文本文稿」 click): only
+ *  in a window DeskMind opened, under POLICY.taskOpened "task", after the outgoing question said「不会」. It only raises
+ *  — 会删改 / 拿不准 / no answer → modify_user; 不会 → the class stays. Not a question a local tier was trained on: never
+ *  asked of Brain (JudgeTier.trained). Its first words differ from the others' (TierStats.kindOf). */
+export const ALTERS_QUESTION = "这一步会不会删掉或改掉用户已有的内容——窗口里本次任务之前就有的东西（一封邮件、一首歌或歌单、一条笔记、已有的文字、设置）被删除、清空、覆盖、改写或追加？不算的只有：选中一行、打开、翻页、切换；往空着的输入框里写。往任何已经有内容的输入框里打字或设值——哪怕只是在末尾追加，哪怕那些字看起来像任务自己刚打的——以及撤销、重做、全选后删除或替换，都算会删改；「目标里已有内容」为是的，就是这种；这一项缺失、或标着「目标内容读不出来」（从画面认的输入框、读不到值的控件），当作有内容。点菜单项或按钮关掉窗口、退出应用，也算会删改（窗口里可能有用户的状态）；把文档存成、另存为磁盘上已有的文件，或在「已存在，要替换吗」的对话框里点替换、覆盖，也算（磁盘上用户的文件会被盖掉）。只看给出的材料，看不出来就选「拿不准」。";
+export const ALTERS_OPTIONS: JudgeOption[] = [
+  { id: "alters", text: "会删掉或改掉用户已有的内容，或关掉窗口、退出应用，或盖掉磁盘上已有的文件" },
+  { id: "keeps", text: "不会：用户已有的内容不动（只往空着的输入框里写、搜索、浏览、选中、打开、翻页、切换）" },
+  { id: "unsure", text: "拿不准：材料看不出这一步会不会删改用户已有的内容" },
 ];
 
 /** The provenance question (owner 10-21 refinement of the per-site rule, docs/outgoing-check-2026-10-20.md §5): an
@@ -268,11 +294,21 @@ export const PROVENANCE_OPTIONS: JudgeOption[] = [
  *    `openai:volcengine|doubao-seed-2-1-lite-260915`: any fast model the gateway can reach, same contract.
  *  Opt-in until measured on these questions: in the 10-18 probe Brain was confidently wrong on 2 of 13
  *  (docs/0.5-decisions.md D24). The floor is a calibration output, not a rule. */
+/** The evidence question's template (executor.plan: the point it names and its readings vary), as JudgeTier.trained
+ *  knows it. */
+export const EVIDENCE_FORM = `evidence:${P.evidenceQuestion("{point}")}`;
+
+/** The questions Brain (the local judge, DeskMind Brain g18b) was trained on — their digests as they were then, written
+ *  out, not computed from today's words: a question whose words or options change drops out on its own and goes to
+ *  the tiers above until Brain is trained on it (test/judge-trained.test.ts names each). intent, outgoing (the words
+ *  before #75), provenance, verify, the evidence template. */
+export const BRAIN_TRAINED: ReadonlySet<string> = new Set(["c452a12c7ac206c7", "f28565a8062bc1f0", "4fc1ac9c98534559", "ebc53ba9c538a602", "523bbf88f22929f5"]);
+
 export function defaultJudge(gateway: Gateway, onEvent?: (kind: string, body: Record<string, unknown>) => void): Judge {
   const tiers: JudgeTier[] = [];
   const url = process.env.DESKMIND_BRAIN_URL;
   const table = (backend: string, model: string) => Object.fromEntries(R.ROLES.map((r) => [r, { backend, model }])) as RoleTable;
-  if (url && process.env.DESKMIND_BRAIN_JUDGE === "1") tiers.push({ name: "brain", gateway: new Gateway(table("systemone", url)), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9), local: true });
+  if (url && process.env.DESKMIND_BRAIN_JUDGE === "1") tiers.push({ name: "brain", gateway: new Gateway(table("systemone", url)), floor: Number(process.env.DESKMIND_BRAIN_FLOOR ?? 0.9), local: true, trained: BRAIN_TRAINED });
   const first = firstTier(process.env.DESKMIND_JUDGE_FIRST, process.env.DESKMIND_JUDGE_FIRST_FLOOR);
   if (first) { const t = table(first.backend, first.model); for (const r of R.ROLES) t[r] = { ...t[r], think: false }; tiers.push({ name: first.name, gateway: new Gateway(t), floor: first.floor }); }   // a choice wants a fast answer
   tiers.push({ name: "frontier", gateway });

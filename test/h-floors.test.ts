@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor } from "../src/executor/executor.js";
-import { INTENT_QUESTION, OUTGOING_QUESTION, type Judge } from "../src/executor/judge.js";
+import { ALTERS_QUESTION, INTENT_QUESTION, OUTGOING_QUESTION, type Judge } from "../src/executor/judge.js";
 import type { Action, Driver, Element, Observation, SaveSheet, Snapshot, WindowInfo } from "../src/executor/types.js";
 import { Workspace, build } from "../src/registry/workspace.js";
 import { fileRegistry } from "../src/registry/fs.js";
@@ -51,7 +51,8 @@ class Desk implements Driver {
 }
 
 function judge(outgoing: string | null) {
-  return { choose: async (q: string) => { const c = q === OUTGOING_QUESTION ? outgoing : q === INTENT_QUESTION ? "matches" : "pass"; return c ? { choice: c, by: "fake", confidence: 1, reason: "" } : null; } } as unknown as Judge;
+  // (#75's one answer put to the two questions since the split: alters → stays to the outgoing one, alters to the other)
+  return { choose: async (q: string) => { const c = q === OUTGOING_QUESTION ? (outgoing === "alters" ? "stays" : outgoing) : q === ALTERS_QUESTION ? (outgoing === "alters" ? "alters" : outgoing === "stays" ? "keeps" : outgoing) : q === INTENT_QUESTION ? "matches" : "pass"; return c ? { choice: c, by: "fake", confidence: 1, reason: "" } : null; } } as unknown as Judge;
 }
 
 async function stage(source: Source, o: { wasRunning?: boolean; sheet?: SaveSheet; outgoing?: string | null; root?: string } = {}) {
@@ -77,7 +78,8 @@ describe("H-floors 1: a close button by its AX subrole closes the window", () =>
       // the rule: closing a window that is not the task's own asks, whatever the judge says; otherwise a click is a click
       // like any other: the outgoing judge is asked of every click, and alters / unsure / no answer raise it
       const closeAsks = btn === "x" && source !== "made";
-      const judgeRaises = outgoing !== "stays";
+      // (since the split, rc.17: 会删改 is asked only in a window DeskMind opened — in the task's own window it is no card)
+      const judgeRaises = outgoing !== "stays" && !(outgoing === "alters" && source !== "opened");
       const wantCard = source === "user" || closeAsks || judgeRaises;
       rows.push(`${source} ${outgoing} ${btn} → ${r.status} ${r.consequence}`);
       expect(r.status === "needs_consent", rows.at(-1)).toBe(wantCard);

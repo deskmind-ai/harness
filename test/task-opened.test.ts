@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor } from "../src/executor/executor.js";
-import { INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, type Judge } from "../src/executor/judge.js";
+import { ALTERS_OPTIONS, ALTERS_QUESTION, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, type Judge } from "../src/executor/judge.js";
 import type { Action, Driver, Element, Observation, Snapshot, WindowInfo } from "../src/executor/types.js";
 import type { TaskOpenedPolicy } from "../src/orchestrator/index.js";
 
@@ -67,13 +67,23 @@ const handsOpened = (w: WindowInfo): WindowInfo => ({ id: w.id, app: w.app, app_
 
 /** A judge that answers the outgoing question with `outgoing` (null: no answer) and the intent question with `intent`,
  *  and records which questions were asked. */
+/** #75's one answer to the step (sends / alters / stays / unsure / none) as the two questions answer it since the split
+ *  (rc.17): the outgoing question (alters → stays there), then the alters one (stays → keeps). undefined: neither. */
+const split = (q: string, combined: string | null): string | null | undefined =>
+  q === OUTGOING_QUESTION ? (combined === "alters" ? "stays" : combined) : q === ALTERS_QUESTION ? (combined === "alters" ? "alters" : combined === "stays" ? "keeps" : combined) : undefined;
+const OUT_OR_ALTERS = (q: string) => q === OUTGOING_QUESTION || q === ALTERS_QUESTION;
+
 function fakeJudge(outgoing: string | null, intent: string | null) {
   const asked: string[] = [];
   const judge = {
+    // `outgoing` is the step's answer in the words of #75's one question (sends / alters / stays / unsure / none); since
+    // the split (rc.17) it is put to the two questions: the outgoing one (alters → stays there), then the alters one
     choose: async (q: string) => {
-      const name = q === OUTGOING_QUESTION ? "outgoing" : q === INTENT_QUESTION ? "intent" : "other";
+      const name = q === OUTGOING_QUESTION ? "outgoing" : q === ALTERS_QUESTION ? "alters" : q === INTENT_QUESTION ? "intent" : "other";
       asked.push(name);
-      const choice = name === "outgoing" ? outgoing : name === "intent" ? intent : "pass";
+      const choice = name === "outgoing" ? (outgoing === "alters" ? "stays" : outgoing)
+        : name === "alters" ? (outgoing === "alters" ? "alters" : outgoing === "stays" ? "keeps" : outgoing)
+        : name === "intent" ? intent : "pass";
       return choice ? { choice, by: "fake", confidence: 1, reason: "" } : null;
     },
   } as unknown as Judge;
@@ -121,7 +131,9 @@ describe("H1: a window the task's launch brought up — the table (source × jud
     // in such a window — a click on the close button is still a click the outgoing judge sees, as any click is
     const asked = judge && kind !== "close_window" && (kind === "click" || kind === "close_button" || (source === "opened" && policy === "task" && !CLOSING.has(kind)));
     // 「会删改」raises only under "task"; the "user" arm is the behaviour before 10-25 (review of #75, C)
-    const raised = asked ? (outgoing === "sends" || outgoing === "unsure" || outgoing === null ? "external" : outgoing === "alters" && policy === "task" ? "modify_user" : null) : null;
+    // (since the split, rc.17: 会删改 is its own question, asked only in a window DeskMind opened under "task"; in the
+    // task's own window — its content is the task's — it is not asked)
+    const raised = asked ? (outgoing === "sends" || outgoing === "unsure" || outgoing === null ? "external" : outgoing === "alters" && policy === "task" && source === "opened" ? "modify_user" : null) : null;
     let cls: string;
     if (raised === "external") cls = "external";
     // closing, quitting and undoing ask for the user's windows and for one DeskMind opened (it may hold their state, and
@@ -165,13 +177,16 @@ describe("H1: a window the task's launch brought up — the table (source × jud
     expect(rows).toEqual(want);
   }, 60_000);
 
-  it("the judge's option exists, and the question still starts as it did (TierStats routes by its first words)", () => {
-    expect(OUTGOING_OPTIONS.map((o) => o.id)).toEqual(["sends", "alters", "stays", "unsure"]);
+  it("the second direction is its own question (rc.17), apart from the outgoing one, which starts as it did (TierStats routes by its first words)", () => {
+    expect(OUTGOING_OPTIONS.map((o) => o.id)).toEqual(["sends", "stays", "unsure"]);
+    expect(ALTERS_OPTIONS.map((o) => o.id)).toEqual(["alters", "keeps", "unsure"]);
     expect(OUTGOING_QUESTION.slice(0, 12)).toBe("这一步会不会把内容发出去");
+    expect(ALTERS_QUESTION.slice(0, 12)).not.toBe(OUTGOING_QUESTION.slice(0, 12));
     // the option's three backstops, where structure cannot see: closing / quitting from a menu or a plain button, and a
     // save over an existing file on disk (another's app's Save As, the overwrite sheet's 替换) — review of #75
-    const alters = OUTGOING_OPTIONS.find((o) => o.id === "alters")!.text;
-    for (const word of ["关掉窗口", "退出应用", "另存为", "替换"]) { expect(alters).toContain(word); expect(OUTGOING_QUESTION).toContain(word); }
+    const alters = ALTERS_OPTIONS.find((o) => o.id === "alters")!.text;
+    for (const word of ["关掉窗口", "退出应用", "另存为", "替换"]) expect(alters + ALTERS_QUESTION).toContain(word);
+    for (const word of ["关掉窗口", "另存为", "替换"]) expect(OUTGOING_QUESTION).not.toContain(word);
   });
 
   it("a save over the user's file from a window DeskMind opened (the overwrite sheet's 替换): the judge is the guard — alters asks, stays runs", async () => {
@@ -244,7 +259,7 @@ describe("H1: the property — an object the user had at begin is never changed 
       desk.launches["Editor"] = { window: made, says: "new_window" };
       const protectedIds = new Set([u1.id, u2.id, hidden.id]);                     // the ground truth: what the user had at begin
       let outgoing: string | null = "stays", intent: string | null = "matches";
-      const judge = { choose: async (q: string) => { const c = q === OUTGOING_QUESTION ? outgoing : q === INTENT_QUESTION ? intent : "pass"; return c ? { choice: c, by: "fake", confidence: 1, reason: "" } : null; } } as unknown as Judge;
+      const judge = { choose: async (q: string) => { const sp = split(q, outgoing); const c = sp !== undefined ? sp : q === INTENT_QUESTION ? intent : "pass"; return c ? { choice: c, by: "fake", confidence: 1, reason: "" } : null; } } as unknown as Judge;
       const app = ConsentSigner.fresh();
       const ex = new Executor(desk, { task: "p", publicKey: app.publicKey, raw: "随便做点什么", taskOpened: policy, judge });
       await ex.begin(); await ex.plan({ steps: [] });
@@ -421,8 +436,8 @@ describe("review of #75", () => {
       await rt.run();
       expect([policy, cards.map((c) => c.kind)]).toEqual([policy, want]);
     }
-    // the judge's answer in the task's own window
-    for (const [policy, status] of [["user", "ok"], ["task", "needs_consent"]] as const) {
+    // the judge's「会删改」in the task's own window: not asked there since the split (rc.17) — its content is the task's
+    for (const [policy, status] of [["user", "ok"], ["task", "ok"]] as const) {
       const { desk, ex, target, o } = await stage("made", policy, fakeJudge("alters", "matches").judge);
       const before = desk.effects.length;
       const r = await ex.act({ action: action("click", target.id), epoch: o.epoch });
@@ -461,7 +476,7 @@ describe("review of #75, delta round", () => {
   it("D: the content fact — a field holding anything is the user's, even text the task itself just typed (nothing is credited to the task: Codex round 3)", async () => {
     const { desk, ex, target, o } = await stage("opened", "task", undefined);
     const seen: Record<string, unknown>[] = [];
-    (ex as unknown as { opts: { judge: Judge; raw: string } }).opts.judge = { choose: async (q: string, ctx: Record<string, unknown>) => { if (q === OUTGOING_QUESTION) seen.push(ctx); return { choice: q === OUTGOING_QUESTION ? "stays" : "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
+    (ex as unknown as { opts: { judge: Judge; raw: string } }).opts.judge = { choose: async (q: string, ctx: Record<string, unknown>) => { if (q === OUTGOING_QUESTION) seen.push(ctx); return { choice: split(q, "stays") ?? "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
     expect((await ex.act({ action: { kind: "type", window: target.id, target: "search", text: "的" }, epoch: o.epoch })).status).toBe("ok");
     const fact = () => { const el = seen.at(-1)!["目标元素"] as Record<string, unknown>; return [el["目标里已有内容"], "已有内容是本次任务打的" in el]; };
     expect(fact()).toEqual([false, false]);                              // an empty field, and no "task's own" fact exists any more
@@ -495,7 +510,7 @@ describe("Codex review of #75", () => {
       const search = ELS.find((e) => e.id === "search")!;
       (search as { value?: string }).value = "";
       // the judge answers, and meanwhile the field fills with the user's synced content, the epoch unmoved
-      const judge = { choose: async (q: string) => { if (q === OUTGOING_QUESTION) (search as { value?: string }).value = "用户同步过来的草稿"; return { choice: q === OUTGOING_QUESTION ? "stays" : "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
+      const judge = { choose: async (q: string) => { if (q === OUTGOING_QUESTION) (search as { value?: string }).value = "用户同步过来的草稿"; return { choice: split(q, "stays") ?? "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
       const { desk, ex, target, o } = await stage("opened", "task", judge);
       const before = desk.effects.length;
       const a: Action = kind === "set_value" ? { kind, window: target.id, target: "search", value: "会议" } : { kind, window: target.id, target: "search", text: "会议" };
@@ -516,7 +531,8 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
     const facts: Record<string, unknown>[] = [];
     const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
       let choice = "matches";
-      if (q === OUTGOING_QUESTION) { const el = ctx["目标元素"] as Record<string, unknown>; facts.push(el); choice = el["目标里已有内容"] ? "alters" : "stays"; }
+      if (q === OUTGOING_QUESTION) facts.push(ctx["目标元素"] as Record<string, unknown>);
+      if (OUT_OR_ALTERS(q)) { const el = ctx["目标元素"] as Record<string, unknown>; choice = split(q, el["目标里已有内容"] ? "alters" : "stays")!; }
       return { choice, by: "fake", confidence: 1, reason: "follow the supplied ownership facts" };
     } } as unknown as Judge;
     const { desk, ex, target, o } = await stage("opened", "task", judge);
@@ -629,10 +645,10 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
       const world = new World(r);
       world.wins.push({ id: "Notes#1", app: "Notes", app_name: "Notes", title: "购物清单" }); world.userWins.add("Notes#1");
       const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
-        if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
+        if (!OUT_OR_ALTERS(q)) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
         const el = ctx["目标元素"] as Record<string, unknown> | null;
         const holds = el ? el["目标里已有内容"] : false;
-        return { choice: holds === true ? "alters" : holds === false ? "stays" : "unsure", by: "fake", confidence: 1, reason: "" };
+        return { choice: split(q, holds === true ? "alters" : holds === false ? "stays" : "unsure")!, by: "fake", confidence: 1, reason: "" };
       } } as unknown as Judge;
       const app = ConsentSigner.fresh();
       const journal = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "h1p2-")), "journal.jsonl");
@@ -725,9 +741,9 @@ describe("Codex review of #75, round 3", () => {
   it("a same-looking body field in another document of the same window, holding the task's earlier text: still a card (nothing is credited to the task)", async () => {
     let value = "", doc = "新建文稿", holds: unknown;
     const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
-      if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
+      if (!OUT_OR_ALTERS(q)) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
       const el = ctx["目标元素"] as Record<string, unknown>; holds = el["目标里已有内容"];
-      return { choice: holds ? "alters" : "stays", by: "fake", confidence: 1, reason: "follow the supplied content fact" };
+      return { choice: split(q, holds ? "alters" : "stays")!, by: "fake", confidence: 1, reason: "follow the supplied content fact" };
     } } as unknown as Judge;
     const { desk, ex, target } = await stage("opened", "task", judge);
     target.title = doc; desk.epoch += 1;
@@ -773,9 +789,9 @@ describe("Codex review of #75, round 4 — unknown is never the safe value", () 
   it("an editable field whose value the driver could not read (the screen) is unknown, not empty: the judge gets no 「已有内容」 fact and a flag, and the write asks", async () => {
     let value = "用户原有的正文", fact: unknown, flag: unknown;
     const judge = { choose: async (q: string, ctx: Record<string, unknown>) => {
-      if (q !== OUTGOING_QUESTION) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
+      if (!OUT_OR_ALTERS(q)) return { choice: "matches", by: "fake", confidence: 1, reason: "" };
       const el = ctx["目标元素"] as Record<string, unknown>; fact = el["目标里已有内容"]; flag = el["目标内容读不出来"];
-      const choice = fact === true ? "alters" : fact === false ? "stays" : "unsure";
+      const choice = split(q, fact === true ? "alters" : fact === false ? "stays" : "unsure")!;
       return { choice, by: "fake", confidence: 1, reason: "follow the supplied content fact" };
     } } as unknown as Judge;
     const { desk, ex, target } = await stage("opened", "task", judge);
