@@ -268,3 +268,43 @@ describe("Codex review of #78 (adopted): floors are worked out on live facts at 
     }
   });
 });
+
+describe("Codex review of #78, round 2 (adopted): the floors read the action as the driver gets it, last, with no wait after", () => {
+  it("the live close floor uses the target id from the fresh look", async () => {
+    const s = await stage("opened");
+    const observe = s.desk.observe.bind(s.desk);
+    const button: Element = { id: "old-id", role: "button", label: "Close", actions: ["click"], rect: [10, 10, 15, 15] };
+    s.desk.observe = (id: string) => ({ ...observe(id), elements: [button] });
+    s.look = await s.ex.observe(s.target.id);
+    s.desk.observe = (id: string) => ({ ...observe(id), elements: [{ ...button, id: "fresh-id", ax_subrole: "AXCloseButton" }] });
+    const performed: Action[] = [];
+    const perform = s.desk.perform.bind(s.desk);
+    s.desk.perform = (a: Action) => { performed.push(a); return perform(a); };
+    const r = await act(s, { kind: "click", window: s.target.id, target: "old-id" });
+    expect({ status: r.status, performed }).toEqual({ status: "stale", performed: [] });
+  });
+
+  it("a file appearing during the snapshot after the final look must still prevent saving", async () => {
+    const folder = fs.mkdtempSync(path.join(os.tmpdir(), "review78-last-snapshot-"));
+    const dest = path.join(folder, "report.txt");
+    const sheet: SaveSheet = { read: true, name: "report.txt", stem: "report", name_focused: true, folder, path: dest, nested_sheet: false };
+    const s = await stage("made", { sheet });
+    let finalLook = false;
+    const observe = s.desk.observe.bind(s.desk), snapshot = s.desk.snapshot.bind(s.desk), perform = s.desk.perform.bind(s.desk);
+    s.desk.observe = (id: string) => { finalLook = true; return observe(id); };
+    s.desk.snapshot = () => { if (finalLook) fs.writeFileSync(dest, "user original"); return snapshot(); };
+    let collisionAtPerform = false;
+    s.desk.perform = (a: Action) => { if (a.kind === "click") collisionAtPerform = fs.existsSync(dest); return perform(a); };
+    const r = await act(s, { kind: "click", window: s.target.id, target: "save" });
+    expect({ status: r.status, collisionAtPerform }).toEqual({ status: "stale", collisionAtPerform: false });
+  });
+
+  it("no await between the last floor check and the driver call (structure of act, read from the source)", () => {
+    const src = fs.readFileSync(path.join(__dirname, "..", "src", "executor", "executor.ts"), "utf-8");
+    const from = src.indexOf("const floorNow = this.floorsNow(act, lookNow);");
+    const to = src.indexOf("await this.driver.perform(this.forDriver(act)", from);
+    expect(from).toBeGreaterThan(0); expect(to).toBeGreaterThan(from);
+    // the only await on the way is the span that calls the driver (it runs its function synchronously to the call)
+    expect(src.slice(from, to).match(/\bawait\b/g)).toEqual(["await"]);
+  });
+});

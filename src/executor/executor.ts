@@ -1516,8 +1516,7 @@ export class Executor {
   private card(a: Action, decided: Observation | undefined, consequence: Consequence, look: Observation | undefined = decided): { sending: ReturnType<typeof outgoing> | null; typed: string[]; content: SendBinding | undefined; text: string; act: Action; lost: boolean; facts: ActionCardFacts } {
     // the target as the caller decided it (its ids are those of `decided`), found in `look` — what is there now
     const id = "target" in a && a.target ? a.target : null;
-    const el = id && decided && look ? resolve(decided, id, look) : undefined;
-    const act = el && el.id !== id ? ({ ...a, target: el.id } as Action) : a;
+    const { act, el } = mapOnto(a, decided, look);
     const sending = consequence === "external" ? outgoing(look) : null;
     const typed = sending ? this.typedIn(a).filter((t) => t.trim()) : [];
     const typedLines = typed.filter((t) => !sending!.fields.some((l) => l.includes(t.trim())));
@@ -1649,9 +1648,9 @@ export class Executor {
     const latest = target ? this.looks.get(target) ?? obs : undefined;
     let act: Action = req.action;
     if (obs && latest && "target" in req.action && req.action.target) {
-      const el = resolve(obs, req.action.target, latest);
-      if (!el) return done({ ...base, status: "stale", why: `element ${req.action.target} cannot be found for certain in what ${target} shows now (gone, or not one of a kind); observe it again`, epoch: now.epoch });
-      if (el.id !== req.action.target) act = { ...req.action, target: el.id } as Action;
+      const m = mapOnto(req.action, obs, latest);
+      if (m.lost) return done({ ...base, status: "stale", why: `element ${req.action.target} cannot be found for certain in what ${target} shows now (gone, or not one of a kind); observe it again`, epoch: now.epoch });
+      act = m.act;
     }
     if (obs && latest && latest !== obs && (req.action.kind === "key" || req.action.kind === "type")) {
       const f1 = obs.elements.find((e) => e.focused), f2 = latest.elements.find((e) => e.focused);
@@ -1662,7 +1661,8 @@ export class Executor {
     const asked = this.classified.size;
     const c0 = await this.classify(req.action, req.epoch, req.consequence);
     // the live floors on the latest look and the disk now, never lowered by a class cached earlier (Codex review of #78)
-    const liveFloor = this.floorsNow(req.action, target ? this.looks.get(target) ?? obs : obs);
+    // (the action as mapped onto the look it is judged against: the ids of that look — mapOnto, as the driver gets it)
+    const liveFloor = this.floorsNow(act, latest ?? obs);
     const c = liveFloor && rank(liveFloor.consequence) > rank(c0.consequence) ? { ...c0, consequence: liveFloor.consequence, why: liveFloor.why, by: "structure" as const, opened: undefined } : c0;
     if (c !== c0) this.emit("executor.floor_raised", { action: req.action, from: c0.consequence, to: c.consequence, why: liveFloor!.why });
     consequence = c.consequence; base = { consequence, object: c.object };
@@ -1782,10 +1782,6 @@ export class Executor {
       // so the reason may describe a later change; a snapshot that fails leaves the reason out, the result is the same
       if (fresh.epoch !== req.epoch) return staleOn(await Promise.resolve().then(() => this.see()).catch(() => ({ epoch: fresh.epoch } as Snapshot)), { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${fresh.epoch}); observe again`, epoch: fresh.epoch });
       const changed = (what: string) => done({ ...base, status: "stale", why: `${target} changed right before acting (${what}); observe it again and decide anew`, epoch: fresh.epoch });
-      // the floors again, on this very look and the disk now: one that rose above the class decided on is a step not
-      // covered by what was decided (or consented): nothing is done, the caller looks again (and asks, when it must)
-      const lastFloor = this.floorsNow(req.action, fresh);
-      if (lastFloor && rank(lastFloor.consequence) > rank(consequence)) return changed(`now: ${lastFloor.why}`);
       // the target, always found again by identity (content, and id or place) and required one of a kind: the driver acts
       // on ids of this look, and text recognition renumbers them — its ocr:1 may now be the other pane's「发送」
       const again = this.card(req.action, obs, consequence, fresh);
@@ -1818,6 +1814,20 @@ export class Executor {
       if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
       if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed right before acting (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+    }
+    // the floors one last time, on the action as the driver will get it (mapped onto the window's latest look — the final
+    // look when one was taken) and the disk read now. Nothing awaits from here to the driver call: a check followed by a
+    // wait would be a check of the past (Codex review of #78, round 2). A floor above what was decided or consented is a
+    // step not covered: nothing is done, the caller looks again (and asks, when it must). (A file another program writes
+    // in the moment between this read and the click itself cannot be ruled out here: the system's own "replace?" sheet —
+    // the nested_sheet floor on the next step — is the backstop.)
+    {
+      const lookNow = (target ? this.looks.get(target) : undefined) ?? obs;
+      const floorNow = this.floorsNow(act, lookNow);
+      if (floorNow && rank(floorNow.consequence) > rank(consequence)) {
+        this.emit("executor.floor_raised", { action: act, from: consequence, to: floorNow.consequence, why: floorNow.why, last: true });
+        return done({ ...base, status: "stale", why: `${target ?? "the window"} changed right before acting (now: ${floorNow.why}); observe it again and decide anew`, epoch: this.epoch });
+      }
     }
     const before = "window" in req.action ? this.lastObs.get(req.action.window) ?? null : null;
     // a real driver can fail on either side of the action: that is a result the model reads, never an exception
@@ -2467,6 +2477,16 @@ export function shortUrl(u: string, lang?: Lang): string {
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
+/** `a` as the driver gets it on `look`: its target (named by an id of `decided`, the observation it was decided on)
+ *  found in `look` by what it is and where — exactly one, or `lost`. The one mapping, used for the card, the floors and
+ *  the effect alike (Codex review of #78, round 2: floors read an old id that the final look had renumbered). */
+function mapOnto(a: Action, decided: Observation | undefined, look: Observation | undefined): { act: Action; el: Element | undefined; lost: boolean } {
+  const id = "target" in a && a.target ? a.target : null;
+  if (!id) return { act: a, el: undefined, lost: false };
+  const el = (decided && look ? resolve(decided, id, look) : undefined) ?? undefined;
+  return { act: el && el.id !== id ? ({ ...a, target: el.id } as Action) : a, el, lost: !el };
+}
+
 /** Whether `a` presses a close button on `look` (its AX subrole AXCloseButton, hands#70; or a role that says close):
  *  a click or double-click on it, or Space / Return on it focused — every way of pressing it, not one action name. */
 function pressesClose(a: Action, look: Observation | undefined): boolean {
