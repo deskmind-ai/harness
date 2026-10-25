@@ -8,7 +8,7 @@
  *     when it was trained); any other question skips it and goes to the tiers above.
  *  2. The outgoing question is back to its words before #75; the second direction is its own question, asked only in a
  *     window DeskMind opened under POLICY.taskOpened "task", after the outgoing question said「不会」, never of Brain.
- *  3. What a card lists as going out never holds an element whose value only repeats its label.
+ *  (What a card lists as going out is as before: the forward window keeps its recipient, item and draft.)
  */
 import { describe, expect, it } from "vitest";
 import { ConsentSigner } from "../src/executor/consent.js";
@@ -112,7 +112,7 @@ describe("2 and 4. the outgoing question in Brain's words; the alters question a
   }
 });
 
-describe("3. what a card lists as going out: a send control's window as before; a window with none shows only what was typed or set", () => {
+describe("3. what a card lists as going out is unchanged (#79 review: the sidebar noise was the wrong send, an effect — deskmind#90)", () => {
   /** The executor on `desk` with a top-only judge saying「会发出去」to the outgoing question (as rc.17's Brain did). */
   async function sendsCard(desk: Driver & { w: WindowInfo }, target: string) {
     const top = { ask: async (_r: string, _s: string, prompt: string) => { const q = prompt.slice(prompt.indexOf("问题：") + 3, prompt.indexOf("\n选项：")); return { outcome: "answered", data: { choice: q === INTENT_QUESTION ? "matches" : "sends" } }; } };
@@ -124,12 +124,6 @@ describe("3. what a card lists as going out: a send control's window as before; 
     expect(r.status).toBe("needs_consent");
     return r.challenge!;
   }
-  it("the Open panel (no send control, the judge alone said 会发出去): the sidebar is not listed as going out", async () => {
-    const c = await sendsCard(new Desk(), "syn:newdoc");
-    const listed = c.text.slice(c.text.indexOf("要发出去的"));
-    for (const n of ["最近使用", "文稿", "Downloads", "红色", "个人收藏"]) expect(listed, n).not.toContain(n);
-    expect(c.facts!.outgoing.map((x) => x.value)).not.toContain("文稿");
-  });
   it("(review of #79) a forward window with a 发送 control: the recipient, the forwarded item and the draft — static texts whose value is their label — are all listed", async () => {
     const w: WindowInfo = { id: "Mail#9", app: "Mail", app_name: "邮件", title: "转发：Q3 预算" };
     const els: Element[] = [

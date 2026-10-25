@@ -1501,12 +1501,12 @@ export class Executor {
     if (!ans) return settle({ consequence: "external", object: s.object, why: "the outgoing check got no answer: treated as sending", by: "no_answer" });
     if (ans.choice !== "stays") return settle({ consequence: "external", object: s.object, why: `判官（${ans.by}）：${ans.choice === "sends" ? "会发出去" : "拿不准"}${ans.reason ? "。" + ans.reason : ""}`, by: ans.by, definite: ans.choice === "sends" });
     const m = mine();
-    // the second direction (M3–M6 plan §1.2), its own question, after「不会发出去」, under POLICY.taskOpened "task" — as the
-    // one question asked it before the split: in a window DeskMind opened (every step there), and of the steps put to the
-    // outgoing judge in the task's own windows (a click on 替换, a save over a file, a quit item: the backstop where
-    // structure cannot see). Not where the class is already modify_user. It only raises — 会删改 / 拿不准 / no answer →
+    // the second direction (M3–M6 plan §1.2), its own question, after「不会发出去」, under POLICY.taskOpened "task" —
+    // exactly where the one question asked it before the split: every step put to the outgoing judge (the guard above:
+    // mightSend, or a window DeskMind opened), in any window — the backstop for 替换, a save over a file, a quit item.
+    // Not where the class is already modify_user. It only raises — 会删改 / 拿不准 / no answer →
     // modify_user (a card); 不会 → the class stays. Never asked of a local tier (not a wording Brain ran with)
-    if (this.taskOpenedPolicy === "task" && rank(m.consequence) < rank("modify_user") && (s.opened || a.kind === "click" || a.kind === "double_click")) {
+    if (this.taskOpenedPolicy === "task" && rank(m.consequence) < rank("modify_user")) {
       const al = await this.choose(judge, ALTERS_QUESTION, ctx, ALTERS_OPTIONS, undefined, { settle: "alters", route: false });
       if (!al || al.choice !== "keeps") return settle({ consequence: higher(m.consequence, "modify_user"), object: s.object, why: al ? `判官（${al.by}）：${al.choice === "alters" ? "会删掉或改掉用户已有的内容" : "拿不准会不会删改用户已有的内容"}${al.reason ? "。" + al.reason : ""}；${m.why}` : `the alters check got no answer: taken to change the user's things; ${m.why}`, by: al?.by ?? "no_answer" });
       return settle({ ...m, why: `判官（${ans.by}）：不会发出去；判官（${al.by}）：也不删改用户已有的内容${al.reason ? "。" + al.reason : ""}；${m.why}`, by: al.by });
@@ -2392,20 +2392,6 @@ function reach(ws: Workspace, paths: string[]): string[] {
   return [...new Set(paths.flatMap((p) => (ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
 }
 
-/** The elements of a list or sidebar, by role and the tree order hands reads them in: an outline (or list / table)
- *  and the rows, cells, texts and images that follow it, up to the first element of another role. */
-const LIST = /^(ax)?(outline|list|table)$/i, IN_LIST = /^(ax)?(row|outlinerow|cell|statictext|image)$/i;
-function listRows(els: readonly Element[]): Set<Element> {
-  const out = new Set<Element>();
-  let inside = false;
-  for (const e of els) {
-    const role = e.role.replace(/[\s_-]/g, "");
-    if (LIST.test(role)) { inside = true; continue; }
-    if (inside && IN_LIST.test(role)) { out.add(e); continue; }
-    inside = false;
-  }
-  return out;
-}
 
 /** What a send in this window would send, for the card and the consent. `fields`: every element that holds content —
  *  a value (typed, picked, or only shown) or, with nothing to do on it, a text of its own (a confirmation page's
@@ -2419,17 +2405,11 @@ function listRows(els: readonly Element[]): Set<Element> {
  *  text-recognition row or a recipient tag with actions of its own). */
 export function outgoing(obs: Observation | undefined): { fields: string[]; shown: string[]; bound: unknown } {
   const els = obs?.elements ?? [];
-  // the rows of a list or sidebar (an outline, and the rows, cells and texts in it: rc.17's Open panel listed every
-  // sidebar place as going out) are where things are picked, not what goes out; every other field and text is listed,
-  // as before — a static text can be the forwarded item or the user's draft. The consent binding covers every element
-  // either way (bound, below)
-  const inList = listRows(els);
   const fields = [
-    ...els.filter((e) => !inList.has(e) && (e.value || (!e.actions.length && e.label))).map((e) => (e.value ? `${e.label}：${e.value}` : e.label)),
+    ...els.filter((e) => e.value || (!e.actions.length && e.label)).map((e) => (e.value ? `${e.label}：${e.value}` : e.label)),
     ...els.filter((e) => e.focused && !e.value && e.actions.length && !e.sends).map((e) => `✓ ${e.label}`),
   ];
-  const listed = new Set([...inList].map((e) => (e.value ?? e.label).trim()).filter(Boolean));
-  const shown = (obs?.text ?? "").split("\n").map((l) => l.trim()).filter((l) => l && !listed.has(l) && !fields.some((f) => f.includes(l)));
+  const shown = (obs?.text ?? "").split("\n").map((l) => l.trim()).filter((l) => l && !fields.some((f) => f.includes(l)));
   // where it goes: a page's address may be only in the window's metadata (review of #16: a webview switched sites)
   if (obs?.window.url) fields.unshift(`URL：${obs.window.url}`);
   const bound = obs ? {
@@ -2447,8 +2427,7 @@ export function outgoingItems(obs: Observation | undefined, typed: string[] = []
   const els = obs?.elements ?? [];
   const out: ActionCardFacts["outgoing"] = [];
   if (obs?.window.url) out.push({ kind: "field", label: "URL", value: obs.window.url });
-  const inList = listRows(els);
-  for (const e of els.filter((x) => !inList.has(x) && (x.value || (!x.actions.length && x.label)))) out.push(e.value ? { kind: "field", label: e.label, value: e.value } : { kind: "text", label: "", value: e.label });
+  for (const e of els.filter((x) => x.value || (!x.actions.length && x.label))) out.push(e.value ? { kind: "field", label: e.label, value: e.value } : { kind: "text", label: "", value: e.label });
   for (const e of els.filter((x) => x.focused && !x.value && x.actions.length && !x.sends)) out.push({ kind: "selected", label: e.label, value: "" });
   for (const t of typed.map((x) => x.trim()).filter(Boolean)) out.push({ kind: "typed", label: "", value: t });
   for (const l of outgoing(obs).shown) out.push({ kind: "text", label: "", value: l });
