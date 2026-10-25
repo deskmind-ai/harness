@@ -96,7 +96,7 @@ export const fsMove = make({
     fs.renameSync(ws.abs(src), ws.abs(dst)); maybeCrash(); return after(ws, [src, dst]);
   },
   check: (ws, a, r) => moveBlocked(ws, a, r),
-  undoWrites: (_ws, a) => ({ remove: [norm(a.destination!)], into: [parentOf(norm(a.source!))] }),
+  undoWrites: (_ws, a) => { const src = norm(a.source!), dst = norm(a.destination!); return { remove: [dst], into: [parentOf(src)], ...(parentOf(src) !== parentOf(dst) ? { cross: [dst] } : {}), restores: { [src]: dst } }; },
   undo: (ws, a, r) => {
     const src = norm(a.source!), dst = norm(a.destination!);
     const e = untouched(ws, r, [src, dst]) ?? moveBlocked(ws, a, r); if (e) return e;
@@ -179,7 +179,7 @@ export const fsTrash = make({
   // were undone first and the undo stopped half way). It runs on undo's paper folder: the path and its folder as
   // they will be when this step's undo runs; a symlink at the path (never in the entries) from the real disk
   check: (ws, a, r) => trashBlocked(ws, a, r),
-  undoWrites: (_ws, a, r) => ({ remove: typeof r.undo?.trashed === "string" ? [r.undo.trashed] : [], into: [parentOf(norm(a.target!))] }),
+  undoWrites: (_ws, a, r) => (typeof r.undo?.trashed === "string" ? { remove: [r.undo.trashed], cross: [r.undo.trashed], into: [parentOf(norm(a.target!))], restores: { [norm(a.target!)]: r.undo.trashed } } : { into: [parentOf(norm(a.target!))] }),
   undo: (ws, a, r) => {
     const q = norm(a.target!);
     const e = untouched(ws, r, [q]) ?? trashBlocked(ws, a, r);

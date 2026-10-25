@@ -1998,11 +1998,9 @@ export class Executor {
     return { reversible: steps.every((s) => s.can), steps };
   }
 
-  /** Take every effect back, newest first; nothing is touched unless all of them can be (the orchestrator's rule).
-   *  A file a later program changed is refused by the capability's own check. */
-  async undo(): Promise<{ undone: number; total: number; refused: string | null; unsure?: string }> {
-    const plan = this.undoable();
-    if (!plan.reversible) return { undone: 0, total: plan.steps.length, refused: plan.steps.find((s) => !s.can)?.why ?? "cannot undo" };
+  /** Undo's check of every step, before anything is touched: null when all of them can be taken back. */
+  private undoPrecheck(plan: ReturnType<Executor["undoable"]>): string | null {
+    if (!plan.reversible) return plan.steps.find((s) => !s.can)?.why ?? "cannot undo";
     const ws = this.opts.files?.workspace;
     // check every file step first, as the orchestrator's undoRun does: nothing is touched unless all of them can be
     // taken back (review of #16: second.txt was deleted, then the user's edit to first.txt stopped the undo). The
@@ -2018,13 +2016,29 @@ export class Executor {
       // the step's own untouched test (registry/spec.ts), asked of the paper folder: the very predicate its undo asks the
       // disk — what is at each path as the volume resolves its name, nothing at all where the step left nothing — then
       // the capability's check, which its undo also asks after untouched
-      let why: string | null;
-      try {
-        why = untouched(paper!.asWorkspace, { ...f.exec, output: {} } as ExecResult, f.writes) ?? f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
-      } catch (e) { why = `could not check the undo: ${errText(e)}`; }   // nothing touched yet: refused as a whole
-      if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return { undone: 0, total: plan.steps.length, refused: why }; }
-      paper!.takeBack(f.writes, before, left, f.madeParents);
+      const why = untouched(paper!.asWorkspace, { ...f.exec, output: {} } as ExecResult, f.writes) ?? f.cap.undoCheck?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never, ours) ?? null;
+      if (why) { this.emit("executor.undo_refused", { why, undone: 0, checked_first: true }); return why; }
+      paper!.takeBack(f.writes, before, left, f.madeParents, f.cap.undoWrites?.(paper!.asWorkspace, f.args, { ...f.exec, output: {}, undo: f.exec.undo ?? f.undo_prep } as never).restores);
     }
+    return null;
+  }
+
+  /** Take every effect back, newest first; nothing is touched unless all of them can be (the orchestrator's rule).
+   *  A file a later program changed is refused by the capability's own check. */
+  async undo(): Promise<{ undone: number; total: number; refused: string | null; unsure?: string }> {
+    // everything before the first change — the plan, the paper folder (it reads the whole folder: an unreadable
+    // subfolder throws), every check — refuses as a whole when it throws: nothing has been touched yet (review of #74)
+    let plan: ReturnType<Executor["undoable"]>;
+    try {
+      plan = this.undoable();
+      const why = this.undoPrecheck(plan);
+      if (why) return { undone: 0, total: plan.steps.length, refused: why };
+    } catch (e) {
+      const why = `could not check the undo: ${errText(e)}`;
+      this.emit("executor.undo_refused", { why, undone: 0, checked_first: true });
+      return { undone: 0, total: this.possiblySteps().length, refused: why };
+    }
+    const ws = this.opts.files?.workspace;
     let undone = 0;
     for (const step of plan.steps) {
       const r = this.receipts.find((x) => x.seq === step.seq)!;

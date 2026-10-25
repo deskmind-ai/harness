@@ -78,15 +78,17 @@ export class Workspace {
 
   /** Remove tools' temporary outputs a crashed process left in TMP: only there, and only old ones, so another run
    *  checking its output right now keeps it. */
-  sweepTemp() {
-    this.sweepUndo();
+  sweepTemp(o: { except?: string } = {}) {
+    this.sweepUndo(o);
     const dir = path.join(this.root, TMP);
     let names: string[] = [];
     try { names = fs.readdirSync(dir); } catch { return; }
     const cutoff = Date.now() - STALE_TEMP_MS;
     for (const n of names) {
       const full = path.join(dir, n);
-      try { if (fs.lstatSync(full).mtimeMs < cutoff) fs.rmSync(full, { force: true }); } catch { /* raced, or next time */ }
+      // a volume probe (names()) lives for milliseconds: one a minute old was left by a process that died
+      const until = n.startsWith(PROBE) ? Date.now() - 60_000 : cutoff;
+      try { if (fs.lstatSync(full).mtimeMs < until) fs.rmSync(full, { force: true }); } catch { /* raced, or next time */ }
     }
   }
 
@@ -142,7 +144,7 @@ export class Workspace {
     try { dev = fs.statSync(this.root).dev; } catch { return defaultNames(); }
     const known = VOLUME_NAMES.get(dev);
     if (known) return known;
-    const dir = path.join(this.root, TMP), base = `probe-${randomUUID().slice(0, 8)}-a\u00e9`;
+    const dir = path.join(this.root, TMP), base = `${PROBE}${randomUUID().slice(0, 8)}-a\u00e9`;
     let found: VolumeNames;
     const made = !fs.existsSync(dir);
     try {
@@ -262,17 +264,25 @@ export class Workspace {
    *  (review of #74: a file made read-only or locked after the task let undo start and then throw half way):
    *  - "content": its bytes can be written (replace, append: the file writable, not locked or append-only);
    *  - "remove": it can be unlinked or renamed away (the entry not locked, its folder accepts the change);
-   *  - "into": a folder that takes an entry in (writable and searchable, not locked).
+   *  - "into": a folder that takes an entry in (writable and searchable, not locked);
+   *  - "cross": it can be renamed into another folder — a folder moved across parents needs write permission on
+   *    itself (macOS refuses EACCES on a 555 folder); a file needs nothing more.
    *  Nothing there: null (whether something must be there is untouched's and the capability's question). */
-  writeBlocked(p: string, how: "content" | "remove" | "into"): string | null {
+  writeBlocked(p: string, how: "content" | "remove" | "into" | "cross"): string | null {
+    if (how === "remove") return this.entryBlocked(p) ?? this.writeBlocked(parentRel(p), "into");
     const full = this.abs(p), name = p === "" ? "." : p;
     let st: fs.Stats;
-    try { st = fs.lstatSync(full); } catch { return how === "remove" ? this.writeBlocked(parentRel(p), "into") : null; }
-    if (how === "into" && !st.isDirectory()) return null;
-    if (fileFlags(full) & LOCK_FLAGS) return how === "into" ? `folder ${name} is locked` : `${name} is locked`;
-    if (how === "remove") return this.writeBlocked(parentRel(p), "into");
-    try { fs.accessSync(full, how === "into" ? fs.constants.W_OK | fs.constants.X_OK : fs.constants.W_OK); } catch { return how === "into" ? `folder ${name} is read-only` : `${name} is read-only`; }
+    try { st = fs.lstatSync(full); } catch { return null; }
+    if ((how === "into" || how === "cross") && !st.isDirectory()) return null;
+    if (fileFlags(full) & LOCK_FLAGS) return how === "content" ? `${name} is locked` : `folder ${name} is locked`;
+    try { fs.accessSync(full, how === "into" ? fs.constants.W_OK | fs.constants.X_OK : fs.constants.W_OK); } catch { return how === "content" ? `${name} is read-only` : `folder ${name} is read-only`; }
     return null;
+  }
+  /** The entry at `p` itself can be unlinked or renamed: not locked (its folder is asked apart). */
+  entryBlocked(p: string): string | null {
+    const full = this.abs(p);
+    try { fs.lstatSync(full); } catch { return null; }
+    return fileFlags(full) & LOCK_FLAGS ? `${p} is locked` : null;
   }
 
   isDir(p: string): boolean {
@@ -342,3 +352,5 @@ export function fileFlags(full: string): number {
   try { return Number(execFileSync("/usr/bin/stat", ["-f", "%f", full], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim()) || 0; } catch { return 0; }
 }
 const parentRel = (p: string) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
+/** The name a volume probe starts with (Workspace.names): swept by sweepTemp. */
+const PROBE = "probe-";

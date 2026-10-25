@@ -57,6 +57,8 @@ export interface Capability {
    *  step of the same run may have written the same path. `ours`: every path this run wrote, which later steps'
    *  undos take back first (so a folder holding only our files counts as empty). */
   undoCheck?(ws: Workspace, args: Args, receipt: ExecResult, ours: ReadonlySet<string>): string | null;
+  /** What undo writes on the disk, and which paths it brings back from where (spec.ts writeBack, paper.ts). */
+  undoWrites?(ws: Workspace, args: Args, receipt: ExecResult): UndoWrites;
   /** The action discards existing content of a written path (replace, trash). Overwriting content this run did not
    *  write then needs the user's approval; an append or a move does not discard anything. */
   readonly discards?: boolean;
@@ -80,6 +82,15 @@ export class Crash extends Error {}
 /** What a model is asked to make for an action (Capability.derive): `instruction` applied to `source`, the answer
  *  stored under `field`; `also` is stored with it. */
 export interface Derivation { field: string; instruction: string; source: string; also?: Record<string, string> }
+
+/** What an undo writes on the disk:
+ *  - content: files whose bytes it writes back;
+ *  - remove: entries it unlinks or renames away;
+ *  - into: folders it puts an entry into;
+ *  - cross: entries it renames into another folder (a folder moved across parents needs write permission on itself);
+ *  - restores: the paths it brings back, each from where it is now (move: source ← destination; trash: target ←
+ *    the trashed file), so a check on paper asks about the file that will be there. */
+export interface UndoWrites { content?: string[]; remove?: string[]; into?: string[]; cross?: string[]; restores?: Record<string, string> }
 
 /** A capability's self-description for prompts: never the implementation. */
 export const describeCapability = (c: Capability) => ({ id: c.id, description: c.description, effect: c.effect, input: c.schema.properties, required: c.schema.required });
@@ -107,6 +118,7 @@ export function renamed(c: Capability, map: Record<string, string>, suffix = ".a
     execute: (ws, a) => base.execute(ws, inv(a)),
     ...(base.undo ? { undo: (ws: Workspace, a: Args, r: ExecResult) => base.undo!(ws, inv(a), r) } : {}),
     ...(base.prepareUndo ? { prepareUndo: (ws: Workspace, a: Args) => base.prepareUndo!(ws, inv(a)) } : {}),
+    ...(base.undoWrites ? { undoWrites: (ws: Workspace, a: Args, r: ExecResult) => base.undoWrites!(ws, inv(a), r) } : {}),
     ...(base.undoCheck ? { undoCheck: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => base.undoCheck!(ws, inv(a), r, ours) } : {}),
     ...(base.derive ? { derive: (ws: Workspace, a: Args) => base.derive!(ws, inv(a)) } : {}),
   };

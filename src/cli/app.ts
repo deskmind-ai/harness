@@ -383,7 +383,7 @@ export async function appRun(req: Request, o: { runs: string; out: (ev: AppEvent
   const ws = req.scope ? new Workspace(req.scope) : undefined;
   // undo copies: this run's in a folder of its own; a run killed before any exit path ran left its folder behind —
   // swept now, by its owner process being gone
-  if (ws) { ws.undoOwner = runId; ws.sweepUndo({ except: runId }); }
+  if (ws) { ws.undoOwner = runId; ws.sweepTemp({ except: runId }); }   // dead runs' undo copies, old tool outputs, a dead process's volume probe
   // one task_done per run, and it is the last running event: what the runtime or an action still out at the driver says
   // after it (a stop's deadline wrote it) is in the trace only. The words of a steer that came too late are still said
   let done = false;

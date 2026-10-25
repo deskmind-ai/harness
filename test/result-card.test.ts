@@ -1386,6 +1386,76 @@ describe("REV74 (review of #74, adopted)", () => {
     expect(fs.existsSync(path.join(d.scope, "a.txt"))).toBe(true);
   });
 
+  /** Run `steps`, then `between` (the user, after the task), then the undo; the answer and whether appRun threw. */
+  async function undoAfter(d: Desk, steps: Step[], between: () => void) {
+    const r = start(d, steps, (e, write, input) => {
+      between();
+      const i = e.result_card?.options.findIndex((x: any) => x.kind === "undo") ?? -1;
+      if (i >= 0) write({ type: "respond", option: i }); else input.end();
+    });
+    let threw: unknown = null;
+    try { await Promise.race([r.run, new Promise((_, rej) => setTimeout(() => rej(new Error("hung")), 8000))]); } catch (e) { threw = e; }
+    return { threw, resp: r.events.find((e) => e.kind === "result_response") as any };
+  }
+
+  it("G: replace u2.txt, then move it to notes/u3.txt; the user makes notes/u3.txt read-only: refused before anything (the check asks about the file the replace's undo will write — u3.txt brought back)", async () => {
+    const d = desk();
+    const x = await undoAfter(d, [
+      { calls: [{ name: "fs_replace_text", args: { target: "u2.txt", text: "新的\n" } }] },
+      { calls: [{ name: "fs_move", args: { source: "u2.txt", destination: "notes/u3.txt" } }] },
+    ], () => fs.chmodSync(path.join(d.scope, "notes", "u3.txt"), 0o444));
+    expect(x.threw).toBeNull();
+    expect(x.resp).toMatchObject({ undone: 0, total: 2, refused: expect.stringMatching(/read-only/) });
+    expect(fs.existsSync(path.join(d.scope, "notes", "u3.txt"))).toBe(true);                     // nothing taken back
+  });
+
+  it("G2: replace u2.txt, then trash it; the user makes the trashed file read-only: refused before anything (the file the replace's undo writes is the trashed one put back)", async () => {
+    const d = desk();
+    const x = await undoAfter(d, [
+      { calls: [{ name: "fs_replace_text", args: { target: "u2.txt", text: "新的\n" } }] },
+      { calls: [{ name: "fs_trash", args: { target: "u2.txt" } }] },
+    ], () => { const t = path.join(d.scope, ".deskmind-trash"); fs.chmodSync(path.join(t, fs.readdirSync(t)[0]!, "u2.txt"), 0o444); });
+    // the replace's undo writes the trashed file once it is back: read-only, so refused as a whole
+    expect(x.threw).toBeNull();
+    expect(x.resp).toMatchObject({ undone: 0, total: 2, refused: expect.stringMatching(/read-only/) });
+    expect(fs.existsSync(path.join(d.scope, "u2.txt"))).toBe(false);
+  });
+
+  it("H: create a.txt; the user makes notes/ unreadable (chmod 000): the undo answers (refused as a whole), never throws", async () => {
+    const d = desk();
+    let x: Awaited<ReturnType<typeof undoAfter>>;
+    try { x = await undoAfter(d, [{ calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] }], () => fs.chmodSync(path.join(d.scope, "notes"), 0o000)); }
+    finally { fs.chmodSync(path.join(d.scope, "notes"), 0o755); }
+    expect(x.threw).toBeNull();
+    expect(x.resp).toMatchObject({ undone: 0, total: 1, refused: expect.stringMatching(/could not check the undo/) });
+    expect(fs.existsSync(path.join(d.scope, "a.txt"))).toBe(true);
+    expect(copiesIn(d)).toEqual([]);
+  });
+
+  it("a folder moved across parents, made 555 by the user: moving it back needs write permission on itself — refused before anything", async () => {
+    const d = desk();
+    fs.mkdirSync(path.join(d.scope, "archive"));
+    let x: Awaited<ReturnType<typeof undoAfter>>;
+    try {
+      x = await undoAfter(d, [
+        { calls: [{ name: "fs_move", args: { source: "notes", destination: "archive/notes" } }] },
+        { calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] },
+      ], () => fs.chmodSync(path.join(d.scope, "archive", "notes"), 0o555));
+    } finally { try { fs.chmodSync(path.join(d.scope, "archive", "notes"), 0o755); } catch { /* moved back */ } }
+    expect(x.threw).toBeNull();
+    expect(x.resp).toMatchObject({ undone: 0, total: 2, refused: expect.stringMatching(/folder archive\/notes is read-only/) });
+    expect(fs.existsSync(path.join(d.scope, "a.txt"))).toBe(true);
+  });
+
+  it("a volume probe a dead process left in .deskmind-tmp is swept by the next app run", async () => {
+    const d = desk();
+    const tmpDir = path.join(d.scope, ".deskmind-tmp"), probe = path.join(tmpDir, "probe-dead0000-a\u00e9");
+    fs.mkdirSync(tmpDir); fs.writeFileSync(probe, "");
+    const old = new Date(Date.now() - 5 * 60_000); fs.utimesSync(probe, old, old);
+    await undoAfter(d, [{ calls: [{ name: "fs_create_text", args: { parent: ".", name: "a.txt", text: "hi" } }] }], () => {});
+    expect(fs.existsSync(probe)).toBe(false);
+  });
+
   it("D: trash a file whose name is 250 bytes (worked on main)", async () => {
     const d = desk();
     const name = "长".repeat(81) + ".txt";   // 244 bytes
@@ -1451,8 +1521,8 @@ describe("file undo: every exit path of the executor discards its own copies; th
 describe("file undo: a capability's check refuses whenever its undo would (never half way)", () => {
   const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
   it("random file steps, then another program interferes at random: undo takes back all of it or none of it", async () => {
-    const INTERFERE = ["none", "rm_notes", "retake_trashed", "retake_trashed_case", "retake_trashed_nfd", "symlink_trashed", "edit_a_file", "drop_copies", "rename_case"];
-    for (let seed = 101; seed < 155; seed++) {
+    const INTERFERE = ["none", "rm_notes", "retake_trashed", "retake_trashed_case", "retake_trashed_nfd", "symlink_trashed", "edit_a_file", "drop_copies", "rename_case", "readonly_a_file", "readonly_notes"];
+    for (let seed = 101; seed < 167; seed++) {
       const rand = rng(seed);
       const pick = <X,>(xs: X[]) => xs[Math.floor(rand() * xs.length)]!;
       const d = desk();
@@ -1492,9 +1562,12 @@ describe("file undo: a capability's check refuses whenever its undo would (never
           if (interfere === "symlink_trashed" && trashed[0] && fs.existsSync(path.dirname(path.join(d.scope, trashed[0])))) fs.symlinkSync("/nonexistent", path.join(d.scope, trashed[0]));
           if (interfere === "edit_a_file") { const f = [...files].find((p) => fs.existsSync(path.join(d.scope, p))); if (f) fs.appendFileSync(path.join(d.scope, f), "别人加的"); }
           if (interfere === "drop_copies") fs.rmSync(path.join(d.scope, ".deskmind-undo"), { recursive: true, force: true });
+          // permissions the user changes: never a reason to stop half way (the check asks what the undo meets)
+          if (interfere === "readonly_a_file") for (const f of [...files]) if (fs.existsSync(path.join(d.scope, f))) fs.chmodSync(path.join(d.scope, f), 0o444);
+          if (interfere === "readonly_notes" && fs.existsSync(path.join(d.scope, "notes"))) fs.chmodSync(path.join(d.scope, "notes"), 0o555);
         } catch { /* the situation does not apply */ }
       } return orig(...xs); };
-      await r.done;
+      try { await r.done; } finally { try { fs.chmodSync(path.join(d.scope, "notes"), 0o755); } catch { /* gone */ } }
       const resp = r.events.find((e) => e.kind === "result_response") as any;
       const ctx = `seed ${seed}: ${ops.join(",")} / ${interfere}`;
       if (!resp) continue;

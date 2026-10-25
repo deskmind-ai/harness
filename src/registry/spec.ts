@@ -3,7 +3,7 @@
  * builds a capability from a short spec with the common argument checks.
  */
 import * as fs from "node:fs";
-import { Crash, schemaCheck, type Args, type Capability, type Derivation, type Effect, type ExecResult, type FieldSchema, type Footprint } from "./capability.js";
+import { Crash, schemaCheck, type UndoWrites, type Args, type Capability, type Derivation, type Effect, type ExecResult, type FieldSchema, type Footprint } from "./capability.js";
 import { ABSENT, Workspace } from "./workspace.js";
 
 export const s = (description: string): FieldSchema => ({ type: "string", minLength: 1, description });
@@ -68,6 +68,7 @@ export function make(sp: Spec): Capability {
     execute: sp.run,
     // every undo and its check first ask whether what it writes can be written (writeBack), then their own questions
     ...(sp.undo ? { undo: (ws: Workspace, a: Args, r: ExecResult) => writeBack(ws, sp.undoWrites!(ws, a, r)) ?? sp.undo!(ws, a, r) } : {}),
+    ...(sp.undo ? { undoWrites: sp.undoWrites! } : {}),
     ...(sp.undo ? { undoCheck: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => writeBack(ws, sp.undoWrites!(ws, a, r)) ?? sp.check?.(ws, a, r, ours) ?? null } : {}),
     ...(sp.prep ? { prepareUndo: sp.prep } : {}),
     ...(sp.derive ? { derive: sp.derive.from } : {}),
@@ -77,14 +78,13 @@ export function make(sp: Spec): Capability {
 export const CRASH_FLAG = { crashAfterEffect: false };     // test hook: die after the effect, before the receipt
 export const maybeCrash = () => { if (CRASH_FLAG.crashAfterEffect) throw new Crash("crash after the effect, before the receipt"); };
 
-/** What an undo writes on the disk (Spec.undoWrites). */
-export interface UndoWrites { content?: string[]; remove?: string[]; into?: string[] }
+export type { UndoWrites };
 /** Whether an undo can write what it writes: each file whose bytes it writes back writable and not locked, each entry
  *  it unlinks or renames not locked and its folder writable, each folder it puts an entry into writable (Workspace.
  *  writeBlocked: the mode, and the flags the mode does not show — the Finder's lock). Asked by the check (on paper)
  *  and by the undo (on the disk). */
 export const writeBack = (ws: Workspace, w: UndoWrites): string | null => {
-  for (const [how, ps] of [["content", w.content], ["remove", w.remove], ["into", w.into]] as const)
+  for (const [how, ps] of [["content", w.content], ["remove", w.remove], ["into", w.into], ["cross", w.cross]] as const)
     for (const q of ps ?? []) { const e = ws.writeBlocked(q, how); if (e) return e; }
   return null;
 };
