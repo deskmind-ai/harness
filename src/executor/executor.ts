@@ -1366,6 +1366,10 @@ export class Executor {
     const judge = this.opts.judge;
     // a step in a window DeskMind opened (structure: opened) with no judge attached: nobody can say it leaves the user's
     // content there alone, so it is theirs to consent to — no contributor is an implicit allow
+    // floors first, then judges, then fallbacks (Codex review of #75, P1-1): a target on hands' name list, or Return in a
+    // window with such a control, is a send by structure wherever the window came from and whoever is attached
+    const f0 = this.floor(a);
+    if (f0.consequence === "external") return settle({ ...f0, by: "structure", definite: !!this.hints(a).el?.sends });
     if (s.opened && !judge) return settle({ consequence: higher("modify_user", declared ?? "read"), object: s.object, why: `${s.why}; no judge is attached, so it is taken to change the user's things`, by: "structure" });
     // such a step is asked about whatever its kind — a key, a value set or a choice can empty the user's list as a click
     // can; elsewhere only the actions that might send are asked (cost)
@@ -1668,7 +1672,10 @@ export class Executor {
     // #23: 「预览」 decided, 「发送」 there). For a send, what goes out is worked out again from that look; when it is not
     // what the consent was bound to, nothing is sent and the user is asked about what is there now (rc.6 end-to-end,
     // harness-dd's proposal (b)). Only what goes out is compared — a new incoming message or a clock does not ask again
-    if (target && obs && (this.mightSend(req.action) || consequence === "external")) {
+    // a step cleared in a window DeskMind opened is looked at again too: the facts the clearance rested on — the target's
+    // content (empty, or the task's own), the focus — must hold at the moment of acting; a sync that filled the field
+    // meanwhile moves no epoch (Codex review of #75, P1-2)
+    if (target && obs && (this.mightSend(req.action) || consequence === "external" || c.opened)) {
       let fresh: Observation;
       try { fresh = await this.look(target); } catch (e) { return done({ ...base, status: "stale", why: `the window could not be looked at again before acting: ${e instanceof Error ? e.message : e}`, epoch: this.epoch }); }
       // why it moved: from a snapshot taken now (the look itself carries no reason). Taking it may move the epoch again,
@@ -1683,6 +1690,16 @@ export class Executor {
       if (again.facts?.outgoing && canon(again.facts.outgoing) !== canon(cardOutgoing ?? [])) finalOutgoing = again.facts.outgoing;
       act = again.act;
       if (this.mightSend(req.action) && !sameSendFacts(req.action, obs, fresh)) return changed("the focus, or which controls send");
+      if (c.opened && !NEEDS_CONSENT.has(consequence)) {
+        // the field a cleared type / set_value writes into holds exactly what it held when the step was judged
+        if ("target" in req.action && req.action.target && (req.action.kind === "type" || req.action.kind === "set_value")) {
+          const was = obs.elements.find((e) => e.id === (req.action as { target: string }).target);
+          const nowEl = fresh.elements.find((e) => e.id === (again.act as { target?: string }).target);
+          if ((was?.value ?? "") !== (nowEl?.value ?? "")) return changed("the target's content changed while this step was being checked");
+        }
+        // a cleared key goes to the focused element: the same one as when it was judged
+        if (req.action.kind === "key" && !sameSendFacts(req.action, obs, fresh)) return changed("the focus changed while this step was being checked");
+      }
       if (consequence === "external") {
         if (!accepted || !again.content || !within(accepted, again.content, this.pixelPolicy)) {
           diag = { binding: accepted && again.content ? bindingDiff(accepted, again.content, this.pixelPolicy) : null, epoch: fresh.epoch };

@@ -30,7 +30,8 @@ class Desk implements Driver {
   observe(id: string): Observation {
     const w = this.wins.find((x) => x.id === id);
     if (!w) throw new Error(`no window ${id}`);
-    return { epoch: this.epoch, window: w, modal: null, elements: ELS, text: "收件箱：张三 · 会议时间" };
+    // a copy per look, as a real driver gives one: a later change to ELS is a change on screen, not in an old observation
+    return { epoch: this.epoch, window: w, modal: null, elements: ELS.map((e) => ({ ...e })), text: "收件箱：张三 · 会议时间" };
   }
   perform(action: Action, opts?: { foreground_ok?: boolean }) {
     this.performed.push({ action, ...(opts ? { opts } : {}) });
@@ -459,5 +460,42 @@ describe("review of #75, delta round", () => {
     await ex.act({ action: { kind: "type", window: target.id, target: "body", text: "！" }, epoch: o2.epoch });
     expect(fact()).toEqual([true, false]);
     delete (note as { value?: string }).value; delete (search as { value?: string }).value;
+  });
+});
+
+describe("Codex review of #75", () => {
+  it("P1-1: floors before fallbacks — a send-marked control in a window DeskMind opened is a send with or without a judge", async () => {
+    ELS.push({ id: "sendbtn", role: "button", label: "", actions: ["click"], sends: true });
+    try {
+      for (const judge of [undefined, fakeJudge("stays", "matches").judge]) {
+        const { desk, ex, target, o } = await stage("opened", "task", judge);
+        const before = desk.effects.length;
+        const r = await ex.act({ action: { kind: "click", window: target.id, target: "sendbtn" }, epoch: o.epoch });
+        expect([!!judge, r.status, r.consequence, desk.effects.length > before]).toEqual([!!judge, "needs_consent", "external", false]);
+      }
+      // the same floor for Return in a window that has such a control, no judge attached
+      const { desk, ex, target, o } = await stage("opened", "task", undefined);
+      const r = await ex.act({ action: { kind: "key", window: target.id, chord: "return" }, epoch: o.epoch });
+      expect([r.status, r.consequence, desk.effects.length]).toEqual(["needs_consent", "external", 0]);
+    } finally { ELS.pop(); }
+  });
+
+  it("P1-2: a cleared write re-checks the field right before acting — content that arrived while judging (no epoch moved) stops it", async () => {
+    for (const kind of ["set_value", "type"] as const) {
+      const search = ELS.find((e) => e.id === "search")!;
+      delete (search as { value?: string }).value;
+      // the judge answers, and meanwhile the field fills with the user's synced content, the epoch unmoved
+      const judge = { choose: async (q: string) => { if (q === OUTGOING_QUESTION) (search as { value?: string }).value = "用户同步过来的草稿"; return { choice: q === OUTGOING_QUESTION ? "stays" : "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
+      const { desk, ex, target, o } = await stage("opened", "task", judge);
+      const before = desk.effects.length;
+      const a: Action = kind === "set_value" ? { kind, window: target.id, target: "search", value: "会议" } : { kind, window: target.id, target: "search", text: "会议" };
+      const r = await ex.act({ action: a, epoch: o.epoch });
+      expect([kind, r.status, desk.effects.length > before]).toEqual([kind, "stale", false]);
+      expect(r.why).toContain("content changed");
+      delete (search as { value?: string }).value;
+      // and with the field as it was judged, the write goes through
+      const quiet = await stage("opened", "task", fakeJudge("stays", "matches").judge);
+      expect((await quiet.ex.act({ action: kind === "set_value" ? { kind, window: quiet.target.id, target: "search", value: "会议" } : { kind, window: quiet.target.id, target: "search", text: "会议" }, epoch: quiet.o.epoch })).status).toBe("ok");
+    }
   });
 });
