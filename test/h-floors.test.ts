@@ -118,7 +118,9 @@ describe("H-floors 3: a save sheet that may write over a file asks, whoever's wi
     if (!sh) return false;
     if (sh.nested_sheet === true || !sh.read || !sh.name || !sh.stem || !sh.folder || sh.nested_sheet === null) return true;
     let names: string[]; try { names = fs.readdirSync(sh.folder); } catch { return true; }
-    return names.some((n) => n.replace(/\.[^.]*$/, "").toLowerCase() === sh.stem!.toLowerCase());
+    if (!path.isAbsolute(sh.folder)) return true;
+    // a file of that stem, or the shown name with a hidden extension after it
+    return names.some((n) => n.replace(/\.[^.]*$/, "").toLowerCase() === sh.stem!.toLowerCase() || n.toLowerCase().startsWith(sh.name!.toLowerCase() + "."));
   };
   it("table: sheet (none | a new name | stem there | other extension | case | alert | not read | folder unknown | folder gone) × owner (opened | made | user) × judge stays × step (click save | Return | type a name) → modify_user exactly when it may write over a file", async () => {
     const f = folder();
@@ -166,3 +168,40 @@ describe("H-floors 3: a save sheet that may write over a file asks, whoever's wi
     }
   });
 });
+
+describe("review of #78 (adopted): dotted names with a hidden extension; a relative folder; a typed Return", () => {
+  const sh = (folder: string, name: string, stem: string, extra: Partial<SaveSheet> = {}): SaveSheet => ({ read: true, name, stem, name_focused: true, folder, path: null, nested_sheet: false, ...extra });
+  it("E1 hidden extension, dotted name: sheet shows report.v2 (stem per hands' splitext: report), folder has report.v2.pages", async () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "e1-")); fs.writeFileSync(path.join(d, "report.v2.pages"), "x");
+    const s = await stage("made", { sheet: sh(d, "report.v2", "report") });
+    expect(await act(s, { kind: "click", window: s.target.id, target: "save" })).toEqual({ status: "needs_consent", consequence: "modify_user" });
+  });
+  it("E1b hidden extension, a.tar shown for a.tar.gz", async () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "e1b-")); fs.writeFileSync(path.join(d, "a.tar.gz"), "x");
+    const s = await stage("made", { sheet: sh(d, "a.tar", "a") });
+    expect(await act(s, { kind: "key", window: s.target.id, chord: "return" })).toEqual({ status: "needs_consent", consequence: "modify_user" });
+  });
+  it("E4 relative folder read against the harness cwd", async () => {
+    const s = await stage("made", { sheet: sh("src", "new.ts", "new") });
+    expect(await act(s, { kind: "click", window: s.target.id, target: "save" })).toEqual({ status: "needs_consent", consequence: "modify_user" });
+  });
+  it("a newline typed into a risky sheet commits it; plain text does not", async () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), "e7-")); fs.writeFileSync(path.join(d, "Notes.txt"), "x");
+    for (const [text, card] of [["Notes\n", true], ["Notes\r", true], ["Notes", false]] as const) {
+      const s = await stage("made", { sheet: sh(d, "Notes.txt", "Notes") });
+      const r = await act(s, { kind: "type", window: s.target.id, target: "name", text });
+      expect(r.status === "needs_consent", JSON.stringify(text)).toBe(card);
+    }
+  });
+  it("the sim's launch of an installed app reports was_running false (hands' contract): its restored window counts as opened", async () => {
+    const { SimComputer } = await import("../src/executor/sim.js");
+    const sim = new SimComputer();
+    sim.installEditor("Pages", { title: "报告", text: "x", path: null });
+    const ex = new Executor(sim, { task: "t1", publicKey: ConsentSigner.fresh().publicKey, taskOpened: "task" });
+    await ex.begin(); await ex.plan({ steps: [] });
+    const r = await ex.act({ action: { kind: "open_window", app: "Pages" }, epoch: ex.currentEpoch });
+    expect(r.status).toBe("ok");
+    expect(ex.opened(`window:${sim.snapshot().windows.find((w) => w.app === "Pages")!.id}`)).toBe(true);
+  });
+});
+

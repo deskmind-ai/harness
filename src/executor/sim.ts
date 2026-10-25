@@ -190,7 +190,8 @@ export class SimComputer implements Driver {
         if (inst.bundle) w.bundle = inst.bundle;
         for (const x of this.wins) x.focused = x === w;
         this.log.push({ launched: w.id });
-        return { status: "ok", window: w.id, opened_window: this.info(w) };
+        // (hands' contract: was_running false — a launch of an app that was not running, the only proof hands gives)
+        return { status: "ok", window: w.id, opened_window: { ...this.info(w), was_running: false } };
       }
       const b = simBrowser(a.app), name = b ? b.names[0]! : a.app;
       const known = this.wins.find((x) => x.app.toLowerCase() === name.toLowerCase() || x.bundle?.toLowerCase() === a.app.toLowerCase())?.kind ?? (b ? "browser" : undefined);

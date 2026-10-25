@@ -1178,6 +1178,8 @@ export class Executor {
   private sheetRisk(sheet: SaveSheet): string | null {
     if (sheet.nested_sheet === true) return "the save sheet has an alert open in it (a file of that name exists: replacing it)";
     if (sheet.read !== true || !sheet.name || !sheet.stem || !sheet.folder || sheet.nested_sheet !== false) return "the save sheet could not be read whole: where it saves, and over what, is not known";
+    // (a folder that is not an absolute path names no place this side can read: it would be read against our own cwd)
+    if (!path.isAbsolute(sheet.folder)) return "the save sheet's folder is not an absolute path: where it saves is not known";
     const ws = this.opts.files?.workspace;
     if (ws && sheet.path) {
       const rel = path.relative(ws.root, sheet.path);
@@ -1187,7 +1189,9 @@ export class Executor {
     try { names = fs.readdirSync(sheet.folder); } catch { return "the folder the save sheet saves into could not be read"; }
     const fold = (x: string) => x.normalize("NFC").toLowerCase();
     const stemOf = (n: string) => { const e = path.extname(n); return e && e !== n ? n.slice(0, -e.length) : n; };
-    const same = names.filter((n) => fold(stemOf(n)) === fold(sheet.stem!) || fold(n) === fold(sheet.name!));
+    // a file of that stem, or the name as shown, or the name with an extension the panel hides (report.v2 shown for
+    // report.v2.pages, a.tar for a.tar.gz: hands' stem then stops at the shown dot)
+    const same = names.filter((n) => fold(stemOf(n)) === fold(sheet.stem!) || fold(n) === fold(sheet.name!) || fold(n).startsWith(fold(sheet.name!) + "."));
     return same.length ? `a file named ${sheet.stem} is already in that folder (${same.slice(0, 3).join(", ")}): saving may replace it` : null;
   }
 
@@ -2402,9 +2406,9 @@ export function shortUrl(u: string, lang?: Lang): string {
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
-/** A step that can commit an open sheet: a click, a double-click, a key (Return), a menu choice. Typing a name into it
- *  or scrolling does not. */
-const commits = (a: Action): boolean => a.kind === "click" || a.kind === "double_click" || a.kind === "key" || a.kind === "select";
+/** A step that can commit an open sheet: a click, a double-click, a key (Return), a menu choice, typed text with a
+ *  newline in it (Return typed). Typing a name into it or scrolling does not. */
+const commits = (a: Action): boolean => a.kind === "click" || a.kind === "double_click" || a.kind === "key" || a.kind === "select" || (a.kind === "type" && /[\r\n]/.test(a.text));
 
 export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability, lang?: Lang): string {
   const t = T(lang);
