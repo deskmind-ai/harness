@@ -15,6 +15,7 @@
 import type { ActionCardFacts } from "../protocol/cards.js";
 import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
+import { POLICY, type TaskOpenedPolicy } from "../orchestrator/index.js";
 import { Crash, type Capability, type Registry } from "../registry/capability.js";
 import { reconcile as reconcileVersions } from "../registry/reconcile.js";
 import { norm, parentOf } from "../registry/spec.js";
@@ -57,6 +58,10 @@ export interface ExecutorOptions {
   /** A judgement policy (owner 10-20; the app's settings panel will show it, deskmind#90 item 3): how a consent to a
    *  send is held against a window read from the screen. Unset: `DESKMIND_PIXEL_SEND_BINDING`, else strict. */
   pixelSendBinding?: PixelSendBinding;
+  /** What a window the task's own launch brought up counts as (orchestrator POLICY.taskOpened; unset: the policy's
+   *  default). "task": a step inside it is the task's own — no card unless the judge says it deletes or changes the
+   *  user's content there (or sends, or cannot tell), and the intent judge reads it all the same; "user": as before. */
+  taskOpened?: TaskOpenedPolicy;
 }
 
 /** How a consent to a send is held, in a window whose elements were read from the screen, against what is there right
@@ -74,6 +79,9 @@ export const pixelSendBindingFrom = (v: string | undefined): PixelSendBinding =>
  *  effect, or — with no judge attached — the old send hints), the model's own class, a judge tier (its name: "brain",
  *  "frontier"…) answering "will this send something out?", or no answer (then external). */
 export interface Classification { consequence: Consequence; object: string; why: string; by: string;
+  /** A screen action in a window DeskMind opened for the user's app, taken as the task's own step under POLICY.taskOpened
+   *  "task": `act` still reads it against the user's words (the intent judge) before it runs, card or no card. */
+  opened?: true;
   /** A send that is certain, not only possible: the target is on hands' name list, or the judge answered「会发出去」.
    *  Only after such a send went through is the window's typed text taken as gone (not after「拿不准」on an attach
    *  button, which sent nothing). */
@@ -841,7 +849,8 @@ export class Executor {
   /** Codex's guardian, in the executor: before an action that changes the user's things or sends something out, an
    *  independent judge reads the user's words, the action in words and the evidence around it. A mismatch is refused
    *  with the judge's reason; "not enough evidence" and a judge that cannot answer fall through to the user's consent
-   *  (no contributor is an implicit allow — the user decides). Read-only and task-own actions are never judged. */
+   *  (no contributor is an implicit allow — the user decides). Read-only and task-own actions are never judged; a step in
+   *  a window DeskMind opened for the user's app is (act), the card being what it does not raise. */
   private async judgeIntent(a: Action, consequence: Consequence, object: string, evidence: Record<string, unknown>, text: string): Promise<{ verdict: "matches" | "mismatch" | "insufficient" | "unavailable"; reason: string; by?: string }> {
     const j = this.opts.judge;
     if (!j || !this.opts.raw) return { verdict: "unavailable", reason: "no judge" };
@@ -891,6 +900,15 @@ export class Executor {
    *  theirs, so its floor is unchanged and undo leaves it open — but known as one DeskMind opened: the foreground route
    *  is allowed for it, and the cards say so. */
   private taskOpened = new Set<string>();
+  /** Whether this object is a window the task's own launch brought up (`opened`). */
+  opened(object: string): boolean { return object.startsWith("window:") && this.taskOpened.has(object.slice("window:".length)); }
+  /** How such windows are classed: the option, else POLICY.taskOpened — read when asked, so an experiment's switch applies. */
+  get taskOpenedPolicy(): TaskOpenedPolicy { return this.opts.taskOpened ?? POLICY.taskOpened; }
+  /** A step inside this window is the task's own: POLICY.taskOpened "task", and the window is one DeskMind opened. */
+  private relaxed(object: string): boolean { return this.taskOpenedPolicy === "task" && this.opened(object); }
+  /** A change to this object is the user's to consent to, by structure: theirs by the ledger, and not a window DeskMind
+   *  opened under POLICY.taskOpened "task". The plan card lists, classes and signs by this (service.ts). */
+  protects(object: string): boolean { return this.ledger.ownerOf(object) === "user" && !this.relaxed(object); }
   /** Marks a window the task opened (`opened`), for what the user reads. */
   private mark<W extends { id: string; opened?: boolean }>(w: W): W { const { opened: _driverSaid, ...rest } = w; this.seenWindows.add(w.id); return (this.taskOpened.has(w.id) ? { ...rest, opened: true } : rest) as W; }
   /** Every window id this task has seen (the begin snapshot, every snapshot and look since): a window a launch brings
@@ -1003,7 +1021,7 @@ export class Executor {
   }
 
   /** The minimum class an action can have, from structure alone: ownership and what a capability declares. */
-  structure(a: Action): { consequence: Consequence; object: string; why: string } {
+  structure(a: Action): { consequence: Consequence; object: string; why: string; opened?: true } {
     if (a.kind === "file") {
       const f = this.fileOf(a);
       if ("error" in f) return { consequence: "read", object: `cap:${a.capability}`, why: f.error };
@@ -1056,7 +1074,12 @@ export class Executor {
       return { consequence: "create", object, why: "a window of the task's own" };
     }
     const owner = this.ledger.ownerOf(object);
-    if (a.kind === "close_window") return owner === "user" ? { consequence: "modify_user", object, why: "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
+    // a window the task's launch brought up (taskOpened) is the user's by the ledger: its content is theirs, undo leaves
+    // it open, and closing it may lose their state, so that asks. Under POLICY.taskOpened "task" a step inside it is the
+    // task's own (M3–M6 plan §1.2): the judge's「会删掉或改掉用户已有的内容」(classify) and the intent check (act) stand
+    // where the card stood
+    if (a.kind === "close_window") return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
+    if (owner === "user" && this.relaxed(object)) return { consequence: "create", object, why: "acts in a window DeskMind opened for the user's app; its content is theirs, so the judge checks the step deletes or changes none of it", opened: true };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
   }
 
@@ -1105,7 +1128,7 @@ export class Executor {
 
   /** The minimum class from structure alone, the send hints included: what decides when no judge is attached (tests,
    *  the practice ground without a model). With a judge, `classify` uses `structure` and asks instead. */
-  floor(a: Action): { consequence: Consequence; object: string; why: string } {
+  floor(a: Action): { consequence: Consequence; object: string; why: string; opened?: true } {
     const s = this.structure(a);
     if (s.consequence === "external" || a.kind === "file" || a.kind === "close_window" || a.kind === "open_window") return s;
     const h = this.hints(a);
@@ -1258,7 +1281,7 @@ export class Executor {
     const obs = "window" in a ? this.lastObs.get(a.window) : undefined;
     const current = !("window" in a) || obs?.epoch === epoch;
     // a certain send is a fact of the target (on hands' name list) or the judge's「会」, whichever path settled the class
-    const settle = (c0: Classification) => { const c = c0.consequence === "external" && this.hints(a).el?.sends ? { ...c0, definite: true } : c0; if (current) this.classified.set(key, c); this.emit("executor.classify", { action: a, epoch, ...c, ...(current ? {} : { not_current: true }) }); return c; };
+    const settle = (c0: Classification) => { const c1 = c0.consequence === "external" && this.hints(a).el?.sends ? { ...c0, definite: true } : c0; const c: Classification = s.opened ? { ...c1, opened: true } : c1; if (current) this.classified.set(key, c); this.emit("executor.classify", { action: a, epoch, ...c, ...(current ? {} : { not_current: true }) }); return c; };
     const mine = (): Classification => ({ consequence: higher(s.consequence, declared ?? "read"), object: s.object, why: model ? `the model's class (${declared}); structure: ${s.why}` : s.why, by: model ? "model" : "structure" });
     // an open the per-site rule makes a send (a host not approved, with read material): the provenance question, which
     // only raises — 没有 from a tier that may give it clears this URL on this material, and the class is the floor
@@ -1275,7 +1298,12 @@ export class Executor {
     if (s.consequence === "external") return settle({ ...s, by: "structure" });
     if (declared === "external") return settle(mine());
     const judge = this.opts.judge;
-    if (!judge || !this.mightSend(a)) {
+    // a step in a window DeskMind opened (structure: opened) with no judge attached: nobody can say it leaves the user's
+    // content there alone, so it is theirs to consent to — no contributor is an implicit allow
+    if (s.opened && !judge) return settle({ consequence: higher("modify_user", declared ?? "read"), object: s.object, why: `${s.why}; no judge is attached, so it is taken to change the user's things`, by: "structure" });
+    // such a step is asked about whatever its kind — a key, a value set or a choice can empty the user's list as a click
+    // can; elsewhere only the actions that might send are asked (cost)
+    if (!judge || !(this.mightSend(a) || s.opened)) {
       // not a question for the judge (or none attached): the old hints still raise, as before
       const f = this.floor(a);
       if (f.consequence === "external") return settle({ ...f, by: "structure", definite: !!this.hints(a).el?.sends });
@@ -1298,7 +1326,7 @@ export class Executor {
       ...(a.kind === "key" ? { 按的键: a.chord } : {}),
       ...(a.kind === "type" ? { 输入的文字: a.text } : {}),
       目标元素: h.el ? { 角色: h.el.role, 名字: h.el.label, ...(h.el.value ? { 值: h.el.value } : {}), 来源: screen(h.el), 名字命中发送词表: !!h.el.sends } : null,
-      窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
+      窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.opened ? { 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : {}), ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
       窗口里标了会发出的其他元素: els.filter((e) => e.sends && e !== h.el).map((e) => ({ 角色: e.role, 名字: e.label, 来源: screen(e) })),
       窗口里的其他控件: els.filter((e) => e !== h.el && e.actions.length).slice(0, 60).map((e) => ({ 角色: e.role, 名字: e.label, ...(e.value ? { 值: e.value.slice(0, 80) } : {}), 来源: screen(e) })),
       ...(h.obs?.text ? { "窗口里的文字（前 800 字）": h.obs.text.slice(0, 800) } : {}),
@@ -1307,9 +1335,12 @@ export class Executor {
     };
     const ans = await this.choose(judge, OUTGOING_QUESTION, ctx, OUTGOING_OPTIONS, undefined, { settle: "sends", route: false });
     if (!ans) return settle({ consequence: "external", object: s.object, why: "the outgoing check got no answer: treated as sending", by: "no_answer" });
+    // the judge's other direction (M3–M6 plan §1.2): the user's existing content in the window deleted or changed, though
+    // nothing goes out — raised to modify_user; in a window DeskMind opened that is the card structure no longer asks for
+    if (ans.choice === "alters") { const m = mine(); return settle({ consequence: higher(m.consequence, "modify_user"), object: s.object, why: `判官（${ans.by}）：会删掉或改掉用户已有的内容${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by }); }
     if (ans.choice !== "stays") return settle({ consequence: "external", object: s.object, why: `判官（${ans.by}）：${ans.choice === "sends" ? "会发出去" : "拿不准"}${ans.reason ? "。" + ans.reason : ""}`, by: ans.by, definite: ans.choice === "sends" });
     const m = mine();
-    return settle({ ...m, why: `判官（${ans.by}）：不会发出去${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by });
+    return settle({ ...m, why: `判官（${ans.by}）：不会发出去${s.opened ? "，也不删改用户已有的内容" : ""}${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by });
   }
 
   /** A send's card and consent binding, from one observation of its window: what goes out (outgoing(): the filled-in
@@ -1478,6 +1509,27 @@ export class Executor {
       if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
       if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
     }
+    // a step in a window DeskMind opened that the outgoing judge cleared (create, POLICY.taskOpened "task"): read against
+    // the user's words before it runs, as every change of the user's things is — the card was the other reader, and this
+    // step has none. A mismatch is refused; not enough evidence, or no answer, falls to the user's consent (a card)
+    let judged: { verdict: "matches" | "mismatch" | "insufficient" | "unavailable"; reason: string; by?: string } | null = null;
+    if (c.opened && !NEEDS_CONSENT.has(consequence)) {
+      const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
+      const text = describeAction(req.action, (target ? this.looks.get(target) : undefined) ?? obs, consequence, undefined, this.opts.lang);
+      judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner, 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
+      if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
+      if (judged.verdict !== "matches") { consequence = "modify_user"; base = { consequence, object: base.object }; this.emit("executor.opened_asks", { object: base.object, verdict: judged.verdict, reason: judged.reason }); }
+      else {
+        this.emit("executor.opened_cleared", { object: base.object, by: judged.by ?? "" });
+        // the judge answered over the network: the computer is looked at again before the effect, as after any judge
+        now = await this.driver.snapshot();
+        if (now.locked) return done({ ...base, status: "environment", why: "the screen is locked", cause: "screen_locked", epoch: now.epoch });
+        if (now.user_active) { const w = await this.waitForUser(now, base.object); now = w.now; if (w.end) return done({ ...base, ...w.end, epoch: now.epoch }); }
+        if (epochBound && req.epoch !== now.epoch) return staleOn(now, { ...base, status: "stale", why: `the computer changed while this step was being checked (epoch ${req.epoch}, now ${now.epoch}); observe again`, epoch: now.epoch });
+        if (target && !now.windows.some((w) => w.id === target)) return done({ ...base, status: "stale", why: `window ${target} is gone`, epoch: now.epoch });
+      }
+    }
     if (NEEDS_CONSENT.has(consequence) && !this.planAccepted) return done({ ...base, status: "needs_plan", why: "touching the user's things or sending something out needs a plan first: call plan with the objects, your readings and their evidence", epoch: now.epoch });
     let accepted: SendBinding | undefined;
     if (NEEDS_CONSENT.has(consequence)) {
@@ -1492,9 +1544,10 @@ export class Executor {
       cardOutgoing = cardFacts?.outgoing;
       if (lost) return done({ ...base, status: "stale", why: `the target is gone from ${target}, or no longer one of a kind; observe it again and decide anew`, epoch: now.epoch });
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
-      const judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      // (a step already judged above, in a window DeskMind opened, is not asked twice)
+      const verdict = judged ?? await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(sending ? { 将发出的内容: { 字段: sending.fields, 窗口里的其他文字: sending.shown, ...(typed.length ? { 本次任务在这个窗口里打的字: typed } : {}) } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
       if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
-      if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
+      if (verdict.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${verdict.by}）：不是用户要的。${verdict.reason}`, epoch: now.epoch });
       // the judge answers over the network: the user may have selected another row meanwhile, and the action would land
       // on something the judge never saw — the computer is looked at again, as at the top (the file twin is in actFile)
       now = await this.driver.snapshot();

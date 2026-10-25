@@ -48,6 +48,14 @@ export class SimComputer implements Driver {
 
   constructor(readonly wsRoot?: string) {}
 
+  /** Apps on this computer that are not on screen: a launch (open_window) brings up the window they restore from their
+   *  last session, content and all — reported as hands does for a window it cannot prove the action made
+   *  (`opened_window`, hands#54), so the executor counts it as one DeskMind opened for the user's app. */
+  private installed: { app: string; kind: "mail" | "editor"; state: Record<string, unknown>; names: string[]; bundle?: string }[] = [];
+  /** `names`: the app's other names (its English name, a bundle id), as a real Mac resolves a localized app by any of them. */
+  installMail(state: Parameters<SimComputer["addMail"]>[0], o: { names?: string[]; bundle?: string } = {}) { this.installed.push({ app: state.app, kind: "mail", state, names: o.names ?? [], bundle: o.bundle }); }
+  installEditor(app: string, doc: { title: string; text: string; path: string | null }, o: { names?: string[]; bundle?: string } = {}) { this.installed.push({ app, kind: "editor", state: { doc }, names: o.names ?? [], bundle: o.bundle }); }
+
   private bump() { this.epoch += 1; }
   private nextId(app: string) { this.n += 1; return `${app}-${this.n}`; }
 
@@ -174,6 +182,16 @@ export class SimComputer implements Driver {
       // which fake app opens: the kind an app of that name already has on this desktop (as a real one is resolved
       // from the running apps), one of its installed browsers by name or bundle id (the executor hands it the bundle
       // it settled on), a browser when a URL is asked for, otherwise an editor — no app names in code
+      // an installed app not on screen: its restored window comes up, the user's content in it (opened_window, no proof made)
+      const want = a.app.trim().toLowerCase();
+      const inst = this.installed.find((x) => [x.app, x.bundle, ...x.names].some((n) => n?.toLowerCase() === want));
+      if (inst && !this.wins.some((x) => x.app.toLowerCase() === inst.app.toLowerCase())) {
+        const w = inst.kind === "mail" ? this.addMail(inst.state as Parameters<SimComputer["addMail"]>[0]) : this.addEditor(inst.app, inst.state.doc as { title: string; text: string; path: string | null });
+        if (inst.bundle) w.bundle = inst.bundle;
+        for (const x of this.wins) x.focused = x === w;
+        this.log.push({ launched: w.id });
+        return { status: "ok", window: w.id, opened_window: this.info(w) };
+      }
       const b = simBrowser(a.app), name = b ? b.names[0]! : a.app;
       const known = this.wins.find((x) => x.app.toLowerCase() === name.toLowerCase() || x.bundle?.toLowerCase() === a.app.toLowerCase())?.kind ?? (b ? "browser" : undefined);
       const w = known === "mail" ? null : known === "browser" || (!known && a.url) ? this.addBrowser(name, [{ title: a.url ?? "新标签页", url: a.url ?? "about:blank" }]) : this.addEditor(name);

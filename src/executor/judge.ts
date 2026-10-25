@@ -225,11 +225,14 @@ export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取
  *  拿不准 / no answer → external; 不会 → the class stays. A lower tier may settle only「会发出去」alone (the safe
  *  direction), so its「不会」always goes up and is compared with the top's answer (TierStats.noteEscalation). Its
  *  first words differ from INTENT_QUESTION's: TierStats.kindOf routes by the first 12 characters. */
-export const OUTGOING_QUESTION = "这一步会不会把内容发出去——发给别人，或者发到这台电脑以外（发消息、发邮件、提交表单、发布、分享、支付、点赞、关注、转发都算）？只看给出的材料：动作、目标元素（角色、名字、是不是从画面认出来的）、窗口和窗口里的其他控件、按的键、这次任务在这个窗口里打过的字。名字命中发送词表、回车或换行只是线索，不是结论：站内搜索框里按回车、只打开分享面板还没发，都不算发出去；没有名字、只有图标的按钮，要结合它所在的窗口和刚打过的字判断。看不出来就选「拿不准」。";
+export const OUTGOING_QUESTION = "这一步会不会把内容发出去——发给别人，或者发到这台电脑以外（发消息、发邮件、提交表单、发布、分享、支付、点赞、关注、转发都算）？只看给出的材料：动作、目标元素（角色、名字、是不是从画面认出来的）、窗口和窗口里的其他控件、按的键、这次任务在这个窗口里打过的字。名字命中发送词表、回车或换行只是线索，不是结论：站内搜索框里按回车、只打开分享面板还没发，都不算发出去；没有名字、只有图标的按钮，要结合它所在的窗口和刚打过的字判断。看不出来就选「拿不准」。不发出去的，再看会不会删掉或改掉用户已有的内容——窗口里本次任务之前就有的东西（一封邮件、一首歌或歌单、已有的文字、设置）被删除、清空、覆盖或改写：会的选「会删掉或改掉用户已有的内容」；选中一行、打开、搜索、翻页、在空处新写、改本次任务自己打的字，都不算。既发出去又删改的，选「会发出去」。";
 export const OUTGOING_OPTIONS: JudgeOption[] = [
   { id: "sends", text: "会发出去：这一步会把内容发给别人，或发到这台电脑以外" },
-  { id: "stays", text: "不会：内容留在这台电脑上（本地编辑、搜索、浏览、打开面板、切换）" },
-  { id: "unsure", text: "拿不准：材料看不出这一步会不会发出去" },
+  // M3–M6 plan §1.2 (H1): the second direction the judge may raise in — the user's existing content in the window
+  // deleted or changed, though nothing goes out. Only read for what it raises (to modify_user); never lowers
+  { id: "alters", text: "会删掉或改掉用户已有的内容：不发出去，但会删除、清空、覆盖或改写窗口里本次任务之前就有的东西" },
+  { id: "stays", text: "不会：内容留在这台电脑上，用户已有的内容也不动（本地新写、搜索、浏览、选中、打开面板、切换）" },
+  { id: "unsure", text: "拿不准：材料看不出这一步会不会发出去、会不会删改用户已有的内容" },
 ];
 
 /** The provenance question (owner 10-21 refinement of the per-site rule, docs/outgoing-check-2026-10-20.md §5): an

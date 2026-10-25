@@ -152,7 +152,7 @@ describe("interaction cards", () => {
     expect(u1.cards[0]!.kind).toBe("cannot");
     expect(s1.status).toBe("failed");
     expect(s1.result_card).toBeNull();
-    expect(s1.policy).toEqual({ cannot: "ask", evidence: "v2" });
+    expect(s1.policy).toEqual({ cannot: "ask", evidence: "v2", taskOpened: "task" });
     const u2 = picker({ text: "那就在末尾加一行「买牛奶」" });
     const s2 = await setup(TODO, [lack, byRole({ goal: GOAL, plan: PLAN, bind: BIND, intent: MATCH }), byRole({ plan: PLAN }), byRole({ bind: BIND }), byRole({ intent: MATCH })], u2, "把 todo.txt 打印出来").o.run();
     expect(s2.answers).toContain("那就在末尾加一行「买牛奶」");
