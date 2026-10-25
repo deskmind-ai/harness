@@ -97,8 +97,15 @@ function chord(c: string): { cmd: boolean; shift: boolean; key: string } {
   const parts = c.toLowerCase().split("+").map((p) => p.trim()).filter(Boolean);
   return { cmd: parts.includes("cmd") || parts.includes("command") || parts.includes("meta"), shift: parts.includes("shift"), key: parts[parts.length - 1] ?? "" };
 }
-/** The app a window belongs to, as the ledger of seen apps keys it: its bundle id when the driver gives one, else its name. */
-const appKey = (w: { app: string; bundle?: string }) => (w.bundle ?? w.app).toLowerCase();
+/** Every name the driver has for a window's app: its bundle id, its name, its localized name, and the `bundle#` prefix of
+ *  its id. hands puts the bundle on snapshot windows but not on `opened_window` (id, app, app_name, title — review of
+ *  #75, B2), so an app is matched on any of them; two apps sharing a name are taken for one (the safe side: the user's). */
+function appKeys(w: { id: string; app?: string; app_name?: string; bundle?: string }): string[] {
+  const out = new Set<string>();
+  for (const s of [w.bundle, w.app, w.app_name, w.id.includes("#") ? w.id.slice(0, w.id.lastIndexOf("#")) : undefined]) if (s && s.trim()) out.add(s.trim().toLowerCase());
+  return [...out];
+}
+const sameApp = (a: { id: string; app?: string; app_name?: string; bundle?: string }, b: { id: string; app?: string; app_name?: string; bundle?: string }) => { const ks = new Set(appKeys(a)); return appKeys(b).some((k) => ks.has(k)); };
 
 /** Read material, bounded (characters): what one entry keeps, how many of the latest entries the provenance question
  *  shows, and how much of each. The question says the material may be partial, so a URL the user's words cannot explain
@@ -406,6 +413,21 @@ export class Executor {
    *  alike; no state of its own to forget (review of harness#66, Codex P1, the 3rd bug of the "typed text" family:
    *  a typed newline that ended unverified was never recorded, and the send key after it was classed create). Evidence
    *  for the outgoing question, and what a card shows goes out where the screen may not show an input box. */
+  /** Whether a field's whole value is what this task put there: the text typed or set into that very element (by the
+   *  caller's element id) since its last set_value, joined, is the value. Anything else — a character of the task's inside
+   *  the user's note, text in another field, an element renumbered since — is not the task's (review of #75, D). */
+  private ownValue(w: string, target: string, value: string): boolean {
+    let seq: { kind: "type" | "set_value"; text: string }[] = [];
+    const lines = this.jlines;
+    for (const s of journalSteps(lines)) {
+      const act = s.action as Action | undefined;
+      if (!act || !("window" in act) || act.window !== w) continue;
+      if ((lines[s.intent] as { takes_typed?: unknown } | undefined)?.takes_typed === true && s.receipt?.status === "ok") { seq = []; continue; }
+      if (!(act.kind === "type" || act.kind === "set_value") || act.target !== target || !s.possibly) continue;
+      if (act.kind === "set_value") seq = [{ kind: "set_value", text: act.value }]; else seq.push({ kind: "type", text: act.text });
+    }
+    return seq.length > 0 && value.trim() === seq.map((x) => x.text).join("").trim();
+  }
   private typedIn(a: Action): string[] {
     if (!("window" in a)) return [];
     return [...this.typedOn(a.window), ...(a.kind === "type" ? [a.text] : a.kind === "set_value" ? [a.value] : [])];
@@ -917,7 +939,7 @@ export class Executor {
    *  opened under POLICY.taskOpened "task". The plan card lists, classes and signs by this (service.ts). */
   protects(object: string): boolean { return this.ledger.ownerOf(object) === "user" && !this.relaxed(object); }
   /** Marks a window the task opened (`opened`), for what the user reads. */
-  private mark<W extends { id: string; app: string; bundle?: string; opened?: boolean }>(w: W): W { const { opened: _driverSaid, ...rest } = w; this.seenWindows.add(w.id); this.seenApps.add(appKey(w)); return (this.taskOpened.has(w.id) ? { ...rest, opened: true } : rest) as W; }
+  private mark<W extends { id: string; app: string; app_name?: string; bundle?: string; opened?: boolean }>(w: W): W { const { opened: _driverSaid, ...rest } = w; this.seenWindows.add(w.id); for (const k of appKeys(w)) this.seenApps.add(k); return (this.taskOpened.has(w.id) ? { ...rest, opened: true } : rest) as W; }
   /** Every app a window of which this task has seen (the begin snapshot, every snapshot and look since), by bundle id or
    *  name: an app the user had open and quit mid-task comes back from the task's launch with the same mailbox under a new
    *  window id — the user's still, whatever hands calls the window (review of #75, B). */
@@ -1102,7 +1124,7 @@ export class Executor {
       const known = new Map<string, { id: string; app: string; bundle?: string }>();
       for (const w of this.last?.windows ?? []) known.set(w.id, w);
       for (const o of this.lastObs.values()) known.set(o.window.id, o.window);
-      const theirs = [...known.values()].filter((w) => self && w.id !== self.id && appKey(w) === appKey(self) && this.ledger.ownerOf(`window:${w.id}`) === "user");
+      const theirs = [...known.values()].filter((w) => self && w.id !== self.id && sameApp(w, self) && this.ledger.ownerOf(`window:${w.id}`) === "user");
       return theirs.length ? { consequence: "modify_user", object, why: `quits the app: ${theirs.length} window(s) of the user's go with it` } : { consequence: "create", object, why: "quits an app with only the task's own windows" };
     }
     if (closes) return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
@@ -1357,7 +1379,7 @@ export class Executor {
       ...(a.kind === "type" ? { 输入的文字: a.text } : {}),
       目标元素: h.el ? { 角色: h.el.role, 名字: h.el.label, ...(h.el.value ? { 值: h.el.value } : {}), 来源: screen(h.el), 名字命中发送词表: !!h.el.sends,
         // for the second direction: what is in the field now, and whether this task put it there (review of #75, 3)
-        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim(), 已有内容是本次任务打的: !!h.el.value?.trim() && typed.some((t) => h.el!.value!.includes(t)) } : {}) } : null,
+        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim(), 已有内容是本次任务打的: !!h.el.value?.trim() && this.ownValue(a.window, a.target, h.el.value!) } : {}) } : null,
       窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.opened ? { 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : {}), ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
       窗口里标了会发出的其他元素: els.filter((e) => e.sends && e !== h.el).map((e) => ({ 角色: e.role, 名字: e.label, 来源: screen(e) })),
       窗口里的其他控件: els.filter((e) => e !== h.el && e.actions.length).slice(0, 60).map((e) => ({ 角色: e.role, 名字: e.label, ...(e.value ? { 值: e.value.slice(0, 80) } : {}), 来源: screen(e) })),
@@ -1754,7 +1776,7 @@ export class Executor {
     // only a launch without a url, of an app that is not a browser (hands reports it only so; checked here too), and only
     // of an app no window of which this task has seen: the user's Mail quit mid-task and relaunched by the task comes back
     // with their mailbox under a new window id (review of #75, B)
-    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && !this.seenApps.has(appKey(r.opened_window)) ? r.opened_window.id : undefined;
+    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && !appKeys(r.opened_window).some((k) => this.seenApps.has(k)) ? r.opened_window.id : undefined;
     if (req.action.kind === "open_window" && r.opened_window && !broughtUp) this.emit("executor.window_not_opened", { id: r.opened_window.id, why: req.action.url ? "a url launch" : r.opened_window.browser ? "a browser" : "a window of this app was seen in this task" });
     if (fresh(broughtUp)) { this.taskOpened.add(broughtUp); this.openedForUser.set(this.receipts.length + 1, { id: broughtUp, app: appName(r.opened_window!) }); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —

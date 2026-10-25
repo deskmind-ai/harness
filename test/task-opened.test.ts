@@ -39,7 +39,9 @@ class Desk implements Driver {
       const l = Object.values(this.launches).find((x) => x.window.app === action.app || x.window.bundle === action.app);
       if (!l) return { status: "ok" as const };
       if (!this.wins.some((w) => w.id === l.window.id)) this.wins.push(l.window);
-      return { status: "ok" as const, window: l.window.id, ...(l.says === "none" ? {} : { [l.says]: l.window }) };
+      // as hands sends them (executor.py:1268 / :321): an opened_window carries id, app, app_name and title — no bundle;
+      // a new_window and the snapshot's windows carry the bundle. A test cannot pass on a field hands does not send
+      return { status: "ok" as const, window: l.window.id, ...(l.says === "none" ? {} : l.says === "opened_window" ? { opened_window: handsOpened(l.window) } : { new_window: l.window }) };
     }
     if (action.kind === "close_window") { this.wins = this.wins.filter((w) => w.id !== action.window); this.effects.push({ action, window: action.window }); return { status: "ok" as const }; }
     if ("window" in action && action.kind !== "scroll" && action.kind !== "focus_window") this.effects.push({ action, window: action.window });
@@ -55,6 +57,8 @@ const ELS: Element[] = [
   { id: "closebtn", role: "AXCloseButton", label: "", actions: ["click"] },
 ];
 const win = (id: string, app: string, title = ""): WindowInfo => ({ id, app, app_name: app, bundle: `com.example.${app}`, title });
+/** hands' `opened_window` field set (executor.py:1268): id, app, app_name, title. */
+const handsOpened = (w: WindowInfo): WindowInfo => ({ id: w.id, app: w.app, app_name: w.app_name ?? w.app, title: w.title, ...(w.browser ? { browser: true } : {}) });
 
 /** A judge that answers the outgoing question with `outgoing` (null: no answer) and the intent question with `intent`,
  *  and records which questions were asked. */
@@ -380,5 +384,57 @@ describe("review of #75", () => {
       const r = await ex.act({ action: action("click", target.id), epoch: o.epoch });
       expect([policy, r.status, desk.effects.length > before]).toEqual([policy, status, status === "ok"]);
     }
+  });
+});
+
+describe("review of #75, delta round", () => {
+  it("B2: as hands sends it — snapshot windows carry the bundle, opened_window does not (id, app, app_name, title)", async () => {
+    const mailAtBegin: WindowInfo = { id: "com.apple.mail#7", app: "邮件", app_name: "邮件", bundle: "com.apple.mail", title: "收件箱" };
+    const desk = new Desk([mailAtBegin]);
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "打开邮件，删掉张三那封", taskOpened: "task", judge: fakeJudge("stays", "matches").judge });
+    await ex.begin(); await ex.plan({ steps: [] });
+    desk.wins = []; desk.epoch += 1;
+    const restored = { id: "com.apple.mail#8", app: "邮件", app_name: "邮件", title: "收件箱" } as WindowInfo;
+    const orig = desk.perform.bind(desk);
+    desk.perform = ((a: Action, op?: { foreground_ok?: boolean }) => { if (a.kind === "open_window") { desk.performed.push({ action: a }); desk.wins.push(restored); return { status: "ok" as const, window: restored.id, opened_window: restored }; } return orig(a, op); }) as typeof desk.perform;
+    await ex.act({ action: { kind: "open_window", app: "邮件" }, epoch: ex.currentEpoch });
+    const o = await ex.observe(restored.id);
+    const before = desk.effects.length;
+    const r = await ex.act({ action: { kind: "click", window: restored.id, target: "del" }, epoch: o.epoch });
+    expect([ex.protects("window:com.apple.mail#8"), r.status, desk.effects.length > before]).toEqual([true, "needs_consent", false]);
+    // and the other way round: the app known at begin only by a window whose id carries the bundle, the launch naming it by its English name
+    const desk2 = new Desk([{ id: "com.apple.mail#7", app: "邮件", bundle: "com.apple.mail", title: "收件箱" }]);
+    const ex2 = new Executor(desk2, { task: "t", publicKey: app.publicKey, raw: "x", taskOpened: "task", judge: fakeJudge("stays", "matches").judge });
+    await ex2.begin(); await ex2.plan({ steps: [] });
+    desk2.wins = []; desk2.epoch += 1;
+    const back = { id: "com.apple.mail#9", app: "Mail", app_name: "Mail", title: "Inbox" } as WindowInfo;
+    desk2.perform = (() => { desk2.wins.push(back); return { status: "ok" as const, window: back.id, opened_window: back }; }) as typeof desk2.perform;
+    await ex2.act({ action: { kind: "open_window", app: "Mail" }, epoch: ex2.currentEpoch });
+    expect([ex2.opened("window:com.apple.mail#9"), ex2.protects("window:com.apple.mail#9")]).toEqual([false, true]);
+  });
+
+  it("D: the typed-text fact — one character typed in the search box does not make the user's note read as the task's; a field the task filled does", async () => {
+    const { desk, ex, target, o } = await stage("opened", "task", undefined);
+    const seen: Record<string, unknown>[] = [];
+    (ex as unknown as { opts: { judge: Judge; raw: string } }).opts.judge = { choose: async (q: string, ctx: Record<string, unknown>) => { if (q === OUTGOING_QUESTION) seen.push(ctx); return { choice: q === OUTGOING_QUESTION ? "stays" : "matches", by: "fake", confidence: 1, reason: "" }; } } as unknown as Judge;
+    expect((await ex.act({ action: { kind: "type", window: target.id, target: "search", text: "的" }, epoch: o.epoch })).status).toBe("ok");
+    const fact = () => { const el = seen.at(-1)!["目标元素"] as Record<string, unknown>; return [el["目标里已有内容"], el["已有内容是本次任务打的"]]; };
+    // the user's note body holds their own text with 的 in it
+    const note = ELS.find((e) => e.id === "body")!; (note as { value?: string }).value = "周末的购物清单：牛奶";
+    desk.epoch += 1; let o2 = await ex.observe(target.id);
+    await ex.act({ action: { kind: "type", window: target.id, target: "body", text: "删掉" }, epoch: o2.epoch });
+    expect(fact()).toEqual([true, false]);
+    // the search box now holds exactly what the task typed: the task's own
+    const search = ELS.find((e) => e.id === "search")!; (search as { value?: string }).value = "的";
+    desk.epoch += 1; o2 = await ex.observe(target.id);
+    await ex.act({ action: { kind: "type", window: target.id, target: "search", text: "会议" }, epoch: o2.epoch });
+    expect(fact()).toEqual([true, true]);
+    // the note now holds the user's text plus the task's appended word: not the task's own
+    (note as { value?: string }).value = "周末的购物清单：牛奶删掉";
+    desk.epoch += 1; o2 = await ex.observe(target.id);
+    await ex.act({ action: { kind: "type", window: target.id, target: "body", text: "！" }, epoch: o2.epoch });
+    expect(fact()).toEqual([true, false]);
+    delete (note as { value?: string }).value; delete (search as { value?: string }).value;
   });
 });
