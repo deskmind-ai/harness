@@ -1368,8 +1368,10 @@ export class Executor {
     // content there alone, so it is theirs to consent to — no contributor is an implicit allow
     // floors first, then judges, then fallbacks (Codex review of #75, P1-1): a target on hands' name list, or Return in a
     // window with such a control, is a send by structure wherever the window came from and whoever is attached
-    const f0 = this.floor(a);
-    if (f0.consequence === "external") return settle({ ...f0, by: "structure", definite: !!this.hints(a).el?.sends });
+    // A target on the name list is the floor whoever is attached; Return beside such a control is the floor only with no
+    // judge — with one it is the judge's question, as before (a site search's Return is no send)
+    const f0 = this.floor(a), marked = !!this.hints(a).el?.sends;
+    if (f0.consequence === "external" && (marked || !judge)) return settle({ ...f0, by: "structure", definite: marked });
     if (s.opened && !judge) return settle({ consequence: higher("modify_user", declared ?? "read"), object: s.object, why: `${s.why}; no judge is attached, so it is taken to change the user's things`, by: "structure" });
     // such a step is asked about whatever its kind — a key, a value set or a choice can empty the user's list as a click
     // can; elsewhere only the actions that might send are asked (cost)

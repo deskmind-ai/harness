@@ -491,7 +491,8 @@ describe("Codex review of #75", () => {
       const a: Action = kind === "set_value" ? { kind, window: target.id, target: "search", value: "会议" } : { kind, window: target.id, target: "search", text: "会议" };
       const r = await ex.act({ action: a, epoch: o.epoch });
       expect([kind, r.status, desk.effects.length > before]).toEqual([kind, "stale", false]);
-      expect(r.why).toContain("content changed");
+      // either reading of the same fact ends it: the field's content differs, or the target no longer resolves by identity
+      expect(r.why).toMatch(/content changed|no longer one of a kind/);
       delete (search as { value?: string }).value;
       // and with the field as it was judged, the write goes through
       const quiet = await stage("opened", "task", fakeJudge("stays", "matches").judge);
