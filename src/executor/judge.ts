@@ -109,7 +109,8 @@ export class Judge {
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. Each
    *  question asked gets an id (`judge_id`), in the context while its tiers are asked, so their model calls name it;
-   *  its outcome is one `judge.answer` event: which tier answered what, who settled it, and the shadow comparison. */
+   *  what it asked is one `judge.asked` event (the prompt and the options, before the first tier) and its outcome one
+   *  `judge.answer` event: which tier answered what, who settled it, and the shadow comparison. */
   async choose(question: string, context: unknown, options: JudgeOption[], role?: Role, how: ChooseOptions = {}): Promise<JudgeAnswer | null> {
     const key = createHash("sha256").update(JSON.stringify({ question, context, options })).digest("hex").slice(0, 24);
     const hit = this.cache.get(key);
@@ -141,6 +142,9 @@ export class Judge {
     const escalations: JudgeAnswer[] = [];                // lower tiers that answered and passed the question up
     const settleOn = how.settle ?? options[0]?.id;
     const prompt = P.choicePrompt(question, context, options);
+    // the question's material, once per question, before any tier is asked: what the trace view shows and an annotation
+    // copies (deskmind M5) -- the same prompt and options every tier, the race and the shadow are given. Trace only.
+    this.opts.onEvent?.("judge.asked", { judge_id, question_kind: kind, prompt, options });
     const sample = (top: string | null) => { if (this.opts.samples && lower && top) this.opts.onEvent?.("judge.sample", { question_kind: kind, prompt, options, lower, top }); };
     const topTier = this.tiers[this.tiers.length - 1]!;
     const skipped = new Set(how.route === false ? [] : this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)));
@@ -225,11 +229,14 @@ export const INTENT_QUESTION = "程序即将执行下面这个动作（已经取
  *  拿不准 / no answer → external; 不会 → the class stays. A lower tier may settle only「会发出去」alone (the safe
  *  direction), so its「不会」always goes up and is compared with the top's answer (TierStats.noteEscalation). Its
  *  first words differ from INTENT_QUESTION's: TierStats.kindOf routes by the first 12 characters. */
-export const OUTGOING_QUESTION = "这一步会不会把内容发出去——发给别人，或者发到这台电脑以外（发消息、发邮件、提交表单、发布、分享、支付、点赞、关注、转发都算）？只看给出的材料：动作、目标元素（角色、名字、是不是从画面认出来的）、窗口和窗口里的其他控件、按的键、这次任务在这个窗口里打过的字。名字命中发送词表、回车或换行只是线索，不是结论：站内搜索框里按回车、只打开分享面板还没发，都不算发出去；没有名字、只有图标的按钮，要结合它所在的窗口和刚打过的字判断。看不出来就选「拿不准」。";
+export const OUTGOING_QUESTION = "这一步会不会把内容发出去——发给别人，或者发到这台电脑以外（发消息、发邮件、提交表单、发布、分享、支付、点赞、关注、转发都算）？只看给出的材料：动作、目标元素（角色、名字、是不是从画面认出来的）、窗口和窗口里的其他控件、按的键、这次任务在这个窗口里打过的字。名字命中发送词表、回车或换行只是线索，不是结论：站内搜索框里按回车、只打开分享面板还没发，都不算发出去；没有名字、只有图标的按钮，要结合它所在的窗口和刚打过的字判断。看不出来就选「拿不准」。不发出去的，再看会不会删掉或改掉用户已有的内容——窗口里本次任务之前就有的东西（一封邮件、一首歌或歌单、一条笔记、已有的文字、设置）被删除、清空、覆盖、改写或追加：会的选「会删掉或改掉用户已有的内容」。不算的只有：选中一行、打开、翻页、切换；往空着的输入框里写。往任何已经有内容的输入框里打字或设值——哪怕只是在末尾追加，哪怕那些字看起来像任务自己刚打的——以及撤销、重做、全选后删除或替换，都算会删改；「目标里已有内容」为是的，就是这种；这一项缺失、或标着「目标内容读不出来」（从画面认的输入框、读不到值的控件），当作有内容。点菜单项或按钮关掉窗口、退出应用，也算「会删掉或改掉用户已有的内容」（窗口里可能有用户的状态）；把文档存成、另存为磁盘上已有的文件，或在「已存在，要替换吗」的对话框里点替换、覆盖，也算（磁盘上用户的文件会被盖掉）。既发出去又删改的，选「会发出去」。";
 export const OUTGOING_OPTIONS: JudgeOption[] = [
   { id: "sends", text: "会发出去：这一步会把内容发给别人，或发到这台电脑以外" },
-  { id: "stays", text: "不会：内容留在这台电脑上（本地编辑、搜索、浏览、打开面板、切换）" },
-  { id: "unsure", text: "拿不准：材料看不出这一步会不会发出去" },
+  // M3–M6 plan §1.2 (H1): the second direction the judge may raise in — the user's existing content in the window
+  // deleted or changed, though nothing goes out. Only read for what it raises (to modify_user); never lowers
+  { id: "alters", text: "会删掉或改掉用户已有的内容，或关掉窗口、退出应用，或盖掉磁盘上已有的文件：不发出去，但会删除、清空、覆盖、改写或追加窗口里本次任务之前就有的东西，或者关掉这个窗口、退出这个应用，或者把文档存成 / 另存为已有的文件、在替换对话框里点替换" },
+  { id: "stays", text: "不会：内容留在这台电脑上，用户已有的内容也不动（只往空着的输入框里写、搜索、浏览、选中、打开面板、切换）" },
+  { id: "unsure", text: "拿不准：材料看不出这一步会不会发出去、会不会删改用户已有的内容" },
 ];
 
 /** The provenance question (owner 10-21 refinement of the per-site rule, docs/outgoing-check-2026-10-20.md §5): an

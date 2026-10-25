@@ -258,6 +258,28 @@ describe("M0 slice C: cost and timing", () => {
   });
 });
 
+describe("M5-H: the judge questions' material in a run's trace", () => {
+  it("a scripted run: every judge.answer in trace.jsonl has its judge.asked; the protocol has none", async () => {
+    for (const r of [await editorRun(), await mailRun()]) {
+      const ev: [string, any][] = r.trace.map((t: any) => [t.kind, t]);
+      const answers = ev.filter(([k]) => k === "judge.answer");
+      expect(answers.length).toBeGreaterThan(0);
+      // (M5-H) each answer has exactly one asked before it with its id
+      const ids = ev.filter(([k]) => k === "judge.asked").map(([, b]) => b.judge_id);
+      expect(new Set(ids).size).toBe(ids.length);
+      ev.forEach(([k, b], i) => { if (k === "judge.answer") expect(ev.slice(0, i).filter(([k2, b2]) => k2 === "judge.asked" && b2.judge_id === b.judge_id)).toHaveLength(1); });
+      for (const [, a] of ev.filter(([k]) => k === "judge.asked")) {
+        // (the prompt holds the user's words and window text: its length and kind only)
+        expect(typeof a.prompt).toBe("string");
+        expect(a.prompt.length).toBeGreaterThan(0);
+        expect(typeof a.question_kind).toBe("string");
+        expect(Array.isArray(a.options) && a.options.length > 0).toBe(true);
+      }
+      expect(r.events.some((e: any) => e.kind === "judge.asked")).toBe(false);
+    }
+  });
+});
+
 describe("M0 slice D: the run as an OpenTelemetry trace", () => {
   const spansOf = (r: { read: (f: string) => any[] }) => r.read("trace.otel.jsonl").flatMap((l: any) => l.resourceSpans.flatMap((rs: any) => rs.scopeSpans.flatMap((ss: any) => ss.spans)));
   const attr = (s: any, k: string) => { const a = s.attributes.find((x: any) => x.key === k); return a ? Object.values(a.value)[0] : undefined; };
