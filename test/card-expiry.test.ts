@@ -542,9 +542,7 @@ describe("H1 through the session: the task keeps the computer while its card is 
     h.start();
     h.handle(JSON.stringify({ type: "cua", text: "回复林晓：收到，谢谢" }));
     await waitFor(() => evs.some((e) => e.kind === "ask" && e.card.kind === "action"));
-    // while it is open, a steer is refused (card_open); once expired, it is taken
-    h.handle(JSON.stringify({ type: "steer", text: "先别发了" }));
-    expect(evs.filter((e) => e.kind === "session.error").at(-1)).toMatchObject({ code: "card_open" });
+    // (a steer while it is open voids it: H5, test/steer-card.test.ts); once expired, a steer is taken
     clock.advance(CARD_EXPIRY_MS);
     await waitFor(() => evs.some((e) => e.kind === "ask_void" && e.why === "timeout"));
     h.handle(JSON.stringify({ type: "steer", text: "先别发了" }));
@@ -773,7 +771,7 @@ describe("H1 round 6: a card is registered before anything announces it (an app 
     expect(r.sim.mailState(r.w).replies).toHaveLength(1);
   });
 
-  it("through the session: a steer typed inside the ask event is refused card_open (the session knew the card first)", async () => {
+  it("through the session: a steer typed inside the ask event voids that card first (H5); the answer after it is refused; nothing is sent", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "expiry-ses-"));
     const launch: Launcher = (req, o) => {
       const m = mailSim();
@@ -793,8 +791,13 @@ describe("H1 round 6: a card is registered before anything announces it (an app 
     hosts.push(h);
     h.start();
     h.handle(JSON.stringify({ type: "cua", text: "回复林晓：收到，谢谢" }));
-    await waitFor(() => evs.some((e) => e.kind === "session.task_end"), 4000);
-    expect(evs.filter((e) => e.kind === "session.error" && e.control === "steer").map((e) => e.code)).toEqual(["card_open", "card_open"]);
-    expect(evs.find((e) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+    await waitFor(() => evs.some((e) => e.kind === "session.task_end"), 8000);
+    // the session knew the card first, and took the words: never card_open; every card asked was voided by the steer
+    // typed inside its own event, before its answer was read — which was refused, so nothing went out
+    expect(evs.filter((e) => e.kind === "session.error" && e.control === "steer")).toEqual([]);
+    const asks = evs.filter((e) => e.kind === "ask").map((e) => e.ask_id);
+    expect(asks.length).toBeGreaterThan(0);
+    for (const id of asks) expect(evs.find((e) => e.kind === "ask_void" && e.ask_id === id)).toMatchObject({ why: "steer" });
+    expect(evs.filter((e) => e.kind === "consent" && e.picked === "approve")).toEqual([]);
   });
 });

@@ -29,7 +29,8 @@ export const ConsequenceSchema = lit(CONSEQUENCES);
 /** A plan step: purpose, objects, consequence, and the URLs it opens with open_window (shown on the plan card). */
 export const PlanStepSchema = Type.Object({ purpose: Type.String(), objects: Type.Array(Type.String()), consequence: ConsequenceSchema, opens: Type.Optional(Type.Array(Type.Object({ app: Type.String(), url: Type.String(), sends: Type.Optional(Type.String({ description: "网址会把什么发到这个网站，一句话，比如「搜索『北京天气』」" })) }), { description: "这一步用 open_window 打开的网址：应用、网址、发过去的内容" })) });
 /** A point of the request that can be read more than one way: the reading chosen, the others, and what tells them apart. */
-export const ReadingSchema = Type.Object({ point: Type.String(), reading: Type.String(), alternatives: Type.Array(Type.String()), evidence: Type.Array(Type.String()) });
+export const ReadingSchema = Type.Object({ point: Type.String(), reading: Type.String(), alternatives: Type.Array(Type.String()), evidence: Type.Array(Type.String()),
+  details: Type.Optional(Type.Array(Type.String(), { description: "每个理解一句说明，顺序和 [reading, ...alternatives] 一一对应（比如那份文件的日期和位置）；用户界面的语言写" })) });
 
 // --- each port method's input ----------------------------------------------------------------------------------------
 export const BeginParams = Type.Object({ raw: Type.String() });

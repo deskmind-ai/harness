@@ -41,6 +41,9 @@ export interface Spec {
   /** reversible = `undo` exists (or the capability only observes). `check` says whether undo can run now without
    *  changing anything; `undo` checks again and acts. `prep` records before the action what undo will need. */
   undo?: (ws: Workspace, a: Args, r: ExecResult) => string | null;
+  /** The action in plain words for the user (Capability.human): required — every capability a user may see a card or a
+   *  result line of says what it does in their language. */
+  human: (a: Args, lang: "zh" | "en") => string;
   /** What `undo` writes on the disk (required with `undo`): files whose bytes it writes back, entries it unlinks or
    *  renames away, folders it puts an entry into. make() asks writeBack of them before the check and before the undo:
    *  the permission question, one predicate for both, on paper or on the disk. */
@@ -64,6 +67,7 @@ export function make(sp: Spec): Capability {
       return null;
     },
     footprint: sp.footprint,
+    human: sp.human,
     preconditions: sp.pre,
     execute: sp.run,
     // every undo and its check first ask whether what it writes can be written (writeBack), then their own questions
@@ -97,3 +101,8 @@ export const untouched = (ws: Workspace, r: ExecResult, paths: string[]) => {
   return moved.length ? `changed since the action: ${moved.join(", ")}` : null;
 };
 
+
+/** A name as the user reads it in a sentence (H3 rule 2): Chinese 「」, English curly quotes. */
+export const q = (x: string, lang: "zh" | "en") => (lang === "en" ? `\u201c${x}\u201d` : `「${x}」`);
+/** A text the action writes, cut short for a sentence. */
+export const snippet = (x: string, lang: "zh" | "en", n = 40) => { const t = x.replace(/\s+/g, " ").trim(); return q(t.length > n ? t.slice(0, n) + "…" : t, lang); };

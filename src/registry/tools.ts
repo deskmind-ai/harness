@@ -14,7 +14,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Capability, ExecResult } from "./capability.js";
 import { ask, helperBin, helperProblem, run } from "./mac.js";
-import { after, folderOk, make, maybeCrash, norm, p, parentOf, s, untouched } from "./spec.js";
+import { after, folderOk, make, maybeCrash, norm, p, parentOf, q, s, snippet, untouched } from "./spec.js";
 import { ABSENT, NOT_UTF8_EN, TMP, isText, sha, type Workspace } from "./workspace.js";
 import { readZip, writeZip } from "./zip.js";
 
@@ -73,6 +73,7 @@ const removeOutput = (ws: Workspace, dst: string, r: ExecResult) => { const e = 
 
 export const fsTransformText = make({
   id: "fs.transform_text",
+  human: (a, l) => (l === "en" ? `write ${q(norm(a.destination!), l)} from ${q(norm(a.source!), l)}: ${snippet(a.instruction ?? "", l, 60)}` : `按${snippet(a.instruction ?? "", l, 60)}把${q(norm(a.source!), l)}改写成新文件${q(norm(a.destination!), l)}`),
   description: "按一句说明改写一个文本文件的内容，写成一个新文件（原文件不动）：翻译、总结、改写语气或格式都用它。改写由模型完成，结果原样写入。",
   effect: "create",
   fields: {
@@ -148,6 +149,7 @@ function zipMatches(ws: Workspace, file: string, names: string[]): string | null
 
 export const fsZipFiles = make({
   id: "fs.zip_files",
+  human: (a, l) => (l === "en" ? `compress ${pathsOf(a.sources!).map((x) => q(x, l)).join(", ")} into ${q(norm(a.destination!), l)}` : `把${pathsOf(a.sources!).map((x) => q(x, l)).join("、")}压缩成${q(norm(a.destination!), l)}`),
   description: "把一个或几个文件、文件夹压缩成一个新的 .zip 文件（原文件不动；中文文件名在 Windows 上也正常）。",
   effect: "create",
   fields: {
@@ -186,6 +188,7 @@ const squash = (t: string) => t.replace(/\s+/g, "");
 
 export const fsConvertToPdf = make({
   id: "fs.convert_to_pdf",
+  human: (a, l) => (l === "en" ? `convert ${q(norm(a.source!), l)} to the PDF ${q(norm(a.destination!), l)}` : `把${q(norm(a.source!), l)}转成 PDF ${q(norm(a.destination!), l)}`),
   description: "把一个文档（纯文本、Markdown、CSV，或 RTF、Word、HTML）转成一个新的 PDF 文件（原文件不动；只保留文字，不保留排版）。",
   effect: "create",
   fields: { source: p("要转换的文档"), destination: p("新 PDF 的完整路径，以 .pdf 结尾；不能是已有文件") },
@@ -237,6 +240,7 @@ const IMAGES = new Set([".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff", ".gif
 
 export const fsOcrImage = make({
   id: "fs.ocr_image",
+  human: (a, l) => (l === "en" ? `read the text in ${q(norm(a.source!), l)} into ${q(norm(a.destination!), l)}` : `识别${q(norm(a.source!), l)}里的文字，写进${q(norm(a.destination!), l)}`),
   description: "识别一张图片里的文字（中文、英文），按从上到下的行写成一个新的文本文件（原图不动）。在本机完成，不上传。",
   effect: "create",
   fields: { source: p("要识别的图片（png、jpg、heic 等）"), destination: p("写入识别结果的新文本文件的完整路径；不能是已有文件") },

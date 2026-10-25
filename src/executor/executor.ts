@@ -12,7 +12,7 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
-import type { ActionCardFacts } from "../protocol/cards.js";
+import type { ActionCardFacts, Beyond } from "../protocol/cards.js";
 import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
 import { POLICY, type TaskOpenedPolicy } from "../orchestrator/index.js";
@@ -454,11 +454,12 @@ export class Executor {
   private challenges = new Map<string, { action: Action; epoch: number; object: string; consequence: Consequence; uncertain?: ReadonlySet<number> }>();
   /** An object as the user knows it, for a card's fields: a window by its app and title (the last snapshot), a tab by
    *  its title, a file by its path; never a bare window id. */
-  private labelOf(object: string): string {
+  /** An object as the user knows it (never its ref: `path:…`, `window:…` are internal), in the run's language. */
+  labelOf(object: string): string {
     const id = object.slice(object.indexOf(":") + 1);
-    if (object.startsWith("path:")) return id;
+    if (object.startsWith("path:")) return T(this.opts.lang).quote(id);
     if (object.startsWith("window:")) { const w = this.last?.windows.find((x) => x.id === id); return w ? windowLabel(w, this.opts.lang) : appName({ app: id.split("#")[0]! }); }
-    if (object.startsWith("tab:")) for (const w of this.last?.windows ?? []) { const t = w.tabs?.find((x) => x.id === id); if (t) return `「${t.title}」`; }
+    if (object.startsWith("tab:")) for (const w of this.last?.windows ?? []) { const t = w.tabs?.find((x) => x.id === id); if (t) return T(this.opts.lang).quote(t.title); }
     return id;
   }
 
@@ -473,15 +474,18 @@ export class Executor {
     const text = uncertain ? `${this.uncertainLines(steps)}${said ? `\n${t.modelSaysUnchecked(said)}` : ""}\n${text0}` : text0;
     const base: ActionCardFacts = facts0 ?? { action: action.kind, action_text: stepText(action, undefined, this.opts.lang), target: null, object, object_label: this.labelOf(object), consequence, outgoing: [], site: null };
     const facts: ActionCardFacts = uncertain ? { ...base, uncertain: steps.slice(-UNCERTAIN_KEPT).map((x) => this.uncertainFact(x)), uncertain_total: steps.length, ...(said ? { model_says_unchecked: said } : {}) } : base;
-    const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
-      // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
-      facts };
-    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: new Set(steps.map((x) => x.intent)) });
-    // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
-    while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
     // a host asked about after the task read material: the yes approves the host for the rest of the task — not while a
     // step is uncertain: then the yes is for this one open (an action token), and the next asks again
     const site = consequence === "external" && !uncertain ? this.siteRule(action)?.host : undefined;
+    // the headline and beyond[] in the same pass, from what the yes signs (H2): the object (and the host a site token
+    // approves); the headline names the action as done to what is there and what is selected, from the same look
+    const beyond: Beyond[] = [{ kind: "object", ref: object, label: base.object_label }, ...(site ? [{ kind: "site" as const, ref: site, label: site }] : [])];
+    const c: Challenge = { ...this.consent.challenge(action, object, consequence, text, undefined, content),
+      // the card's facts in fields (a screen action's come from card(); anything else is said by its text alone)
+      facts, headline: t.actionHeadline(base.action_text, base.selected ?? [], steps.length), beyond };
+    this.challenges.set(c.nonce, { action, epoch, object, consequence, uncertain: new Set(steps.map((x) => x.intent)) });
+    // a task's cards are few; a runaway loop's are not kept forever (the oldest go first)
+    while (this.challenges.size > 200) this.challenges.delete(this.challenges.keys().next().value!);
     return site ? { ...c, site } : c;
   }
   /** The run's uncertain steps — one rule, possibly.ts' (review of harness#66 round 5: the list kept its own rule and
@@ -590,9 +594,26 @@ export class Executor {
    *  user_resumed. An answer that came after its timeout goes to the trace (executor.late_reply): the step was
    *  recorded unverified, and this is what became of it. */
   private fromDriver(ev: DriverEvent) {
-    if (ev.kind === "user_wait") this.emit("executor.user_wait", { object: this.flight?.object ?? "", by: "driver", ...(ev.app ? { app: ev.app } : {}), ...(ev.what ? { what: ev.what } : {}) });
-    else if (ev.kind === "user_resumed") this.emit("executor.user_resumed", { by: "driver", ...(ev.ended === "timeout" ? { timed_out: true } : {}), ...(ev.waited_s !== undefined ? { waited_s: ev.waited_s } : {}) });
+    // (H4) what the wait is for, said with the numbers the driver waits by — passed through, never made up here
+    if (ev.kind === "user_wait") {
+      const label = ev.app ? this.appLabel(ev.app) : undefined;
+      this.emit("executor.user_wait", { object: this.flight?.object ?? "", by: "driver", ...(ev.app ? { app: ev.app } : {}), ...(ev.what ? { what: ev.what } : {}),
+        why: ev.needs_front ? "needs_front" : "user_active", ...(ev.needs_front !== undefined ? { needs_front: ev.needs_front } : {}), ...(ev.quiet_s !== undefined ? { quiet_s: ev.quiet_s } : {}),
+        ...(label ? { app_label: label } : {}), ...(ev.started_at !== undefined ? { started_at: ev.started_at } : {}), ...(ev.gives_up_at !== undefined ? { gives_up_at: ev.gives_up_at } : {}) });
+    } else if (ev.kind === "user_resumed") {
+      // how it ended: the driver's word, else what this side saw (it gave up on the request: timed out); a reply means
+      // the user paused and the step went on
+      // (hands' "" — the user went quiet — is said as "paused"; "failed" passes through)
+      const why = ev.why === "stopped" ? "stopped" : ev.why === "failed" ? "failed" : ev.why === "timed_out" || ev.ended === "timeout" ? "timed_out" : ev.ended === "exit" ? "" : "paused";
+      this.emit("executor.user_resumed", { by: "driver", why, ...(why === "timed_out" ? { timed_out: true } : {}), ...(why === "stopped" ? { stopped: true } : {}), ...(ev.waited_s !== undefined ? { waited_s: ev.waited_s } : {}) });
+    }
     else if (ev.kind === "late_reply") this.emit("executor.late_reply", { op: ev.op, id: ev.id, late_ms: ev.late_ms, ok: ev.ok, ...(ev.status ? { status: ev.status } : {}), ...(ev.why ? { why: ev.why } : {}) });
+  }
+
+  /** An app as the user knows it (a bundle id → the name a window of it carries), for what the app shows. */
+  private appLabel(app: string): string {
+    const w = (this.last ?? this.beginSnapshot)?.windows.find((x) => x.app === app);
+    return w ? appName(w) : app;
   }
 
   /** The journal's records, earlier processes' (read at recover) and this one's, whether or not a file is kept: what
@@ -1470,9 +1491,12 @@ export class Executor {
     // an open the per-site rule makes a send: the card names the site (not the page) and why — nothing on screen goes out
     const site = consequence === "external" ? this.siteRule(a) : null;
     const object = this.floor(a).object;
+    // what is selected there (H2: the card names which mail a 「删除」 deletes) — the selection flag, by structure: a
+    // focused element the keyboard does not type into, other than the one acted on, from the same look
+    const selected = (look?.elements ?? []).filter((e) => e.focused && !keyboardFocus(e) && e !== el).map((e) => elementName(e)).filter((x): x is string => !!x).map((x) => cardText(x, 80, this.opts.lang));
     const facts = (text: string, outgoingItems: ActionCardFacts["outgoing"], host: string | null): ActionCardFacts => ({
       action: a.kind, action_text: stepText(act, look, this.opts.lang), target: elementName(el ?? undefined), object,
-      object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host });
+      object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host, ...(selected.length ? { selected } : {}) });
     if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!, this.opts.lang)) : t.openLink(a.app, shortUrl(a.url!, this.opts.lang)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el, facts: facts(text, sending ? outgoingItems(look, typedLines) : [], null) };
@@ -1524,7 +1548,7 @@ export class Executor {
       // the receipt is evidence for the verdict: what the app alone uses (the step's picture, screen frames, a card's
       // fields) is not in it
       const { shot: _s, target_frame: _t, window_frame: _w, ...kept } = r;
-      const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, ...c }) => c)(kept.challenge) } : kept;
+      const plain: ActResult = kept.challenge?.facts ? { ...kept, challenge: (({ facts: _f, headline: _h, beyond: _b, ...c }) => c)(kept.challenge) } : kept;
       this.receipts.push({ seq: this.receipts.length + 1, t: this.opts.now?.() ?? Date.now(), request: { ...rest, ...(consent ? { consent: { scope: consent.scope, nonce: consent.nonce } } : {}) }, result: plain });
       r.possibly_done = journalSteps(this.jlines.slice(jmark)).some((x) => x.possibly);
       this.emit("executor.act", { action: req.action, status: r.status, consequence: r.consequence, object: r.object, why: r.why ?? "", ...(diag ? { changed: diag } : {}), ...(r.status === "stale" && epochWhy !== undefined ? { epoch_reason: epochWhy } : {}), ...(foregroundOk ? { foreground_ok: true } : {}) });
@@ -1759,7 +1783,7 @@ export class Executor {
     foregroundOk = !!fgWindow && (this.ledger.ownerOf(`window:${fgWindow}`) === "task" || this.taskOpened.has(fgWindow) || objectToken || stepConsented);
     let land: (() => void) | null = null;
     if (consequence !== "read") {
-      const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence);
+      const text = describeAction(act, (target ? this.looks.get(target) : undefined) ?? obs, consequence, undefined, this.opts.lang);
       // a certain send (the judge's 会, or a control marked as sending) takes the window's typed text with it once it
       // ends ok (typedOn); a 拿不准 one does not
       const takesTyped = consequence === "external" && "window" in req.action && (c.definite || !!(obs && "target" in req.action && obs.elements.find((e) => e.id === (req.action as { target: string }).target)?.sends));
@@ -1871,8 +1895,15 @@ export class Executor {
 
   private async waitForUserNow(now: Snapshot, object: string): Promise<{ now: Snapshot; end?: { status: "blocked" | "stopped"; why: string } }> {
     const wait = this.opts.userWait ?? { ms: 120_000, pollMs: 2_000 };
-    const until = (this.opts.now?.() ?? Date.now()) + wait.ms;
-    this.emit("executor.user_wait", { object });
+    const started = this.opts.now?.() ?? Date.now();
+    const until = started + wait.ms;
+    // (H4) what it waits for: the user at the keyboard; how still they must be (the driver's number, when it says);
+    // whether the step's app can only be operated in front; the app; when it began and when it gives up (ms, like `t`)
+    const win = object.startsWith("window:") ? now.windows.find((w) => `window:${w.id}` === object) : undefined;
+    const front = !!win && (!!win.needs_foreground || (now.needs_foreground ?? []).some((b) => b.toLowerCase() === win.app.toLowerCase() || win.id.toLowerCase().startsWith(b.toLowerCase() + "#")));
+    this.emit("executor.user_wait", { object, why: "user_active", needs_front: front, ...(typeof now.user_quiet_s === "number" ? { quiet_s: now.user_quiet_s } : {}),
+      ...(win ? { app_label: appName(win) } : {}), started_at: started, gives_up_at: until });
+    const waited = () => Math.round(((this.opts.now?.() ?? Date.now()) - started) / 100) / 10;
     while (now.user_active && (this.opts.now?.() ?? Date.now()) < until && !this.stopped) {
       await new Promise((r) => setTimeout(r, wait.pollMs));
       now = await this.see();
@@ -1880,9 +1911,9 @@ export class Executor {
     // every wait ends with a resumed, whichever way it ends: the app clears its "paused" state on it (deskmind#85). A
     // stop is said as a stop even when the user is still at the keyboard — it ended the wait, not they (a stop that
     // came before the first look used to be reported "blocked: try again later")
-    if (this.stopped) { this.emit("executor.user_resumed", { stopped: true }); return { now, end: { status: "stopped", why: "the app stopped the task" } }; }
-    if (now.user_active) { this.emit("executor.user_resumed", { timed_out: true }); return { now, end: { status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later` } }; }
-    this.emit("executor.user_resumed", {});
+    if (this.stopped) { this.emit("executor.user_resumed", { why: "stopped", stopped: true, waited_s: waited() }); return { now, end: { status: "stopped", why: "the app stopped the task" } }; }
+    if (now.user_active) { this.emit("executor.user_resumed", { why: "timed_out", timed_out: true, waited_s: waited() }); return { now, end: { status: "blocked", why: `the user has been using the computer for the last ${Math.round(wait.ms / 1000)} s; try again later` } }; }
+    this.emit("executor.user_resumed", { why: "paused", waited_s: waited() });
     return { now };
   }
 
@@ -1989,7 +2020,7 @@ export class Executor {
     // what undo needs from before (a copy of the file a replace overwrites: its place and version) is in the intent,
     // written before the action: it outlives a crash. A copy is this process's to remove when its undo window closes
     if (typeof undo_prep?.backup === "string") this.undoCopies.push(undo_prep.backup);
-    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {}, writes: fp.writes, contents_before, ...(undo_prep ? { undo_prep } : {}) });
+    if (cap.effect !== "observe") this.journal("intent", { action: a, object, consequence, text: describeAction(a, undefined, consequence, cap, this.opts.lang), versions_before, expect_after: (fp as { expectAfter?: Record<string, string> }).expectAfter ?? {}, writes: fp.writes, contents_before, ...(undo_prep ? { undo_prep } : {}) });
     let r: ReturnType<Capability["execute"]>;
     try { r = cap.execute(ws, a.args); } catch (e) { ws.invalidate(); if (e instanceof Crash) throw e; return { ...base, status: "error", why: e instanceof Error ? e.message : String(e) }; }
     ws.invalidate();
@@ -2331,7 +2362,7 @@ export const appName = (w: { app: string; app_name?: string }): string => w.app_
 export function windowLabel(w: { app: string; app_name?: string; title: string; opened?: boolean }, lang?: Lang): string {
   const t = T(lang), app = appName(w);
   if (w.opened) return w.title.trim() ? t.openedTitled(app, w.title) : t.openedMain(app);
-  return w.title.trim() ? `${app}「${w.title}」` : t.mainWindow(app);
+  return w.title.trim() ? t.titled(app, w.title) : t.mainWindow(app);
 }
 
 /** Characters a card must not show as they are: C0 and C1 controls (newlines included), line and paragraph separators,
@@ -2373,14 +2404,24 @@ export function shortUrl(u: string, lang?: Lang): string {
 }
 
 /** The consent card's text: the action in words, with the element it touches and what that means. */
+/** A file action in the user's words (H3): the capability's own sentence in their language (Capability.human) — never
+ *  its field names (`text=「↵」`, rc.16) nor the model-facing description. One without a sentence of its own (a
+ *  capability from elsewhere) is named by its id and its values, quoted. */
+export function fileWords(a: Extract<Action, { kind: "file" }>, cap: Capability | undefined, lang?: Lang): string {
+  const l = lang === "en" ? "en" : "zh";
+  if (cap?.human) { try { return cap.human(a.args, l); } catch { /* args the sentence cannot read: named below */ } }
+  const vals = Object.values(a.args).map((v) => (l === "en" ? `\u201c${cardText(v, 40, lang)}\u201d` : `「${cardText(v, 40, lang)}」`));
+  return `${a.capability}${vals.length ? (l === "en" ? ": " : "：") + vals.join(l === "en" ? ", " : "，") : ""}`;
+}
+
 export function describeAction(a: Action, obs: Observation | undefined, consequence: Consequence, cap?: Capability, lang?: Lang): string {
   const t = T(lang);
   if (a.kind === "file") {
-    const what = `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}：${Object.entries(a.args).map(([k, v]) => `${k}=「${v.slice(0, 80)}」`).join("，")}`;
-    return consequence === "external" ? `${what}（${t.sends}）` : consequence === "modify_user" ? `${what}（${t.modifiesFile}）` : what;
+    const what = fileWords(a, cap, lang);
+    return consequence === "external" ? `${what}${t.paren(t.sends)}` : consequence === "modify_user" ? `${what}${t.paren(t.modifiesFile)}` : what;
   }
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
-  const where = obs ? (obs.window.opened ? windowLabel(obs.window, lang) : `${appName(obs.window)}「${obs.window.title}」`) : "window" in a ? a.window : "";
+  const where = obs ? (obs.window.opened ? windowLabel(obs.window, lang) : t.titled(appName(obs.window), obs.window.title)) : "window" in a ? a.window : "";
   const what = a.kind === "click" ? t.click(el?.label ?? a.target) : a.kind === "double_click" ? t.doubleClick(el?.label ?? a.target)
     : a.kind === "set_value" ? t.set(el?.label ?? a.target, a.value)
     : a.kind === "type" ? t.type(el?.label ?? a.target, a.text)
@@ -2388,7 +2429,7 @@ export function describeAction(a: Action, obs: Observation | undefined, conseque
     : a.kind === "key" ? t.key(a.chord)
     : a.kind === "close_window" ? t.closeWindow : a.kind === "open_window" ? (a.url ? t.openUrl(a.app, a.url) : t.openWindow(a.app)) : a.kind === "focus_window" ? t.focusWindow : a.kind === "scroll" ? t.scroll : t.wait;
   const cls = consequence === "external" ? t.sends : consequence === "modify_user" ? t.modifies : "";
-  return `${where ? t.at(where) : ""}${what}${cls ? "（" + cls + "）" : ""}`;
+  return `${where ? t.at(where) : ""}${what}${cls ? t.paren(cls) : ""}`;
 }
 
 /** An element as the user would name it: its own label; one whose label only names its role (hands' label_from_role)
@@ -2405,7 +2446,7 @@ export function elementName(el: Element | undefined): string | null {
  *  only; an element id or the action's JSON never shows. Values the task types are cut short. */
 export function stepText(a: Action, obs: Observation | undefined, lang?: Lang, cap?: Capability): string {
   const t = T(lang);
-  if (a.kind === "file") return `${(cap?.description ?? a.capability).split("；")[0]!.replace(/。$/, "")}${Object.keys(a.args).length ? "：" + Object.values(a.args).map((v) => `「${cardText(v, 40, lang)}」`).join("，") : ""}`;
+  if (a.kind === "file") return fileWords(a, cap, lang);
   const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
   const name = elementName(el) ?? t.anElement;
   const short = (x: string) => cardText(x, 40, lang);

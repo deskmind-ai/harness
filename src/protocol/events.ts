@@ -26,11 +26,23 @@ const PlanFacts = z.object({
 const ActionFacts = z.object({
   action: z.string(), action_text: z.string(), target: z.string().nullable(), object: z.string(), object_label: z.string(), consequence: Consequence,
   outgoing: z.array(z.object({ kind: z.enum(["field", "selected", "typed", "text"]), label: z.string(), value: z.string() })), site: z.string().nullable(),
+  // (every field the card's facts carry reaches the app: EventBody.parse strips what the schema leaves out — review of
+  // #77) the steps of this run with an unknown result, how many in all, what the model says (not checked); and what is
+  // selected in the window (H2)
+  uncertain: z.array(z.object({ consequence: Consequence, object: z.string(), text: z.string(),
+    outgoing: z.array(z.object({ kind: z.enum(["field", "selected", "typed", "text"]), label: z.string(), value: z.string() })) })).optional(),
+  uncertain_total: z.number().int().optional(), model_says_unchecked: z.string().optional(),
+  selected: z.array(z.string()).optional(),
 });
 export const CardEvent = z.object({
   kind: z.string(), text: z.string(),
-  options: z.array(z.object({ kind: z.string(), text: z.string() })),
+  options: z.array(z.object({ kind: z.string(), text: z.string(), detail: z.string().optional() })),
   free_text: z.boolean(), blocking: z.boolean(),
+  // additive (H2): one sentence from the facts the yes signs; what the yes covers beyond the request (exactly the signed
+  // objects and sites); the card about an interrupted step, which a steer does not void (H5)
+  headline: z.string().optional(),
+  beyond: z.array(z.object({ kind: z.enum(["object", "site"]), ref: z.string(), label: z.string(), at: z.string().optional(), at_label: z.string().optional(), sends: z.literal(true).optional() })).optional(),
+  reconcile: z.literal(true).optional(),
   // additive (events v1, M0): the card's facts in fields, for an app that lays them out itself; `text` says all of it.
   // plan: kind "plan"; consent: kind "action" when it asks consent for one action
   plan: PlanFacts.optional(), consent: ActionFacts.optional(),
@@ -63,12 +75,18 @@ export const EventBody = z.discriminatedUnion("kind", [
   // — even after task_done, while the process lives; if none comes, the file at step_result.shot is the answer
   z.object({ kind: z.literal("shot_ready"), step_id: z.string(), shot: z.string() }),
   z.object({ kind: z.literal("ask"), ask_id: z.string(), card: CardEvent }),
-  z.object({ kind: z.literal("waiting"), ask_id: z.string().optional() }),
+  // without ask_id: the step waits for the user (H4, additive). `why`: "user_active" they are using the keyboard or mouse
+  // (this side's own wait), "needs_front" the app can only be operated in front and the driver waits for a still Mac;
+  // `quiet_s` how long they must be still; `needs_front` whether the step needs the app in front; `app_label` the app;
+  // `started_at` / `gives_up_at` ms since the epoch (like `t`): when the wait began and when the step is given up
+  z.object({ kind: z.literal("waiting"), ask_id: z.string().optional(), why: z.enum(["user_active", "needs_front"]).optional(), quiet_s: z.number().optional(), needs_front: z.boolean().optional(),
+    app_label: z.string().optional(), started_at: z.number().optional(), gives_up_at: z.number().optional() }),
   // `voided`: the card was let go without an answer because the user changed the request (a steer, "steer"): the app
   // closes it; an answer sent for it later is refused (additive field, events v1)
   // `why` (M0, without ask_id): how the wait for the user to stop typing ended — "" they paused, "stopped" the app stopped
   // the task, "timed_out" they kept on (the step is refused, the task goes on)
-  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional(), why: z.enum(["", "stopped", "timed_out"]).optional() }),
+  // (H4: "paused" — they paused — replaces "" for a wait that says so; `waited_s` how long it waited)
+  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional(), why: z.enum(["", "paused", "stopped", "timed_out", "failed"]).optional(), waited_s: z.number().optional() }),
   // an open card let go without an answer (M0): the user changed the request (steer), stopped the task (stop), or the app
   // went away (ended). An answer sent for it later is refused
   // timeout (M2, additive): an action card left unanswered for 10 minutes (wall clock). Nobody answers for the user:

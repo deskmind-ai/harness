@@ -650,7 +650,7 @@ describe("executor: undo", () => {
     expect((await file("fs.append_line", { target: "todo.txt", line: "买牛奶" }, tok)).status).toBe("ok");
     const win = await ex.act({ action: { kind: "open_window", app: "编辑器" }, epoch: ex.currentEpoch });
     expect(ex.undoable()).toMatchObject({ reversible: true });
-    expect(ex.undoable().steps.map((s) => s.text)).toEqual(["打开 编辑器", expect.stringContaining("追加"), expect.stringContaining("新建")]);
+    expect(ex.undoable().steps.map((s) => s.text)).toEqual(["打开 编辑器", expect.stringContaining("加一行"), expect.stringContaining("新建")]);
     const u = await ex.undo();
     expect(u).toEqual({ undone: 3, total: 3, refused: null });
     expect(ws.read("todo.txt")).toBe("交房租\n");

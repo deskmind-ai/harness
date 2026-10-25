@@ -45,6 +45,8 @@ export interface Begun {
   /** Whether the task has tutorials at all (a `readSkill` tool is worth offering), candidates or not. */
   skillsOffered: boolean;
   files: FileTool[];
+  /** The language the user reads (H3: the app's setting): what the model writes for them is in it. Absent: zh. */
+  lang?: "zh" | "en";
 }
 
 export type TaskStatus = "succeeded" | "unconfirmed" | "failed" | "cancelled" | "environment" | "stopped";

@@ -57,6 +57,9 @@ export interface Capability {
    *  step of the same run may have written the same path. `ours`: every path this run wrote, which later steps'
    *  undos take back first (so a folder holding only our files counts as empty). */
   undoCheck?(ws: Workspace, args: Args, receipt: ExecResult, ours: ReadonlySet<string>): string | null;
+  /** The action in plain words for the user, in their language (H3): what it does to which file, names as they are —
+   *  never the field names, never the model-facing description. */
+  human?(args: Args, lang: "zh" | "en"): string;
   /** What undo writes on the disk, and which paths it brings back from where (spec.ts writeBack, paper.ts). */
   undoWrites?(ws: Workspace, args: Args, receipt: ExecResult): UndoWrites;
   /** The action discards existing content of a written path (replace, trash). Overwriting content this run did not
@@ -118,6 +121,7 @@ export function renamed(c: Capability, map: Record<string, string>, suffix = ".a
     execute: (ws, a) => base.execute(ws, inv(a)),
     ...(base.undo ? { undo: (ws: Workspace, a: Args, r: ExecResult) => base.undo!(ws, inv(a), r) } : {}),
     ...(base.prepareUndo ? { prepareUndo: (ws: Workspace, a: Args) => base.prepareUndo!(ws, inv(a)) } : {}),
+    ...(base.human ? { human: (a: Args, lang: "zh" | "en") => base.human!(inv(a), lang) } : {}),
     ...(base.undoWrites ? { undoWrites: (ws: Workspace, a: Args, r: ExecResult) => base.undoWrites!(ws, inv(a), r) } : {}),
     ...(base.undoCheck ? { undoCheck: (ws: Workspace, a: Args, r: ExecResult, ours: ReadonlySet<string>) => base.undoCheck!(ws, inv(a), r, ours) } : {}),
     ...(base.derive ? { derive: (ws: Workspace, a: Args) => base.derive!(ws, inv(a)) } : {}),
