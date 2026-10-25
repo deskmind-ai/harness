@@ -92,6 +92,13 @@ export interface Classification { consequence: Consequence; object: string; why:
 export const fromScreen = (e: Element): boolean => (e.source ? e.source === "pixels" : /^(ocr|gen|icon|desc):/.test(e.id));
 
 const RETURN = /\b(return|enter)\b/i;
+/** A key chord's parts (structure of the action, not the user's words): the command modifier, shift, and the key. */
+function chord(c: string): { cmd: boolean; shift: boolean; key: string } {
+  const parts = c.toLowerCase().split("+").map((p) => p.trim()).filter(Boolean);
+  return { cmd: parts.includes("cmd") || parts.includes("command") || parts.includes("meta"), shift: parts.includes("shift"), key: parts[parts.length - 1] ?? "" };
+}
+/** The app a window belongs to, as the ledger of seen apps keys it: its bundle id when the driver gives one, else its name. */
+const appKey = (w: { app: string; bundle?: string }) => (w.bundle ?? w.app).toLowerCase();
 
 /** Read material, bounded (characters): what one entry keeps, how many of the latest entries the provenance question
  *  shows, and how much of each. The question says the material may be partial, so a URL the user's words cannot explain
@@ -851,11 +858,11 @@ export class Executor {
    *  with the judge's reason; "not enough evidence" and a judge that cannot answer fall through to the user's consent
    *  (no contributor is an implicit allow — the user decides). Read-only and task-own actions are never judged; a step in
    *  a window DeskMind opened for the user's app is (act), the card being what it does not raise. */
-  private async judgeIntent(a: Action, consequence: Consequence, object: string, evidence: Record<string, unknown>, text: string): Promise<{ verdict: "matches" | "mismatch" | "insufficient" | "unavailable"; reason: string; by?: string }> {
+  private async judgeIntent(a: Action, consequence: Consequence, object: string, evidence: Record<string, unknown>, text: string, how: { settle?: string } = {}): Promise<{ verdict: "matches" | "mismatch" | "insufficient" | "unavailable"; reason: string; by?: string }> {
     const j = this.opts.judge;
     if (!j || !this.opts.raw) return { verdict: "unavailable", reason: "no judge" };
     const ctx = { ...this.userWords(), 即将执行的动作: text, 后果类别: consequence, 对象: object, 证据: evidence };
-    const ans = await this.choose(j, INTENT_QUESTION, ctx, INTENT_OPTIONS);
+    const ans = await this.choose(j, INTENT_QUESTION, ctx, INTENT_OPTIONS, undefined, how);
     if (!ans) return { verdict: "unavailable", reason: "the judge could not answer" };
     this.emit("executor.intent", { action: a, verdict: ans.choice, by: ans.by, confidence: ans.confidence, reason: ans.reason ?? "", ...(ans.judge_id ? { judge_id: ans.judge_id } : {}) });
     return { verdict: ans.choice as "matches" | "mismatch" | "insufficient", reason: ans.reason ?? "", by: ans.by };
@@ -910,7 +917,11 @@ export class Executor {
    *  opened under POLICY.taskOpened "task". The plan card lists, classes and signs by this (service.ts). */
   protects(object: string): boolean { return this.ledger.ownerOf(object) === "user" && !this.relaxed(object); }
   /** Marks a window the task opened (`opened`), for what the user reads. */
-  private mark<W extends { id: string; opened?: boolean }>(w: W): W { const { opened: _driverSaid, ...rest } = w; this.seenWindows.add(w.id); return (this.taskOpened.has(w.id) ? { ...rest, opened: true } : rest) as W; }
+  private mark<W extends { id: string; app: string; bundle?: string; opened?: boolean }>(w: W): W { const { opened: _driverSaid, ...rest } = w; this.seenWindows.add(w.id); this.seenApps.add(appKey(w)); return (this.taskOpened.has(w.id) ? { ...rest, opened: true } : rest) as W; }
+  /** Every app a window of which this task has seen (the begin snapshot, every snapshot and look since), by bundle id or
+   *  name: an app the user had open and quit mid-task comes back from the task's launch with the same mailbox under a new
+   *  window id — the user's still, whatever hands calls the window (review of #75, B). */
+  private seenApps = new Set<string>();
   /** Every window id this task has seen (the begin snapshot, every snapshot and look since): a window a launch brings
    *  back — a minimised or hidden one of the user's — is none the task made or opened (review of #32). */
   private seenWindows = new Set<string>();
@@ -1074,11 +1085,30 @@ export class Executor {
       return { consequence: "create", object, why: "a window of the task's own" };
     }
     const owner = this.ledger.ownerOf(object);
-    // a window the task's launch brought up (taskOpened) is the user's by the ledger: its content is theirs, undo leaves
-    // it open, and closing it may lose their state, so that asks. Under POLICY.taskOpened "task" a step inside it is the
-    // task's own (M3–M6 plan §1.2): the judge's「会删掉或改掉用户已有的内容」(classify) and the intent check (act) stand
-    // where the card stood
-    if (a.kind === "close_window") return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
+    // closing, quitting and undoing are read off the action's structure (the kind, a chord's keys, the element's role),
+    // never asked of the judge: a window the task's launch brought up (taskOpened) is the user's by the ledger — its
+    // content is theirs, undo leaves it open, and closing it may lose their state — and cmd+q takes the app's other
+    // windows with it, the user's included (review of #75, A)
+    const k = a.kind === "key" ? chord(a.chord) : null;
+    const closeButton = a.kind === "click" && !!this.lastObs.get(a.window)?.elements.find((e) => e.id === a.target && /close/i.test(e.role));
+    const closes = a.kind === "close_window" || closeButton || (!!k && k.cmd && k.key === "w" && !k.shift);
+    const quits = !!k && k.cmd && (k.key === "q" || (k.key === "w" && k.shift));
+    const undoes = !!k && k.cmd && k.key === "z";
+    if (quits) {
+      if (owner === "user") return { consequence: "modify_user", object, why: this.opened(object) ? "quits the app: the window DeskMind opened for the user's app goes with it, and any other of theirs" : "quits the app: the user's window goes with it" };
+      // the task's own window: the app's other windows go too — any of the user's among those seen (the last snapshot, the
+      // windows looked at) makes it theirs
+      const self = this.lastObs.get((a as { window: string }).window)?.window ?? this.last?.windows.find((w) => `window:${w.id}` === object);
+      const known = new Map<string, { id: string; app: string; bundle?: string }>();
+      for (const w of this.last?.windows ?? []) known.set(w.id, w);
+      for (const o of this.lastObs.values()) known.set(o.window.id, o.window);
+      const theirs = [...known.values()].filter((w) => self && w.id !== self.id && appKey(w) === appKey(self) && this.ledger.ownerOf(`window:${w.id}`) === "user");
+      return theirs.length ? { consequence: "modify_user", object, why: `quits the app: ${theirs.length} window(s) of the user's go with it` } : { consequence: "create", object, why: "quits an app with only the task's own windows" };
+    }
+    if (closes) return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "closes a window DeskMind opened for the user's app: it may hold their state" : "closes the user's window" } : { consequence: "create", object, why: "closes the task's own window" };
+    if (undoes) return owner === "user" ? { consequence: "modify_user", object, why: this.opened(object) ? "undoes a change in a window DeskMind opened: the user's own edits may go" : "undoes a change in the user's window" } : { consequence: "create", object, why: "undoes a change in the task's own window" };
+    // under POLICY.taskOpened "task" a step inside such a window is the task's own (M3–M6 plan §1.2): the judge's
+    //「会删掉或改掉用户已有的内容」(classify) and the intent check (act) stand where the card stood
     if (owner === "user" && this.relaxed(object)) return { consequence: "create", object, why: "acts in a window DeskMind opened for the user's app; its content is theirs, so the judge checks the step deletes or changes none of it", opened: true };
     return owner === "user" ? { consequence: "modify_user", object, why: "acts in the user's window" } : { consequence: "create", object, why: "acts in the task's own window" };
   }
@@ -1325,7 +1355,9 @@ export class Executor {
       动作: describeAction(a, h.obs, "read"),
       ...(a.kind === "key" ? { 按的键: a.chord } : {}),
       ...(a.kind === "type" ? { 输入的文字: a.text } : {}),
-      目标元素: h.el ? { 角色: h.el.role, 名字: h.el.label, ...(h.el.value ? { 值: h.el.value } : {}), 来源: screen(h.el), 名字命中发送词表: !!h.el.sends } : null,
+      目标元素: h.el ? { 角色: h.el.role, 名字: h.el.label, ...(h.el.value ? { 值: h.el.value } : {}), 来源: screen(h.el), 名字命中发送词表: !!h.el.sends,
+        // for the second direction: what is in the field now, and whether this task put it there (review of #75, 3)
+        ...(a.kind === "type" || a.kind === "set_value" ? { 目标里已有内容: !!h.el.value?.trim(), 已有内容是本次任务打的: !!h.el.value?.trim() && typed.some((t) => h.el!.value!.includes(t)) } : {}) } : null,
       窗口: h.obs ? { 应用: h.obs.window.app, 标题: h.obs.window.title, 归谁: h.obs.window.owner ?? null, ...(h.obs.window.opened ? { 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : {}), ...(h.obs.window.url ? { 网址: h.obs.window.url } : {}), 有弹窗: h.obs.modal?.title ?? null } : null,
       窗口里标了会发出的其他元素: els.filter((e) => e.sends && e !== h.el).map((e) => ({ 角色: e.role, 名字: e.label, 来源: screen(e) })),
       窗口里的其他控件: els.filter((e) => e !== h.el && e.actions.length).slice(0, 60).map((e) => ({ 角色: e.role, 名字: e.label, ...(e.value ? { 值: e.value.slice(0, 80) } : {}), 来源: screen(e) })),
@@ -1337,7 +1369,10 @@ export class Executor {
     if (!ans) return settle({ consequence: "external", object: s.object, why: "the outgoing check got no answer: treated as sending", by: "no_answer" });
     // the judge's other direction (M3–M6 plan §1.2): the user's existing content in the window deleted or changed, though
     // nothing goes out — raised to modify_user; in a window DeskMind opened that is the card structure no longer asks for
-    if (ans.choice === "alters") { const m = mine(); return settle({ consequence: higher(m.consequence, "modify_user"), object: s.object, why: `判官（${ans.by}）：会删掉或改掉用户已有的内容${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by }); }
+    // (under POLICY.taskOpened "user" — the behaviour before 10-25, the experiment's other arm — the answer leaves the
+    // class as it was, like「不会」)
+    if (ans.choice === "alters" && this.taskOpenedPolicy === "task") { const m = mine(); return settle({ consequence: higher(m.consequence, "modify_user"), object: s.object, why: `判官（${ans.by}）：会删掉或改掉用户已有的内容${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by }); }
+    if (ans.choice === "alters") { const m = mine(); return settle({ ...m, why: `判官（${ans.by}）：会删掉或改掉用户已有的内容（POLICY.taskOpened "user"：不据此调级）；${m.why}`, by: ans.by }); }
     if (ans.choice !== "stays") return settle({ consequence: "external", object: s.object, why: `判官（${ans.by}）：${ans.choice === "sends" ? "会发出去" : "拿不准"}${ans.reason ? "。" + ans.reason : ""}`, by: ans.by, definite: ans.choice === "sends" });
     const m = mine();
     return settle({ ...m, why: `判官（${ans.by}）：不会发出去${s.opened ? "，也不删改用户已有的内容" : ""}${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by });
@@ -1516,7 +1551,9 @@ export class Executor {
     if (c.opened && !NEEDS_CONSENT.has(consequence)) {
       const el = "target" in req.action && req.action.target ? obs?.elements.find((e) => e.id === (req.action as { target: string }).target) : undefined;
       const text = describeAction(req.action, (target ? this.looks.get(target) : undefined) ?? obs, consequence, undefined, this.opts.lang);
-      judged = await this.judgeIntent(req.action, consequence, base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner, 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text);
+      // told as a change of the user's things (the window's content is theirs), and final: no card follows a「是用户要的」,
+      // so no lower tier may settle it alone — only a refusal direction settles below the top (review of #75 notes)
+      judged = await this.judgeIntent(req.action, "modify_user", base.object, { 窗口: obs ? { app: obs.window.app, title: obs.window.title, owner: obs.window.owner, 来历: "本次任务启动这个应用时出现的窗口，里面已有的内容是用户的" } : null, ...(el ? { 元素: { role: el.role, label: el.label, value: el.value } } : {}), ...(req.purpose ? { 模型说的目的: req.purpose } : {}) }, text, { settle: "insufficient" });
       if (this.stopped) return done({ ...base, status: "stopped", why: "the app stopped the task", epoch: this.epoch });
       if (judged.verdict === "mismatch") return done({ ...base, status: "refused", why: `意图核对（${judged.by}）：不是用户要的。${judged.reason}`, epoch: now.epoch });
       if (judged.verdict !== "matches") { consequence = "modify_user"; base = { consequence, object: base.object }; this.emit("executor.opened_asks", { object: base.object, verdict: judged.verdict, reason: judged.reason }); }
@@ -1714,7 +1751,11 @@ export class Executor {
     if (r.appeared?.length) this.emit("executor.window_appeared", { windows: r.appeared });
     // a window the launch brought up without proof the task made it (hands#54 `opened_window`): the user's, and known
     // as opened by DeskMind; undo leaves it open (it may hold the user's state)
-    const broughtUp = req.action.kind === "open_window" ? r.opened_window?.id : undefined;       // only a launch brings one up
+    // only a launch without a url, of an app that is not a browser (hands reports it only so; checked here too), and only
+    // of an app no window of which this task has seen: the user's Mail quit mid-task and relaunched by the task comes back
+    // with their mailbox under a new window id (review of #75, B)
+    const broughtUp = req.action.kind === "open_window" && !req.action.url && r.opened_window?.browser !== true && r.opened_window && !this.seenApps.has(appKey(r.opened_window)) ? r.opened_window.id : undefined;
+    if (req.action.kind === "open_window" && r.opened_window && !broughtUp) this.emit("executor.window_not_opened", { id: r.opened_window.id, why: req.action.url ? "a url launch" : r.opened_window.browser ? "a browser" : "a window of this app was seen in this task" });
     if (fresh(broughtUp)) { this.taskOpened.add(broughtUp); this.openedForUser.set(this.receipts.length + 1, { id: broughtUp, app: appName(r.opened_window!) }); }
     // files the action wrote through the app (a save sheet, cmd+s): the task's own effect, like a window it opened —
     // credited to it once the window is read back (its name there is the evidence), not found later as "changed by

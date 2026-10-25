@@ -52,6 +52,7 @@ const ELS: Element[] = [
   { id: "search", role: "textField", label: "搜索", actions: ["set_value", "type"] },
   { id: "body", role: "textArea", label: "正文", actions: ["type", "set_value"] },
   { id: "dd", role: "popUpButton", label: "排序", actions: ["select"], options: ["日期", "发件人"] },
+  { id: "closebtn", role: "AXCloseButton", label: "", actions: ["click"] },
 ];
 const win = (id: string, app: string, title = ""): WindowInfo => ({ id, app, app_name: app, bundle: `com.example.${app}`, title });
 
@@ -71,11 +72,15 @@ function fakeJudge(outgoing: string | null, intent: string | null) {
 }
 
 type Source = "user" | "back" | "opened" | "made";
-type Kind = "click" | "set_value" | "type" | "key" | "select" | "close_window" | "scroll";
-const KINDS: Kind[] = ["click", "set_value", "type", "key", "select", "close_window", "scroll"];
+type Kind = "click" | "set_value" | "type" | "key" | "select" | "close_window" | "scroll" | "key_close" | "key_quit" | "key_undo" | "close_button";
+const KINDS: Kind[] = ["click", "set_value", "type", "key", "select", "close_window", "scroll", "key_close", "key_quit", "key_undo", "close_button"];
+/** The kinds that close the window, quit the app or undo in it (review of #75, A): read off the action's structure. */
+const CLOSING = new Set<Kind>(["close_window", "key_close", "key_quit", "key_undo", "close_button"]);
 const action = (kind: Kind, window: string): Action =>
   kind === "click" ? { kind, window, target: "del" } : kind === "set_value" ? { kind, window, target: "search", value: "会议" }
   : kind === "type" ? { kind, window, target: "body", text: "好的" } : kind === "key" ? { kind, window, chord: "cmd+a" }
+  : kind === "key_close" ? { kind: "key", window, chord: "cmd+w" } : kind === "key_quit" ? { kind: "key", window, chord: "Cmd+Q" } : kind === "key_undo" ? { kind: "key", window, chord: "shift+cmd+z" }
+  : kind === "close_button" ? { kind: "click", window, target: "closebtn" }
   : kind === "select" ? { kind, window, target: "dd", option: "发件人" } : kind === "close_window" ? { kind, window } : { kind, window, dy: 3 };
 
 /** A desk and an executor with one window of the given provenance on it (plus a window of the user's for company),
@@ -103,13 +108,16 @@ describe("H1: a window the task's launch brought up — the table (source × jud
     if (kind === "scroll") return { status: "ok", consequence: "read" };
     const protectedWindow = source === "user" || source === "back" || (source === "opened" && policy === "user");
     // a send is a send wherever it is: the judge is asked of a click in any window; of every changing action in a window
-    // DeskMind opened; the hints decide elsewhere (none here)
-    const asked = judge && kind !== "close_window" && (kind === "click" || (source === "opened" && policy === "task"));
-    const raised = asked ? (outgoing === "sends" || outgoing === "unsure" || outgoing === null ? "external" : outgoing === "alters" ? "modify_user" : null) : null;
+    // DeskMind opened; the hints decide elsewhere (none here). Closing, quitting and undoing are structure, not a question,
+    // in such a window — a click on the close button is still a click the outgoing judge sees, as any click is
+    const asked = judge && kind !== "close_window" && (kind === "click" || kind === "close_button" || (source === "opened" && policy === "task" && !CLOSING.has(kind)));
+    // 「会删改」raises only under "task"; the "user" arm is the behaviour before 10-25 (review of #75, C)
+    const raised = asked ? (outgoing === "sends" || outgoing === "unsure" || outgoing === null ? "external" : outgoing === "alters" && policy === "task" ? "modify_user" : null) : null;
     let cls: string;
     if (raised === "external") cls = "external";
-    // closing asks for the user's windows and for one DeskMind opened (it may hold their state); the task's own closes freely
-    else if (protectedWindow || (kind === "close_window" && source === "opened") || raised === "modify_user") cls = "modify_user";
+    // closing, quitting and undoing ask for the user's windows and for one DeskMind opened (it may hold their state, and
+    // the user's edits); the task's own closes freely
+    else if (protectedWindow || (CLOSING.has(kind) && source === "opened") || raised === "modify_user") cls = "modify_user";
     else if (source === "made") return { status: "ok", consequence: "create" };
     else if (!judge) cls = "modify_user";                      // a window DeskMind opened, nobody to clear the step: asks
     else {
@@ -139,7 +147,7 @@ describe("H1: a window the task's launch brought up — the table (source × jud
         want.push(`${label} → ${e.status} ${e.consequence} effect=${e.status === "ok" && kind !== "scroll"}`);
         // the two readers of a step in a window DeskMind opened: the outgoing judge on every changing kind, and the intent
         // judge every time — before the card where the class asks one, in its place where the judge cleared the step
-        if (c.judge && source === "opened" && policy === "task" && kind !== "scroll" && kind !== "close_window") expect([label, fj!.asked.includes("outgoing"), fj!.asked.includes("intent")]).toEqual([label, true, true]);
+        if (c.judge && source === "opened" && policy === "task" && kind !== "scroll" && !CLOSING.has(kind)) expect([label, fj!.asked.includes("outgoing"), fj!.asked.includes("intent")]).toEqual([label, true, true]);
         // a step in a window the user had (or one taken as theirs) is never read by the intent judge without a card to follow
         if (c.judge && kind !== "scroll" && (source === "user" || source === "back" || (source === "opened" && policy === "user"))) expect([label, r.status]).toEqual([label, c.intent === "mismatch" ? "refused" : "needs_consent"]);
         if (r.status === "ok" && source === "opened" && policy === "task" && kind !== "scroll") expect([label, desk.performed.at(-1)!.opts]).toEqual([label, { foreground_ok: true }]);
@@ -202,7 +210,7 @@ describe("H1: the property — an object the user had at begin is never changed 
       const ex = new Executor(desk, { task: "p", publicKey: app.publicKey, raw: "随便做点什么", taskOpened: policy, judge });
       await ex.begin(); await ex.plan({ steps: [] });
       if (r() < 0.5) desk.wins = desk.wins.filter((w) => w !== hidden);              // the user hides their mail window
-      const consentedEffects: { window: string; kind: string; consent: boolean; label: string }[] = [];
+      const consentedEffects: { window: string; kind: string; closing: boolean; consent: boolean; label: string }[] = [];
       for (let step = 0; step < 25; step++) {
         outgoing = pick(r, ["stays", "stays", "alters", "sends", "unsure", null] as const);
         intent = pick(r, ["matches", "matches", "mismatch", "insufficient", null] as const);
@@ -216,13 +224,13 @@ describe("H1: the property — an object the user had at begin is never changed 
         const label = `seed ${seed} step ${step} ${policy} ${w.id} ${kind} ${outgoing}+${intent}`;
         let before = desk.effects.length;
         const res = await ex.act({ action: a, epoch: o.epoch });
-        for (const e of desk.effects.slice(before)) consentedEffects.push({ window: e.window, kind: e.action.kind, consent: false, label });
+        for (const e of desk.effects.slice(before)) consentedEffects.push({ window: e.window, kind: e.action.kind, closing: CLOSING.has(kind), consent: false, label });
         if (res.status === "refused") expect([label, desk.effects.length]).toEqual([label, before]);
         if (res.status === "needs_consent" && r() < 0.6) {
           // the user says yes on the card: the effect may land now, with the token
           before = desk.effects.length;
           const again = await ex.act({ action: a, epoch: o.epoch, consent: app.forAction(res.challenge!) });
-          for (const e of desk.effects.slice(before)) consentedEffects.push({ window: e.window, kind: e.action.kind, consent: true, label });
+          for (const e of desk.effects.slice(before)) consentedEffects.push({ window: e.window, kind: e.action.kind, closing: CLOSING.has(kind), consent: true, label });
           if (again.status === "ok" && res.consequence !== "read") expect([label, desk.effects.length > before || kind === "scroll"]).toEqual([label, true]);
         }
       }
@@ -231,7 +239,7 @@ describe("H1: the property — an object the user had at begin is never changed 
       // a consent; so does closing the window the launch opened for the user's app (it may hold their state), and under
       // policy "user" every change in it
       for (const e of consentedEffects) {
-        const needs = protectedIds.has(e.window) || (e.window === opened.id && (policy === "user" || e.kind === "close_window"));
+        const needs = protectedIds.has(e.window) || (e.window === opened.id && (policy === "user" || e.closing));
         if (needs) expect([e.label, e.consent]).toEqual([e.label, true]);
       }
       // the ground truth and the record agree: every effect the desk saw is accounted for
@@ -279,5 +287,98 @@ describe("H1: the plan card (service level) — a plan on a window DeskMind open
     expect(cards[0]!.text).toContain("DeskMind 打开的 Mail「收件箱」");
     expect(cards[0]!.text).toContain("改你的东西");
     expect(events.some((e) => e.k === "plan.no_card")).toBe(false);
+  });
+});
+
+describe("review of #75", () => {
+  it("A: closing, quitting or undoing in a window DeskMind opened asks, whatever the judge says — structure, not a question", async () => {
+    const out: string[] = [];
+    for (const chord of ["cmd+w", "cmd+q", "cmd+z", "shift+cmd+w", "cmd+shift+z"]) {
+      const { desk, ex, target, o } = await stage("opened", "task", fakeJudge("stays", "matches").judge);
+      const before = desk.effects.length;
+      const r = await ex.act({ action: { kind: "key", window: target.id, chord }, epoch: o.epoch });
+      out.push(`${chord} ${r.status} ${r.consequence} effect=${desk.effects.length > before}`);
+    }
+    expect(out).toEqual(["cmd+w", "cmd+q", "cmd+z", "shift+cmd+w", "cmd+shift+z"].map((c) => `${c} needs_consent modify_user effect=false`));
+    // the close button too; and cmd+q in the task's own window of an app the user has a window of
+    const closeBtn = await stage("opened", "task", fakeJudge("stays", "matches").judge);
+    expect((await closeBtn.ex.act({ action: { kind: "click", window: closeBtn.target.id, target: "closebtn" }, epoch: closeBtn.o.epoch })).status).toBe("needs_consent");
+    const desk = new Desk([win("Mail#1", "Mail", "收件箱")]);
+    desk.launches["Mail"] = { window: win("Mail#2", "Mail"), says: "new_window" };
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "x", taskOpened: "task", judge: fakeJudge("stays", "matches").judge });
+    await ex.begin(); await ex.plan({ steps: [] });
+    desk.epoch += 1; await ex.act({ action: { kind: "open_window", app: "Mail" }, epoch: ex.currentEpoch });
+    const o = await ex.observe("Mail#2");
+    expect(ex.ledger.ownerOf("window:Mail#2")).toBe("task");
+    expect((await ex.act({ action: { kind: "key", window: "Mail#2", chord: "cmd+q" }, epoch: o.epoch })).status).toBe("needs_consent");           // quits the user's Mail#1 too
+    expect((await ex.act({ action: { kind: "key", window: "Mail#2", chord: "cmd+w" }, epoch: o.epoch })).status).toBe("ok");                       // closes only its own
+  });
+
+  it("B: the user's Mail on screen at begin, quit mid-task, relaunched by the task with a new window id: still the user's", async () => {
+    const desk = new Desk([win("Mail#7", "Mail", "收件箱")]);
+    const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
+    const ex = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "打开邮件，删掉张三那封", taskOpened: "task", judge: fakeJudge("stays", "matches").judge, onEvent: (k, b) => events.push({ k, b }) });
+    await ex.begin(); await ex.plan({ steps: [] });
+    desk.wins = []; desk.epoch += 1;                                   // the user quits Mail
+    const restored = win("Mail#8", "Mail", "收件箱");                  // the same mailbox, a new window id
+    desk.launches["Mail"] = { window: restored, says: "opened_window" };
+    await ex.act({ action: { kind: "open_window", app: "Mail" }, epoch: ex.currentEpoch });
+    const o = await ex.observe(restored.id);
+    const before = desk.effects.length;
+    const r = await ex.act({ action: { kind: "click", window: restored.id, target: "del" }, epoch: o.epoch });
+    expect([ex.protects("window:Mail#8"), ex.opened("window:Mail#8"), r.status, desk.effects.length > before]).toEqual([true, false, "needs_consent", false]);
+    expect(events.find((e) => e.k === "executor.window_not_opened")?.b).toEqual({ id: "Mail#8", why: "a window of this app was seen in this task" });
+    expect(ex.undoable().steps.some((s) => s.left_open)).toBe(false);
+  });
+
+  it("B': an opened_window from a url launch, or of a browser, is never one DeskMind opened", async () => {
+    for (const [why, launch, url] of [["a url launch", { window: win("Mail#3", "Mail"), says: "opened_window" as Says }, "https://x.test"], ["a browser", { window: { ...win("Safari#3", "Safari"), browser: true }, says: "opened_window" as Says }, undefined]] as const) {
+      const desk = new Desk([]);
+      desk.launches[launch.window.app] = launch;
+      const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
+      const ex = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "x", taskOpened: "task", judge: fakeJudge("stays", "matches").judge, onEvent: (k, b) => events.push({ k, b }) });
+      await ex.begin(); await ex.plan({ steps: [] });
+      desk.epoch += 1;
+      const epoch = (await ex.snapshot()).epoch;
+      const open: Action = { kind: "open_window", app: launch.window.app, ...(url ? { url } : {}) };
+      let r = await ex.act({ action: open, epoch });
+      // a url for an app with no window on screen is taken to land in the user's window: the card is answered here
+      if (r.status === "needs_consent") r = await ex.act({ action: open, epoch, consent: app.forAction(r.challenge!) });
+      expect([why, r.status, ex.opened(`window:${launch.window.id}`), ex.protects(`window:${launch.window.id}`)]).toEqual([why, "ok", false, true]);
+      expect([why, events.find((e) => e.k === "executor.window_not_opened")?.b.why]).toEqual([why, why]);
+    }
+  });
+
+  it("C: under POLICY.taskOpened \"user\" the plan grades as before: a declared modify_user on the task's own window still draws the card; the judge's「会删改」does not raise", async () => {
+    // the plan
+    const { Gateway } = await import("../src/gateway/index.js");
+    const { FrontierRuntime } = await import("../src/host/frontier.js");
+    const { scriptedStream } = await import("../src/runtime/scripted.js");
+    const table = Object.fromEntries(["goal", "plan", "bind", "intent", "choice", "skill", "verify", "transform"].map((r) => [r, { backend: "scripted", model: "scripted" }])) as never;
+    for (const [policy, want] of [["user", ["plan"]], ["task", []]] as const) {
+      const desk = new Desk([win("Notes#1", "Notes", "购物清单")]);
+      desk.launches["Mail"] = { window: win("Mail#7", "Mail"), says: "new_window" };
+      const app = ConsentSigner.fresh();
+      const ex = new Executor(desk, { task: "t1", publicKey: app.publicKey, taskOpened: policy, judge: fakeJudge("stays", "matches").judge });
+      const gw = new Gateway(table); gw.script = Array(10).fill(() => ({ choice: "pass", reason: "ok" }));
+      const cards: { kind: string }[] = [];
+      const model = { model: { id: "scripted", name: "scripted", api: "openai-completions", provider: "test", baseUrl: "", input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, reasoning: false, contextWindow: 1e6, maxTokens: 1e5 } } as never;
+      const steps = [
+        { calls: [{ name: "computer_act", args: { action: { kind: "open_window", app: "Mail" }, epoch: 1, consequence: "create", purpose: "打开邮件" } }] },
+        { calls: [{ name: "plan", args: { steps: [{ purpose: "删掉张三那封", objects: ["窗口 Mail#7"], consequence: "modify_user" }] } }] },
+        { calls: [{ name: "finish", args: { outcome: "done", summary: "x" } }] },
+      ];
+      const rt = new FrontierRuntime({ task: "t1", raw: "打开邮件，删掉张三那封", executor: ex, signer: app, user: { ask: (c: { kind: string; options: { kind: string }[] }) => { cards.push(c); return { option: c.options.findIndex((o) => o.kind === "approve") }; } }, gateway: gw, model: { ...(model as object), streamFn: scriptedStream(steps as never) } as never });
+      await rt.run();
+      expect([policy, cards.map((c) => c.kind)]).toEqual([policy, want]);
+    }
+    // the judge's answer in the task's own window
+    for (const [policy, status] of [["user", "ok"], ["task", "needs_consent"]] as const) {
+      const { desk, ex, target, o } = await stage("made", policy, fakeJudge("alters", "matches").judge);
+      const before = desk.effects.length;
+      const r = await ex.act({ action: action("click", target.id), epoch: o.epoch });
+      expect([policy, r.status, desk.effects.length > before]).toEqual([policy, status, status === "ok"]);
+    }
   });
 });
