@@ -67,6 +67,14 @@ export class PaperFolder {
     }
     return { kind: "entry", key: cur };
   }
+  /** The key of the object at `p` — the one lookup of an object on paper, every other goes through it (review of #74,
+   *  Codex: a move back looked its object up by the exact name, so one another program renamed to OUT.txt or to the
+   *  NFD form was lost, with its place on the disk). "" is the task folder; null when no entry is there. */
+  private key(p: string): string | null {
+    if (p === "" || p === ".") return "";
+    const r = this.resolve(p);
+    return r?.kind === "entry" ? r.key : null;
+  }
   /** Where the thing at paper path `p` is on the disk now; null when the paper holds nothing there. */
   private diskOf(p: string): string | null {
     if (p === "" || p === ".") return "";
@@ -80,21 +88,18 @@ export class PaperFolder {
   // --- what a capability's undo check reads (the Workspace methods it uses) ---------------------------------------
   private flat(): Record<string, string> { const o: Record<string, string> = {}; for (const [k, x] of this.e) o[k] = x.v; return o; }
   version(p: string): string {
-    if (p === "" || p === ".") return folderVersion(this.flat(), "");
-    const x = this.e.get(p);
-    if (!x) return ABSENT;
-    return x.v === "dir" ? folderVersion(this.flat(), p) : x.v;
+    const k = this.key(p);
+    if (k === "") return folderVersion(this.flat(), "");
+    if (k === null) return ABSENT;
+    const x = this.e.get(k)!;
+    return x.v === "dir" ? folderVersion(this.flat(), k) : x.v;
   }
-  exists(p: string): boolean { return p === "" || this.e.has(p); }
-  isDir(p: string): boolean { return p === "" || this.e.get(p)?.v === "dir"; }
+  exists(p: string): boolean { return this.key(p) !== null; }
+  isDir(p: string): boolean { const k = this.key(p); return k === "" || (k !== null && this.e.get(k)!.v === "dir"); }
   entries(): Record<string, string> { return this.flat(); }
-  members(d: string): string[] { return this.children(d); }
+  members(d: string): string[] { const k = this.key(d); return k === null ? [] : this.children(k); }
   /** Workspace.at on paper: the version of what is at `p`, the name matched as the volume matches it. */
-  at(p: string): string {
-    if (p === "" || p === ".") return this.version("");
-    const r = this.resolve(p);
-    return r?.kind === "entry" ? this.version(r.key) : ABSENT;
-  }
+  at(p: string): string { return this.version(p); }
   /** Workspace.occupied on paper: anything at `p` — an entry, a link, a hidden name — under any spelling. */
   occupied(p: string): boolean { return this.resolve(p) !== null; }
   /** Whether the thing at `p` can be written back (Workspace.writeBlocked), asked of that object where it is on the
@@ -126,11 +131,11 @@ export class PaperFolder {
       else this.rekey(from, to);
     }
     for (const p of writes) {
-      const b = before(p);
+      const b = before(p), k = this.key(p);
       if (b === ABSENT) { if (!brought.has(p)) this.drop(p); continue; }
-      const x = this.e.get(p);
-      if (b.startsWith("dir:")) { if (!x) this.e.set(p, { v: "dir", disk: p }); continue; }
-      this.e.set(p, { v: b, disk: x?.disk ?? p });            // the same object, its bytes as they were
+      if (b.startsWith("dir:")) { if (k === null) this.e.set(p, { v: "dir", disk: p }); continue; }
+      // the same object, its bytes as they were (under the name the paper holds it by)
+      if (k) this.e.set(k, { v: b, disk: this.e.get(k)!.disk }); else this.e.set(p, { v: b, disk: p });
     }
     for (const d of madeParents) this.drop(d);
   }
@@ -138,7 +143,9 @@ export class PaperFolder {
   private under(d: string, x: string) { return x === d || x.startsWith(d + "/"); }
   /** Move the object at `from` and everything under it (its hidden names too) to `to`: the objects keep their place
    *  on the disk. */
-  private rekey(from: string, to: string) {
+  private rekey(fromName: string, to: string) {
+    const from = this.key(fromName);
+    if (!from) return;                                          // nothing there (its check refused already)
     const moved = [...this.e].filter(([k]) => this.under(from, k));
     for (const [k] of moved) this.e.delete(k);
     for (const [k, x] of moved) this.e.set(to + k.slice(from.length), x);
@@ -146,7 +153,9 @@ export class PaperFolder {
     for (const [d] of others) this.other.delete(d);
     for (const [d, n] of others) this.other.set(to + d.slice(from.length), n);
   }
-  private drop(d: string) {
+  private drop(name: string) {
+    const d = this.key(name);
+    if (!d) return;
     for (const k of [...this.e.keys()]) if (this.under(d, k)) this.e.delete(k);
     for (const k of [...this.other.keys()]) if (this.under(d, k)) this.other.delete(k);
   }

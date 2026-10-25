@@ -138,18 +138,53 @@ describe("undo models objects, not paths: the pre-check and the real undo agree 
     expect(u.why).toMatch(/not empty/);
   });
 
+  // Codex re-review of 9998124: the move back looked its object up by the exact name; another program's rename to an
+  // equivalent name (case, Unicode form) lost the object and its place on the disk, so the read-only file it is went
+  // unseen → undone 1/2. (Codex's repro, ported.)
+  it("a moved file renamed by another program to OUT.txt (case) and made read-only: refused as a whole", async () => {
+    const d = await desk();
+    expect((await d.act("fs.replace_text", { target: "u2.txt", text: "new" })).status).toBe("ok");
+    expect((await d.act("fs.move", { source: "u2.txt", destination: "out.txt" })).status).toBe("ok");
+    fs.renameSync(path.join(d.root, "out.txt"), path.join(d.root, "OUT.txt"));
+    fs.chmodSync(path.join(d.root, "OUT.txt"), 0o444);
+    expect(await d.ex.undo()).toMatchObject({ undone: 0, total: 2, refused: expect.stringMatching(/OUT.txt is read-only/) });
+    expect(fs.existsSync(path.join(d.root, "OUT.txt"))).toBe(true);
+  });
+  it("a moved file renamed by another program to its NFD form and made read-only: refused as a whole", async () => {
+    const d = await desk();
+    const before = "가방.txt", after = before.normalize("NFD");
+    expect((await d.act("fs.replace_text", { target: "u2.txt", text: "new" })).status).toBe("ok");
+    fs.unlinkSync(path.join(d.root, before));
+    expect((await d.act("fs.move", { source: "u2.txt", destination: before })).status).toBe("ok");
+    fs.renameSync(path.join(d.root, before), path.join(d.root, after));
+    fs.chmodSync(path.join(d.root, after), 0o444);
+    expect(await d.ex.undo()).toMatchObject({ undone: 0, total: 2 });
+    expect(fs.readFileSync(path.join(d.root, after), "utf-8")).toBe("new");
+  });
+  it("a moved folder renamed to upper case by another program, a child made read-only: refused as a whole; untouched, taken back", async () => {
+    for (const lock of [true, false]) {
+      const d = await desk();
+      expect((await d.act("fs.replace_text", { target: "notes/u1.txt", text: "new" })).status).toBe("ok");
+      expect((await d.act("fs.move", { source: "notes", destination: "archive" })).status).toBe("ok");
+      fs.renameSync(path.join(d.root, "archive"), path.join(d.root, "ARCHIVE"));
+      if (lock) fs.chmodSync(path.join(d.root, "ARCHIVE", "u1.txt"), 0o444);
+      await agree(d, [], `folder case, lock ${lock}`);
+      if (lock) expect(fs.existsSync(path.join(d.root, "ARCHIVE"))).toBe(true);
+    }
+  });
+
   it("random nested runs × another program in between: the pre-check and the real undo agree; a yes restores the start tree", async () => {
     const rng = (seed: number) => () => { seed |= 0; seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-    const INTERFERE = ["none", "edit_file", "add_in_trashed_folder", "edit_in_trashed_folder", "readonly_file", "readonly_dir", "retake_vacated", "retake_vacated_case", "rm_empty_dir", "none"];
+    const INTERFERE = ["none", "edit_file", "add_in_trashed_folder", "edit_in_trashed_folder", "readonly_file", "readonly_dir", "retake_vacated", "retake_vacated_case", "rm_empty_dir", "rename_moved_case", "rename_moved_nfd", "rename_moved_case_readonly", "none"];
     const outcomes = { yes: 0, no: 0 }, stat = { acted: 0, idle: 0 }, opStat: Record<string, number> = {};
-    for (let seed = 1; seed <= 80; seed++) {
+    for (let seed = 1; seed <= 104; seed++) {
       const rand = rng(seed);
       const pick = <X,>(xs: X[]) => xs[Math.floor(rand() * xs.length)]!;
       const d = await desk();
       // the model of the folder: files and folders by path
       const files = new Set(Object.keys(START)), dirs = new Set(["notes", "deep", "deep/sub"]);
       let k = 0;
-      const ops: string[] = [];
+      const ops: string[] = [], moved: string[] = [];
       const parentOf = (p: string) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : ".");
       const relocate = (from: string, to: string) => {
         for (const s of [files, dirs]) for (const p of [...s]) if (p === from || p.startsWith(from + "/")) { s.delete(p); s.add(to + p.slice(from.length)); }
@@ -161,12 +196,12 @@ describe("undo models objects, not paths: the pre-check and the real undo agree 
         let r: any = null;
         if (op === "create") { const par = where(), name = `n${k++}.txt`; r = await d.act("fs.create_text", { parent: par, name, text: `t${i}` }); if (r.status === "ok") files.add(par === "." ? name : `${par}/${name}`); }
         else if (op === "mkdir") { const par = where(), p = par === "." ? `d${k++}` : `${par}/d${k++}`; r = await d.act("fs.mkdir", { path: p }); if (r.status === "ok") dirs.add(p); }
-        else if (op === "move_file" && files.size) { const src = pick([...files]), par = where(), dst = par === "." ? `m${k++}.txt` : `${par}/m${k++}.txt`; r = await d.act("fs.move", { source: src, destination: dst }); if (r.status === "ok") relocate(src, dst); }
+        else if (op === "move_file" && files.size) { const src = pick([...files]), par = where(), dst = par === "." ? `mé${k++}.txt` : `${par}/mé${k++}.txt`; r = await d.act("fs.move", { source: src, destination: dst }); if (r.status === "ok") { relocate(src, dst); moved.push(dst); } }
         else if (op === "move_dir" && dirs.size) {
           const src = pick([...dirs]);
           const into = [".", ...[...dirs].filter((x) => x !== src && !x.startsWith(src + "/"))];
-          const par = pick(into), dst = par === "." ? `f${k++}` : `${par}/f${k++}`;
-          r = await d.act("fs.move", { source: src, destination: dst }); if (r.status === "ok") relocate(src, dst);
+          const par = pick(into), dst = par === "." ? `fé${k++}` : `${par}/fé${k++}`;
+          r = await d.act("fs.move", { source: src, destination: dst }); if (r.status === "ok") { relocate(src, dst); moved.push(dst); }
         }
         else if (op === "trash" && files.size) { const f = pick([...files]); r = await d.act("fs.trash", { target: f }); if (r.status === "ok") files.delete(f); }
         else if (op === "trash_dir" && dirs.size) { const t = pick([...dirs]); r = await d.act("fs.trash", { target: t }); if (r.status === "ok") { for (const s of [files, dirs]) for (const p of [...s]) if (p === t || p.startsWith(t + "/")) s.delete(p); } }
@@ -187,6 +222,15 @@ describe("undo models objects, not paths: the pre-check and the real undo agree 
       if (interfere === "readonly_dir" && dirs.size) fs.chmodSync(abs(pick([...dirs])), 0o555);
       if (interfere === "retake_vacated" && vacated[0]) { fs.writeFileSync(abs(vacated[0]), "又一个"); ext.push(vacated[0]); }
       if (interfere === "retake_vacated_case" && vacated[0]) { const p = path.join(path.dirname(vacated[0]), path.basename(vacated[0]).toUpperCase()); fs.writeFileSync(abs(p), "大写的"); ext.push(p); }
+      // an object the run moved, renamed by another program to a name the volume takes for the same (case, Unicode
+      // form) — and made read-only: the paper must still find it, and its place on the disk
+      const live = moved.filter((m) => fs.existsSync(abs(m)));
+      if (interfere.startsWith("rename_moved") && live.length) {
+        const m = live[live.length - 1]!, base = path.basename(m);
+        const to = path.join(path.dirname(m), interfere === "rename_moved_nfd" ? base.normalize("NFD") : base.toUpperCase());
+        fs.renameSync(abs(m), abs(to));
+        if (interfere === "rename_moved_case_readonly") { const f = fs.lstatSync(abs(to)).isDirectory() ? fs.readdirSync(abs(to)).find((x) => fs.lstatSync(path.join(abs(to), x)).isFile()) : ""; fs.chmodSync(f ? path.join(abs(to), f) : abs(to), f || !fs.lstatSync(abs(to)).isDirectory() ? 0o444 : 0o555); }
+      }
       if (interfere === "rm_empty_dir") { const e = [...dirs].find((x) => fs.readdirSync(abs(x)).length === 0); if (e) { fs.rmdirSync(abs(e)); ext.push(e); } }
       d.ws.invalidate();
       const ctx = `seed ${seed}: ${ops.join(",")} / ${interfere}`;
@@ -196,7 +240,9 @@ describe("undo models objects, not paths: the pre-check and the real undo agree 
         const r = await agree(d, ext, ctx);
         outcomes[r.why === null ? "yes" : "no"] += 1;
       } finally {
-        for (const x of [...dirs, ...files]) try { fs.chmodSync(abs(x), dirs.has(x) ? 0o755 : 0o644); } catch { /* moved back, gone */ }
+        // every mode back, whatever the names are now (the temp folder is removed later)
+        const fix = (dir: string) => { try { fs.chmodSync(dir, 0o755); } catch { return; } for (const e of fs.readdirSync(dir, { withFileTypes: true })) { const f = path.join(dir, e.name); if (e.isDirectory()) fix(f); else if (e.isFile()) fs.chmodSync(f, 0o644); } };
+        fix(d.root);
       }
     }
     // both sides of the invariant were exercised
