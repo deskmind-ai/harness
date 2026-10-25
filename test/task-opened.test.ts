@@ -7,6 +7,9 @@
  * Invariant: an object the user had when the task began (on screen at begin, or hidden then and brought back by a
  * launch) is never changed or closed without the user's consent, under either policy.
  */
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConsentSigner } from "../src/executor/consent.js";
 import { Executor } from "../src/executor/executor.js";
@@ -553,8 +556,10 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
     expect({ snaps, looks }).toEqual({ snaps: 1, looks: 1 });
     const see = src.slice(src.indexOf("private async see()"), src.indexOf("private async watch("));
     const watch = src.slice(src.indexOf("private async watch("), src.indexOf("private async watch(") + 400);
-    expect(see).toContain("this.driver.snapshot("); expect(see).toContain("this.ledger.saw(");
-    expect(watch).toContain("this.driver.observe("); expect(watch).toContain("this.ledger.saw(");
+    expect(see).toContain("this.driver.snapshot("); expect(see).toContain("this.noteSeen(");
+    expect(watch).toContain("this.driver.observe("); expect(watch).toContain("this.noteSeen(");
+    const note = src.slice(src.indexOf("private noteSeen("), src.indexOf("private noteSeen(") + 600);
+    expect(note).toContain("this.ledger.saw("); expect(note).toContain('this.journal("seen"');
     // no other module reaches the executor's driver either
     for (const f of ["service.ts", "judge.ts", "consent.ts"]) expect(fs.readFileSync(new URL(`../src/executor/${f}`, import.meta.url), "utf-8")).not.toMatch(/executor\.driver\.(snapshot|observe)/);
   });
@@ -623,13 +628,16 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
         return { choice: el && el["目标里已有内容"] && !el["已有内容是本次任务打的"] ? "alters" : "stays", by: "fake", confidence: 1, reason: "" };
       } } as unknown as Judge;
       const app = ConsentSigner.fresh();
-      const ex = new Executor(world, { task: "p2", publicKey: app.publicKey, raw: "随便做点什么", taskOpened: "task", judge });
+      const journal = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "h1p2-")), "journal.jsonl");
+      let ex = new Executor(world, { task: "p2", publicKey: app.publicKey, raw: "随便做点什么", taskOpened: "task", judge, journal });
       await ex.begin(); await ex.plan({ steps: [] });
       // `theirs` is taken at the moment of the effect: an app the user opens later does not make an earlier launch theirs
       const record: { window: string; theirs: boolean; consent: boolean; userContent: boolean; kind: string; chord: string; label: string }[] = [];
       const theirsNow = (window: string) => world.userSeenApps.has(window.split("#")[0]!);
       for (let step = 0; step < 30; step++) {
         if (r() < 0.5) world.userActs();
+        // the process dies and the task resumes in a new one, on the same journal: what the first saw must still count
+        if (r() < 0.08) { ex = new Executor(world, { task: "p2", publicKey: app.publicKey, raw: "随便做点什么", taskOpened: "task", judge, journal }); await ex.begin(); await ex.plan({ steps: [] }); }
         const k = r();
         let a: Action; let epoch: number;
         if (k < 0.15) { a = { kind: "wait", ms: 0 }; epoch = (await ex.snapshot()).epoch; }
@@ -662,4 +670,46 @@ describe("Codex review of #75, round 2 — the facts the gate rests on come from
       }
     }
   }, 120_000);
+});
+
+describe("review of #75, probe R — the ledger survives the process", () => {
+  it("R: the user's Mail seen at begin in process 1, quit, then relaunched by process 2 on the same journal: still the user's", async () => {
+    const journal = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "r75-")), "journal.jsonl");
+    const mail: WindowInfo = { id: "com.apple.mail#7", app: "邮件", app_name: "邮件", bundle: "com.apple.mail", title: "收件箱" };
+    const desk = new Desk([mail]);
+    const app = ConsentSigner.fresh();
+    const ex1 = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "打开邮件，删掉张三那封", taskOpened: "task", journal, judge: fakeJudge("stays", "matches").judge });
+    await ex1.begin(); await ex1.plan({ steps: [] });
+    desk.wins = []; desk.epoch += 1;                                    // the user quits Mail; process 1 dies
+    const events: { k: string; b: Record<string, unknown> }[] = [];
+    const ex2 = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "打开邮件，删掉张三那封", taskOpened: "task", journal, judge: fakeJudge("stays", "matches").judge, onEvent: (k, b) => events.push({ k, b }) });
+    await ex2.begin(); await ex2.plan({ steps: [] });
+    expect(events.find((e) => e.k === "executor.ledger_reloaded")?.b).toEqual({ seen_lines: 1 });   // process 1's begin (process 2 saw nothing new before reading it)
+    const restored = { id: "com.apple.mail#8", app: "邮件", app_name: "邮件", title: "收件箱" } as WindowInfo;
+    const orig = desk.perform.bind(desk);
+    desk.perform = ((a: Action, op?: { foreground_ok?: boolean }) => { if (a.kind === "open_window") { desk.wins.push({ ...restored, bundle: "com.apple.mail" }); return { status: "ok" as const, window: restored.id, opened_window: restored }; } return orig(a, op); }) as typeof desk.perform;
+    await ex2.act({ action: { kind: "open_window", app: "邮件" }, epoch: ex2.currentEpoch });
+    const o = await ex2.observe(restored.id);
+    const before = desk.effects.length;
+    const r = await ex2.act({ action: { kind: "click", window: restored.id, target: "del" }, epoch: o.epoch });
+    expect([ex2.protects("window:com.apple.mail#8"), r.status, desk.effects.length > before]).toEqual([true, "needs_consent", false]);
+    // the journal's seen lines carry id and the app's names, nothing else of the window
+    const seen = fs.readFileSync(journal, "utf-8").split("\n").filter((l) => l.includes('"seen"')).map((l) => JSON.parse(l) as { windows: Record<string, unknown>[] });
+    expect(seen[0]!.windows).toEqual([{ id: "com.apple.mail#7", app: "邮件", app_name: "邮件", bundle: "com.apple.mail" }]);
+  });
+
+  it("a journal from before `seen` lines existed fails closed: every window an intent names counts as seen, by its id's bundle prefix", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "r75old-")), journal = path.join(dir, "journal.jsonl");
+    fs.writeFileSync(journal, JSON.stringify({ t: 1, kind: "intent", action: { kind: "click", window: "com.apple.mail#3", target: "x" }, object: "window:com.apple.mail#3", consequence: "modify_user", text: "点「删除」" }) + "\n" + JSON.stringify({ t: 2, kind: "receipt", status: "ok", seq: 1, driver_status: "ok" }) + "\n");
+    const desk = new Desk([]);
+    const app = ConsentSigner.fresh(), events: { k: string; b: Record<string, unknown> }[] = [];
+    const ex = new Executor(desk, { task: "t", publicKey: app.publicKey, raw: "x", taskOpened: "task", journal, judge: fakeJudge("stays", "matches").judge, onEvent: (k, b) => events.push({ k, b }) });
+    await ex.begin(); await ex.plan({ steps: [] });
+    expect(events.filter((e) => e.k.startsWith("executor.ledger") || e.k.startsWith("executor.journal")).map((e) => [e.k, e.b])).toEqual([["executor.ledger_reloaded", { seen_lines: 0 }]]);
+    const restored = { id: "com.apple.mail#9", app: "邮件", app_name: "邮件", title: "收件箱" } as WindowInfo;
+    desk.perform = (() => { desk.wins.push(restored); return { status: "ok" as const, window: restored.id, opened_window: restored }; }) as typeof desk.perform;
+    desk.epoch += 1;
+    await ex.act({ action: { kind: "open_window", app: "邮件" }, epoch: (await ex.snapshot()).epoch });
+    expect([ex.opened("window:com.apple.mail#9"), ex.protects("window:com.apple.mail#9")]).toEqual([false, true]);
+  });
 });

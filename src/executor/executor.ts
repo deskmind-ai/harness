@@ -624,7 +624,7 @@ export class Executor {
   private jlines: JournalLine[] = [];
   private ownFrom = 0;
 
-  private journal(kind: "begin" | "intent" | "receipt" | "reconcile_pending" | "reconciled", body: Record<string, unknown>) {
+  private journal(kind: "begin" | "intent" | "receipt" | "reconcile_pending" | "reconciled" | "seen", body: Record<string, unknown>) {
     const line = { t: this.opts.now?.() ?? Date.now(), kind, ...body };
     if (this.opts.journal) {
       const fd = fs.openSync(this.opts.journal, "a");
@@ -651,6 +651,16 @@ export class Executor {
     const writesOf = (l: Record<string, unknown>): string[] => (Array.isArray(l.writes) ? (l.writes as string[]) : Object.keys((l.expect_after as Record<string, string> | undefined) ?? {}));
     const first = lines.find((l) => l.kind === "begin" && l.versions);
     if (first) this.firstBegin = { versions: { ...(first.versions as Record<string, string>) }, contents: { ...((first.contents as Record<string, string> | undefined) ?? {}) } };
+    // what earlier processes of this task saw: their `seen` lines reload the ledger. A journal from before those lines
+    // were written has no such record: every window an intent names counts as seen, its id's `bundle#` prefix as its
+    // app (fail closed — review of #75, probe R)
+    const seenLines = lines.filter((l) => l.kind === "seen" && Array.isArray(l.windows));
+    if (seenLines.length) {
+      for (const l of seenLines) for (const w of l.windows as { id: string; app?: string; app_name?: string; bundle?: string }[]) if (w && typeof w.id === "string") this.ledger.saw(w);
+    } else {
+      for (const l of lines) { const a = l.kind === "intent" ? (l.action as { window?: string } | undefined) : undefined; if (a?.window) this.ledger.saw({ id: a.window, app: a.window.includes("#") ? a.window.slice(0, a.window.lastIndexOf("#")) : a.window }); }
+    }
+    if (seenLines.length || lines.some((l) => l.kind === "intent")) this.emit("executor.ledger_reloaded", { seen_lines: seenLines.length });
     for (const l of lines) if (l.kind === "intent") for (const p of writesOf(l)) this.journalWrites.add(p);
     // a reconciliation an earlier process raised and the user has not settled (the process died with the card open, or
     // the user chose to stop and the task was started again): it still holds, whatever came after
@@ -968,13 +978,20 @@ export class Executor {
    *  no other line calls the driver's snapshot or observe. */
   private async see(): Promise<Snapshot> {
     const s = await this.driver.snapshot();
-    for (const w of s.windows) this.ledger.saw(w);
+    this.noteSeen(s.windows);
     return s;
   }
   private async watch(windowId: string, opts?: { screenshot?: boolean }): Promise<Observation> {
     const o = await this.driver.observe(windowId, opts);
-    this.ledger.saw(o.window);
+    this.noteSeen([o.window]);
     return o;
+  }
+  /** The ledger is told, and what it did not know yet goes into the journal (`seen`: id and the app's names), so a process
+   *  that resumes this task reloads it (recover): a ledger kept in memory alone forgot the user's Mail across a restart,
+   *  and the task's relaunch of it counted as one DeskMind opened (review of #75, probe R). */
+  private noteSeen(ws: readonly WindowInfo[]) {
+    const fresh = ws.filter((w) => this.ledger.saw(w)).map((w) => ({ id: w.id, app: w.app, ...(w.app_name ? { app_name: w.app_name } : {}), ...(w.bundle ? { bundle: w.bundle } : {}) }));
+    if (fresh.length) this.journal("seen", { windows: fresh });
   }
 
   async snapshot(): Promise<Snapshot> {

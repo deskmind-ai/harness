@@ -25,7 +25,14 @@ export class Ledger {
    *  the same mailbox under a new window id, the user's still (review of #75, B; Codex round 2). */
   private readonly seenWindows = new Set<string>();
   private readonly seenApps = new Set<string>();
-  saw(w: { id: string; app?: string; app_name?: string; bundle?: string }) { this.seenWindows.add(w.id); for (const k of appKeys(w)) this.seenApps.add(k); }
+  /** Records a window as seen; true when it, or a name of its app, was not known before (the executor journals those, so
+   *  a process that resumes the task reloads what the earlier one saw — review of #75, probe R). */
+  saw(w: { id: string; app?: string; app_name?: string; bundle?: string }): boolean {
+    let fresh = !this.seenWindows.has(w.id);
+    this.seenWindows.add(w.id);
+    for (const k of appKeys(w)) { if (!this.seenApps.has(k)) fresh = true; this.seenApps.add(k); }
+    return fresh;
+  }
   seen(windowId: string): boolean { return this.seenWindows.has(windowId); }
   seenApp(w: { id: string; app?: string; app_name?: string; bundle?: string }): boolean { return appKeys(w).some((k) => this.seenApps.has(k)); }
 
