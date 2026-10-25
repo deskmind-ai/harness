@@ -109,7 +109,8 @@ export class Judge {
 
   /** One choice question. The same question (same words, same facts, same options) is answered once per task. Each
    *  question asked gets an id (`judge_id`), in the context while its tiers are asked, so their model calls name it;
-   *  its outcome is one `judge.answer` event: which tier answered what, who settled it, and the shadow comparison. */
+   *  what it asked is one `judge.asked` event (the prompt and the options, before the first tier) and its outcome one
+   *  `judge.answer` event: which tier answered what, who settled it, and the shadow comparison. */
   async choose(question: string, context: unknown, options: JudgeOption[], role?: Role, how: ChooseOptions = {}): Promise<JudgeAnswer | null> {
     const key = createHash("sha256").update(JSON.stringify({ question, context, options })).digest("hex").slice(0, 24);
     const hit = this.cache.get(key);
@@ -141,6 +142,9 @@ export class Judge {
     const escalations: JudgeAnswer[] = [];                // lower tiers that answered and passed the question up
     const settleOn = how.settle ?? options[0]?.id;
     const prompt = P.choicePrompt(question, context, options);
+    // the question's material, once per question, before any tier is asked: what the trace view shows and an annotation
+    // copies (deskmind M5) -- the same prompt and options every tier, the race and the shadow are given. Trace only.
+    this.opts.onEvent?.("judge.asked", { judge_id, question_kind: kind, prompt, options });
     const sample = (top: string | null) => { if (this.opts.samples && lower && top) this.opts.onEvent?.("judge.sample", { question_kind: kind, prompt, options, lower, top }); };
     const topTier = this.tiers[this.tiers.length - 1]!;
     const skipped = new Set(how.route === false ? [] : this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)));

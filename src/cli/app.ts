@@ -331,20 +331,37 @@ function driverFor(name: Request["driver"], scope?: string): Driver {
  *  `why` was -- could not be read from the run afterwards (rc.8, 10-20). What it holds is the user's: their words
  *  (the request, their free answers on cards), what was read from their windows, the judge's prompts. It stays on
  *  this Mac, like the run's other files, and nothing sends it anywhere. The harness removes no run folders itself:
- *  the app's helper keeps the ten newest under its harness-runs folder and deletes the rest after each run
- *  (deskmind Runner.pruneHarnessRuns), trace included; a run started from the command line is kept until deleted. Long strings and long
- *  lists are cut, with a "…(+n)" mark of what was left out, so a prompt or an observation does not make it huge. */
+ *  the app's helper keeps those of the last 30 days, at most 1 GB in all, deleting the oldest first, after each run and
+ *  at the app's launch (deskmind Runner.pruneHarnessRuns), trace included -- the app's annotations of judge answers are
+ *  kept apart and never deleted by it; a run started from the command line is kept until deleted. Long strings and long
+ *  lists are cut, with a "…(+n)" mark of what was left out, so a prompt or an observation does not make it huge -- except
+ *  a judge question's own material (`judge.asked`), which the app's annotation copies as the sample a 「对 / 不对」 is
+ *  about: written whole up to `ASKED_MAX` per string, and past that cut with `cut: true` on the line. */
 export function traceWriter(file: string): (kind: string, body: Record<string, unknown>) => void {
-  const cut = (v: unknown): unknown => typeof v === "string" ? (v.length > 4000 ? v.slice(0, 4000) + `…(+${v.length - 4000})` : v)
-    : Array.isArray(v) ? (v.length > 200 ? [...v.slice(0, 200).map(cut), `…(+${v.length - 200})`] : v.map(cut))
-    : v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, cut(x)])) : v;
+  let wasCut = false;
+  const cutAt = (max: number) => {
+    const cut = (v: unknown): unknown => typeof v === "string" ? (v.length > max ? (wasCut = true, v.slice(0, max) + `…(+${v.length - max})`) : v)
+      : Array.isArray(v) ? (v.length > 200 ? (wasCut = true, [...v.slice(0, 200).map(cut), `…(+${v.length - 200})`]) : v.map(cut))
+      : v && typeof v === "object" ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, cut(x)])) : v;
+    return cut;
+  };
+  const cut = cutAt(4000), cutAsked = cutAt(ASKED_MAX);
+  const shown = (kind: string, b: Record<string, unknown>): Record<string, unknown> => {
+    if (kind !== "judge.asked") return cut(b) as Record<string, unknown>;
+    wasCut = false;
+    const out = cutAsked(b) as Record<string, unknown>;
+    return wasCut ? { ...out, cut: true } : out;
+  };
   return (kind, body) => {
     // the step in progress (otel/context): an executor event, a judge's, a model call's — each names the step it served
     // and the span in progress (otel/trace.ts): the line's place in the call chain of trace.otel.jsonl
     const c = traceContext();
-    try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(c.step_id ? { step_id: c.step_id } : {}), ...(c.span ? { span_id: c.span.spanId } : {}), ...(cut(body ?? {}) as Record<string, unknown>) }) + "\n"); } catch { /* the trace never stops a run */ }
+    try { fs.appendFileSync(file, JSON.stringify({ t: Date.now(), kind, ...(c.step_id ? { step_id: c.step_id } : {}), ...(c.span ? { span_id: c.span.spanId } : {}), ...shown(kind, body ?? {}) }) + "\n"); } catch { /* the trace never stops a run */ }
   };
 }
+
+/** The longest string a `judge.asked` trace line keeps whole (traceWriter). */
+export const ASKED_MAX = 65536;
 
 /** What a run id may be: it names folders. */
 export const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
