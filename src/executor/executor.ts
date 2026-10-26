@@ -29,7 +29,7 @@ import { UNDO_DIR, type Workspace } from "../registry/workspace.js";
 import { NEEDS_CONSENT, higher, isEffectUnknown, rank } from "./types.js";
 import { ConsentVerifier, canon, digestOf, siteOf } from "./consent.js";
 import { Ledger, sameApp } from "./ledger.js";
-import { INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
+import { ALTERS_OPTIONS, ALTERS_QUESTION, EVIDENCE_FORM, EVIDENCE_UNCLEAR, INTENT_OPTIONS, INTENT_QUESTION, OUTGOING_OPTIONS, OUTGOING_QUESTION, PROVENANCE_OPTIONS, PROVENANCE_QUESTION, VERIFY_OPTIONS, VERIFY_QUESTION, type Judge } from "./judge.js";
 import { journalSteps, parseJournal, saysNotPerformed, type JournalLine, type JournalStep } from "./possibly.js";
 import { T, type Lang } from "./text.js";
 import type { KeyObject } from "node:crypto";
@@ -901,8 +901,8 @@ export class Executor {
       if (!r.alternatives.length) continue;
       const evidence = r.evidence.filter((e) => e.trim() && ![this.opts.raw ?? "", ...this.earlierRequests].some((w) => w.includes(e.trim())));   // the request cannot settle its own ambiguity
       if (!evidence.length || !this.opts.judge) { open.push(r); continue; }
-      const options = [r.reading, ...r.alternatives, "说不清：这些证据区分不了"].map((text, i) => ({ id: `r${i}`, text }));
-      const ans = await this.choose(this.opts.judge, P.evidenceQuestion(r.point), { ...this.userWords(), 证据: evidence }, options);
+      const options = [r.reading, ...r.alternatives, EVIDENCE_UNCLEAR].map((text, i) => ({ id: `r${i}`, text }));
+      const ans = await this.choose(this.opts.judge, P.evidenceQuestion(r.point), { ...this.userWords(), 证据: evidence }, options, undefined, { form: EVIDENCE_FORM });
       if (ans?.choice !== "r0") open.push(r);
     }
     this.emit("executor.plan", { steps: p.steps.length, readings: (p.readings ?? []).length, open: open.map((r) => r.point) });
@@ -1499,17 +1499,23 @@ export class Executor {
       本次任务在这个窗口里打过的字: typed,
       结构线索: { 目标名字命中发送词表: !!h.el?.sends, 回车或换行: h.submits, 窗口里有名字命中发送词表的控件: !!h.sender },
     };
+    // the outgoing question in the words Brain was trained on (rc.17: #75 folded the second direction into it, and Brain
+    // answered「会发出去」for a 「新建纯文本文稿」 click)
     const ans = await this.choose(judge, OUTGOING_QUESTION, ctx, OUTGOING_OPTIONS, undefined, { settle: "sends", route: false });
     if (!ans) return settle({ consequence: "external", object: s.object, why: "the outgoing check got no answer: treated as sending", by: "no_answer" });
-    // the judge's other direction (M3–M6 plan §1.2): the user's existing content in the window deleted or changed, though
-    // nothing goes out — raised to modify_user; in a window DeskMind opened that is the card structure no longer asks for
-    // (under POLICY.taskOpened "user" — the behaviour before 10-25, the experiment's other arm — the answer leaves the
-    // class as it was, like「不会」)
-    if (ans.choice === "alters" && this.taskOpenedPolicy === "task") { const m = mine(); return settle({ consequence: higher(m.consequence, "modify_user"), object: s.object, why: `判官（${ans.by}）：会删掉或改掉用户已有的内容${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by }); }
-    if (ans.choice === "alters") { const m = mine(); return settle({ ...m, why: `判官（${ans.by}）：会删掉或改掉用户已有的内容（POLICY.taskOpened "user"：不据此调级）；${m.why}`, by: ans.by }); }
     if (ans.choice !== "stays") return settle({ consequence: "external", object: s.object, why: `判官（${ans.by}）：${ans.choice === "sends" ? "会发出去" : "拿不准"}${ans.reason ? "。" + ans.reason : ""}`, by: ans.by, definite: ans.choice === "sends" });
     const m = mine();
-    return settle({ ...m, why: `判官（${ans.by}）：不会发出去${s.opened ? "，也不删改用户已有的内容" : ""}${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by });
+    // the second direction (M3–M6 plan §1.2), its own question, after「不会发出去」, under POLICY.taskOpened "task" —
+    // exactly where the one question asked it before the split: every step put to the outgoing judge (the guard above:
+    // mightSend, or a window DeskMind opened), in any window — the backstop for 替换, a save over a file, a quit item.
+    // Not where the class is already modify_user. It only raises — 会删改 / 拿不准 / no answer →
+    // modify_user (a card); 不会 → the class stays. Never asked of a local tier (not a wording Brain ran with)
+    if (this.taskOpenedPolicy === "task" && rank(m.consequence) < rank("modify_user")) {
+      const al = await this.choose(judge, ALTERS_QUESTION, ctx, ALTERS_OPTIONS, undefined, { settle: "alters", route: false });
+      if (!al || al.choice !== "keeps") return settle({ consequence: higher(m.consequence, "modify_user"), object: s.object, why: al ? `判官（${al.by}）：${al.choice === "alters" ? "会删掉或改掉用户已有的内容" : "拿不准会不会删改用户已有的内容"}${al.reason ? "。" + al.reason : ""}；${m.why}` : `the alters check got no answer: taken to change the user's things; ${m.why}`, by: al?.by ?? "no_answer" });
+      return settle({ ...m, why: `判官（${ans.by}）：不会发出去；判官（${al.by}）：也不删改用户已有的内容${al.reason ? "。" + al.reason : ""}；${m.why}`, by: al.by });
+    }
+    return settle({ ...m, why: `判官（${ans.by}）：不会发出去${ans.reason ? "。" + ans.reason : ""}；${m.why}`, by: ans.by });
   }
 
   /** A send's card and consent binding, from one observation of its window: what goes out (outgoing(): the filled-in
@@ -2392,6 +2398,7 @@ function reach(ws: Workspace, paths: string[]): string[] {
   const all = Object.keys(ws.entries());
   return [...new Set(paths.flatMap((p) => (ws.isDir(p) ? [p, ...all.filter((x) => x.startsWith(p + "/"))] : [p])))];
 }
+
 
 /** What a send in this window would send, for the card and the consent. `fields`: every element that holds content —
  *  a value (typed, picked, or only shown) or, with nothing to do on it, a text of its own (a confirmation page's

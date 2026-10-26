@@ -8,13 +8,13 @@ import { ConsentSigner, digestOf } from "../src/executor/consent.js";
 import { Executor, describeAction } from "../src/executor/executor.js";
 import { SimComputer, ZH_MAIL_TEXTS } from "../src/executor/sim.js";
 import type { Action } from "../src/executor/types.js";
-import { OUTGOING_QUESTION } from "../src/executor/judge.js";
+import { ALTERS_QUESTION, OUTGOING_QUESTION } from "../src/executor/judge.js";
 
 /** The outgoing check (OUTGOING_QUESTION) is asked of screen actions too: answered here as a plain judge would — a
  *  control hands' name list marks as sending sends, anything else stays — so a test about another question sees only
  *  its own. */
 const outgoingOr = (f: (role: string, s: string, u: string) => unknown) => (role: string, s: string, u: string) =>
-  u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: /"目标名字命中发送词表":\s*true/.test(u) ? "sends" : "stays" } : f(role, s, u);
+  u.includes(ALTERS_QUESTION.slice(0, 12)) ? { choice: "keeps" } : u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: /"目标名字命中发送词表":\s*true/.test(u) ? "sends" : "stays" } : f(role, s, u);
 
 function mailSim() {
   const sim = new SimComputer();
