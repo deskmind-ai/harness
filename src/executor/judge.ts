@@ -159,25 +159,34 @@ export class Judge {
     // copies (deskmind M5) -- the same prompt and options every tier, the race and the shadow are given. Trace only.
     this.opts.onEvent?.("judge.asked", { judge_id, question_kind: kind, prompt, options });
     const sample = (top: string | null) => { if (this.opts.samples && lower && top) this.opts.onEvent?.("judge.sample", { question_kind: kind, prompt, options, lower, top }); };
-    const topTier = this.tiers[this.tiers.length - 1]!;
-    // a lower tier is skipped when the stats route it away, or when this is not a question it was trained on (never
-    // routed back: the words decide, not the stats)
+    // a tier is never asked a question it was not trained on — any tier, the top one too, and so neither the race nor
+    // the shadow (Codex review of #79: with Brain the only judge, it answered the alters question and its「不会」let a
+    // delete through). The tiers left are this question's; with none left there is no answer (the caller takes the
+    // conservative branch: the user decides)
     const digest = questionDigest(question, options, how.form);
-    const untrained = new Set(this.tiers.slice(0, -1).filter((t) => t.trained && !t.trained.has(digest)));
-    const skipped = new Set([...untrained, ...(how.route === false ? [] : this.tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)))]);
-    const lowerAsked = this.tiers.length - 1 > skipped.size;
+    const untrained = this.tiers.filter((t) => t.trained && !t.trained.has(digest));
+    for (const t of untrained) this.opts.onEvent?.("judge.skipped", { tier: t.name, question_kind: kind, why: "untrained" });
+    const tiers = this.tiers.filter((t) => !untrained.includes(t));
+    if (!tiers.length) {
+      this.opts.onEvent?.("judge.answer", { judge_id, name: questionName(question), question: question.slice(0, 80), question_kind: kind, answer: null, tiers: [], why: "no tier was trained on this question", started_at: t0, ms: Date.now() - t0 });
+      return null;
+    }
+    const topTier = tiers[tiers.length - 1]!;
+    // a lower tier is skipped when the stats route it away (never the words' call: those tiers are gone already)
+    const skipped = new Set(how.route === false ? [] : tiers.slice(0, -1).filter((t) => this.opts.stats?.route(t.name, kind)));
+    const lowerAsked = tiers.length - 1 > skipped.size;
     // shadow is drawn before the race: a sampled question keeps the raced top answer for the comparison instead of
     // abandoning it (with both on, aborting first left the agreement routing with no samples — deskmind#86 review)
     const shadowNow = this.opts.shadow === true || (typeof this.opts.shadow === "number" && Math.random() < this.opts.shadow);
     // the race: the top tier starts now, alongside the lower tiers; abortable
     type Answer = Reply<z.infer<typeof schema>>;
-    const raced = this.opts.race && this.tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
+    const raced = this.opts.race && tiers.length > 1 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
     if (raced) raced.promise = within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", stop ? AbortSignal.any([raced.controller.signal, stop]) : raced.controller.signal));
-    for (const tier of this.tiers) {
+    for (const tier of tiers) {
       // stopped meanwhile: no further tier is asked (a raced call in flight is aborted by the same signal)
       if (stop?.aborted) break;
       const final = tier === topTier;
-      if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind, ...(untrained.has(tier) ? { why: "untrained" } : {}) }); continue; }
+      if (!final && skipped.has(tier)) { this.opts.onEvent?.("judge.skipped", { tier: tier.name, question_kind: kind }); continue; }
       this.calls += 1;
       const rep = final && raced?.promise ? await raced.promise : await within({ tier: tier.name }, () => tier.gateway.ask(role ?? tier.role ?? "intent", P.SYSTEM, prompt, schema, "", stop));
       if (rep.outcome !== "answered") { asked.push({ tier: tier.name, outcome: rep.outcome, choice: null, settled: false }); this.opts.onEvent?.("judge.tier_failed", { tier: tier.name, outcome: rep.outcome }); continue; }

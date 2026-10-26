@@ -137,3 +137,46 @@ describe("3. what a card lists as going out is unchanged (#79 review: the sideba
     for (const x of ["alice@example.com", "Q3 预算.pdf", "谢谢，见附件"]) expect(c.text, x).toContain(x);
   });
 });
+
+describe("Codex review of #79: no tier is asked a question it was not trained on — the top one, the race and the shadow included", () => {
+  /** Brain as the only judge (no frontier): answers every question it is asked「不会」/「不删改」/「是用户要的」. */
+  const brainOnly = (asked: string[]) => ({ ask: async (_r: string, _s: string, prompt: string) => {
+    const q = prompt.slice(prompt.indexOf("问题：") + 3, prompt.indexOf("\n选项：")); asked.push(q);
+    return { outcome: "answered", data: { choice: q === INTENT_QUESTION ? "matches" : q === ALTERS_QUESTION ? "keeps" : "stays", scores: { x: 0.99 } } };
+  } });
+  for (const mode of ["plain", "race", "shadow"] as const) {
+    it(`Brain alone (${mode}): the alters question has no tier to ask — no answer, so the step in a window DeskMind opened asks; Brain never hears it`, async () => {
+      const desk = new Desk();
+      const asked: string[] = [];
+      const judge = new Judge([{ name: "brain", gateway: brainOnly(asked) as never, floor: 0.9, local: true, trained: BRAIN_RC16_WORDINGS }], { ...(mode === "race" ? { race: true } : {}), ...(mode === "shadow" ? { shadow: true } : {}) });
+      const ex = new Executor(desk, { task: "t1", publicKey: ConsentSigner.fresh().publicKey, raw: "在文本编辑里新建一个文档", taskOpened: "task", judge });
+      await ex.begin(); await ex.plan({ steps: [] });
+      await ex.act({ action: { kind: "open_window", app: "TextEdit" }, epoch: ex.currentEpoch });
+      const o = await ex.observe(desk.w.id);
+      const performed: Action[] = [];
+      const perform = desk.perform.bind(desk);
+      desk.perform = (a: Action) => { performed.push(a); return perform(a); };
+      const r = await ex.act({ action: { kind: "click", window: desk.w.id, target: "syn:newdoc" }, epoch: o.epoch });
+      expect([r.status, r.consequence]).toEqual(["needs_consent", "modify_user"]);
+      expect(performed).toEqual([]);
+      expect(asked).not.toContain(ALTERS_QUESTION);
+      expect(asked).toContain(OUTGOING_QUESTION);
+    });
+  }
+  it("Brain alone still answers the questions it ran with: the outgoing question", async () => {
+    const asked: string[] = [];
+    const judge = new Judge([{ name: "brain", gateway: brainOnly(asked) as never, local: true, trained: BRAIN_RC16_WORDINGS }]);
+    expect(await judge.choose(OUTGOING_QUESTION, { 对象: "window:w" }, OUTGOING_OPTIONS, undefined, { settle: "sends", route: false })).toMatchObject({ choice: "stays", by: "brain" });
+    expect(await judge.choose(ALTERS_QUESTION, { 对象: "window:w" }, ALTERS_OPTIONS, undefined, { settle: "alters", route: false })).toBeNull();
+    expect(asked).toEqual([OUTGOING_QUESTION]);
+    // Brain in front of a top tier, raced and shadowed: the alters question still never reaches Brain
+    for (const o of [{ race: true }, { shadow: true }, { race: true, shadow: true }]) {
+      const b: string[] = [], top: string[] = [];
+      const topGw = { ask: async (_r: string, _s: string, prompt: string) => { top.push(prompt); return { outcome: "answered", data: { choice: "keeps" } }; } };
+      const j = new Judge([{ name: "brain", gateway: brainOnly(b) as never, floor: 0.9, local: true, trained: BRAIN_RC16_WORDINGS }, { name: "frontier", gateway: topGw as never }], o);
+      expect(await j.choose(ALTERS_QUESTION, { 对象: "window:w" }, ALTERS_OPTIONS, undefined, { settle: "alters", route: false }), JSON.stringify(o)).toMatchObject({ choice: "keeps", by: "frontier" });
+      expect(b, JSON.stringify(o)).toEqual([]);
+      expect(top, JSON.stringify(o)).toHaveLength(1);
+    }
+  });
+});
