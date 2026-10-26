@@ -235,3 +235,16 @@ describe("Codex re-review of #79: a tier's authority is its place among the CONF
     expect(performed).toBe(0);
   });
 });
+
+describe("Codex re-review of #79 (bc3e17e): no tiers at all", () => {
+  for (const opts of [{}, { race: true }, { shadow: true }, { race: true, shadow: true }]) {
+    it(`new Judge([]) ${JSON.stringify(opts)}: no answer, no throw`, async () => {
+      const events: string[] = [];
+      const judge = new Judge([], { ...opts, onEvent: (k) => events.push(k) });
+      await expect(judge.choose(OUTGOING_QUESTION, { 对象: "window:w" }, OUTGOING_OPTIONS, undefined, { settle: "sends", route: false })).resolves.toBeNull();
+      await expect(judge.choose(ALTERS_QUESTION, { 对象: "window:w" }, ALTERS_OPTIONS, undefined, { settle: "alters", route: false })).resolves.toBeNull();
+      expect(events).toContain("judge.answer");
+    });
+  }
+});
+

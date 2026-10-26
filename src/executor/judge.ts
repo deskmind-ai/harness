@@ -168,10 +168,11 @@ export class Judge {
     const digest = questionDigest(question, options, how.form);
     const untrained = this.tiers.filter((t) => t.trained && !t.trained.has(digest));
     for (const t of untrained) this.opts.onEvent?.("judge.skipped", { tier: t.name, question_kind: kind, why: "untrained" });
-    const topTier = this.tiers[this.tiers.length - 1]!;
-    const topAsked = !untrained.includes(topTier);
+    // (no tiers at all: no top, nothing asked, no answer)
+    const topTier: JudgeTier | undefined = this.tiers[this.tiers.length - 1];
+    const topAsked = !!topTier && !untrained.includes(topTier);
     const lowers = this.tiers.slice(0, -1).filter((t) => !untrained.includes(t));
-    const tiers = [...lowers, ...(topAsked ? [topTier] : [])];
+    const tiers = [...lowers, ...(topAsked ? [topTier!] : [])];
     if (!tiers.length) {
       this.opts.onEvent?.("judge.answer", { judge_id, name: questionName(question), question: question.slice(0, 80), question_kind: kind, answer: null, tiers: [], why: "no tier was trained on this question", started_at: t0, ms: Date.now() - t0 });
       return null;
@@ -185,7 +186,7 @@ export class Judge {
     // the race: the top tier starts now, alongside the lower tiers; abortable
     type Answer = Reply<z.infer<typeof schema>>;
     const raced = this.opts.race && topAsked && lowers.length > 0 && lowerAsked ? { controller: new AbortController(), promise: null as Promise<Answer> | null } : null;
-    if (raced) raced.promise = within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", stop ? AbortSignal.any([raced.controller.signal, stop]) : raced.controller.signal));
+    if (raced && topTier) raced.promise = within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema, "", stop ? AbortSignal.any([raced.controller.signal, stop]) : raced.controller.signal));
     for (const tier of tiers) {
       // stopped meanwhile: no further tier is asked (a raced call in flight is aborted by the same signal)
       if (stop?.aborted) break;
@@ -221,7 +222,7 @@ export class Judge {
       this.opts.onEvent?.("judge.stopped", { judge_id, name: questionName(question) });
       return null;
     }
-    if (settled && settledBy && shadowNow && topAsked) {
+    if (settled && settledBy && shadowNow && topAsked && topTier) {
       const rep = raced?.promise ? await raced.promise : await within({ tier: topTier.name }, () => topTier.gateway.ask(role ?? topTier.role ?? "intent", P.SYSTEM, prompt, schema));
       const agree = rep.outcome === "answered" ? rep.data!.choice === last!.choice : null;
       if (agree !== null) this.opts.stats?.noteAgreement(settledBy.name, kind, agree);
