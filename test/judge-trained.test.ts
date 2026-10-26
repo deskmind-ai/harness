@@ -180,3 +180,58 @@ describe("Codex review of #79: no tier is asked a question it was not trained on
     }
   });
 });
+
+describe("Codex re-review of #79: a tier's authority is its place among the CONFIGURED tiers, never among those left", () => {
+  const Q = OUTGOING_QUESTION, OPTS = OUTGOING_OPTIONS, SETTLE = "sends", FLOOR = 0.9;
+  const D = questionDigest(Q, OPTS);
+  type Cfg = "brain" | "brain+top" | "top";
+  type BrainSays = { choice: string; conf: number };
+  /** The rule, written out (the oracle — not the implementation): the configured top answers as final; any other tier
+   *  only by settling (its answer is `settle`, at or above its floor); otherwise none. Untrained tiers are not asked. */
+  function expected(cfg: Cfg, topTrained: boolean, brainTrained: boolean, brain: BrainSays): { by: string; choice: string } | null {
+    if (cfg === "brain") return brainTrained ? { by: "brain", choice: brain.choice } : null;
+    if (cfg === "top") return topTrained ? { by: "top", choice: "unsure" } : null;
+    if (brainTrained && brain.choice === SETTLE && brain.conf >= FLOOR) return { by: "brain", choice: SETTLE };
+    return topTrained ? { by: "top", choice: "unsure" } : null;
+  }
+  it("the table: configured tiers {Brain only, Brain+top, top only} × top trained × Brain trained × {plain, race, shadow} × Brain's answer → who answers, or none; an untrained top is never raced or shadowed", async () => {
+    const rows: string[] = [];
+    const brainAnswers: BrainSays[] = [{ choice: "sends", conf: 0.99 }, { choice: "stays", conf: 0.99 }, { choice: "sends", conf: 0.5 }];
+    for (const cfg of ["brain", "brain+top", "top"] as Cfg[]) for (const topTrained of [true, false]) for (const brainTrained of [true, false]) for (const mode of ["plain", "race", "shadow"] as const) for (const b of brainAnswers) {
+      if (cfg === "brain" && !topTrained) continue;          // (Brain only: its own trained flag is the top's)
+      if (cfg === "top" && !brainTrained) continue;
+      const calls = { brain: 0, top: 0 };
+      const gw = (name: "brain" | "top", answer: () => { choice: string; conf?: number }) => ({ ask: async () => { calls[name] += 1; const a = answer(); return { outcome: "answered", data: { choice: a.choice, ...(a.conf !== undefined ? { scores: { [a.choice]: a.conf } } : {}) } }; } });
+      const brain: JudgeTier = { name: "brain", gateway: gw("brain", () => b) as never, floor: FLOOR, local: true, trained: new Set(brainTrained ? [D] : []) };
+      const top: JudgeTier = { name: "top", gateway: gw("top", () => ({ choice: "unsure" })) as never, trained: new Set(topTrained ? [D] : []) };
+      const tiers = cfg === "brain" ? [{ ...brain, trained: new Set(brainTrained ? [D] : []) }] : cfg === "top" ? [top] : [brain, top];
+      const judge = new Judge(tiers, { ...(mode === "race" ? { race: true } : {}), ...(mode === "shadow" ? { shadow: true } : {}) });
+      const got = await judge.choose(Q, { 对象: `window:${rows.length}` }, OPTS, undefined, { settle: SETTLE, route: false });
+      const want = expected(cfg, topTrained, brainTrained, b);
+      const row = `${cfg} top:${topTrained} brain:${brainTrained} ${mode} brain says ${b.choice}@${b.conf} → ${got ? `${got.by}:${got.choice}` : "none"}`;
+      rows.push(row);
+      expect(got ? { by: got.by, choice: got.choice } : null, row).toEqual(want);
+      // never asked when untrained; the top raced or shadowed only when it is the configured top and trained
+      if (cfg !== "top" && !brainTrained) expect(calls.brain, row).toBe(0);
+      if (cfg === "brain+top" && !topTrained) expect(calls.top, row).toBe(0);
+    }
+    expect(rows.length).toBe(18 + 36 + 18);          // Brain only: 2 × 3 × 3; Brain+top: 4 × 3 × 3; top only: 2 × 3 × 3
+  });
+
+  it("Codex's repro shape: Brain (trained) in front of a top tier that is not, on a send only the judge sees — Brain's「不会」is not final: the step asks, nothing is sent", async () => {
+    const w: WindowInfo = { id: "Chat#1", app: "Chat", app_name: "Chat", title: "群聊" };
+    const els: Element[] = [{ id: "box", role: "textArea", label: "输入", value: "周五见", actions: ["set_value", "type"] }, { id: "go", role: "button", label: "↵", actions: ["click"] }];
+    let performed = 0;
+    const desk = { epoch: 1, snapshot() { return { epoch: this.epoch, locked: false, front_app: "x", windows: [w] }; }, observe() { return { epoch: this.epoch, window: w, modal: null, elements: els.map((e) => ({ ...e })), text: "" }; }, perform() { performed += 1; this.epoch += 1; return { status: "ok" as const, window: w.id }; } };
+    const brain = { ask: async (_r: string, _s: string, prompt: string) => ({ outcome: "answered", data: { choice: prompt.includes(INTENT_QUESTION) ? "matches" : "stays", scores: { x: 0.99 } } }) };
+    const top = { ask: async () => ({ outcome: "answered", data: { choice: "matches" } }) };
+    const judge = new Judge([{ name: "brain", gateway: brain as never, floor: 0.9, local: true, trained: BRAIN_RC16_WORDINGS }, { name: "frontier", gateway: top as never, trained: new Set<string>() }]);
+    const app = ConsentSigner.fresh();
+    const ex = new Executor(desk as never, { task: "t1", publicKey: app.publicKey, raw: "回一句周五见", taskOpened: "user", judge });
+    await ex.begin(); await ex.plan({ steps: [] });
+    const o = await ex.observe(w.id);
+    const r = await ex.act({ action: { kind: "click", window: w.id, target: "go" }, epoch: o.epoch, consent: app.forObject(`window:${w.id}`, "modify_user", "t1") });
+    expect([r.status, r.consequence]).toEqual(["needs_consent", "external"]);
+    expect(performed).toBe(0);
+  });
+});
