@@ -84,15 +84,60 @@ describe("stdio user", () => {
     input.write(JSON.stringify({ ask_id: ask.ask_id, option: 1 }) + "\n");
     expect(await p).toEqual({ option: 1 });
     expect(sent.map((e) => e.kind)).toEqual(["ask", "waiting", "refused", "resumed"]);
+    // (U3) the resumed says what was applied
+    expect(sent.at(-1)).toMatchObject({ kind: "resumed", ask_id: ask.ask_id, answer: { option: 1 } });
     const p2 = u.ask({ kind: "missing", text: "写什么？", free_text: true, blocking: true, options: [] });
     input.write(JSON.stringify({ text: "买牛奶" }) + "\n");      // no ask_id: taken as the answer to the open card
     expect(await p2).toEqual({ text: "买牛奶" });
+    expect(sent.at(-1)).toMatchObject({ kind: "resumed", answer: { text: "买牛奶" } });
+  });
+
+  it("(U3) the resumed carries the answer as applied, never as sent: an option off the card with blank words is no answer; an option off the card with words is the words; at expiry the answer is refused and the resumed is a voided one", async () => {
+    const input = new PassThrough();
+    const sent: AppEvent[] = [];
+    const log = new EventLog(path.join(tmp(), "e.jsonl"), "r1", (ev) => sent.push(ev));
+    const u = new StdioUser(log, new LineReader(input));
+    const card = { kind: "action" as const, text: "点「发送」", free_text: false, blocking: true, options: [{ kind: "approve" as const, text: "可以" }, { kind: "cancel" as const, text: "先别做了" }] };
+    const askOf = () => (sent.filter((e) => e.kind === "ask").at(-1) as Extract<AppEvent, { kind: "ask" }>).ask_id;
+    const last = () => sent.at(-1) as any;
+    const p1 = u.ask(card);
+    await new Promise((r) => setTimeout(r, 5));
+    input.write(JSON.stringify({ ask_id: askOf(), option: 7, text: "  " }) + "\n");
+    expect(await p1).toBeNull();
+    expect(last()).toEqual(expect.objectContaining({ kind: "resumed", ask_id: askOf() }));
+    expect(last()).not.toHaveProperty("answer");
+    // 0.5 is no option: the card settles on no answer and is said so — never a resumed the event schema refuses with the
+    // card left neither open nor settled (review of #80 at 0d3a62b)
+    const p15 = u.ask(card);
+    await new Promise((r) => setTimeout(r, 5));
+    input.write(JSON.stringify({ ask_id: askOf(), option: 0.5 }) + "\n");
+    expect(await p15).toBeNull();
+    expect(last()).toEqual(expect.objectContaining({ kind: "resumed", ask_id: askOf() }));
+    expect(last()).not.toHaveProperty("answer");
+    const p2 = u.ask(card);
+    await new Promise((r) => setTimeout(r, 5));
+    input.write(JSON.stringify({ ask_id: askOf(), option: 9, text: "好的" }) + "\n");
+    expect(await p2).toEqual({ text: "好的" });
+    expect(last()).toMatchObject({ kind: "resumed", ask_id: askOf(), answer: { text: "好的" } });
+    // the card's deadline passes as the answer arrives (expired() closes it first): the answer is refused, the resumed is
+    // a voided one, with no answer on it
+    const ac = new AbortController();
+    const p3 = u.ask(card, { signal: ac.signal, expired: () => { ac.abort("timeout"); return true; } });
+    await new Promise((r) => setTimeout(r, 5));
+    const id3 = askOf();
+    input.write(JSON.stringify({ ask_id: id3, option: 0 }) + "\n");
+    expect(await p3).toBeNull();
+    const tail = sent.slice(sent.findIndex((e) => e.kind === "ask" && (e as any).ask_id === id3));
+    expect(tail.map((e) => e.kind)).toEqual(["ask", "waiting", "resumed", "ask_void", "refused"]);
+    expect(tail[2]).toEqual(expect.objectContaining({ kind: "resumed", ask_id: id3, voided: "timeout" }));
+    expect(tail[2]).not.toHaveProperty("answer");
+    expect(tail[4]).toMatchObject({ kind: "refused", what: `answer for ${id3}` });
   });
 
   it("maps the runtime's events onto the protocol, and drops what the app does not need", () => {
     // a step is the executor's (ExecutorService.step), not the loop's tool call: it reaches the app whoever the caller is
     expect(toProtocol("tool.call", { name: "computer_act", args: { action: { kind: "click", window: "w" }, consequence: "create", purpose: "x" } })).toBeNull();
-    expect(toProtocol("step.start", { step_id: "st_1", action: { kind: "click", window: "w", target: "e1" }, consequence: "create", purpose: "x", object: "window:w", human: "点「发送」", target: { id: "e1", label: "发送", role: "button" }, plan_step: 2 })).toEqual({ kind: "step", text: JSON.stringify({ kind: "click", window: "w", target: "e1" }), consequence: "create", purpose: "x", object: "window:w", step_id: "st_1", human: "点「发送」", target: { id: "e1", label: "发送", role: "button" }, plan_step: 2 });
+    expect(toProtocol("step.start", { step_id: "st_1", action: { kind: "click", window: "w", target: "e1" }, consequence: "create", purpose: "x", object: "window:w", object_label: "邮件「收件箱」", human: "点「发送」", target: { id: "e1", label: "发送", role: "button" }, plan_step: 2 })).toEqual({ kind: "step", text: JSON.stringify({ kind: "click", window: "w", target: "e1" }), consequence: "create", purpose: "x", object: "window:w", object_label: "邮件「收件箱」", step_id: "st_1", human: "点「发送」", target: { id: "e1", label: "发送", role: "button" }, plan_step: 2 });
     expect(toProtocol("step.start", { step_id: "st_2", action: { kind: "file", capability: "fs.write_text", args: { path: "a.txt" } }, consequence: "read", purpose: "写" })).toMatchObject({ kind: "step", text: 'fs.write_text {"path":"a.txt"}', step_id: "st_2" });
     expect(toProtocol("step.end", { step_id: "st_1", status: "stale", why: "epoch", executor_status: "stale" })).toEqual({ kind: "step_result", step_id: "st_1", status: "stale", why: "epoch", executor_status: "stale" });
     expect(toProtocol("executor.act", { action: { kind: "key" }, status: "unverified" })).toBeNull();      // the step's result says it

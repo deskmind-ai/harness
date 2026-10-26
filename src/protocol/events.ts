@@ -33,6 +33,8 @@ const ActionFacts = z.object({
     outgoing: z.array(z.object({ kind: z.enum(["field", "selected", "typed", "text"]), label: z.string(), value: z.string() })) })).optional(),
   uncertain_total: z.number().int().optional(), model_says_unchecked: z.string().optional(),
   selected: z.array(z.string()).optional(),
+  // (U3, additive) the element's place, as step.target carries it: for the app's mark on the picture while the card waits
+  target_box: z.object({ rect_norm: z.tuple([z.number(), z.number(), z.number(), z.number()]), frame: z.tuple([z.number(), z.number(), z.number(), z.number()]) }).optional(),
 });
 export const CardEvent = z.object({
   kind: z.string(), text: z.string(),
@@ -58,6 +60,9 @@ export const EventBody = z.discriminatedUnion("kind", [
     // additive (events v1, M0): the step's id (its `step_result` and the trace name it), the action in the user's words
     // (the element by its label and role, never its id), the element it acts on, and the plan step the caller says it is for
     step_id: z.string().optional(), human: z.string().optional(), plan_step: z.number().int().optional(),
+    // (U3, additive) the window the step acts in, named as the user knows it (the card's object_label, same words) —
+    // for the app's list of what the task changed; only on a step with a window
+    object_label: z.string().optional(),
     // the element: its id, its name and role; where it is in its window as fractions 0–1 (for the cursor over a picture of
     // the window) and on screen in points, when the driver says
     target: z.object({ id: z.string(), label: z.string(), role: z.string(), rect_norm: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional(), frame: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional() }).optional() }),
@@ -86,7 +91,10 @@ export const EventBody = z.discriminatedUnion("kind", [
   // `why` (M0, without ask_id): how the wait for the user to stop typing ended — "" they paused, "stopped" the app stopped
   // the task, "timed_out" they kept on (the step is refused, the task goes on)
   // (H4: "paused" — they paused — replaces "" for a wait that says so; `waited_s` how long it waited)
-  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional(), why: z.enum(["", "paused", "stopped", "timed_out", "failed"]).optional(), waited_s: z.number().optional() }),
+  // `answer` (U3, additive; with ask_id, never with voided): the answer the executor applied to the card — the option's
+  // index into its options, or the user's words — as the card settled; absent when the card closed on no answer
+  z.object({ kind: z.literal("resumed"), ask_id: z.string().optional(), voided: z.string().optional(), why: z.enum(["", "paused", "stopped", "timed_out", "failed"]).optional(), waited_s: z.number().optional(),
+    answer: z.union([z.object({ option: z.number().int() }), z.object({ text: z.string() })]).optional() }),
   // an open card let go without an answer (M0): the user changed the request (steer), stopped the task (stop), or the app
   // went away (ended). An answer sent for it later is refused
   // timeout (M2, additive): an action card left unanswered for 10 minutes (wall clock). Nobody answers for the user:

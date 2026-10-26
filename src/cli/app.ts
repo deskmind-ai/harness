@@ -204,10 +204,12 @@ export class StdioUser implements RuntimeUser {
     if (o && answersOpenCard(a, o.id, this.voided)) {
       this.closeOpen("answered");
       o.taken?.();                 // the card is answered now: the next line (a steer in the same chunk) finds none open
-      this.log.emit({ kind: "resumed", ask_id: o.id });
-      if (typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length) return o.settle({ option: a.option });
-      if (typeof a.text === "string" && a.text.trim()) return o.settle({ text: a.text });
-      return o.settle(null);
+      // the answer as it is applied (U3): an option in range, else non-blank words, else none — said on the resumed
+      // (`answer`), so the session records what was used and never what was sent
+      const answer: Answer | null = typeof a.option === "number" && Number.isInteger(a.option) && a.option >= 0 && a.option < o.card.options.length ? { option: a.option }
+        : typeof a.text === "string" && a.text.trim() ? { text: a.text } : null;
+      this.log.emit({ kind: "resumed", ask_id: o.id, ...(answer ? { answer } : {}) });
+      return o.settle(answer);
     }
     const why = a.ask_id !== undefined ? this.closed.get(a.ask_id) ?? this.over ?? "none" : this.over ?? (this.voided ? "unnamed" : "none");
     this.refuse(a, why);
@@ -272,7 +274,7 @@ export function toProtocol(kind: string, body: Record<string, unknown>): EventBo
     // a step is the executor's (step.start / step.end, ExecutorService.step), so it reaches the app whoever the caller
     // is; `text` stays the action as before (a file action: its capability and arguments), for the app as shipped
     case "step.start": { const a = body.action as { kind?: string; capability?: unknown; args?: unknown };
-      return { kind: "step", text: a?.kind === "file" ? `${s(a.capability)} ${s(a.args)}` : s(a), purpose: s(body.purpose ?? ""), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(body.object ? { object: s(body.object) } : {}),
+      return { kind: "step", text: a?.kind === "file" ? `${s(a.capability)} ${s(a.args)}` : s(a), purpose: s(body.purpose ?? ""), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(body.object ? { object: s(body.object) } : {}), ...(body.object_label ? { object_label: s(body.object_label) } : {}),
         step_id: s(body.step_id), ...(body.human ? { human: s(body.human) } : {}), ...(body.target ? { target: body.target as never } : {}), ...(typeof body.plan_step === "number" ? { plan_step: body.plan_step } : {}) }; }
     case "step.end": return { kind: "step_result", step_id: s(body.step_id), status: body.status as never, ...(body.why ? { why: s(body.why).slice(0, 500) } : {}), ...(body.executor_status ? { executor_status: s(body.executor_status) } : {}), ...(body.consequence ? { consequence: body.consequence as never } : {}), ...(typeof body.possibly_done === "boolean" ? { possibly_done: body.possibly_done } : {}),
       ...(body.shot ? { shot: s(body.shot), ...(body.shot_pending ? { shot_pending: true } : {}) } : {}), ...(body.target_frame ? { target_frame: body.target_frame as never } : {}), ...(body.window_frame ? { window_frame: body.window_frame as never } : {}) };

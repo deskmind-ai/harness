@@ -37,6 +37,8 @@ const gateway = () => {
 };
 const lastJson = (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role === "toolResult"); try { return JSON.parse(m.content[0].text.split("\n")[0]); } catch { return {}; } };
 const textOf = (m: any) => (typeof m.content === "string" ? m.content : m.content.map((c: any) => c.text ?? (c.type === "toolCall" ? `[call ${c.name} ${JSON.stringify(c.arguments)}]` : "")).join(""));
+/** The host idle, then a tick: the task's own end records land after the turn (U3 tests). */
+const s2idle = async (s: { h: SessionHost }) => { await s.h.idle(); await new Promise((r) => setTimeout(r, 20)); await s.h.idle(); };
 const waitFor = async (cond: () => unknown, ms = 10_000) => { const t0 = Date.now(); while (!cond()) { if (Date.now() - t0 > ms) throw new Error("timed out waiting"); await new Promise((r) => setTimeout(r, 5)); } };
 
 /** Executors in process: each task takes the next runtime script; the runtime's model sees are kept per task. */
@@ -1877,6 +1879,110 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       expect(lockState(s.dir)).toBe("free");
       await recovered(s, ex, runA, { from_run: { status: "stopped", reason: "stopped by SIGTERM" } });
     }, 30_000);
+  });
+
+  // U3: what the executor applied to a card is history (session.task_answer), recorded from its resumed{answer}
+  describe("session.task_answer: the answer the executor applied to a card, recorded from its resumed", () => {
+    const approveOf = (e: any) => e.card.options.findIndex((x: any) => x.kind === "approve");
+    const records = (s: ReturnType<typeof session>) => s.stored().filter((e: any) => e.kind === "session.task_answer");
+    /** The editor task through the in-process executor, its handle's writes delayed `delayMs` (two answers can then be
+     *  sent inside the window before the executor decides on the first). */
+    const editorTask = (delayMs = 0) => {
+      const ed = editorSim();
+      const launch: Launcher = (req, o) => { const h = inproc([EDIT("editor-1")], ed.make).launch(req, o); return delayMs ? { ...h, write: (l) => { setTimeout(() => h.write(l), delayMs); } } : h; };
+      return session({ sim: ed.make, model: [CALL("改笔记"), { text: "改好了" }], launch });
+    };
+
+    it("the record names the card and the pick as applied, stored before the resumed is forwarded and before the task's end; an answer sent after the card closed leaves no second record", async () => {
+      const s = editorTask();
+      s.on((e) => { if (e.kind === "ask") setTimeout(() => s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: approveOf(e), req_id: "ans-1" }), 5); });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await s2idle(s);
+      const ask = s.kinds("ask")[0];
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === ask.ask_id)).toMatchObject({ answer: { option: approveOf(ask) } });
+      expect(records(s)).toEqual([expect.objectContaining({ run_id: ask.run_id, ask_id: ask.ask_id, option: approveOf(ask) })]);
+      expect(records(s)[0]).not.toHaveProperty("text");
+      expect(records(s)[0]).not.toHaveProperty("req_id");
+      const kinds = s.stored().map((e: any) => e.kind);
+      expect(kinds.indexOf("session.task_answer")).toBeLessThan(kinds.indexOf("session.task_end"));
+      // the app saw the record, and before the resumed
+      const live = s.evs.map((e) => e.kind);
+      expect(live.indexOf("session.task_answer")).toBeLessThan(live.findIndex((k, i) => k === "resumed" && s.evs[i].ask_id === ask.ask_id));
+      s.send({ type: "answer", run_id: ask.run_id, ask_id: ask.ask_id, option: 0 });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(records(s)).toHaveLength(1);
+    });
+
+    it("two answers sent before the executor decides on the first: one record, the one it took (the second is refused as answered already)", async () => {
+      const s = editorTask(10);
+      s.on((e) => { if (e.kind === "ask") setTimeout(() => { s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: 0 }); s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: 1 }); }, 5); });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await s2idle(s);
+      const ask = s.kinds("ask")[0];
+      expect(s.evs.filter((e) => e.kind === "refused" && e.what === `answer for ${ask.ask_id}`)).toHaveLength(1);
+      expect(records(s)).toEqual([expect.objectContaining({ ask_id: ask.ask_id, option: 0 })]);
+    });
+
+    it("the user's own words are recorded as text; an option off the card with words is recorded as the words (what was used)", async () => {
+      const s = editorTask();
+      let n = 0;
+      s.on((e) => { if (e.kind === "ask") { const i = n++; setTimeout(() => s.send(i === 0 ? { type: "answer", run_id: e.run_id, ask_id: e.ask_id, text: "先别发，等我看看" } : { type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: 9, text: "好的" }), 5); } });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await s2idle(s);
+      // (words on a plan card: the executor asks again with the words taken in — one record per card, each its own)
+      const asks = s.kinds("ask");
+      expect(asks.length).toBeGreaterThanOrEqual(2);
+      const recs = records(s);
+      expect(recs.map((r: any) => [r.ask_id, r.text])).toEqual(asks.map((a, i) => [a.ask_id, i === 0 ? "先别发，等我看看" : "好的"]));
+      for (const r of recs) expect(r).not.toHaveProperty("option");
+    });
+
+    it("an option off the card with blank words, or a line with neither, closes the card on no answer: a resumed without answer, no record", async () => {
+      for (const line of [{ option: 7, text: "  " }, {}]) {
+        const s = editorTask();
+        s.on((e) => { if (e.kind === "ask") setTimeout(() => s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, ...line }), 5); });
+        s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+        await s2idle(s);
+        const ask = s.kinds("ask")[0];
+        const resumed = s.evs.find((e) => e.kind === "resumed" && e.ask_id === ask.ask_id);
+        expect(resumed).toBeTruthy();
+        expect(resumed).not.toHaveProperty("answer");
+        expect(records(s)).toHaveLength(0);
+      }
+    });
+
+    it("an option that is not an index (0.5) is refused by the session (bad_control) and never forwarded: the card stays open, the next answer goes through", async () => {
+      const s = editorTask();
+      let asked: any = null;
+      s.on((e) => { if (e.kind === "ask") asked = e; });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await waitFor(() => asked);
+      s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: 0.5, req_id: "ans-h" });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "bad_control", control: "answer", run_id: asked.run_id, req_id: "ans-h" });
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === asked.ask_id)).toBeFalsy();
+      expect(s.evs.find((e) => e.kind === "refused")).toBeFalsy();
+      s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: approveOf(asked) });
+      await s2idle(s);
+      expect(records(s)).toEqual([expect.objectContaining({ ask_id: asked.ask_id, option: approveOf(asked) })]);
+      expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+    });
+
+    it("a record that cannot be written is lost and nothing else: the answer went through, the task ends as usual, the history has the end but not the pick", async () => {
+      const s = editorTask();
+      const f = failFs("writeSync", lineOf("session.task_answer"));
+      s.on((e) => { if (e.kind === "ask") setTimeout(() => s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: approveOf(e) }), 5); });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await s2idle(s);
+      f.restore();
+      expect(f.hit.n).toBe(1);
+      const ask = s.kinds("ask")[0];
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === ask.ask_id)).toMatchObject({ answer: { option: approveOf(ask) } });
+      expect(s.kinds("session.error")).toHaveLength(0);
+      expect(records(s)).toHaveLength(0);
+      expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+      expect(s.exited()).toBe(false);
+    });
   });
 });
 

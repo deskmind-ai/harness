@@ -78,6 +78,11 @@ export interface ActionCardFacts {
   /** What is selected in the window the action acts in (H2): elements whose selection flag is set (focused, and not
    *  where the keyboard types), by their labels, from the same look the card is made of — which mail a 「删除」 deletes. */
   selected?: string[];
+  /** Where the element acted on is (U3, additive): its rect in its window as fractions 0–1 and on screen in points, as
+   *  `step.target` carries them — from the same look the card is made of, so the app can mark the element on the
+   *  window's picture while the card waits (the step's own rect comes only once the action is carried out). Absent
+   *  when the driver gave no rect or no window frame, or the action has no element. */
+  target_box?: { rect_norm: [number, number, number, number]; frame: [number, number, number, number] };
 }
 
 /** Who answers the executor's cards: the app (stdio: an `ask` event, then the answer line), the evaluation's simulated

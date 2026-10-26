@@ -95,15 +95,8 @@ export function checkAction(a: Action): string | null {
 
 const withoutFrame = <W extends { frame?: unknown }>(w: W): Omit<W, "frame"> => { const { frame: _f, ...rest } = w; return rest; };
 
-/** Where an element is, for the app's cursor over a picture of its window: `rect_norm` — the element's rect (local to
- *  the window, from the observation) as fractions of the window's size, 0–1 — and `frame`, the same on screen in
- *  points. Nothing when the driver gave no rect or no window frame. */
-export function placeOf(rect: [number, number, number, number] | undefined, frame: [number, number, number, number] | undefined): { rect_norm?: [number, number, number, number]; frame?: [number, number, number, number] } {
-  if (!rect || !frame || !(frame[2] > 0) || !(frame[3] > 0)) return {};
-  const c = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 10_000) / 10_000;
-  const [x, y, w, h] = rect, [fx, fy, fw, fh] = frame;
-  return { rect_norm: [c(x / fw), c(y / fh), c(w / fw), c(h / fh)], frame: [fx + x, fy + y, w, h] };
-}
+export { placeOf } from "./place.js";
+import { placeOf } from "./place.js";
 
 /** A card's outcome: the option picked (or the user's own words), nothing (no answer: stopped, the app went away), or
  *  voided (the user changed the request while it was open). An action card can also have expired (`Expiring`). */
@@ -183,7 +176,7 @@ export class ExecutorService {
     const port: ExecutorPort = {
       begin: () => (this.begun ? Promise.reject(new Error("begin was already called for this task")) : this.begin()),
       // where a window is on screen is the app's (its cursor), not the caller's
-      snapshot: () => this.o.executor.snapshot(), observe: async (w) => { const o = await this.o.executor.observe(w); return { ...o, window: withoutFrame(o.window) }; },
+      snapshot: () => this.o.executor.snapshot(), observe: async (w) => { const { screenshot_png: _px, ...o } = await this.o.executor.observe(w); return { ...o, window: withoutFrame(o.window) }; },
       // (as live: once the task is settled — a stop among them — no judge is asked for it; the caller is told so)
       classify: async (p): Promise<Classified> => { const s = this.settled(); if (s) throw new Error((await s).text); const ex = this.o.executor; const c = await ex.classify(p.action, p.epoch ?? ex.currentEpoch, p.consequence); return { consequence: c.consequence, object: c.object, why: c.why, by: c.by, needs_consent: NEEDS_CONSENT.has(c.consequence) }; },
       // a file action goes through `file`, which makes what a capability derives (a rewrite) itself
@@ -527,8 +520,8 @@ export class ExecutorService {
     if (a.kind === "file") { try { consequence = this.o.executor.preview({ action: a, epoch: this.o.executor.currentEpoch, consequence: "read" }).consequence; } catch { consequence = undefined; } }
     const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
-    this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}` } : {}),
-      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, "window" in a ? this.o.executor.frameOf(a.window) : undefined) } } : {}),
+    this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}`, object_label: obs ? windowLabel(obs.window, this.o.lang) : this.o.executor.labelOf(`window:${a.window}`) } : {}),
+      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, this.o.executor.frameOf(obs)) } } : {}),
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
     return span("deskmind.step", { "deskmind.step_id": step_id, "deskmind.action.kind": a.kind, "deskmind.consequence.declared": consequence, "deskmind.plan_step": p.plan_step }, async (sp) => {
       let reply: ToolReply;
