@@ -12,7 +12,7 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
-import { boxOf } from "./place.js";
+import { boxOf, type Box } from "./place.js";
 import type { ActionCardFacts, Beyond } from "../protocol/cards.js";
 import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, SaveSheet, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
@@ -372,6 +372,10 @@ export function objectOf(a: Action, fp?: { reads: string[]; writes: string[] }, 
     default: return `window:${a.window}`;
   }
 }
+
+/** An observation without its window's screen frame, and the frame apart (Executor.frames): the observation is what
+ *  callers, judges and receipts see; the frame is the app's alone. */
+const unframed = (o: Observation): [Observation, Box | undefined] => { const { frame, ...window } = o.window; return [frame ? { ...o, window } : o, frame]; };
 
 export class Executor {
   readonly ledger = new Ledger();
@@ -1009,8 +1013,9 @@ export class Executor {
   }
 
   async observe(windowId: string, opts?: { screenshot?: boolean }): Promise<Observation> {
-    const o = this.unframed(windowId, await this.watch(windowId, opts));
+    const [o, frame] = unframed(await this.watch(windowId, opts));
     const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
+    if (frame) this.frames.set(stamped, frame);
     this.epoch = o.epoch;
     this.lastObs.set(windowId, stamped);
     this.looks.set(windowId, stamped);
@@ -1026,21 +1031,19 @@ export class Executor {
   /** The executor's own look at a window (right before an effect): kept as what is on screen now, not as what the
    *  caller was shown — the caller's ids stay those of its own observation. */
   private async look(windowId: string): Promise<Observation> {
-    const o = this.unframed(windowId, await this.watch(windowId));
+    const [o, frame] = unframed(await this.watch(windowId));
     const stamped: Observation = { ...o, window: this.mark({ ...o.window, owner: this.ledger.ownerOf(`window:${o.window.id}`) }) };
+    if (frame) this.frames.set(stamped, frame);
     this.looks.set(windowId, stamped);
     return stamped;
   }
 
-  /** Where each window was on screen at its last look (hands' observe): for the app's cursor only. It is kept apart from
-   *  the observation, so no judge question, verdict evidence, receipt or caller's reply ever carries it. */
-  private frames = new Map<string, [number, number, number, number]>();
-  frameOf(windowId: string): [number, number, number, number] | undefined { return this.frames.get(windowId); }
-  private unframed(windowId: string, o: Observation): Observation {
-    const { frame, ...window } = o.window;
-    if (frame) this.frames.set(windowId, frame);
-    return frame ? { ...o, window } : o;
-  }
+  /** Where a window was on screen at one look (hands' observe): for the app's cursor and target box only. It is kept
+   *  apart from the observation, keyed by it, so no judge question, verdict evidence, receipt or caller's reply ever
+   *  carries it — and a look the driver gave no frame on has none: the frame of an earlier look is not where the
+   *  window is now (Codex review of #80: moved or resized in between, the box landed off the element). */
+  private frames = new WeakMap<Observation, Box>();
+  frameOf(o: Observation | undefined): Box | undefined { return o ? this.frames.get(o) : undefined; }
 
   /** The caller's last observation of a window (what its element ids refer to), for what a step is said to be. */
   observed(windowId: string): Observation | undefined { return this.lastObs.get(windowId); }
@@ -1544,7 +1547,7 @@ export class Executor {
     // what is selected there (H2: the card names which mail a 「删除」 deletes) — the selection flag, by structure: a
     // focused element the keyboard does not type into, other than the one acted on, from the same look
     const selected = (look?.elements ?? []).filter((e) => e.focused && !keyboardFocus(e) && e !== el).map((e) => elementName(e)).filter((x): x is string => !!x).map((x) => cardText(x, 80, this.opts.lang));
-    const box = el && "window" in a && a.window ? boxOf(el.rect, this.frameOf(a.window)) : undefined;
+    const box = el ? boxOf(el.rect, this.frameOf(look)) : undefined;
     const facts = (text: string, outgoingItems: ActionCardFacts["outgoing"], host: string | null): ActionCardFacts => ({
       action: a.kind, action_text: stepText(act, look, this.opts.lang), target: elementName(el ?? undefined), object,
       object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host, ...(selected.length ? { selected } : {}),

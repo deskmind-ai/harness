@@ -521,7 +521,7 @@ export class ExecutorService {
     const el = "target" in a && a.target ? obs?.elements.find((e) => e.id === a.target) : undefined;
     const cap = a.kind === "file" ? this.o.registry?.get(a.capability) : undefined;
     this.emit("step.start", { step_id, action: a, purpose: p.purpose, ...(consequence ? { consequence } : {}), ...("window" in a && a.window ? { object: `window:${a.window}`, object_label: obs ? windowLabel(obs.window, this.o.lang) : this.o.executor.labelOf(`window:${a.window}`) } : {}),
-      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, "window" in a ? this.o.executor.frameOf(a.window) : undefined) } } : {}),
+      human: stepText(a, obs, this.o.lang, cap), ...(el ? { target: { id: el.id, label: elementName(el) ?? "", role: el.role, ...placeOf(el.rect, this.o.executor.frameOf(obs)) } } : {}),
       ...(typeof p.plan_step === "number" && Number.isInteger(p.plan_step) && p.plan_step > 0 ? { plan_step: p.plan_step } : {}) });
     return span("deskmind.step", { "deskmind.step_id": step_id, "deskmind.action.kind": a.kind, "deskmind.consequence.declared": consequence, "deskmind.plan_step": p.plan_step }, async (sp) => {
       let reply: ToolReply;

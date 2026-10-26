@@ -1,7 +1,8 @@
 /**
  * Where an element is, for the app's cursor and target box over a picture of its window: `rect_norm` — the element's
  * rect (local to the window, from the observation) as fractions of the window's size, 0–1 — and `frame`, the same on
- * screen in points. Nothing when the driver gave no rect or no window frame. Used by the step event (`step.target`,
+ * screen in points — the frame of that same observation, never an earlier one's (Executor.frameOf). Nothing when the
+ * driver gave no rect, or no frame on that observation. Used by the step event (`step.target`,
  * ExecutorService.step) and by an action card's facts (`consent.target_box`, Executor), so the two never disagree.
  */
 export type Box = [number, number, number, number];

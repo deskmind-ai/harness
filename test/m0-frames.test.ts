@@ -94,6 +94,46 @@ describe("M0 slice E review: the app's fields stay the app's", () => {
     for (const e of ready) expect(fs.existsSync(path.join(runs, "r", e.shot))).toBe(true);
   });
 
+  it("a frame is that observation's own: present, then omitted, gives step.target no place and the card no target_box (Codex review of #80)", async () => {
+    // hands gives the window's frame on the first look only (a window moved or resized between looks reports a new frame,
+    // or none); the frame of the earlier look must not be joined to the later look's element rects
+    class FrameOnce extends LateShotSim { framed = true; override observe(id: string) { const ob = super.observe(id) as any; const { frame: _f, ...window } = ob.window; return (this.framed ? ob : { ...ob, window }) as never; } }
+    const sim = new FrameOnce();
+    const w = sim.addMail({ app: "信鸽", texts: ZH_MAIL_TEXTS, flagged: [], inbox: [{ id: "m1", from: "林晓", subject: "Q3", body: ["hi"], time: "14:00" }] }).id;
+    const gw = new Gateway(Object.fromEntries(roles.map((r) => [r, { backend: "scripted", model: "scripted" }])) as never);
+    gw.script = Array(80).fill((role: string, _sys: string, u: string) => role === "verify" ? { choice: "pass", reason: "ok" } : u.includes(OUTGOING_QUESTION.slice(0, 12)) ? { choice: /"目标名字命中发送词表":\s*true/.test(u) ? "sends" : "stays" } : { choice: "matches" });
+    const act = (target: string, consequence: string, extra: Record<string, unknown> = {}) => (m: any[]): Step => ({ calls: [{ name: "computer_act", args: { action: { kind: "click", window: w, target: `${w}:0:${target}`, ...extra }, epoch: lastJson(m).after?.epoch ?? lastJson(m).epoch, consequence, purpose: "回复" } }] });
+    const steps: Step[] = [
+      { calls: [{ name: "plan", args: { steps: [{ purpose: "回复并发送", objects: [`window:${w}`], consequence: "external" }] } }] },
+      { calls: [{ name: "computer_observe", args: { window: w } }] },                         // framed
+      () => { sim.framed = false; return { calls: [{ name: "computer_observe", args: { window: w } }] }; },  // the same window, no frame now
+      act("row:m1", "modify_user"),
+      act("reply", "modify_user"),
+      act("compose_body", "modify_user", { kind: "set_value", value: "收到" }),
+      (m) => ({ calls: [{ name: "computer_observe", args: { window: w } }] }),
+      act("send", "external"),
+      { calls: [{ name: "finish", args: { outcome: "done", summary: "回复了" } }] },
+    ];
+    const input = new PassThrough();
+    const events: AppEvent[] = [];
+    await appRun({ run_id: "r", raw: "回复林晓：收到", config: "ds-flash" }, {
+      runs: fs.mkdtempSync(path.join(os.tmpdir(), "m0-frames-")), input: new LineReader(input), linger: 0,
+      out: (e) => { events.push(e); if (e.kind === "ask" && e.card.blocking) setTimeout(() => input.write(JSON.stringify({ type: "answer", ask_id: e.ask_id, option: e.card.options.findIndex((x) => x.kind === "approve") }) + "\n"), 5); },
+      inject: { driver: sim, gateway: gw, model: { ...model, streamFn: scriptedStream(steps, []) } },
+    });
+    expect((events.find((e) => e.kind === "task_done") as any).status).toBe("succeeded");
+    // every step was decided on an unframed look: the element is still named, its place is not
+    const targets = (events.filter((e) => e.kind === "step") as any[]).map((e) => e.target);
+    expect(targets.length).toBe(4);
+    for (const t of targets) { expect(t.label).toBeTruthy(); expect(t.rect_norm).toBeUndefined(); expect(t.frame).toBeUndefined(); }
+    // the send's card was made of an unframed look too: facts without a box, the rest as before
+    const action = (events.find((e) => e.kind === "ask" && (e as any).card.kind === "action") as any).card;
+    expect(action.consent.target).toBeTruthy();
+    expect(action.consent.target_box).toBeUndefined();
+    // the receipts' frames are the driver's own, per step, and still come
+    expect((events.find((e) => e.kind === "step_result") as any).window_frame).toEqual({ x: 100, y: 50, w: 800, h: 600 });
+  });
+
   it("an MCP caller (a model) reads no frame, picture or card fields either", async () => {
     // a driver that puts frames and a picture in every receipt, asked or not
     class Loud extends LateShotSim { override perform(a: any) { return { ...(super.perform(a) as any), shot: "/x/shots/a.png", shot_pending: true, window_frame: { x: 1, y: 2, w: 3, h: 4 }, target_frame: { x: 1, y: 2, w: 3, h: 4 } }; } }
