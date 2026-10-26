@@ -103,6 +103,8 @@ describe("M0 slice A: step lifecycle and readable text", () => {
     // the first: the text set, under plan step 1, said in words from the element's label — no id, no JSON
     expect(steps[0]).toMatchObject({ plan_step: 1, purpose: "改正文", consequence: "modify_user", object: `window:${r.w}`, target: { id: `${r.w}:0:textarea`, label: "正文", role: "textArea" } });
     expect(steps[0].human).toBe("在 编辑器「笔记.txt」 把「正文」设为「新的」");
+    // (U3) the window named as the card would name it, beside its ref — for the app's list of what the task changed
+    expect(steps[0].object_label).toBe("编辑器「笔记.txt」");
     expect(steps[0].human).not.toContain(r.w + ":");
     expect(JSON.parse(steps[0].text)).toMatchObject({ kind: "set_value" });        // the app as shipped reads the JSON
     expect(results[0]).toMatchObject({ status: "ok", executor_status: "ok", consequence: "modify_user" });
@@ -156,6 +158,8 @@ describe("M0 slice B: card facts in fields", () => {
     expect(consent.consent.object_label).toContain("信鸽");
     expect(consent.consent.outgoing).toContainEqual({ kind: "field", label: "回复内容", value: "收到，谢谢" });
     expect(consent.consent.outgoing).toContainEqual({ kind: "selected", label: "林晓 · Q3 预算", value: "" });
+    // (U3) a driver that gives no rects: the card carries no target box (never a made-up one)
+    expect(consent.consent.target_box).toBeUndefined();
   });
 });
 

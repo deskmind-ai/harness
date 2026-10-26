@@ -33,6 +33,8 @@ const ActionFacts = z.object({
     outgoing: z.array(z.object({ kind: z.enum(["field", "selected", "typed", "text"]), label: z.string(), value: z.string() })) })).optional(),
   uncertain_total: z.number().int().optional(), model_says_unchecked: z.string().optional(),
   selected: z.array(z.string()).optional(),
+  // (U3, additive) the element's place, as step.target carries it: for the app's mark on the picture while the card waits
+  target_box: z.object({ rect_norm: z.tuple([z.number(), z.number(), z.number(), z.number()]), frame: z.tuple([z.number(), z.number(), z.number(), z.number()]) }).optional(),
 });
 export const CardEvent = z.object({
   kind: z.string(), text: z.string(),
@@ -58,6 +60,9 @@ export const EventBody = z.discriminatedUnion("kind", [
     // additive (events v1, M0): the step's id (its `step_result` and the trace name it), the action in the user's words
     // (the element by its label and role, never its id), the element it acts on, and the plan step the caller says it is for
     step_id: z.string().optional(), human: z.string().optional(), plan_step: z.number().int().optional(),
+    // (U3, additive) the window the step acts in, named as the user knows it (the card's object_label, same words) —
+    // for the app's list of what the task changed; only on a step with a window
+    object_label: z.string().optional(),
     // the element: its id, its name and role; where it is in its window as fractions 0–1 (for the cursor over a picture of
     // the window) and on screen in points, when the driver says
     target: z.object({ id: z.string(), label: z.string(), role: z.string(), rect_norm: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional(), frame: z.tuple([z.number(), z.number(), z.number(), z.number()]).optional() }).optional() }),

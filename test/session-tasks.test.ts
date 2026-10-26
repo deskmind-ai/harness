@@ -37,6 +37,8 @@ const gateway = () => {
 };
 const lastJson = (ms: any[]) => { const m = [...ms].reverse().find((x) => x.role === "toolResult"); try { return JSON.parse(m.content[0].text.split("\n")[0]); } catch { return {}; } };
 const textOf = (m: any) => (typeof m.content === "string" ? m.content : m.content.map((c: any) => c.text ?? (c.type === "toolCall" ? `[call ${c.name} ${JSON.stringify(c.arguments)}]` : "")).join(""));
+/** The host idle, then a tick: the task's own end records land after the turn (U3 tests). */
+const s2idle = async (s: { h: SessionHost }) => { await s.h.idle(); await new Promise((r) => setTimeout(r, 20)); await s.h.idle(); };
 const waitFor = async (cond: () => unknown, ms = 10_000) => { const t0 = Date.now(); while (!cond()) { if (Date.now() - t0 > ms) throw new Error("timed out waiting"); await new Promise((r) => setTimeout(r, 5)); } };
 
 /** Executors in process: each task takes the next runtime script; the runtime's model sees are kept per task. */
@@ -1877,6 +1879,80 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       expect(lockState(s.dir)).toBe("free");
       await recovered(s, ex, runA, { from_run: { status: "stopped", reason: "stopped by SIGTERM" } });
     }, 30_000);
+  });
+
+  // U3: what the user answered on a card is history (session.task_answer), stored before the answer goes to the executor
+  describe("a card's answer is stored (session.task_answer) before it goes to the executor", () => {
+    const approveOf = (e: any) => e.card.options.findIndex((x: any) => x.kind === "approve");
+    it("the record names the card and the pick (and echoes req_id); it is in the history before the task's end; a later answer for no open card is not stored", async () => {
+      const ed = editorSim();
+      const s = session({ sim: ed.make, model: [CALL("改笔记"), { text: "改好了" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+      s.on((e) => { if (e.kind === "ask") setTimeout(() => s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, option: approveOf(e), req_id: "ans-1" }), 5); });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await s2idle(s);
+      const ask = s.kinds("ask")[0];
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === ask.ask_id)).toBeTruthy();
+      const recs = s.stored().filter((e: any) => e.kind === "session.task_answer");
+      expect(recs).toEqual([expect.objectContaining({ run_id: ask.run_id, ask_id: ask.ask_id, option: approveOf(ask), req_id: "ans-1" })]);
+      expect(recs[0]).not.toHaveProperty("text");
+      const kinds = s.stored().map((e: any) => e.kind);
+      expect(kinds.indexOf("session.task_answer")).toBeLessThan(kinds.indexOf("session.task_end"));
+      // the app saw it live too (the same record, forwarded)
+      expect(s.kinds("session.task_answer")).toHaveLength(1);
+      // the task is over: an answer sent now names no open card — forwarded or refused as before, never stored as a pick
+      s.send({ type: "answer", run_id: ask.run_id, ask_id: ask.ask_id, option: 0 });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(s.stored().filter((e: any) => e.kind === "session.task_answer")).toHaveLength(1);
+    });
+
+    it("the user's own words are stored as text", async () => {
+      const ed = editorSim();
+      const s = session({ sim: ed.make, model: [CALL("改笔记"), { text: "好" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+      s.on((e) => { if (e.kind === "ask") setTimeout(() => s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id, text: "先别发，等我看看" }), 5); });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await s2idle(s);
+      // (words on a plan card: the executor asks again with the words taken in, and that card is answered the same way —
+      // one record per card, each naming its own card)
+      const asks = s.kinds("ask");
+      const recs = s.stored().filter((e: any) => e.kind === "session.task_answer");
+      expect(recs.map((r: any) => [r.run_id, r.ask_id, r.text])).toEqual(asks.map((a) => [a.run_id, a.ask_id, "先别发，等我看看"]));
+      expect(recs.length).toBeGreaterThanOrEqual(1);
+      for (const r of recs) expect(r).not.toHaveProperty("option");
+    });
+
+    it("a line with neither option nor text is forwarded as before and not stored (the executor takes it as no answer: the card closes with nothing picked, and the history says so by having no record)", async () => {
+      const ed = editorSim();
+      const s = session({ sim: ed.make, model: [CALL("改笔记"), { text: "好" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+      s.on((e) => { if (e.kind === "ask") setTimeout(() => s.send({ type: "answer", run_id: e.run_id, ask_id: e.ask_id }), 5); });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await s2idle(s);
+      const ask = s.kinds("ask")[0];
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === ask.ask_id)).toBeTruthy();
+      expect(s.stored().filter((e: any) => e.kind === "session.task_answer")).toHaveLength(0);
+    });
+
+    it("an answer whose record cannot be stored is not sent: busy, the card stays open, the next answer is stored and goes through", async () => {
+      const ed = editorSim();
+      const s = session({ sim: ed.make, model: [CALL("改笔记"), { text: "改好了" }], launch: (req, o) => inproc([EDIT("editor-1")], ed.make).launch(req, o) });
+      const f = failFs("writeSync", lineOf("session.task_answer"));
+      let asked: any = null;
+      s.on((e) => { if (e.kind === "ask") asked = e; });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await waitFor(() => asked);
+      s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: approveOf(asked), req_id: "ans-2" });
+      await waitFor(() => s.kinds("session.error").length);
+      f.restore();
+      expect(f.hit.n).toBe(1);
+      expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "busy", control: "answer", run_id: asked.run_id, req_id: "ans-2", text: expect.stringContaining("ENOSPC") });
+      // nothing reached the executor: the card is still open (no resumed), nothing stored
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === asked.ask_id)).toBeFalsy();
+      expect(s.stored().filter((e: any) => e.kind === "session.task_answer")).toHaveLength(0);
+      s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: approveOf(asked) });
+      await s2idle(s);
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === asked.ask_id)).toBeTruthy();
+      expect(s.stored().filter((e: any) => e.kind === "session.task_answer")).toEqual([expect.objectContaining({ ask_id: asked.ask_id, option: approveOf(asked) })]);
+      expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+    });
   });
 });
 

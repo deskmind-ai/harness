@@ -12,6 +12,7 @@
  *   stop      the app's stop switch: every later act is refused
  *   end       collect the receipts
  */
+import { boxOf } from "./place.js";
 import type { ActionCardFacts, Beyond } from "../protocol/cards.js";
 import type { Action, ActRequest, ActResult, Challenge, Consequence, ConsentToken, Driver, DriverEvent, Element, ExternalChange, Observation, PerformResult, PlanProposal, PlanVerdict, Reading, Receipt, ReconcileFile, Reconciliation, SaveSheet, Snapshot, WindowInfo } from "./types.js";
 import * as P from "../orchestrator/prompts.js";
@@ -1543,9 +1544,12 @@ export class Executor {
     // what is selected there (H2: the card names which mail a 「删除」 deletes) — the selection flag, by structure: a
     // focused element the keyboard does not type into, other than the one acted on, from the same look
     const selected = (look?.elements ?? []).filter((e) => e.focused && !keyboardFocus(e) && e !== el).map((e) => elementName(e)).filter((x): x is string => !!x).map((x) => cardText(x, 80, this.opts.lang));
+    const box = el && "window" in a && a.window ? boxOf(el.rect, this.frameOf(a.window)) : undefined;
     const facts = (text: string, outgoingItems: ActionCardFacts["outgoing"], host: string | null): ActionCardFacts => ({
       action: a.kind, action_text: stepText(act, look, this.opts.lang), target: elementName(el ?? undefined), object,
-      object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host, ...(selected.length ? { selected } : {}) });
+      object_label: look ? windowLabel(look.window, this.opts.lang) : a.kind === "open_window" ? a.app : this.labelOf(object), consequence, outgoing: outgoingItems, site: host, ...(selected.length ? { selected } : {}),
+      // (U3) where the element is, from this same look: the app marks it on the window's picture while the card waits
+      ...(box ? { target_box: box } : {}) });
     if (site && a.kind === "open_window") { const text = site.host ? t.openSite(a.app, site.host, shortUrl(a.url!, this.opts.lang)) : t.openLink(a.app, shortUrl(a.url!, this.opts.lang)); return { sending: null, typed: [], content: undefined, text, act, lost: false, facts: facts(text, [], site.host ?? siteOf(a.url!) ?? null) }; }
     const text = describeAction(act, look, consequence, undefined, this.opts.lang) + (sending ? t.outgoing([...sending.fields, ...typedLines.map((x) => t.typed(x.trim()))], sending.shown) : "");
     return { sending, typed, content, text, act, lost: !!id && !el, facts: facts(text, sending ? outgoingItems(look, typedLines) : [], null) };
