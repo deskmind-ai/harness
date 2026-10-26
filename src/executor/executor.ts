@@ -1213,7 +1213,7 @@ export class Executor {
   /** The save-sheet floor of `a` on `look`: why committing its sheet may write over a file, or null. */
   private sheetFloor(a: Action, look: Observation | undefined): string | null {
     const sheet = look?.save_sheet;
-    return sheet && commits(a) ? this.sheetRisk(sheet) : null;
+    return sheet && commits(a, look) ? this.sheetRisk(sheet) : null;
   }
 
   /** Why committing this save sheet may write over a file that is there (null: a new name in a folder read whole):
@@ -2511,9 +2511,29 @@ function pressesClose(a: Action, look: Observation | undefined): boolean {
   return false;
 }
 
-/** A step that can commit an open sheet: a click, a double-click, a key (Return), a menu choice, typed text with a
- *  newline in it (Return typed). Typing a name into it or scrolling does not. */
-const commits = (a: Action): boolean => a.kind === "click" || a.kind === "double_click" || a.kind === "key" || a.kind === "select" || (a.kind === "type" && /[\r\n]/.test(a.text));
+/** A step that can COMMIT an open sheet (rc.18: cmd+shift+g — Go to Folder — drew the floor's card), by structure, on
+ *  the look it is judged against:
+ *  - Return / Enter, with any modifiers (the default button's key), or typed text with a newline (Return typed);
+ *  - Space with a button focused (presses it);
+ *  - a click or double-click on a button — any button: hands does not say which one is the default, and Save,
+ *    Replace and Cancel are all buttons — or on an element this look does not show (not known: taken to commit).
+ *  Everything else moves around in the sheet: other keys (cmd+shift+g, Escape, Tab, arrows), typing or setting a name
+ *  or a path, a click on a row, a cell, a pop-up, a checkbox, a choice in a pop-up menu. No app, no words: the key and
+ *  the target's role. */
+const BUTTON = /^(ax)?button$/i;
+function commits(a: Action, look: Observation | undefined): boolean {
+  if (a.kind === "type") return /[\r\n]/.test(a.text);
+  if (a.kind === "key") {
+    const k = chord(a.chord);
+    if (k.key === "return" || k.key === "enter") return true;
+    return k.key === "space" && BUTTON.test(look?.elements.find((e) => e.focused)?.role.replace(/[\s_-]/g, "") ?? "");
+  }
+  if (a.kind === "click" || a.kind === "double_click") {
+    const el = look?.elements.find((e) => e.id === a.target);
+    return !el || BUTTON.test(el.role.replace(/[\s_-]/g, ""));
+  }
+  return false;
+}
 
 /** A file action in the user's words (H3): the capability's own sentence in their language (Capability.human) — never
  *  its field names (`text=「↵」`, rc.16) nor the model-facing description. One without a sentence of its own (a
