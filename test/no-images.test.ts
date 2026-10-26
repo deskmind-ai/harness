@@ -102,8 +102,10 @@ describe("no image reaches a model: the first run's promise, checked on the 0.5 
     // every context the acting model was sent, after compaction; every judge's prompt
     for (const ctx of seen) expect(imagesIn(ctx)).toEqual([]);
     for (const p of prompts) expect(p).not.toMatch(PICTURE_AS_TEXT);
-    // and nothing of the kind on disk in the run's own record of what was sent
-    expect(JSON.stringify(readJsonl(path.join(runs, "r", "model_calls.jsonl")))).not.toMatch(PICTURE_AS_TEXT);
+    // and nothing of the kind on disk in the run's own record of what was sent — a record that is there
+    const calls = readJsonl(path.join(runs, "r", "model_calls.jsonl"));
+    expect(calls.length).toBeGreaterThan(5);
+    expect(JSON.stringify(calls)).not.toMatch(PICTURE_AS_TEXT);
   });
 
   it("the chat session that starts a task: the session model's contexts and the task's", async () => {
@@ -138,6 +140,11 @@ describe("no image reaches a model: the first run's promise, checked on the 0.5 
       for (const ctx of taskSeen) expect(imagesIn(ctx)).toEqual([]);
       for (const p of prompts) expect(p).not.toMatch(PICTURE_AS_TEXT);
       expect(fs.readFileSync(path.join(dir, "sessions", "ses_img", "session.jsonl"), "utf-8")).not.toMatch(PICTURE_AS_TEXT);
+      // the task's own record of its model calls is there, and clean
+      const runId = evs.find((e) => e.kind === "task_done").run_id as string;
+      const calls = readJsonl(path.join(dir, "sessions", "ses_img", "runs", runId, "model_calls.jsonl"));
+      expect(calls.length).toBeGreaterThan(5);
+      expect(JSON.stringify(calls)).not.toMatch(PICTURE_AS_TEXT);
     } finally { h.end(); await new Promise((r) => setTimeout(r, 50)); }
   });
 

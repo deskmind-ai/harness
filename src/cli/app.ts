@@ -204,10 +204,12 @@ export class StdioUser implements RuntimeUser {
     if (o && answersOpenCard(a, o.id, this.voided)) {
       this.closeOpen("answered");
       o.taken?.();                 // the card is answered now: the next line (a steer in the same chunk) finds none open
-      this.log.emit({ kind: "resumed", ask_id: o.id });
-      if (typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length) return o.settle({ option: a.option });
-      if (typeof a.text === "string" && a.text.trim()) return o.settle({ text: a.text });
-      return o.settle(null);
+      // the answer as it is applied (U3): an option in range, else non-blank words, else none — said on the resumed
+      // (`answer`), so the session records what was used and never what was sent
+      const answer: Answer | null = typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length ? { option: a.option }
+        : typeof a.text === "string" && a.text.trim() ? { text: a.text } : null;
+      this.log.emit({ kind: "resumed", ask_id: o.id, ...(answer ? { answer } : {}) });
+      return o.settle(answer);
     }
     const why = a.ask_id !== undefined ? this.closed.get(a.ask_id) ?? this.over ?? "none" : this.over ?? (this.voided ? "unnamed" : "none");
     this.refuse(a, why);

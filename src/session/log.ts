@@ -85,11 +85,11 @@ export const SessionBody = z.discriminatedUnion("kind", [
   // is refused (cancelled) — stored, so it holds across a reopen and is ordered before any later cua line
   z.object({ kind: z.literal("session.cua_cancelled"), client_id: z.string() }),
   z.object({ kind: z.literal("session.task_respond"), run_id: z.string(), option: z.number().int(), undo: z.boolean(), req_id: z.string().optional() }),
-  // (U3, additive) a card of the running task was answered — stored before the answer goes to the executor: which card
-  // (`ask_id`, the one open then) and what was picked: the option's index into the card's options, or the user's own
-  // words. The executor's resumed{ask_id} says the answer took effect; this says what it was, for the app's history.
-  // `req_id` (additive): the app's id for the answer, echoed
-  z.object({ kind: z.literal("session.task_answer"), run_id: z.string(), ask_id: z.string(), option: z.number().int().optional(), text: z.string().optional(), req_id: z.string().optional() }),
+  // (U3, additive) the answer the executor applied to a card of the running task (its resumed{ask_id, answer}, stored
+  // as the session forwards it): the option's index into the card's options, or the user's own words — what was used,
+  // never what was sent. None for a card that closed on no answer, or was voided (resumed{voided}: a steer, its
+  // deadline), so the record is never wrong; a card with no record is shown answered without its pick
+  z.object({ kind: z.literal("session.task_answer"), run_id: z.string(), ask_id: z.string(), option: z.number().int().optional(), text: z.string().optional() }),
   // H2: the result card's undo was done (the executor's result_response, in fields). `unknown` (additive): recorded on
   // reopen for an undo that began and was cut off with no result_response — how much of it was done is not known
   // (undone and total are 0 then, `refused` says why)

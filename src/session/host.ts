@@ -798,6 +798,16 @@ export class SessionHost {
     // is set at task_done above (cardOf), before it is forwarded; its closing by deadline is taken here, before too
     if (ev.kind === "ask") { task.card = typeof ev.ask_id === "string" ? ev.ask_id : null; task.cardHolds = (ev.card as { reconcile?: unknown } | undefined)?.reconcile === true; }
     else if ((ev.kind === "resumed" || ev.kind === "ask_void") && ev.ask_id === task.card) task.card = null;
+    // U3: the answer the executor applied to a card (its resumed with `answer`; a voided one has none) is history —
+    // session.task_answer, stored before the resumed is forwarded, so the app reads the two in that order. The source
+    // of truth is the executor's decision (review of #80: a record made from the line sent could say option 1 when 0
+    // was taken, or an option off the card). A record that cannot be written is lost and nothing else: the app shows
+    // 「已回答」 for that card without the pick (said on stderr)
+    if (ev.kind === "resumed" && typeof ev.ask_id === "string" && ev.voided === undefined && ev.answer && typeof ev.answer === "object") {
+      const an = ev.answer as { option?: unknown; text?: unknown };
+      const pick = typeof an.option === "number" ? { option: an.option } : typeof an.text === "string" ? { text: an.text } : null;
+      if (pick) { try { this.log.emit({ kind: "session.task_answer", run_id: task.runId, ask_id: ev.ask_id, ...pick }); } catch (e) { process.stderr.write(`session: the answer to ${ev.ask_id} could not be stored: ${errText(e)}\n`); } }
+    }
     // (as the executor's asker marks it: a card let go by a steer or its deadline, not by the task's end)
     if (ev.kind === "ask_void" && (ev.why === "steer" || ev.why === "timeout")) task.cardVoided = true;
     else if (ev.kind === "result_card_closed" && task.resultCard.s === "open") task.resultCard = { s: "closed", why: "expired" };
@@ -1085,23 +1095,12 @@ export class SessionHost {
 
   answer(line: Record<string, unknown>, runId?: string, reqId?: string) {
     const t = this.find(runId, "answer", reqId);
-    if (!t) return;
-    // the answer to the open card is stored before it goes to the executor (U3, additive: session.task_answer), so the
-    // app's history names what was picked — the executor's resumed says only that the card was answered. Stored only
-    // when the line names the card open now and carries an option or words (anything else the executor refuses, and a
-    // record of it would say the card was answered with nothing); one that cannot be stored is refused here (busy) and
-    // not sent — the card stays open, the user answers again (as a respond, host above)
-    const opt = line.option, words = line.text;
-    const option = typeof opt === "number" && Number.isInteger(opt) && opt >= 0 ? opt : undefined;
-    const text = typeof words === "string" ? words : undefined;
-    if (t.card !== null && (option !== undefined || text !== undefined) && answersOpenCard(line, t.card, !!t.cardVoided)) {
-      try { this.log.emit({ kind: "session.task_answer", run_id: t.runId, ask_id: t.card, ...(option !== undefined ? { option } : {}), ...(text !== undefined ? { text } : {}), ...(reqId ? { req_id: reqId } : {}) }); }
-      catch (e) { this.refuse("busy", `the answer could not be stored: ${errText(e)}`, "answer", undefined, { run_id: t.runId, ...(reqId ? { req_id: reqId } : {}) }); return; }
-    }
     // an answer to the card that holds steers goes to the executor before anything sent after it: a steer behind it is
     // read once the card is answered — no longer held here (review of #77). (Refused there, the executor holds it itself)
-    if (t.cardHolds && answersOpenCard(line, t.card, !!t.cardVoided)) t.cardHolds = false;
-    t.handle.write(JSON.stringify(line));
+    if (t && t.cardHolds && answersOpenCard(line, t.card, !!t.cardVoided)) t.cardHolds = false;
+    if (t) t.handle.write(JSON.stringify(line));
+    // (what was answered is history only once the executor says what it applied: session.task_answer on its resumed,
+    // below — never from the line sent, which it may refuse, settle as no answer, or take only in part)
   }
 
   /** 「现在回答」 on the running task's expired action card: to its executor, which owns the card and asks it again (or

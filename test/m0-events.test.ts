@@ -110,6 +110,8 @@ describe("M0 slice A: step lifecycle and readable text", () => {
     expect(results[0]).toMatchObject({ status: "ok", executor_status: "ok", consequence: "modify_user" });
     // the second: an element never seen is not acted on (stale), said without its id
     expect(steps[1].human).toBe("在 编辑器「笔记.txt（已修改）」 点「一个元素」");     // the window as last observed
+    // (U3) the label is the step's own look's: the window was retitled since the task's first snapshot
+    expect(steps[1].object_label).toBe("编辑器「笔记.txt（已修改）」");
     expect(steps[1].plan_step).toBeUndefined();
     expect(results[1]).toMatchObject({ status: "stale", executor_status: "stale" });
     // every step's result comes after it and before the next step
