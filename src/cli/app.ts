@@ -206,7 +206,7 @@ export class StdioUser implements RuntimeUser {
       o.taken?.();                 // the card is answered now: the next line (a steer in the same chunk) finds none open
       // the answer as it is applied (U3): an option in range, else non-blank words, else none — said on the resumed
       // (`answer`), so the session records what was used and never what was sent
-      const answer: Answer | null = typeof a.option === "number" && a.option >= 0 && a.option < o.card.options.length ? { option: a.option }
+      const answer: Answer | null = typeof a.option === "number" && Number.isInteger(a.option) && a.option >= 0 && a.option < o.card.options.length ? { option: a.option }
         : typeof a.text === "string" && a.text.trim() ? { text: a.text } : null;
       this.log.emit({ kind: "resumed", ask_id: o.id, ...(answer ? { answer } : {}) });
       return o.settle(answer);

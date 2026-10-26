@@ -106,6 +106,14 @@ describe("stdio user", () => {
     expect(await p1).toBeNull();
     expect(last()).toEqual(expect.objectContaining({ kind: "resumed", ask_id: askOf() }));
     expect(last()).not.toHaveProperty("answer");
+    // 0.5 is no option: the card settles on no answer and is said so — never a resumed the event schema refuses with the
+    // card left neither open nor settled (review of #80 at 0d3a62b)
+    const p15 = u.ask(card);
+    await new Promise((r) => setTimeout(r, 5));
+    input.write(JSON.stringify({ ask_id: askOf(), option: 0.5 }) + "\n");
+    expect(await p15).toBeNull();
+    expect(last()).toEqual(expect.objectContaining({ kind: "resumed", ask_id: askOf() }));
+    expect(last()).not.toHaveProperty("answer");
     const p2 = u.ask(card);
     await new Promise((r) => setTimeout(r, 5));
     input.write(JSON.stringify({ ask_id: askOf(), option: 9, text: "好的" }) + "\n");

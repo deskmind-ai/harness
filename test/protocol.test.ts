@@ -53,6 +53,10 @@ describe("control lines", () => {
   it("typed lines parse; the untyped lines of before map onto the same types", () => {
     expect(parseControl('{"type":"answer","ask_id":"ask_1","option":2}')).toEqual({ type: "answer", ask_id: "ask_1", option: 2 });
     expect(parseControl('{"type":"answer","ask_id":"ask_1","text":"买牛奶"}')).toEqual({ type: "answer", ask_id: "ask_1", text: "买牛奶" });
+    // an option is an index: 0.5 and -1 are no option (review of #80)
+    expect(parseControl('{"type":"answer","ask_id":"ask_1","option":0.5}')).toEqual({ type: "answer", ask_id: "ask_1" });
+    expect(parseControl('{"ask_id":"ask_1","option":-1}')).toEqual({ type: "answer", ask_id: "ask_1" });
+    expect(parseControl('{"respond":1.5}')).toEqual({ type: "respond" });
     expect(parseControl('{"type":"stop"}')).toEqual({ type: "stop" });
     expect(parseControl('{"type":"respond","option":0}')).toEqual({ type: "respond", option: 0 });
     expect(parseControl('{"type":"steer","text":"只看今天的"}')).toEqual({ type: "steer", text: "只看今天的" });

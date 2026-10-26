@@ -1951,6 +1951,23 @@ process.on("SIGTERM",()=>setTimeout(()=>{const d={seq:1,t:1,run_id:rid,kind:"tas
       }
     });
 
+    it("an option that is not an index (0.5) is refused by the session (bad_control) and never forwarded: the card stays open, the next answer goes through", async () => {
+      const s = editorTask();
+      let asked: any = null;
+      s.on((e) => { if (e.kind === "ask") asked = e; });
+      s.send({ type: "say", text: "把笔记的正文改成「新的」" });
+      await waitFor(() => asked);
+      s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: 0.5, req_id: "ans-h" });
+      await new Promise((r) => setTimeout(r, 30));
+      expect(s.kinds("session.error").at(-1)).toMatchObject({ code: "bad_control", control: "answer", run_id: asked.run_id, req_id: "ans-h" });
+      expect(s.evs.find((e) => e.kind === "resumed" && e.ask_id === asked.ask_id)).toBeFalsy();
+      expect(s.evs.find((e) => e.kind === "refused")).toBeFalsy();
+      s.send({ type: "answer", run_id: asked.run_id, ask_id: asked.ask_id, option: approveOf(asked) });
+      await s2idle(s);
+      expect(records(s)).toEqual([expect.objectContaining({ ask_id: asked.ask_id, option: approveOf(asked) })]);
+      expect(s.stored().find((e: any) => e.kind === "session.task_end")).toMatchObject({ status: "succeeded" });
+    });
+
     it("a record that cannot be written is lost and nothing else: the answer went through, the task ends as usual, the history has the end but not the pick", async () => {
       const s = editorTask();
       const f = failFs("writeSync", lineOf("session.task_answer"));

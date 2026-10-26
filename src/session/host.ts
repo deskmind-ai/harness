@@ -1095,6 +1095,11 @@ export class SessionHost {
 
   answer(line: Record<string, unknown>, runId?: string, reqId?: string) {
     const t = this.find(runId, "answer", reqId);
+    // an option that is not an index (0.5, -1) is refused here: forwarded, the executor would drop it (parseControl)
+    // and take the line as no answer — closing the card on nothing the user meant
+    if (t && line.option !== undefined && !(typeof line.option === "number" && Number.isInteger(line.option) && line.option >= 0)) {
+      return this.refuse("bad_control", "an answer's option is the index of one of the card's options (a non-negative integer)", "answer", undefined, { run_id: t.runId, ...(reqId ? { req_id: reqId } : {}) });
+    }
     // an answer to the card that holds steers goes to the executor before anything sent after it: a steer behind it is
     // read once the card is answered — no longer held here (review of #77). (Refused there, the executor holds it itself)
     if (t && t.cardHolds && answersOpenCard(line, t.card, !!t.cardVoided)) t.cardHolds = false;

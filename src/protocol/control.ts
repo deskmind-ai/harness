@@ -28,7 +28,9 @@ export function parseControl(line: string): Control | null {
   if (!j || typeof j !== "object" || Array.isArray(j)) return null;
   const o = j as Record<string, unknown>;
   const str = (k: string) => (typeof o[k] === "string" ? { [k]: o[k] as string } : {});
-  const num = (k: string, from = k) => (typeof o[from] === "number" ? { [k]: o[from] as number } : {});
+  // an option is an index into a card's options: a non-negative integer, or nothing (0.5 is no option — review of #80:
+  // the asker took it, the event schema refused it, and the card was neither settled nor open)
+  const num = (k: string, from = k) => (typeof o[from] === "number" && Number.isInteger(o[from]) && (o[from] as number) >= 0 ? { [k]: o[from] as number } : {});
   if (o.type === undefined) {
     // the untyped lines of before control v1
     if (o.stop === true) return { type: "stop" };
